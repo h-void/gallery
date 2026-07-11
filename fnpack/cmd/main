@@ -1,0 +1,512 @@
+#!/bin/sh
+set -eu
+
+export PATH=/var/apps/__FNPACK_RUNTIME_DEPENDENCY__/target/bin:$PATH
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PACKAGE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+APP_DIR="${TRIM_APPDEST:-${PACKAGE_ROOT}/target}"
+VAR_DIR="${TRIM_PKGVAR:-${PACKAGE_ROOT}/var}"
+TMP_DIR="${TRIM_PKGTMP:-${PACKAGE_ROOT}/tmp}"
+PORT="${TRIM_SERVICE_PORT:-__FNPACK_SERVICE_PORT__}"
+APP_USER="${TRIM_USERNAME:-gallery}"
+PID_FILE="${VAR_DIR}/gallery.pid"
+RUST_ACCEL_BIN="${APP_DIR}/bin/gallery-accel"
+RUST_ACCEL_PID_FILE="${VAR_DIR}/gallery-accel.pid"
+# Pure Rust product: no residual Python required for normal start.
+RUST_ACCEL_PORT="${GALLERY_RUST_ACCEL_PORT:-18899}"
+DATA_SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}"
+DATA_SHARE_DATA_DIR="${DATA_SHARE_PATHS%%:*}"
+DATA_SHARE_REST="${DATA_SHARE_PATHS#*:}"
+if [ "$DATA_SHARE_REST" = "$DATA_SHARE_PATHS" ]; then
+    DATA_SHARE_REST=""
+fi
+DATA_SHARE_PREVIEW_DIR="${DATA_SHARE_REST%%:*}"
+DATA_SHARE_MODEL_REST="${DATA_SHARE_REST#*:}"
+if [ "$DATA_SHARE_MODEL_REST" = "$DATA_SHARE_REST" ]; then
+    DATA_SHARE_MODEL_REST=""
+fi
+DATA_SHARE_MODEL_DIR="${DATA_SHARE_MODEL_REST%%:*}"
+MODEL_CACHE_ROOT="${DATA_SHARE_MODEL_DIR:-${VAR_DIR}/models}"
+APP_STARTUP_LOG_FILE=""
+LOG_FILE="${TRIM_TEMP_LOGFILE:-${VAR_DIR}/gallery.log}"
+
+log() {
+    printf '%s\n' "$*" >> "$LOG_FILE" 2>/dev/null || true
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ] && [ "$TRIM_TEMP_LOGFILE" != "$LOG_FILE" ]; then
+        printf '%s\n' "$*" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+    fi
+}
+
+configure_media_roots() {
+    if [ -z "${TRIM_DATA_ACCESSIBLE_PATHS:-}" ]; then
+        return 0
+    fi
+
+    legacy_roots=""
+    real_roots=""
+    root_index=1
+    old_ifs="$IFS"
+    IFS=":"
+    for real_root in $TRIM_DATA_ACCESSIBLE_PATHS; do
+        if [ -z "$real_root" ]; then
+            continue
+        fi
+        legacy_root="/pictures${root_index}"
+        if [ -z "$legacy_roots" ]; then
+            legacy_roots="$legacy_root"
+            real_roots="$real_root"
+        else
+            legacy_roots="${legacy_roots},${legacy_root}"
+            real_roots="${real_roots},${real_root}"
+        fi
+        root_index=$((root_index + 1))
+    done
+    IFS="$old_ifs"
+
+    if [ -n "$legacy_roots" ]; then
+        export PICTURES_ROOT="$legacy_roots"
+        export PICTURES_ROOT_REAL_PATHS="$real_roots"
+        # Default display labels are the real authorized roots (not /picturesN).
+        # Explicit PICTURES_ROOT_LABELS still wins when set by the operator.
+        export PICTURES_ROOT_LABELS="${PICTURES_ROOT_LABELS:-$real_roots}"
+    fi
+}
+
+prepare_env() {
+    export DATA_DIR="${DATA_DIR:-${DATA_SHARE_DATA_DIR:-${VAR_DIR}/data}}"
+    export IMAGE_PREVIEW_CACHE_DIR="${IMAGE_PREVIEW_CACHE_DIR:-${DATA_SHARE_PREVIEW_DIR:-${VAR_DIR}/preview-cache}}"
+    # ponytail: 128 Mi-pixel ceiling; use a memory-bounded downscaling decoder if huge images become common instead of raising it.
+    export IMAGE_PREVIEW_MAX_SOURCE_PIXELS="${IMAGE_PREVIEW_MAX_SOURCE_PIXELS:-134217728}"
+    export VIDEO_FRAME_CACHE_DIR="${VIDEO_FRAME_CACHE_DIR:-${IMAGE_PREVIEW_CACHE_DIR}/video-frames}"
+    export VIDEO_FRAME_CACHE_MAX_BYTES="${VIDEO_FRAME_CACHE_MAX_BYTES:-2000000000}"
+    export VIDEO_TRANSCODE_CACHE_DIR="${VIDEO_TRANSCODE_CACHE_DIR:-${IMAGE_PREVIEW_CACHE_DIR}/transcode-cache}"
+    export VIDEO_TRANSCODE_CACHE_MAX_BYTES="${VIDEO_TRANSCODE_CACHE_MAX_BYTES:-900000000}"
+    export MODEL_CACHE_ROOT="${MODEL_CACHE_ROOT:-${VAR_DIR}/models}"
+    export HF_HOME="${HF_HOME:-${MODEL_CACHE_ROOT}/huggingface}"
+    export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+    export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HUB_CACHE}}"
+    export HF_XET_CACHE="${HF_XET_CACHE:-${HF_HOME}/xet}"
+    export HF_ASSETS_CACHE="${HF_ASSETS_CACHE:-${HF_HOME}/assets}"
+    export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${MODEL_CACHE_ROOT}/xdg-cache}"
+    if [ -z "${HOME:-}" ] || [ ! -w "${HOME:-/}" ]; then
+        export HOME="${MODEL_CACHE_ROOT}/home"
+    fi
+    export CHARACTER_MODEL_DIR="${CHARACTER_MODEL_DIR:-${MODEL_CACHE_ROOT}/character}"
+    export ARTIST_MODEL_DIR="${ARTIST_MODEL_DIR:-${MODEL_CACHE_ROOT}/artist}"
+    export CHARACTER_MODEL_VARIANT="${CHARACTER_MODEL_VARIANT:-ccip-caformer_b36-24}"
+    # Python/deepghs layout: $CHARACTER_MODEL_DIR/$VARIANT/model_feat.onnx
+    export CHARACTER_MODEL_FILE="${CHARACTER_MODEL_FILE:-model_feat.onnx}"
+    export CHARACTER_OPENVINO_CACHE_DIR="${CHARACTER_OPENVINO_CACHE_DIR:-${MODEL_CACHE_ROOT}/openvino-cache}"
+    # Character recognition on (role/character library). Artist recognition off:
+    # library is already organized by artist folders — no model artist suggestion UI.
+    export CHARACTER_RECOGNITION_ENABLED="${CHARACTER_RECOGNITION_ENABLED:-1}"
+    export CHARACTER_RECOGNITION_PROVIDER="${CHARACTER_RECOGNITION_PROVIDER:-openvino}"
+    export ARTIST_RECOGNITION_ENABLED="${ARTIST_RECOGNITION_ENABLED:-0}"
+    export ARTIST_RECOGNITION_PROVIDER="${ARTIST_RECOGNITION_PROVIDER:-openvino}"
+    export ARTIST_RECOGNITION_WARMUP_ENABLED="${ARTIST_RECOGNITION_WARMUP_ENABLED:-0}"
+    export CHARACTER_OPENVINO_DEVICE="${CHARACTER_OPENVINO_DEVICE:-GPU}"
+    # Default to GPU-only; opt into CPU explicitly when availability matters more than NAS load.
+    export CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK="${CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK:-0}"
+    export CHARACTER_INFERENCE_CONCURRENCY="${CHARACTER_INFERENCE_CONCURRENCY:-1}"
+    export CHARACTER_ONNX_INTRA_OP_THREADS="${CHARACTER_ONNX_INTRA_OP_THREADS:-1}"
+    export CHARACTER_ONNX_INTER_OP_THREADS="${CHARACTER_ONNX_INTER_OP_THREADS:-1}"
+    export CHARACTER_IMPORT_SEED_REFERENCES_PER_CHARACTER="${CHARACTER_IMPORT_SEED_REFERENCES_PER_CHARACTER:-3}"
+    export CHARACTER_IMPORT_MAX_REFERENCES_PER_CHARACTER="${CHARACTER_IMPORT_MAX_REFERENCES_PER_CHARACTER:-0}"
+    export CHARACTER_IMPORT_MIN_SIMILARITY="${CHARACTER_IMPORT_MIN_SIMILARITY:-0.35}"
+    export CHARACTER_IMPORT_DUPLICATE_SIMILARITY="${CHARACTER_IMPORT_DUPLICATE_SIMILARITY:-0.95}"
+    export CHARACTER_IMPORT_AUTO_CLEANUP_ENABLED="${CHARACTER_IMPORT_AUTO_CLEANUP_ENABLED:-1}"
+    export CHARACTER_IMPORT_CLEANUP_MIN_REFERENCES_PER_CHARACTER="${CHARACTER_IMPORT_CLEANUP_MIN_REFERENCES_PER_CHARACTER:-3}"
+    export CHARACTER_IMPORT_IDLE_ENABLED="${CHARACTER_IMPORT_IDLE_ENABLED:-0}"
+    export CHARACTER_IMPORT_IDLE_INTERVAL="${CHARACTER_IMPORT_IDLE_INTERVAL:-60}"
+    export CHARACTER_IMPORT_IDLE_BACKOFF_INTERVAL="${CHARACTER_IMPORT_IDLE_BACKOFF_INTERVAL:-600}"
+    export CHARACTER_IMPORT_IDLE_START_DELAY="${CHARACTER_IMPORT_IDLE_START_DELAY:-120}"
+    export CHARACTER_IMPORT_IDLE_FOREGROUND_COOLDOWN="${CHARACTER_IMPORT_IDLE_FOREGROUND_COOLDOWN:-10}"
+    export CHARACTER_IMPORT_STALE_TAG_SINGLE_REPAIR_ENABLED="${CHARACTER_IMPORT_STALE_TAG_SINGLE_REPAIR_ENABLED:-1}"
+    export CHARACTER_IMPORT_STALE_TAG_SINGLE_REPAIR_BATCH_SIZE="${CHARACTER_IMPORT_STALE_TAG_SINGLE_REPAIR_BATCH_SIZE:-10}"
+    export CHARACTER_IMPORT_STALE_TAG_SINGLE_REPAIR_INTERVAL="${CHARACTER_IMPORT_STALE_TAG_SINGLE_REPAIR_INTERVAL:-600}"
+    export CHARACTER_IMPORT_STALE_TAG_SINGLE_REPAIR_START_DELAY="${CHARACTER_IMPORT_STALE_TAG_SINGLE_REPAIR_START_DELAY:-180}"
+    export CHARACTER_STALE_REEMBED_BATCH_SIZE="${CHARACTER_STALE_REEMBED_BATCH_SIZE:-12}"
+    export SCAN_ON_START="${SCAN_ON_START:-0}"
+    export SCAN_INTERVAL="${SCAN_INTERVAL:-21600}"
+    export HASH_INTERVAL="${HASH_INTERVAL:-30}"
+    export HASH_BATCH_SIZE="${HASH_BATCH_SIZE:-500}"
+    export DB_BACKUP_INTERVAL="${DB_BACKUP_INTERVAL:-43200}"
+    export DB_BACKUP_RETENTION="${DB_BACKUP_RETENTION:-4}"
+    export DB_BACKUP_ON_START="${DB_BACKUP_ON_START:-0}"
+    export DB_BACKUP_START_DELAY="${DB_BACKUP_START_DELAY:-120}"
+    export GALLERY_STATIC_DIR="${GALLERY_STATIC_DIR:-${APP_DIR}/app/static}"
+    export APP_STARTUP_LOG_FILE="${DATA_DIR}/logs/startup.log"
+    export LOG_FILE="${APP_STARTUP_LOG_FILE}"
+
+    mkdir -p "$VAR_DIR" "$TMP_DIR"
+    if ! mkdir -p "${DATA_DIR}/logs" "${IMAGE_PREVIEW_CACHE_DIR}" "${VIDEO_FRAME_CACHE_DIR}" \
+        "${VIDEO_TRANSCODE_CACHE_DIR}" "${CHARACTER_MODEL_DIR}" "${ARTIST_MODEL_DIR}" "${CHARACTER_OPENVINO_CACHE_DIR}" \
+        "${HF_HOME}" "${HF_HUB_CACHE}" "${HF_XET_CACHE}" "${HF_ASSETS_CACHE}" \
+        "${XDG_CACHE_HOME}" "${HOME}" "${HF_HOME}/logs" "${HF_XET_CACHE}/logs"; then
+        log "Gallery startup aborted: unable to create runtime directories."
+        log "Check fnOS data-share ownership/permissions for gallery-data, gallery-preview-cache, and gallery-model-cache."
+        exit 1
+    fi
+
+    export PYTHONPATH="$APP_DIR"
+    configure_media_roots
+}
+
+database_path_details() {
+    path="$1"
+    if [ ! -e "$path" ]; then
+        log "$path: exists=0"
+        return 0
+    fi
+    if [ -d "$path" ]; then
+        kind="dir"
+    elif [ -f "$path" ]; then
+        kind="regular"
+    else
+        kind="other"
+    fi
+    access=""
+    [ -r "$path" ] && access="${access}r"
+    [ -w "$path" ] && access="${access}w"
+    [ -x "$path" ] && access="${access}x"
+    [ -n "$access" ] || access="-"
+    if details=$(stat -c 'mode=%a uid=%u gid=%g size=%s' "$path" 2>/dev/null); then
+        :
+    elif details=$(stat -f 'mode=%Lp uid=%u gid=%g size=%z' "$path" 2>/dev/null); then
+        :
+    else
+        details="mode=unknown uid=unknown gid=unknown size=unknown"
+    fi
+    log "$path: exists=1 type=$kind $details access=$access"
+}
+
+check_data_dir() {
+    db_path="${DATA_DIR}/gallery.db"
+    log "Gallery database path details:"
+    database_path_details "$DATA_DIR"
+    database_path_details "$db_path"
+    database_path_details "${db_path}-wal"
+    database_path_details "${db_path}-shm"
+
+    if [ ! -d "$DATA_DIR" ]; then
+        log "Gallery database preflight failed: data directory is not a directory: $DATA_DIR"
+    elif [ ! -r "$DATA_DIR" ] || [ ! -w "$DATA_DIR" ] || [ ! -x "$DATA_DIR" ]; then
+        log "Gallery database preflight failed: data directory is not readable/writable/searchable: $DATA_DIR"
+    elif [ -e "$db_path" ] && [ ! -f "$db_path" ]; then
+        log "Gallery database preflight failed: database path is not a regular file: $db_path"
+    elif [ -f "$db_path" ] && { [ ! -r "$db_path" ] || [ ! -w "$db_path" ]; }; then
+        log "Gallery database preflight failed: database file is not readable/writable: $db_path"
+    else
+        log "Gallery database preflight ok: $db_path"
+        return 0
+    fi
+
+    log "Expected fnOS data share location: gallery-data/gallery.db. Stop Gallery before replacing the database, confirm gallery.db is a regular SQLite file, fix ownership/permissions for the gallery package user, and remove stale SQLite sidecar files gallery.db-wal/gallery.db-shm left from the stopped old database."
+    return 1
+}
+
+is_running() {
+    pid_file_running "$PID_FILE" || pid_file_running "$RUST_ACCEL_PID_FILE" || \
+        gallery_processes_exist || port_listeners_exist
+}
+
+pid_file_running() {
+    pid_file="$1"
+    [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null
+}
+
+gallery_process_pids() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -u "$APP_USER" -x gallery-accel 2>/dev/null || true
+    fi
+}
+
+gallery_processes_exist() {
+    pids=$(gallery_process_pids)
+    [ -n "$pids" ]
+}
+
+stop_gallery_processes() {
+    pids=$(gallery_process_pids)
+    if [ -z "$pids" ]; then
+        return 0
+    fi
+    log "Gallery stopping package-user gallery-accel pid(s): $(printf '%s' "$pids" | tr '\n' ' ')"
+    pkill -TERM -u "$APP_USER" -x gallery-accel 2>/dev/null || true
+    sleep 1
+    if gallery_processes_exist; then
+        pkill -KILL -u "$APP_USER" -x gallery-accel 2>/dev/null || true
+        sleep 1
+    fi
+    if gallery_processes_exist; then
+        log "Gallery warning: package-user gallery-accel process still running after kill attempt."
+        return 1
+    fi
+    log "Gallery package-user gallery-accel process stopped."
+    return 0
+}
+
+# List PIDs listening on the service TCP port (orphans after sg-render restarts).
+port_listener_pids() {
+    pids=""
+    if command -v ss >/dev/null 2>&1; then
+        # ss -lptn 'sport = :8899' → users:(("gallery-accel",pid=123,fd=10))
+        pids=$(ss -lptn "sport = :${PORT}" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u || true)
+    fi
+    if [ -z "$pids" ] && command -v fuser >/dev/null 2>&1; then
+        pids=$(fuser "${PORT}/tcp" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u || true)
+    fi
+    if [ -z "$pids" ] && command -v lsof >/dev/null 2>&1; then
+        pids=$(lsof -t -iTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null | sort -u || true)
+    fi
+    printf '%s\n' "$pids"
+}
+
+port_listeners_exist() {
+    pids=$(port_listener_pids)
+    [ -n "$pids" ]
+}
+
+# Kill package-owned listeners on $PORT only. Never kill unknown processes.
+free_service_port() {
+    pids=$(port_listener_pids)
+    if [ -z "$pids" ]; then
+        return 0
+    fi
+    log "Gallery inspecting port $PORT holder pid(s): $(printf '%s' "$pids" | tr '\n' ' ')"
+    owned=""
+    foreign=""
+    for pid in $pids; do
+        [ -n "$pid" ] || continue
+        # Only kill gallery-accel owned by package user.
+        cmd=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+        owner=$(ps -p "$pid" -o user= 2>/dev/null || true)
+        if [ "$cmd" = "gallery-accel" ] && [ "$owner" = "$APP_USER" ]; then
+            owned="${owned}${pid} "
+        else
+            foreign="${foreign}${pid} "
+        fi
+    done
+    if [ -n "$foreign" ]; then
+        log "Gallery refusing to kill non-gallery listener(s) on port $PORT: $foreign"
+        return 1
+    fi
+    if [ -z "$owned" ]; then
+        log "Gallery port $PORT held by unknown process; refusing automatic kill."
+        return 1
+    fi
+    log "Gallery freeing port $PORT held by gallery-accel pid(s): $owned"
+    for pid in $owned; do
+        kill "$pid" 2>/dev/null || true
+    done
+    sleep 1
+    pids=$(port_listener_pids)
+    if [ -n "$pids" ]; then
+        for pid in $pids; do
+            cmd=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+            owner=$(ps -p "$pid" -o user= 2>/dev/null || true)
+            if [ "$cmd" = "gallery-accel" ] && [ "$owner" = "$APP_USER" ]; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+        sleep 1
+    fi
+    if port_listeners_exist; then
+        log "Gallery warning: port $PORT still in use after kill attempt."
+        return 1
+    fi
+    log "Gallery port $PORT is free."
+    return 0
+}
+
+stop_pid_file() {
+    stop_file="$1"
+    stop_label="$2"
+    if pid_file_running "$stop_file"; then
+        kill "$(cat "$stop_file")" 2>/dev/null || true
+        # Brief wait so children (sg → gallery-accel) can exit with the parent.
+        sleep 1
+        if pid_file_running "$stop_file"; then
+            kill -9 "$(cat "$stop_file")" 2>/dev/null || true
+        fi
+        rm -f "$stop_file"
+        log "$stop_label stopped."
+    else
+        rm -f "$stop_file"
+        log "$stop_label is not running."
+    fi
+}
+
+launch_rust_primary() {
+    if [ ! -x "$RUST_ACCEL_BIN" ]; then
+        log "Gallery Rust primary binary not found: $RUST_ACCEL_BIN"
+        return 1
+    fi
+    # Official ONNX Runtime shared libs ship next to gallery-accel (libonnxruntime.so*).
+    RUST_BIN_DIR="$(cd "$(dirname "$RUST_ACCEL_BIN")" && pwd)"
+    export LD_LIBRARY_PATH="${RUST_BIN_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    # load-dynamic: prefer explicit dylib path for ort::init_from
+    if [ -f "${RUST_BIN_DIR}/libonnxruntime.so.1" ]; then
+        export ORT_DYLIB_PATH="${RUST_BIN_DIR}/libonnxruntime.so.1"
+    elif [ -f "${RUST_BIN_DIR}/libonnxruntime.so" ]; then
+        export ORT_DYLIB_PATH="${RUST_BIN_DIR}/libonnxruntime.so"
+    elif [ -f "${RUST_BIN_DIR}/libonnxruntime.so.1.24.1" ]; then
+        export ORT_DYLIB_PATH="${RUST_BIN_DIR}/libonnxruntime.so.1.24.1"
+    fi
+    # Fail fast if the binary cannot even start (e.g. old glibc / missing ORT .so).
+    if ! "$RUST_ACCEL_BIN" --help >/dev/null 2>>"$LOG_FILE"; then
+        log "Gallery Rust primary binary failed --help smoke (see $LOG_FILE). Check GLIBC version and libonnxruntime under $RUST_BIN_DIR."
+        tail -n 5 "$LOG_FILE" 2>/dev/null | while IFS= read -r line; do log "  $line"; done
+        return 1
+    fi
+    rm -f "$PID_FILE"
+    # Intel OpenVINO GPU needs /dev/dri (render group). fnOS may launch without
+    # supplemental groups even after usermod; force primary group via `sg render`.
+    START_CMD="\"$RUST_ACCEL_BIN\" --primary --host 0.0.0.0 --port \"$PORT\" --db \"${DATA_DIR}/gallery.db\" --enable-writes --enable-media --enable-ml --static-dir \"${GALLERY_STATIC_DIR}\""
+    if command -v sg >/dev/null 2>&1 && getent group render >/dev/null 2>&1; then
+        log "Gallery starting under sg render for OpenVINO GPU (/dev/dri)."
+        # shellcheck disable=SC2086
+        nohup sg render -c "$RUST_ACCEL_BIN --primary --host 0.0.0.0 --port $PORT --db ${DATA_DIR}/gallery.db --enable-writes --enable-media --enable-ml --static-dir ${GALLERY_STATIC_DIR}" \
+            >> "$LOG_FILE" 2>&1 &
+    else
+        log "Gallery starting without sg render (group/sg missing); OpenVINO may fall back to CPU."
+        nohup "$RUST_ACCEL_BIN" \
+            --primary \
+            --host 0.0.0.0 \
+            --port "$PORT" \
+            --db "${DATA_DIR}/gallery.db" \
+            --enable-writes \
+            --enable-media \
+            --enable-ml \
+            --static-dir "${GALLERY_STATIC_DIR}" \
+            >> "$LOG_FILE" 2>&1 &
+    fi
+    echo "$!" > "$PID_FILE"
+    cp "$PID_FILE" "$RUST_ACCEL_PID_FILE" 2>/dev/null || true
+    log "Gallery pure-Rust primary started on port $PORT with pid $(cat "$PID_FILE") (OpenVINO CCIP; LD_LIBRARY_PATH=$RUST_BIN_DIR; ORT_DYLIB_PATH=${ORT_DYLIB_PATH:-})."
+    return 0
+}
+
+start_app() {
+    prepare_env
+    log "Gallery data dir: $DATA_DIR"
+    log "Gallery startup log: $APP_STARTUP_LOG_FILE"
+    log "Gallery preview cache dir: $IMAGE_PREVIEW_CACHE_DIR"
+    log "Gallery video-frame cache dir: $VIDEO_FRAME_CACHE_DIR"
+    log "Gallery transcode cache dir: $VIDEO_TRANSCODE_CACHE_DIR"
+    log "Gallery model cache dir: $CHARACTER_MODEL_DIR"
+    log "Gallery artist model dir: $ARTIST_MODEL_DIR"
+    log "Gallery pure-Rust runtime (no residual Python / uvicorn)"
+    if [ -n "${PICTURES_ROOT:-}" ]; then
+        log "Gallery media roots: $PICTURES_ROOT"
+        log "Gallery media real paths: ${PICTURES_ROOT_REAL_PATHS:-}"
+        log "Gallery media labels: ${PICTURES_ROOT_LABELS:-}"
+        # Per-root alias -> real path for confirming authorized order on other machines.
+        alias_rest="${PICTURES_ROOT},"
+        real_rest="${PICTURES_ROOT_REAL_PATHS:-},"
+        while [ -n "$alias_rest" ] && [ "$alias_rest" != "," ]; do
+            alias_one="${alias_rest%%,*}"
+            real_one="${real_rest%%,*}"
+            alias_rest="${alias_rest#*,}"
+            real_rest="${real_rest#*,}"
+            if [ -n "$alias_one" ]; then
+                if [ -n "$real_one" ]; then
+                    log "Gallery media map: ${alias_one} -> ${real_one}"
+                else
+                    log "Gallery media map: ${alias_one} -> (unset)"
+                fi
+            fi
+        done
+    fi
+    if [ -z "${PICTURES_ROOT:-}" ]; then
+        log "No authorized media path found. Gallery will start with its default media-root discovery."
+    fi
+    if is_running; then
+        # Prefer healthy already-running instance (fnOS checkport would also pass).
+        if pid_file_running "$PID_FILE"; then
+            log "Gallery is already running with pid $(cat "$PID_FILE")."
+            exit 0
+        fi
+        if pid_file_running "$RUST_ACCEL_PID_FILE"; then
+            log "Gallery is already running with pid $(cat "$RUST_ACCEL_PID_FILE")."
+            exit 0
+        fi
+        # Port held by orphan (common after sg-render PID mismatch) → free then start.
+        log "Gallery port $PORT is in use without a tracked pid file; reclaiming before start."
+        if ! free_service_port; then
+            log "Gallery startup aborted: port $PORT is held by a non-gallery process."
+            exit 1
+        fi
+    fi
+    if ! check_data_dir; then
+        log "Gallery startup aborted: database preflight failed. Check ${APP_STARTUP_LOG_FILE}."
+        exit 1
+    fi
+    cd "$APP_DIR"
+    if ! launch_rust_primary; then
+        log "Gallery startup aborted: Rust primary binary missing or failed to start."
+        exit 1
+    fi
+    log "Gallery started on port $PORT with pid $(cat "$PID_FILE")."
+    sleep 3
+    if ! is_running; then
+        log "Gallery process exited immediately after start. Last Gallery startup log lines:"
+        if [ -n "${TRIM_TEMP_LOGFILE:-}" ] && [ "$TRIM_TEMP_LOGFILE" != "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
+            tail -n 80 "$LOG_FILE" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE"
+        stop_pid_file "$RUST_ACCEL_PID_FILE" "Gallery Rust primary"
+        free_service_port || true
+        exit 1
+    fi
+    # Prefer recording the real listener pid (not only the sg/nohup wrapper).
+    listener=$(port_listener_pids | head -n 1 || true)
+    if [ -z "$listener" ]; then
+        listener=$(gallery_process_pids | head -n 1 || true)
+    fi
+    if [ -n "$listener" ]; then
+        echo "$listener" > "$PID_FILE"
+        cp "$PID_FILE" "$RUST_ACCEL_PID_FILE" 2>/dev/null || true
+        log "Gallery tracked listener pid $listener on port $PORT."
+    fi
+}
+
+stop_app() {
+    stop_pid_file "$PID_FILE" "Gallery"
+    stop_pid_file "$RUST_ACCEL_PID_FILE" "Gallery Rust primary"
+    # sg render is setuid-root on fnOS, so the package user cannot inspect the
+    # listener via ss/fuser or signal the wrapper. Kill its owned child by name.
+    stop_gallery_processes || true
+    # Always clear port leftovers (sg → gallery-accel orphans, stale upgrades).
+    free_service_port || true
+}
+
+status_app() {
+    if is_running; then
+        echo "Gallery is running."
+        exit 0
+    fi
+    echo "Gallery is not running."
+    exit 3
+}
+
+case "${1:-status}" in
+    start)
+        start_app
+        ;;
+    stop)
+        stop_app
+        ;;
+    restart)
+        stop_app
+        start_app
+        ;;
+    status)
+        status_app
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

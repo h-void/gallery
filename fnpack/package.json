@@ -1,0 +1,24 @@
+{
+  "appname": "gallery",
+  "version": "1.0.175",
+  "display_name": "Gallery",
+  "desc": "Local media library (pure Rust runtime) for browsing, tagging, previewing, and maintaining NAS media.",
+  "arch": "x86_64",
+  "platform": "all",
+  "source": "thirdparty",
+  "maintainer": "hczhr",
+  "desktop_uidir": "ui",
+  "desktop_applaunchname": "gallery.main",
+  "service_port": 8899,
+  "checkport": true,
+  "disable_authorization_path": false,
+  "ctl_stop": true,
+  "runtime_dependency": "",
+  "ui": {
+    "title": "Gallery",
+    "icon": "images/gallery-icon-v1_0_142_{0}.png",
+    "protocol": "http",
+    "url": "/",
+    "allUsers": true
+  }
+}

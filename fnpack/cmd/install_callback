@@ -1,0 +1,59 @@
+#!/bin/sh
+set -u
+
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/tmp/gallery-install-callback.log}"
+APP_USER="${TRIM_USERNAME:-gallery}"
+MANUAL_GPU_COMMAND="sudo usermod -aG render,video gallery"
+if [ "$APP_USER" != "gallery" ]; then
+    MANUAL_GPU_COMMAND="sudo usermod -aG render,video $APP_USER"
+fi
+
+log() {
+    printf '%s\n' "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+ensure_gpu_groups() {
+    if ! id "$APP_USER" >/dev/null 2>&1; then
+        log "Gallery GPU authorization skipped: package user $APP_USER does not exist yet."
+        return 0
+    fi
+
+    current_groups="$(id -nG "$APP_USER" 2>/dev/null || true)"
+    available_groups=""
+    missing_groups=""
+    for group in render video; do
+        if ! getent group "$group" >/dev/null 2>&1; then
+            log "Gallery GPU authorization note: system group $group does not exist on this fnOS host."
+            continue
+        fi
+        available_groups="${available_groups:+$available_groups,}$group"
+        case " $current_groups " in
+            *" $group "*) ;;
+            *) missing_groups="${missing_groups:+$missing_groups,}$group" ;;
+        esac
+    done
+
+    if [ -z "$available_groups" ]; then
+        log "Gallery GPU authorization skipped: no render/video groups exist on this fnOS host."
+        return 0
+    fi
+
+    if [ -z "$missing_groups" ]; then
+        log "Gallery GPU authorization already present for $APP_USER: $(id "$APP_USER" 2>/dev/null)"
+        return 0
+    fi
+
+    if [ "${TRIM_RUN_USERNAME:-}" = "root" ] || [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+        if usermod -aG "$missing_groups" "$APP_USER" >> "$LOG_FILE" 2>&1; then
+            log "Gallery GPU authorization added: $APP_USER joined $missing_groups. Restart Gallery after install/upgrade."
+        else
+            log "Gallery GPU authorization failed. If OpenVINO falls back to CPU, run: $MANUAL_GPU_COMMAND; then restart Gallery."
+        fi
+        return 0
+    fi
+
+    log "Gallery GPU authorization requires administrator action: run '$MANUAL_GPU_COMMAND', then restart Gallery."
+}
+
+ensure_gpu_groups
+exit 0

@@ -1,0 +1,24 @@
+{
+  "data-share": {
+    "shares": [
+      {
+        "name": "gallery-data",
+        "permission": {
+          "rw": ["gallery"]
+        }
+      },
+      {
+        "name": "gallery-preview-cache",
+        "permission": {
+          "rw": ["gallery"]
+        }
+      },
+      {
+        "name": "gallery-model-cache",
+        "permission": {
+          "rw": ["gallery"]
+        }
+      }
+    ]
+  }
+}

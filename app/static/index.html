@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>画廊档案</title>
+<link rel="stylesheet" href="/static/style.css?v=20260712-select-artist-open">
+</head>
+<body>
+
+<div class="scan-progress" id="progressPanel" aria-live="polite">
+  <div class="scan-progress-meta">
+    <span id="progressTitle">扫描中</span>
+    <span id="progressCount"></span>
+  </div>
+  <div class="scan-progress-track"><div class="fill" id="progressFill" style="width:0%"></div></div>
+  <div class="scan-progress-path" id="progressPath"></div>
+</div>
+
+<header id="appHeader" class="mobile-tools-collapsed">
+  <h1>画廊档案</h1>
+  <div class="artist-picker" id="artistPicker">
+    <input type="text" id="artistSearch" placeholder="选择或搜索画师" autocomplete="off" maxlength="256">
+    <div class="artist-dropdown" id="artistDropdown"></div>
+  </div>
+  <button id="mobileHeaderToggle" class="btn btn-ghost mobile-header-toggle" type="button" aria-expanded="false" aria-label="展开搜索和扫描" title="展开搜索和扫描">搜索</button>
+  <div class="mode-tabs" role="tablist" aria-label="模式切换">
+    <button class="btn btn-segment active" type="button" data-mode="browse" aria-pressed="true">浏览</button>
+    <button class="btn btn-segment" type="button" data-mode="edit" aria-pressed="false">编辑</button>
+    <button class="btn btn-segment" type="button" data-mode="moves" aria-pressed="false">维护</button>
+  </div>
+  <div class="search-control" id="searchControl">
+    <input type="text" id="searchInput" placeholder="搜索标签或文件名" maxlength="256">
+    <button id="searchOptionsBtn" class="btn btn-ghost search-options-btn" type="button" aria-expanded="false" aria-controls="searchOptionsMenu" title="搜索范围">范围</button>
+    <div class="search-options-menu" id="searchOptionsMenu" hidden>
+      <div class="search-options-title">搜索范围</div>
+      <div class="search-scope-list" role="group" aria-label="搜索范围">
+        <button class="btn btn-segment active" type="button" data-search-scope="auto" aria-pressed="true">自动</button>
+        <button class="btn btn-segment" type="button" data-search-scope="artist" aria-pressed="false">当前画师</button>
+        <button class="btn btn-segment" type="button" data-search-scope="folder" aria-pressed="false">当前文件夹</button>
+        <button class="btn btn-segment" type="button" data-search-scope="global" aria-pressed="false">全局</button>
+      </div>
+      <label class="search-tags-only">
+        <input type="checkbox" id="tagsOnlyToggle">
+        <span>仅标签</span>
+      </label>
+    </div>
+  </div>
+  <button id="scanBtn" class="btn btn-ghost" type="button" title="扫描全库">扫描全库</button>
+  <button id="scanFolderBtn" class="btn btn-ghost scan-folder-btn" type="button" style="display:none">扫描文件夹</button>
+  <button id="stopScanBtn" class="btn btn-danger" type="button" title="停止扫描" style="display:none">停止</button>
+</header>
+
+<main>
+  <div class="filter-backdrop" id="filterBackdrop" hidden></div>
+  <aside class="sidebar" id="filterSidebar">
+    <div class="sidebar-mobile-head">
+      <span>筛选</span>
+      <button id="filterDrawerClose" class="btn btn-ghost btn-icon" type="button" aria-label="关闭筛选" title="关闭筛选">
+        <span class="btn-glyph" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M6 6l12 12"></path>
+            <path d="M18 6 6 18"></path>
+          </svg>
+        </span>
+      </button>
+    </div>
+    <div class="sidebar-mobile-columns">
+      <div class="sidebar-header">
+        <span>列数</span>
+      </div>
+      <div class="view-toggle mobile-column-toggle" id="mobileColumnToggle" aria-label="选择列数">
+        <button class="btn btn-segment" type="button" data-mobile-columns="1" aria-pressed="false">1列</button>
+        <button class="btn btn-segment active" type="button" data-mobile-columns="2" aria-pressed="true">2列</button>
+        <button class="btn btn-segment" type="button" data-mobile-columns="3" aria-pressed="false">3列</button>
+      </div>
+    </div>
+    <div class="duplicate-section" id="duplicateSection" style="display:none">
+      <button class="duplicate-toggle" id="duplicateToggle" type="button">
+        <span>重复文件夹</span>
+        <span class="count" id="duplicateCount">0</span>
+      </button>
+      <div class="duplicate-list" id="duplicateList"></div>
+    </div>
+    <div class="sidebar-section tag-section">
+      <div class="sidebar-header">
+        <span>标签</span>
+        <span id="sidebarTotal" style="font-size:11px"></span>
+      </div>
+      <div class="sidebar-list" id="sidebarList"></div>
+    </div>
+    <div class="sidebar-section folder-section">
+      <div class="sidebar-header">
+        <span>文件夹</span>
+        <span id="folderTotal" style="font-size:11px"></span>
+      </div>
+      <div class="folder-tree" id="folderTree"></div>
+    </div>
+    <div class="sidebar-empty-hint" id="sidebarEmptyHint" hidden>
+      选择画师后显示标签与文件夹
+    </div>
+  </aside>
+  <div id="sidebarResizer" class="sidebar-resizer" role="separator" aria-orientation="vertical" tabindex="0" aria-label="调整侧栏宽度"></div>
+
+  <div class="content">
+    <div class="toolbar">
+      <button id="mobileFilterBtn" class="btn btn-ghost mobile-filter-btn" type="button" aria-expanded="false" aria-controls="filterSidebar">筛选</button>
+      <button id="duplicateFilesBtn" class="btn btn-ghost duplicate-files-btn" type="button" style="display:none" aria-pressed="false">重复文件</button>
+      <div class="view-toggle desktop-view-toggle" id="desktopViewToggle">
+        <button class="btn btn-segment active" type="button" data-view="grid" aria-pressed="true">网格</button>
+        <button class="btn btn-segment" type="button" data-view="compact" aria-pressed="false">紧凑</button>
+        <button class="btn btn-segment" type="button" data-view="list" aria-pressed="false">列表</button>
+      </div>
+    </div>
+    <div class="edit-bar" id="editBar">
+      <div class="edit-bar-main">
+        <span class="selected-count" id="selectedCount">已选 0 项</span>
+        <button id="editSelectAllBtn" class="btn btn-ghost" type="button">全选</button>
+        <div class="tag-picker" id="editTagPicker">
+          <input type="text" id="editTagSearch" placeholder="选择或搜索标签" autocomplete="off" maxlength="256">
+          <div class="tag-picker-panel" id="editTagPickerPanel"></div>
+        </div>
+        <span class="tag-picker-summary" id="editTagPickerSummary">未选标签</span>
+        <div class="edit-bar-actions">
+          <button class="btn btn-primary" id="editApplyBtn" type="button">添加标签</button>
+          <button class="btn btn-ghost" id="editDeleteRoleBtn" type="button">移除标签</button>
+          <button class="btn btn-ghost" id="editCancelBtn" type="button">取消</button>
+          <button class="btn btn-danger edit-delete-selected" id="editDeleteSelectedBtn" type="button">删除所选</button>
+        </div>
+      </div>
+      <div class="edit-bar-suggestions">
+        <div class="character-suggestions" id="characterSuggestions" aria-live="polite">
+          <span class="character-suggestions-label">角色建议</span>
+          <span class="character-suggestions-status" id="characterSuggestionsStatus">未识别</span>
+          <div class="character-suggestions-list" id="characterSuggestionsList"></div>
+        </div>
+        <div class="artist-suggestions" id="artistSuggestions" hidden aria-hidden="true" aria-live="polite">
+          <span class="artist-suggestions-label">画师建议</span>
+          <span class="artist-suggestions-status" id="artistSuggestionsStatus">未检查</span>
+          <div class="artist-suggestions-list" id="artistSuggestionsList"></div>
+        </div>
+      </div>
+    </div>
+    <div class="move-panel" id="movePanel">
+      <div class="maintenance-dashboard">
+        <section class="maintenance-hero">
+          <div class="maintenance-hero-copy">
+            <div class="move-title">维护</div>
+            <div class="move-subtitle">状态、路径确认与高级工具</div>
+          </div>
+          <div class="maintenance-hero-actions">
+            <label class="maintenance-auto-toggle" title="扫描完成后，自动执行安全的归档方案">
+              <input id="folderRenameAutoExecuteToggle" type="checkbox">
+              <span>自动归档</span>
+            </label>
+            <button id="moveRefreshBtn" class="btn btn-ghost" type="button">刷新</button>
+          </div>
+        </section>
+
+        <div class="maintenance-view-tabs" role="tablist" aria-label="维护视图">
+          <button class="btn btn-segment active" type="button" data-maintenance-view="overview" role="tab" aria-selected="true">状态</button>
+          <button class="btn btn-segment" type="button" data-maintenance-view="paths" role="tab" aria-selected="false">路径确认</button>
+          <button class="btn btn-segment" type="button" data-maintenance-view="advanced" role="tab" aria-selected="false">高级</button>
+        </div>
+
+        <div class="maintenance-view-panel active" data-maintenance-view-panel="overview">
+        <section class="maintenance-section health-panel" id="healthPanel">
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">状态总览</div>
+              <div class="health-subtitle">数据库、备份、扫描进度和相同文件检查的概况</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <button id="manualBackupBtn" class="btn btn-ops" type="button">立即备份数据库</button>
+              <span id="backupResult"></span>
+            </div>
+          </div>
+          <div class="health-grid" id="healthGrid">
+            <div class="maintenance-card status-card status-muted move-empty small">等待读取健康状态</div>
+          </div>
+        </section>
+
+        <section class="maintenance-section maintenance-overview-actions" id="overviewActionsPanel">
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">接下来做什么</div>
+              <div class="health-subtitle">按优先级处理路径确认、归档和角色库</div>
+            </div>
+          </div>
+          <div class="maintenance-overview-cards" id="overviewActionCards">
+            <button type="button" class="maintenance-overview-card" data-maintenance-jump="paths">
+              <b>路径确认</b>
+              <span id="overviewPathsHint">检查是否有需要你确认的路径变更</span>
+            </button>
+            <button type="button" class="maintenance-overview-card" data-maintenance-jump="history">
+              <b>整理历史</b>
+              <span>查看文件夹归档与路径变更历史</span>
+            </button>
+            <button type="button" class="maintenance-overview-card" data-maintenance-jump="characters">
+              <b>角色库</b>
+              <span>导入参考图，提升识别建议准确度</span>
+            </button>
+          </div>
+        </section>
+        </div>
+
+        <div class="maintenance-view-panel" data-maintenance-view-panel="paths" hidden>
+        <section class="maintenance-section maintenance-actions">
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">待处理事项</div>
+              <div class="health-subtitle">先处理需要确认的路径，再等待相同文件检查完成</div>
+            </div>
+          </div>
+          <div class="move-summary">
+            <div class="maintenance-card action-card metric-card metric-alert"><strong id="movePendingCount">0</strong><span>需要你确认</span></div>
+            <div class="maintenance-card action-card metric-card metric-info"><strong id="moveWaitingHashCount">0</strong><span>系统处理中</span></div>
+            <div class="maintenance-card action-card metric-card metric-ok"><strong id="movePreviewCount">0</strong><span>已自动确认</span></div>
+          </div>
+        </section>
+
+        <section class="maintenance-section maintenance-workbench">
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">路径确认工作区</div>
+              <div class="health-subtitle">能自动处理好的会先处理；这里只留下需要你判断的项</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <button id="moveAutoResolveBtn" class="btn btn-ops" type="button">处理可自动确认的项</button>
+            </div>
+          </div>
+          <div class="hash-status maintenance-command-strip">
+            <div>
+              <span class="hash-label">相同文件检查</span>
+              <span id="hashStatusText">等待检查</span>
+            </div>
+          </div>
+          <div class="move-group-list" id="moveCandidateGroupList"></div>
+          <div class="move-list" id="moveCandidateList"></div>
+        </section>
+
+        <section class="maintenance-section move-history-panel" id="moveHistoryPanel">
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">自动确认记录</div>
+              <div class="health-subtitle">系统已经自动确认过的路径变更，方便回看</div>
+            </div>
+          </div>
+          <div class="move-history">
+            <div class="move-history-list" id="moveHistoryList"></div>
+          </div>
+        </section>
+        </div>
+
+        <div class="maintenance-view-panel" data-maintenance-view-panel="advanced" hidden>
+        <details class="maintenance-section character-library-panel maintenance-advanced-detail" id="characterLibraryPanel" open>
+          <summary>角色库</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">角色库</div>
+              <div class="health-subtitle">用「只有一个角色标签」的图当参考，建好后识别会优先猜角色名。</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <button id="characterImportAllBtn" class="btn btn-ops" type="button">导入全库标签</button>
+              <button id="characterImportCurrentArtistBtn" class="btn btn-ops" type="button">导入当前画师标签</button>
+              <button id="characterRebuildIndexBtn" class="btn btn-ops" type="button">刷新角色参考</button>
+            </div>
+          </div>
+          <div class="character-library-summary" id="characterLibrarySummary">角色库读取中</div>
+          <div class="character-library-grid">
+            <div class="character-library-column">
+              <div class="operation-log-title">可导入标签</div>
+              <div class="character-tag-import-list" id="characterTagImportList"></div>
+            </div>
+            <div class="character-library-column">
+              <div class="operation-log-title">已建角色</div>
+              <div class="character-list" id="characterList"></div>
+            </div>
+            <div class="character-library-column">
+              <div class="operation-log-title">参考图</div>
+              <div class="character-reference-list" id="characterReferenceList"></div>
+            </div>
+          </div>
+        </details>
+
+        <details class="maintenance-section operation-log-panel maintenance-advanced-detail" id="operationLogPanel">
+          <summary>历史 / 错误</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">移动、重命名和错误</div>
+              <div class="health-subtitle">查看最近的路径整理记录和报错摘要，方便排查问题。</div>
+            </div>
+          </div>
+          <div class="operation-log-summary" id="operationLogSummary">历史读取中</div>
+          <div class="operation-log-grid">
+            <div class="operation-log-column">
+              <div class="operation-log-title">移动 / 重命名历史</div>
+              <div class="operation-history-list" id="operationHistoryList"></div>
+            </div>
+            <div class="operation-log-column">
+              <div class="operation-log-title">最近错误</div>
+              <div class="operation-error-list" id="operationErrorList"></div>
+            </div>
+          </div>
+        </details>
+
+        <details class="maintenance-section maintenance-guide">
+          <summary>功能说明</summary>
+          <div class="maintenance-guide-grid">
+            <div><b>扫描建库</b><span>第一次用，或盘上新加了很多图，点一次「扫描」。系统会把目录里的图片、视频记进库，按画师、文件夹整理好，之后才能流畅浏览和搜索。</span></div>
+            <div><b>打标签与编辑</b><span>在编辑模式里给作品打标签、选角色。标签记在图库里，方便以后按人、按作品类型筛选。</span></div>
+            <div><b>角色识别</b><span>打开图片时可以自动猜角色名（需要先有角色库参考图）。结果仅供参考，不确定时可以改标签。</span></div>
+            <div><b>路径确认</b><span>你在盘上移动、重命名了文件后，图库里的旧路径可能对不上。系统会尽量自动匹配；拿不准的会放到「路径确认」里，请你点一下「是同一张」或「当新文件」。</span></div>
+            <div><b>文件夹归档</b><span>可以把杂乱文件夹整理成「日期 + 角色/标签」这类规范名字。先看方案、确认后再执行；执行前会备份数据库。</span></div>
+            <div><b>网页预览</b><span>列表和灯箱里可以直接看图、看视频。预览用的是缓存缩略图或兼容播放，打开更快。</span></div>
+          </div>
+        </details>
+
+        <details class="maintenance-section maintenance-guide">
+          <summary>维护说明 / 操作须知</summary>
+          <div class="maintenance-guide-grid">
+            <div><b>什么时候要扫描</b><span>新拷进图、换了目录结构、列表里缺文件时，再扫一次。平时不用反复扫。全库扫描最省心；只改了一个画师或一个文件夹时，也可以只扫那一块。</span></div>
+            <div><b>扫描会做什么</b><span>会发现新增文件，并把已经不在原位置的记录标成「找不到」。扫描主要是更新图库索引。</span></div>
+            <div><b>自动扫描</b><span>后台大约每 6 小时会自动扫一轮。你手动扫完以后，计时会重新开始，避免刚扫完又马上再扫。</span></div>
+            <div><b>「正在检查相同文件」</b><span>系统在比对新旧位置是不是同一张图。看到这条提示时稍等即可，一般不用你插手。</span></div>
+            <div><b>路径确认怎么选</b><span>左右分别是旧位置和新位置。能确定是同一张图 →「确认同一文件」；确定不是 →「作为独立新文件」；暂时不想处理 →「忽略」。拿不准可以先忽略，以后还能再来处理。</span></div>
+            <div><b>「找不到」的记录</b><span>文件挪走或删掉且对不上时会出现。记录会先留一段时间（约 90 天），方便你以后找回对应关系。</span></div>
+            <div><b>会改路径的操作</b><span>例如执行文件夹归档，会先请你确认，并尽量先备份数据库。请先看清方案再点执行。</span></div>
+          </div>
+        </details>
+        </div>
+      </div>
+    </div>
+    <div class="grid-container" id="gridContainer">
+      <div class="library-empty" id="libraryEmptyState" style="display:none">
+        <div class="library-empty-kicker" id="libraryEmptyKicker">画廊档案</div>
+        <h2 id="libraryEmptyTitle">画廊还是空的</h2>
+        <p id="libraryEmptyText">先扫描一次，把画师、文件夹和媒体文件整理进画廊。</p>
+        <div class="library-empty-actions">
+          <button id="emptySelectArtistBtn" class="btn btn-primary" type="button" style="display:none">选择画师</button>
+          <button id="emptyScanBtn" class="btn btn-primary" type="button">扫描全库</button>
+          <span id="libraryEmptyMeta">扫描会在后台运行，顶部会显示进度。</span>
+        </div>
+      </div>
+      <div class="grid" id="grid"></div>
+    </div>
+  </div>
+</main>
+
+<div class="lightbox" id="lightbox" style="display:none">
+  <button class="btn btn-ghost btn-icon close" type="button" aria-label="关闭预览" title="关闭预览">
+    <span class="btn-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <path d="M6 6l12 12"></path>
+        <path d="M18 6 6 18"></path>
+      </svg>
+    </span>
+  </button>
+  <a class="lightbox-download btn btn-ghost btn-icon" id="lightboxDownloadBtn" href="#" download title="下载文件" aria-label="下载文件">
+    <span class="btn-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3v10"></path>
+        <path d="M8 9l4 4 4-4"></path>
+        <path d="M5 21h14"></path>
+      </svg>
+    </span>
+  </a>
+  <button class="btn btn-ghost btn-icon lightbox-delete" id="lightboxDeleteBtn" type="button" title="删除文件" aria-label="删除文件">
+    <span class="btn-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 6h18"></path><path d="M8 6V4h8v2"></path>
+        <path d="M19 6l-1 14H6L5 6"></path>
+        <path d="M10 11v5"></path><path d="M14 11v5"></path>
+      </svg>
+    </span>
+    <span class="lightbox-delete-label">删除</span>
+  </button>
+  <button class="btn btn-ghost btn-icon nav prev" type="button" aria-label="上一张" title="上一张">
+    <span class="btn-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M15 18 9 12l6-6"></path>
+      </svg>
+    </span>
+  </button>
+  <div class="lightbox-stage" id="lightboxStage">
+    <img id="lightboxImg" alt="" style="display:none">
+    <video id="lightboxVideo" controls preload="metadata" playsinline webkit-playsinline style="display:none"></video>
+    <div id="lightboxFile" class="lightbox-file" style="display:none"></div>
+    <div id="lightboxText" class="lightbox-text" style="display:none"></div>
+  </div>
+  <button class="btn btn-ghost btn-icon nav next" type="button" aria-label="下一张" title="下一张">
+    <span class="btn-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 18 15 12 9 6"></path>
+      </svg>
+    </span>
+  </button>
+  <div class="lightbox-caption" id="lightboxCaption">
+    <div class="lightbox-path-wrap" id="lightboxPath"></div>
+    <div class="info-bar" id="lightboxInfo"></div>
+  </div>
+</div>
+
+<script src="/static/js/core.js?v=20260712-select-artist-open"></script>
+<script src="/static/js/layout.js?v=20260712-select-artist-open"></script>
+<script src="/static/js/maintenance.js?v=20260712-select-artist-open"></script>
+<script src="/static/js/media.js?v=20260712-select-artist-open"></script>
+<script src="/static/js/edit.js?v=20260712-select-artist-open"></script>
+<script src="/static/js/events.js?v=20260712-select-artist-open"></script>
+
+</body>
+</html>

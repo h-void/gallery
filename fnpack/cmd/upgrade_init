@@ -1,0 +1,28 @@
+#!/bin/sh
+set -u
+
+APP_USER="${TRIM_USERNAME:-gallery}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/tmp/gallery-upgrade-init.log}"
+
+log() {
+    printf '%s\n' "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+gallery_process_pids() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -u "$APP_USER" -x gallery-accel 2>/dev/null || true
+    fi
+}
+
+pids=$(gallery_process_pids)
+if [ -n "$pids" ]; then
+    log "Gallery upgrade stopping legacy gallery-accel pid(s): $(printf '%s' "$pids" | tr '\n' ' ')"
+    pkill -TERM -u "$APP_USER" -x gallery-accel 2>/dev/null || true
+    sleep 2
+    if [ -n "$(gallery_process_pids)" ]; then
+        pkill -KILL -u "$APP_USER" -x gallery-accel 2>/dev/null || true
+        sleep 1
+    fi
+fi
+
+exit 0

@@ -427,22 +427,22 @@
             <section class="maintenance-guide-block">
               <h3>第一次使用</h3>
               <div class="maintenance-guide-item">
-                <b>如果你是第一次使用，或刚导入大量新图片</b>
-                <span>点击顶部的「扫描全库」，等待扫描完成即可。这一步会让所有图片出现在列表中。</span>
+                <b>初次使用或批量导入新作品</b>
+                <span>点击顶部的「扫描全库」，等待后台扫描完成即可。系统将自动发现并整理媒体目录中的所有画师与作品，让图片出现在列表中。</span>
               </div>
               <div class="maintenance-guide-item">
-                <b>只新增了某个画师或文件夹的内容</b>
-                <span>可以只扫描那个画师或文件夹，比扫描全库快很多。</span>
+                <b>仅新增个别画师或文件夹</b>
+                <span>可以直接选择并扫描对应画师或文件夹，速度远快于扫描全库。</span>
               </div>
             </section>
 
             <section class="maintenance-guide-block">
               <h3>找图、看图</h3>
               <ul class="maintenance-guide-list">
-                <li>按画师、文件夹、标签浏览，或者直接搜索名字。</li>
+                <li>支持按画师、文件夹、标签灵活浏览与筛选，也可直接搜索名字。</li>
                 <li>搜索画师支持全名、拼音或部分名字，不用记住完整的准确名称。</li>
-                <li>图片、视频、源文件、文本、压缩包都能查看。</li>
-                <li>列表里直接预览，点开还能看大图；系统会自动生成缩略图，下次打开速度更快。</li>
+                <li>图片、视频、源文件、文本（.txt/.md/.html）及压缩包都能查看。</li>
+                <li>画廊列表即时预览，点开还能看大图与播放视频；系统会自动生成缩略图，下次打开速度更快。</li>
               </ul>
             </section>
 
@@ -450,28 +450,28 @@
               <h3>整理与标签</h3>
               <div class="maintenance-guide-item">
                 <b>加标签</b>
-                <span>切换到编辑模式，选中作品（或整个文件夹），添加标签，之后按标签筛选会更方便。</span>
+                <span>切换到编辑模式，选中作品（或整个文件夹），批量添加标签，之后按标签组合筛选会更方便。</span>
               </div>
               <div class="maintenance-guide-item">
                 <b>角色识别</b>
-                <span>选中一张图，系统会给出「这可能是谁」的建议，你确认后标签才会生效，不会自动添加。</span>
+                <span>选中作品时，AI 系统会给出「这可能是谁」的角色识别建议，只有你主动确认后标签才会生效，不会自动添加。</span>
               </div>
             </section>
 
             <section class="maintenance-guide-block">
               <h3>状态页看什么</h3>
-              <p class="maintenance-guide-lead">日常有空时看一眼就行。状态页会展示以下信息：</p>
+              <p class="maintenance-guide-lead">日常有空时看一眼即可，状态页会展示以下核心信息：</p>
               <div class="maintenance-guide-item">
                 <b>运行状态</b>
-                <span>数据库、扫描、备份、查重是否正常运行。</span>
+                <span>实时查看数据库健康、扫描进度、自动备份与文件查重是否正常运行。</span>
               </div>
               <div class="maintenance-guide-item">
                 <b>操作记录</b>
-                <span>最近的操作和报错，方便了解系统情况。</span>
+                <span>记录最近的文件整理与报错日志，方便随时排查与回溯。</span>
               </div>
               <div class="maintenance-guide-item">
                 <b>备份</b>
-                <span>点击「立即备份数据库」即可。备份只保存标签和路径信息，不包含图片/视频本身。</span>
+                <span>点击「立即备份数据库」即可一键创建快照。备份只保存标签和路径信息，不包含图片/视频本身。</span>
               </div>
             </section>
 
@@ -479,7 +479,7 @@
               <h3>文件夹整理在做什么</h3>
               <div class="maintenance-guide-item">
                 <b>想整理成什么样</b>
-                <span>在每个画师目录下，尽量把文件夹整理成「年 / 日期 标签」这种结构；多个标签会用 &amp; 连在一起。已经整理好的文件夹不会再动。</span>
+                <span>在每个画师目录下，尽量把文件夹规范整理成「年 / 日期 标签」这种结构；多个标签会用 &amp; 连在一起。已经整理好的文件夹不会再动。</span>
               </div>
               <div class="maintenance-guide-item">
                 <b>具体会移动哪些文件</b>
@@ -487,11 +487,11 @@
               </div>
               <div class="maintenance-guide-item">
                 <b>安全吗？会不会丢失文件？</b>
-                <span>整理开始前会自动备份数据库。系统只会执行有十足把握的整理操作，任何不确定的项目都会被跳过并记录跳过原因，不会强行修改。清空后的文件夹会被自动清理，但不会删除画师根目录。你可以在「整理历史」中查看每一步的操作详情。</span>
+                <span>整理开始前会自动备份数据库。系统只会执行有十足把握的安全整理规则，任何不确定的项目都会被跳过并记录跳过原因，不会强行修改。清空后的空文件夹会被自动清理，但不会删除画师根目录。你可以在「整理历史」中查看每一步的操作详情。</span>
               </div>
               <div class="maintenance-guide-item">
                 <b>自动整理开关</b>
-                <span>位于维护页右上角，默认关闭。打开后，只有全库扫描成功结束才会自动执行上述整理操作；只扫描某个画师或文件夹不会触发。如果不确定，保持关闭即可。</span>
+                <span>位于维护页右上角，自动整理默认关闭。打开后，只有全库扫描成功结束才会自动执行上述整理操作；只扫描某个画师或文件夹不会触发。如果不确定，保持关闭即可。</span>
               </div>
             </section>
 
@@ -507,11 +507,11 @@
               </div>
               <div class="maintenance-guide-item">
                 <b>看到「正在检查相同文件」要做什么？</b>
-                <span>无需操作，等待系统比对完成即可。</span>
+                <span>无需操作，系统正在后台比对文件特征以自动迁移标签，等待比对完成即可。</span>
               </div>
               <div class="maintenance-guide-item">
                 <b>自动扫描是做什么的？</b>
-                <span>大约每 6 小时后台自动扫描一次，让列表保持最新。手动扫描后，6 小时倒计时会重置。</span>
+                <span>系统大约每 6 小时在后台自动扫描一次，让列表保持最新。每次手动扫描后，6 小时倒计时会重置。</span>
               </div>
               <div class="maintenance-guide-item">
                 <b>自动整理和扫描有什么区别？</b>

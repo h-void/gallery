@@ -1,0 +1,24 @@
+name: gallery
+
+services:
+  gallery:
+    build: .
+    image: crpi-hwq9kgccbg8v0l26.cn-hangzhou.personal.cr.aliyuncs.com/hczhr/gallery:stable
+    restart: unless-stopped
+    ports:
+      - "${GALLERY_PORT:-8899}:8899"
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    volumes:
+      - "${GALLERY_MEDIA_DIR:-./media}:/media:ro"
+      - gallery-data:/data
+      - gallery-cache:/cache
+      - gallery-models:/models
+    environment:
+      PICTURES_ROOT_LABELS: "${GALLERY_MEDIA_LABEL:-media}"
+
+volumes:
+  gallery-data:
+  gallery-cache:
+  gallery-models:

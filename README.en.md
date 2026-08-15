@@ -1,6 +1,6 @@
 # Gallery
 
-Gallery is a local media library for fnOS. The backend is written in Rust and distributed as a native fnOS FPK package (no Docker required). It indexes the media directories you connect, partitions the library by artist, and organizes images, videos, and source files by folders and tags within each artist.
+Gallery is a local media library. The backend is written in Rust and runs either as a native fnOS FPK package or as a Docker container. It indexes the media directories you connect, partitions the library by artist, and organizes images, videos, and source files by folders and tags within each artist.
 
 ## Features
 
@@ -18,6 +18,17 @@ The service listens on port `8899` by default and **has no built-in authenticati
 Download the latest published `gallery_<version>_x86_64.fpk` from [Releases](https://github.com/hczhr/gallery-archive/releases) and install it via the fnOS app installer.
 
 The source repository and FPK **do not include** the character model, databases, or caches. The FPK supplies the runtime only; obtain the model separately and place it at the path above.
+
+### Docker
+
+Windows, Linux, and macOS can run the same image with Docker Desktop or Docker Engine. Set the media directory and start the stack from the repository root:
+
+```powershell
+$env:GALLERY_MEDIA_DIR = 'D:\Pictures'
+docker compose up -d --build
+```
+
+The container listens on `http://localhost:8899/` by default. Docker volumes persist the database, preview cache, and models. Docker uses CPU character recognition by default; place the model at `character/ccip-caformer_b36-24/model_feat.onnx` in the `gallery-models` volume. Media is mounted read-only by default. To enable organization, archiving, or deletion, change `/media:ro` to `/media` in `docker-compose.yml` only after intentionally granting write access.
 
 ## Building
 
@@ -42,6 +53,7 @@ python tools/build_rust_accel.py
 | `rust/gallery_accel/` | Rust runtime and Axum API |
 | `app/static/` | Web UI |
 | `fnpack/` | fnOS package config and startup scripts |
+| `Dockerfile` / `docker-compose.yml` | Docker image and local compose config |
 | `tools/` | Tools to build Rust, package the FPK, and generate the public source tree |
 
 ## License
@@ -53,5 +65,5 @@ Copyright (C) 2026 hczhr.
 
 ## Third-party licenses
 
-The FPK bundles ONNX Runtime, OpenVINO, and Rust dependency licenses and notices
-under `fnpack/app/licenses/`.
+The FPK and Docker image bundle ONNX Runtime and Rust dependency licenses and
+notices under `fnpack/app/licenses/`.

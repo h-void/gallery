@@ -10,7 +10,18 @@ from typing import Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ROOT_FILES = frozenset((".gitattributes", ".gitignore", "LICENSE", "README.md", "README.en.md"))
+ROOT_FILES = frozenset(
+    (
+        ".dockerignore",
+        ".gitattributes",
+        ".gitignore",
+        "Dockerfile",
+        "LICENSE",
+        "README.md",
+        "README.en.md",
+        "docker-compose.yml",
+    )
+)
 TOOL_FILES = frozenset(
     (
         "tools/__init__.py",
@@ -24,7 +35,9 @@ TOOL_FILES = frozenset(
 REQUIRED_FILES = frozenset(
     (
         ".gitattributes",
+        "Dockerfile",
         "README.md",
+        "docker-compose.yml",
         "rust/gallery_accel/Cargo.toml",
         "rust/gallery_accel/Cargo.lock",
         "app/static/index.html",

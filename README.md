@@ -1,6 +1,6 @@
 # Gallery
 
-Gallery 是一个运行在 fnOS 上的本地图库，后端用 Rust 编写，以 fnOS 原生 FPK 包形式分发（无需 Docker）。它索引接入的媒体目录，按画师划分图库，并在每位画师下按文件夹与标签整理图片、视频和源文件。
+Gallery 是一个本地图库，后端用 Rust 编写，可作为 fnOS 原生 FPK 包或 Docker 容器运行。它索引接入的媒体目录，按画师划分图库，并在每位画师下按文件夹与标签整理图片、视频和源文件。
 
 ## 功能
 
@@ -18,6 +18,17 @@ Gallery 是一个运行在 fnOS 上的本地图库，后端用 Rust 编写，以
 从 [Releases](https://github.com/hczhr/gallery-archive/releases) 下载最新发布的 `gallery_<version>_x86_64.fpk`，通过 fnOS 应用安装器安装。
 
 源码仓库和 FPK **不包含**角色模型、数据库与缓存；FPK 只提供运行时，模型需自行取得并放到上述路径。
+
+### Docker
+
+Windows、Linux 和 macOS 可使用 Docker Desktop 或 Docker Engine 运行同一份镜像。先准备媒体目录，然后在仓库根目录执行：
+
+```powershell
+$env:GALLERY_MEDIA_DIR = 'D:\Pictures'
+docker compose up -d --build
+```
+
+容器默认监听 `http://localhost:8899/`，数据、预览缓存和模型分别保存到 Docker volumes。Docker 默认使用 CPU 角色识别；把模型放到 `gallery-models` volume 的 `character/ccip-caformer_b36-24/model_feat.onnx`。媒体目录默认以只读方式挂载；需要整理、归档或删除文件时，将 `docker-compose.yml` 中的 `/media:ro` 改为 `/media`，并确认这是有意授权。
 
 ## 构建
 
@@ -42,6 +53,7 @@ python tools/build_rust_accel.py
 | `rust/gallery_accel/` | Rust 运行时与 Axum API |
 | `app/static/` | 网页界面 |
 | `fnpack/` | fnOS 安装包配置与启动脚本 |
+| `Dockerfile` / `docker-compose.yml` | Docker 镜像与本地编排配置 |
 | `tools/` | 构建 Rust、打包 FPK、生成公开源码树的工具 |
 
 ## 许可证
@@ -52,5 +64,5 @@ Copyright (C) 2026 hczhr。
 
 ## 第三方许可证
 
-FPK 随附的 ONNX Runtime、OpenVINO 和 Rust 依赖的许可证及通知位于
+FPK 和 Docker 镜像随附的 ONNX Runtime 及 Rust 依赖许可证和通知位于
 `fnpack/app/licenses/`。

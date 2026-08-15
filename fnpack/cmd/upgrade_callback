@@ -1,0 +1,136 @@
+#!/bin/sh
+set -u
+
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/tmp/gallery-upgrade-callback.log}"
+APP_USER="${TRIM_USERNAME:-gallery}"
+MANUAL_GPU_COMMAND="sudo usermod -aG render,video gallery"
+if [ "$APP_USER" != "gallery" ]; then
+    MANUAL_GPU_COMMAND="sudo usermod -aG render,video $APP_USER"
+fi
+
+log() {
+    printf '%s\n' "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+copy_legacy_share() {
+    source_dir="$1"
+    target_dir="$2"
+    label="$3"
+    [ -n "$source_dir" ] && [ -d "$source_dir" ] || return 0
+    if ! mkdir -p "$target_dir" || ! cp -a "$source_dir"/. "$target_dir"/; then
+        log "Gallery upgrade aborted: unable to migrate legacy $label from $source_dir to $target_dir."
+        return 1
+    fi
+    log "Gallery upgrade copied legacy $label into $target_dir."
+}
+
+copy_legacy_share_if_missing() {
+    source_dir="$1"
+    target_dir="$2"
+    label="$3"
+    [ -n "$source_dir" ] && [ -d "$source_dir" ] || return 0
+    if [ -e "$target_dir" ] && [ ! -d "$target_dir" ]; then
+        log "Gallery upgrade aborted: destination $label is not a directory."
+        return 1
+    fi
+    if [ -d "$target_dir" ] && [ -n "$(find "$target_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+        log "Gallery upgrade found existing $label; leaving it unchanged."
+        return 0
+    fi
+    copy_legacy_share "$source_dir" "$target_dir" "$label"
+}
+
+migrate_legacy_data_shares() {
+    data_share_root="${TRIM_DATA_SHARE_PATHS%%:*}"
+    [ -n "$data_share_root" ] || return 0
+    migration_marker="$data_share_root/.legacy-share-migration-complete"
+    if [ -e "$migration_marker" ]; then
+        log "Gallery upgrade legacy share migration already complete."
+        return 0
+    fi
+
+    migration_root=""
+    if [ -n "${TRIM_PKGVAR:-}" ]; then
+        migration_root="$TRIM_PKGVAR/legacy-share-migration"
+    fi
+    if [ -n "$migration_root" ] && [ -d "$migration_root" ]; then
+        legacy_data_dir="$migration_root/data"
+        legacy_preview_dir="$migration_root/cache"
+        legacy_model_dir="$migration_root/models"
+    else
+        legacy_share_parent="$(dirname "$data_share_root")"
+        legacy_data_dir="$legacy_share_parent/gallery-data"
+        legacy_preview_dir="$legacy_share_parent/gallery-preview-cache"
+        legacy_model_dir="$legacy_share_parent/gallery-model-cache"
+    fi
+    destination_db="$data_share_root/data/gallery.db"
+    if [ -e "$destination_db" ] && [ ! -f "$destination_db" ]; then
+        log "Gallery upgrade aborted: destination database is not a regular file."
+        return 1
+    fi
+    if [ -f "$destination_db" ]; then
+        log "Gallery upgrade found existing gallery/data/gallery.db; leaving database unchanged."
+    elif ! copy_legacy_share "$legacy_data_dir" "$data_share_root/data" "database data"; then
+        return 1
+    fi
+    if ! copy_legacy_share_if_missing "$legacy_preview_dir" "$data_share_root/cache" "preview cache" || \
+       ! copy_legacy_share_if_missing "$legacy_model_dir" "$data_share_root/models" "model cache"; then
+        return 1
+    fi
+    if [ -n "$migration_root" ] && [ -d "$migration_root" ] && ! rm -rf "$migration_root"; then
+        log "Gallery upgrade aborted: unable to remove legacy migration staging."
+        return 1
+    fi
+    if ! : > "$migration_marker"; then
+        log "Gallery upgrade aborted: unable to record legacy migration completion."
+        return 1
+    fi
+    log "Gallery upgrade legacy share migration complete."
+}
+
+ensure_gpu_groups() {
+    if ! id "$APP_USER" >/dev/null 2>&1; then
+        log "Gallery GPU authorization skipped: package user $APP_USER does not exist yet."
+        return 0
+    fi
+
+    current_groups="$(id -nG "$APP_USER" 2>/dev/null || true)"
+    available_groups=""
+    missing_groups=""
+    for group in render video; do
+        if ! getent group "$group" >/dev/null 2>&1; then
+            log "Gallery GPU authorization note: system group $group does not exist on this fnOS host."
+            continue
+        fi
+        available_groups="${available_groups:+$available_groups,}$group"
+        case " $current_groups " in
+            *" $group "*) ;;
+            *) missing_groups="${missing_groups:+$missing_groups,}$group" ;;
+        esac
+    done
+
+    if [ -z "$available_groups" ]; then
+        log "Gallery GPU authorization skipped: no render/video groups exist on this fnOS host."
+        return 0
+    fi
+
+    if [ -z "$missing_groups" ]; then
+        log "Gallery GPU authorization already present for $APP_USER: $(id "$APP_USER" 2>/dev/null)"
+        return 0
+    fi
+
+    if [ "${TRIM_RUN_USERNAME:-}" = "root" ] || [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+        if usermod -aG "$missing_groups" "$APP_USER" >> "$LOG_FILE" 2>&1; then
+            log "Gallery GPU authorization added: $APP_USER joined $missing_groups. Restart Gallery after install/upgrade."
+        else
+            log "Gallery GPU authorization failed. If OpenVINO falls back to CPU, run: $MANUAL_GPU_COMMAND; then restart Gallery."
+        fi
+        return 0
+    fi
+
+    log "Gallery GPU authorization requires administrator action: run '$MANUAL_GPU_COMMAND', then restart Gallery."
+}
+
+migrate_legacy_data_shares || exit 1
+ensure_gpu_groups
+exit 0

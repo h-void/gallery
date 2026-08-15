@@ -28,7 +28,7 @@ $env:GALLERY_MEDIA_DIR = 'D:\Pictures'
 docker compose up -d --build
 ```
 
-The container listens on `http://localhost:8899/` by default. Docker volumes persist the database, preview cache, and models. Docker uses CPU character recognition by default; place the model at `character/ccip-caformer_b36-24/model_feat.onnx` in the `gallery-models` volume. Media is mounted read-only by default. To enable organization, archiving, or deletion, change `/media:ro` to `/media` in `docker-compose.yml` only after intentionally granting write access.
+The container listens on `http://localhost:8899/` by default. The database, preview cache, and models are unified in the `data/`, `cache/`, and `models/` directories of the `gallery-storage` volume. Docker uses CPU character recognition by default; place the model at `models/character/ccip-caformer_b36-24/model_feat.onnx` in that volume. Docker does not merge the three named volumes used by earlier deployments; back them up and migrate their data before removing them. Media is mounted read-only by default. To enable organization, archiving, or deletion, change `/media:ro` to `/media` in `docker-compose.yml` only after intentionally granting write access.
 
 ## Building
 

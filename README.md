@@ -28,7 +28,7 @@ $env:GALLERY_MEDIA_DIR = 'D:\Pictures'
 docker compose up -d --build
 ```
 
-容器默认监听 `http://localhost:8899/`，数据、预览缓存和模型分别保存到 Docker volumes。Docker 默认使用 CPU 角色识别；把模型放到 `gallery-models` volume 的 `character/ccip-caformer_b36-24/model_feat.onnx`。媒体目录默认以只读方式挂载；需要整理、归档或删除文件时，将 `docker-compose.yml` 中的 `/media:ro` 改为 `/media`，并确认这是有意授权。
+容器默认监听 `http://localhost:8899/`。数据库、预览缓存和模型统一保存在 `gallery-storage` volume 的 `data/`、`cache/`、`models/` 子目录中。Docker 默认使用 CPU 角色识别；把模型放到该 volume 的 `models/character/ccip-caformer_b36-24/model_feat.onnx`。从早期三个 named volumes 升级时，Docker 不会自动合并旧数据；请先备份并迁移，确认新 volume 数据完整前不要删除旧 volumes。媒体目录默认以只读方式挂载；需要整理、归档或删除文件时，将 `docker-compose.yml` 中的 `/media:ro` 改为 `/media`，并确认这是有意授权。
 
 ## 构建
 

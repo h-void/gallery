@@ -12,13 +12,9 @@ services:
       - /tmp:size=512m,mode=1777
     volumes:
       - "${GALLERY_MEDIA_DIR:-./media}:/media:ro"
-      - gallery-data:/data
-      - gallery-cache:/cache
-      - gallery-models:/models
+      - gallery-storage:/gallery
     environment:
       PICTURES_ROOT_LABELS: "${GALLERY_MEDIA_LABEL:-media}"
 
 volumes:
-  gallery-data:
-  gallery-cache:
-  gallery-models:
+  gallery-storage:

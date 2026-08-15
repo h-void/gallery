@@ -32,25 +32,26 @@ COPY app/static/ ./static/
 COPY LICENSE ./LICENSE
 COPY fnpack/app/licenses/ONNXRUNTIME_LICENSE.txt fnpack/app/licenses/ONNXRUNTIME_THIRD_PARTY_NOTICES.txt ./licenses/
 
-RUN mkdir -p /data/logs /data/db-backups /cache/video-frames /cache/transcode-cache \
-        /models/character /models/artist \
-    && chown -R gallery:gallery /data /cache /models /opt/gallery
+RUN mkdir -p /gallery/data/logs /gallery/data/db-backups \
+        /gallery/cache/video-frames /gallery/cache/transcode-cache \
+        /gallery/models/character /gallery/models/artist \
+    && chown -R gallery:gallery /gallery /opt/gallery
 
-ENV DATA_DIR=/data \
+ENV DATA_DIR=/gallery/data \
     GALLERY_STATIC_DIR=/opt/gallery/static \
     PICTURES_ROOT=/media \
     PICTURES_ROOT_REAL_PATHS=/media \
     PICTURES_ROOT_LABELS=media \
-    IMAGE_PREVIEW_CACHE_DIR=/cache \
+    IMAGE_PREVIEW_CACHE_DIR=/gallery/cache \
     IMAGE_PREVIEW_CACHE_MAX_BYTES=10000000000 \
     IMAGE_PREVIEW_MAX_SOURCE_PIXELS=134217728 \
-    VIDEO_FRAME_CACHE_DIR=/cache/video-frames \
+    VIDEO_FRAME_CACHE_DIR=/gallery/cache/video-frames \
     VIDEO_FRAME_CACHE_MAX_BYTES=2000000000 \
-    VIDEO_TRANSCODE_CACHE_DIR=/cache/transcode-cache \
+    VIDEO_TRANSCODE_CACHE_DIR=/gallery/cache/transcode-cache \
     VIDEO_TRANSCODE_CACHE_MAX_BYTES=900000000 \
-    MODEL_CACHE_ROOT=/models \
-    CHARACTER_MODEL_DIR=/models/character \
-    ARTIST_MODEL_DIR=/models/artist \
+    MODEL_CACHE_ROOT=/gallery/models \
+    CHARACTER_MODEL_DIR=/gallery/models/character \
+    ARTIST_MODEL_DIR=/gallery/models/artist \
     CHARACTER_RECOGNITION_PROVIDER=cpu \
     CHARACTER_IMPORT_IDLE_ENABLED=0 \
     ARTIST_RECOGNITION_ENABLED=0 \
@@ -68,10 +69,10 @@ ENV DATA_DIR=/data \
 USER gallery
 
 EXPOSE 8899
-VOLUME ["/data", "/cache", "/models"]
+VOLUME ["/gallery"]
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=20s \
     CMD curl -fsS http://127.0.0.1:8899/api/health > /dev/null || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--", "gallery-accel"]
-CMD ["--primary", "--enable-ml", "--db", "/data/gallery.db", "--static-dir", "/opt/gallery/static"]
+CMD ["--primary", "--enable-ml", "--db", "/gallery/data/gallery.db", "--static-dir", "/opt/gallery/static"]

@@ -92,7 +92,7 @@ Gallery indexes user-authorized media directories, partitions the entire collect
 
 Gallery offers an optimized native FPK package for fnOS, delivering native performance with minimal memory overhead.
 
-1. **Download FPK**: Obtain the latest `gallery_<version>_x86_64.fpk` from [Releases](https://github.com/h-void/gallery-archive/releases).
+1. **Download FPK**: Obtain the latest `gallery_<version>_x86_64.fpk` from [Releases](https://github.com/h-void/gallery/releases).
 2. **Install via App Center**: Open the fnOS App Center, choose manual installation, and select the `.fpk` file.
 3. **Authorize Media Directories**: Grant access to the media shares you want Gallery to manage.
 4. **Persistent Data Layout**: fnOS creates a persistent `@appshare/gallery` directory structured as:

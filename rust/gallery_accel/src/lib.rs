@@ -131,7 +131,8 @@ pub use recognition_status::{
     recognize_character_native_topk_with_roots, suggest_artists_native,
 };
 pub use recycle::{
-    capture_item_snapshot, ensure_recycle_schema, recycle_entries_response, restore_recycle_entry,
+    capture_item_snapshot, ensure_recycle_schema, reconcile_moving_recycle_entries,
+    recycle_entries_response, restore_recycle_entry,
 };
 pub use scan::{
     get_scan_state, resolve_scan_scope, run_full_library_scan, run_scan, update_scan_state,

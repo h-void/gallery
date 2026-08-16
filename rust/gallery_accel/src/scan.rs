@@ -510,7 +510,7 @@ pub fn run_scan(
                     ("phase", json!("scan")),
                 ],
             )?;
-            let (nc, ui, walk_stopped) =
+            let (nc, ui, walk_stopped, walk_error) =
                 walk_artist(conn, aid, &artist_s, &scan_root, &scan_id, control)?;
             new_candidates += nc;
             updated_items += ui;
@@ -519,6 +519,11 @@ pub fn run_scan(
                 stopped = true;
                 // Do not reconcile missing after a partial walk.
                 break;
+            }
+            if walk_error {
+                // A subtree failed (permission/I/O): unseen files are unknown,
+                // not missing. Keep scanning the remaining artists.
+                continue;
             }
             // Missing reconciliation only after a complete walk of this scope.
             reconcile_missing(conn, aid, &artist_s, &scan_root, &scan_id)?;
@@ -1067,7 +1072,7 @@ fn walk_artist(
     scan_root: &str,
     scan_id: &str,
     control: &ScanControl,
-) -> Result<(i64, i64, bool)> {
+) -> Result<(i64, i64, bool, bool)> {
     ensure_scan_seen(conn)?;
     let artist_norm = artist_path
         .replace('\\', "/")
@@ -1077,17 +1082,23 @@ fn walk_artist(
     let mut updated = 0i64;
     let mut seen_batch: Vec<(String, i64, String, String, i64, f64, String, String)> = Vec::new();
     let mut stopped = false;
+    let mut walk_error = false;
 
-    for entry in WalkDir::new(scan_root)
-        .into_iter()
-        .filter_entry(|e| {
-            e.file_name()
-                .to_str()
-                .map(|n| !n.starts_with('.'))
-                .unwrap_or(true)
-        })
-        .filter_map(|e| e.ok())
-    {
+    for entry in WalkDir::new(scan_root).into_iter().filter_entry(|e| {
+        e.file_name()
+            .to_str()
+            .map(|n| !n.starts_with('.'))
+            .unwrap_or(true)
+    }) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                // Permission/I/O failure on a subtree: the walk is partial, so
+                // reconcile_missing must not flag the unseen files as missing.
+                walk_error = true;
+                continue;
+            }
+        };
         if control.is_stop_requested() {
             stopped = true;
             break;
@@ -1307,7 +1318,7 @@ fn walk_artist(
         flush_scan_seen(conn, &seen_batch)?;
     }
     let _ = hash_file; // reserved for optional inline hash
-    Ok((new_candidates, updated, stopped))
+    Ok((new_candidates, updated, stopped, walk_error))
 }
 
 fn flush_scan_seen(

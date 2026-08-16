@@ -166,10 +166,11 @@ fn folder_item_ids(conn: &Connection, artist_id: i64, folder: &str) -> Result<Ve
             .replace('\\', "/")
             .trim_end_matches('/')
             .to_string();
-        format!("{base}/{folder}/")
+        escape_like(&format!("{base}/{folder}/"))
     };
     sql.push_str(
-        " AND (replace(file_path,'\\\\','/') LIKE ? OR replace(file_path,'\\\\','/') LIKE ?)",
+        " AND (replace(file_path,'\\\\','/') LIKE ? ESCAPE '\\' \
+           OR replace(file_path,'\\\\','/') LIKE ? ESCAPE '\\')",
     );
     // Also match files directly under folder without trailing slash edge cases.
     let like_prefix = format!("{prefix}%");
@@ -183,6 +184,20 @@ fn folder_item_ids(conn: &Connection, artist_id: i64, folder: &str) -> Result<Ve
         ids.push(row?);
     }
     Ok(ids)
+}
+
+/// Escape SQL LIKE wildcards so folder names (and artist paths) containing
+/// `%` or `_` match literally instead of widening the pattern to unrelated
+/// items — folder tag writes must never touch the wrong item set.
+fn escape_like(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 pub fn update_folder_tags_response(
@@ -758,10 +773,31 @@ pub fn get_character_import_job() -> Value {
 
 fn import_job_busy() -> bool {
     let guard = import_job_slot().lock().unwrap_or_else(|e| e.into_inner());
-    matches!(
-        guard
+    import_job_status_is_active(guard.as_ref())
+}
+
+/// Atomically claim the single import-job slot. Returns the busy payload when a
+/// job is already pending/running, so check-then-start can never race into two
+/// concurrent imports.
+fn claim_import_job_or_busy(job: Value) -> Option<Value> {
+    let mut guard = import_job_slot().lock().unwrap_or_else(|e| e.into_inner());
+    if import_job_status_is_active(guard.as_ref()) {
+        let mut busy = guard
             .as_ref()
-            .and_then(|j| j.value.get("status"))
+            .map(|j| j.value.clone())
+            .unwrap_or_else(|| json!({}));
+        if let Some(obj) = busy.as_object_mut() {
+            obj.insert("busy".into(), json!(true));
+        }
+        return Some(busy);
+    }
+    *guard = Some(ImportJob { value: job });
+    None
+}
+
+fn import_job_status_is_active(job: Option<&ImportJob>) -> bool {
+    matches!(
+        job.and_then(|j| j.value.get("status"))
             .and_then(|v| v.as_str()),
         Some("pending" | "running")
     )
@@ -971,13 +1007,6 @@ fn start_character_import_job_with_index_changes(
             "added_references": 0,
         }));
     }
-    if import_job_busy() {
-        let mut busy = get_character_import_job();
-        if let Some(obj) = busy.as_object_mut() {
-            obj.insert("busy".into(), json!(true));
-        }
-        return Ok(busy);
-    }
 
     let job_id = format!("{:x}", (now() * 1000.0) as u64);
     let artist_id = body.get("artist_id").and_then(|v| v.as_i64());
@@ -1060,9 +1089,8 @@ fn start_character_import_job_with_index_changes(
         "max_references_per_character": hard_max,
         "candidate_limit": candidate_limit,
     });
-    {
-        let mut guard = import_job_slot().lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(ImportJob { value: job.clone() });
+    if let Some(busy) = claim_import_job_or_busy(job.clone()) {
+        return Ok(busy);
     }
     let mut run_guard = ImportJobRunGuard {
         conn,
@@ -1570,6 +1598,45 @@ pub fn spawn_character_import_idle_worker(pool: std::sync::Arc<crate::db::DbPool
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn folder_item_ids_escapes_like_wildcards_in_folder_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE items (
+               id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT,
+               media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0,
+               missing INTEGER DEFAULT 0
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, path) VALUES (1, '/pictures/a')",
+            [],
+        )
+        .unwrap();
+        for (id, path) in [
+            (1, "/pictures/a/100%/f1.jpg"),
+            (2, "/pictures/a/100x/f2.jpg"),
+            (3, "/pictures/a/sub_dir/f3.jpg"),
+            (4, "/pictures/a/subxdir/f4.jpg"),
+        ] {
+            conn.execute(
+                "INSERT INTO items (id, artist_id, file_path) VALUES (?, 1, ?)",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+        }
+        // `%` and `_` in the requested folder must match literally; unescaped
+        // they widen the pattern and the tag write would touch other folders.
+        let ids = folder_item_ids(&conn, 1, "100%").unwrap();
+        assert_eq!(ids, vec![1], "% must not act as a wildcard");
+        let ids = folder_item_ids(&conn, 1, "sub_dir").unwrap();
+        assert_eq!(ids, vec![3], "_ must not act as a wildcard");
+        let ids = folder_item_ids(&conn, 1, "100x").unwrap();
+        assert_eq!(ids, vec![2], "plain folders still match exactly");
+    }
 
     #[test]
     fn operation_log_includes_errors_array() {

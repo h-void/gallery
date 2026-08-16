@@ -749,6 +749,10 @@ async function loadItems(options = {}) {
     state.itemsOffset = 0;
     state.hasMoreItems = false;
     if (!append) {
+      // This call claimed the load sequence number; an in-flight older load is
+      // now stale and would skip its own flag reset, so release the flags here.
+      state.loadingItems = false;
+      state.loadingMoreItems = false;
       releaseAllImageLoads();
       releaseAllVideoPreviewLoads();
       const grid = $('#grid');

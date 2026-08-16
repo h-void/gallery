@@ -52,7 +52,6 @@ use gallery_accel::{
     update_tag, video_frame_jpeg, video_transcode_status, DbConfig, DbPool, MediaRoots,
     ScanControl, WorkerStatus, MAX_CLUSTER_SCORE_VECTORS,
 };
-use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::services::{ServeDir, ServeFile};
@@ -563,7 +562,14 @@ async fn api_health(State(state): State<AppState>) -> Json<Value> {
     }
     // Native fields are complete in product mode. An optional upstream may only fill gaps.
     if let Some(upstream) = state.upstream.as_ref() {
-        if let Ok(remote) = upstream.get_json("/api/health").await {
+        // Gap-filling must never stall /api/health itself: a dead upstream answers
+        // within seconds instead of blocking the endpoint past NAS watchdog limits.
+        let remote = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            upstream.get_json("/api/health"),
+        )
+        .await;
+        if let Ok(Ok(remote)) = remote {
             if let Some(obj) = body.as_object_mut() {
                 for key in [
                     "scan",
@@ -1073,17 +1079,28 @@ async fn api_folder_rename_auto_run(
 async fn api_artists(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    artists_response(&conn).map(Json).map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        artists_response(&conn).map(Json).map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_duplicate_artists(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    duplicate_artists_response(&conn, &state.roots)
-        .map(Json)
-        .map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        duplicate_artists_response(&conn, &roots)
+            .map(Json)
+            .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_artist_stats(
@@ -1322,10 +1339,15 @@ async fn api_folders(
     State(state): State<AppState>,
     Query(query): Query<FoldersQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    folders_response(&conn, query.artist_id)
-        .map(Json)
-        .map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        folders_response(&conn, query.artist_id)
+            .map(Json)
+            .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_item_detail(
@@ -1849,10 +1871,15 @@ async fn api_characters(
     State(state): State<AppState>,
     Query(query): Query<CharactersQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    characters_response(&conn, query.search.as_deref())
-        .map(Json)
-        .map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        characters_response(&conn, query.search.as_deref())
+            .map(Json)
+            .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_character(
@@ -2034,16 +2061,28 @@ async fn api_scan_state(
 async fn api_hash_run(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Hashing reads the same media files that scans, moves, and archive
+    // executions rewrite; share their operation slot instead of racing them.
+    if !state.scan.try_start() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "another file operation is running"})),
+        ));
+    }
+    let _operation_guard = OperationGuard {
+        control: Arc::clone(&state.scan),
+    };
     let pool = Arc::clone(&state.pool);
     let roots = state.roots.clone();
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let conn = pool.get()?;
         run_hash_batch_with_roots(&conn, &roots, 32)
     })
     .await
     .map_err(blocking_http_error)?
     .map(Json)
-    .map_err(to_http_error)
+    .map_err(to_http_error);
+    result
 }
 
 async fn api_serve_file(
@@ -2804,7 +2843,14 @@ async fn api_character_import_job_start(
     State(state): State<AppState>,
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let payload = body.map(|j| j.0).unwrap_or_else(|_| json!({}));
+    // A malformed body must not silently fall back to `{}`: that maps to the
+    // most expensive scope ("all" — full-library import).
+    let payload = body.map(|j| j.0).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid JSON body: {err}")})),
+        )
+    })?;
     let pool = Arc::clone(&state.pool);
     let roots = state.roots.clone();
     tokio::task::spawn_blocking(move || {
@@ -2892,10 +2938,15 @@ async fn api_update_folder_tags(
         .get("tag_ids")
         .map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect())
         .unwrap_or_default();
-    let conn = state.pool.get().map_err(to_http_error)?;
-    update_folder_tags_response(&conn, artist_id, &folder, &tag_ids, &mode)
-        .map(Json)
-        .map_err(to_tag_write_http_error)
+    let conn_pool = Arc::clone(&state.pool);
+    tokio::task::spawn_blocking(move || {
+        let conn = conn_pool.get().map_err(to_http_error)?;
+        update_folder_tags_response(&conn, artist_id, &folder, &tag_ids, &mode)
+            .map(Json)
+            .map_err(to_tag_write_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 #[derive(serde::Deserialize)]
@@ -2917,16 +2968,21 @@ async fn api_update_folder_tags_by_name(
     State(state): State<AppState>,
     Json(body): Json<FolderTagsByNameBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    update_folder_tags_by_name_response(
-        &conn,
-        body.artist_id,
-        &body.folder,
-        &body.tag_names,
-        &body.mode,
-    )
-    .map(Json)
-    .map_err(to_tag_write_http_error)
+    let pool = Arc::clone(&state.pool);
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        update_folder_tags_by_name_response(
+            &conn,
+            body.artist_id,
+            &body.folder,
+            &body.tag_names,
+            &body.mode,
+        )
+        .map(Json)
+        .map_err(to_tag_write_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 fn preview_cache_control(versioned: bool) -> &'static str {
@@ -3162,23 +3218,39 @@ async fn api_upstream_fallback(State(state): State<AppState>, request: Request) 
     }
 }
 
+/// Proxy forwarding is for residual JSON APIs; refuse to buffer unbounded
+/// upload bodies (an accidental large POST must not exhaust NAS memory).
+const PROXY_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
+
 async fn proxy_request(
     upstream: Upstream,
     request: Request,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     let (parts, body) = request.into_parts();
-    let bytes = body
-        .collect()
-        .await
-        .map_err(|err| {
+    let mut stream = body.into_data_stream();
+    let mut buffered: Vec<u8> = Vec::new();
+    while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+        let chunk = chunk.map_err(|err| {
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("read body: {err}")})),
             )
-        })?
-        .to_bytes();
+        })?;
+        if buffered.len() + chunk.len() > PROXY_BODY_MAX_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"error": "request body exceeds proxy forwarding limit"})),
+            ));
+        }
+        buffered.extend_from_slice(&chunk);
+    }
     upstream
-        .forward(parts.method, &parts.uri, parts.headers, Bytes::from(bytes))
+        .forward(
+            parts.method,
+            &parts.uri,
+            parts.headers,
+            Bytes::from(buffered),
+        )
         .await
         .map_err(|err| {
             (

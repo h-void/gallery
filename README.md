@@ -92,7 +92,7 @@
 
 Gallery 为 fnOS 提供了经过深度优化的原生应用安装包，具备极高的执行性能与低资源开销。
 
-1. **获取安装包**：从 [Releases](https://github.com/hczhr/gallery-archive/releases) 下载最新发布的 `gallery_<version>_x86_64.fpk` 文件。
+1. **获取安装包**：从 [Releases](https://github.com/h-void/gallery-archive/releases) 下载最新发布的 `gallery_<version>_x86_64.fpk` 文件。
 2. **应用中心安装**：进入 fnOS Web 管理界面，打开「应用中心」选择手动安装，上传 `.fpk` 文件。
 3. **媒体目录授权**：在安装向导中为 Gallery 勾选并授权你要管理的媒体文件夹（系统将自动挂载映射）。
 4. **持久化存储结构**：安装后，系统会在 `@appshare/gallery` 下自动维护持久化数据：
@@ -189,7 +189,7 @@ gallery/
 ## 📄 开源许可证
 
 本项目基于 [GNU General Public License v3.0 only](LICENSE)（`GPL-3.0-only`）开源许可协议发布。  
-Copyright (C) 2026 hczhr.
+Copyright (C) 2026 h-void.
 
 重新分发本项目或其衍生修改版本时，必须完整提供对应源代码，并保持以 GPL-3.0-only 协议授权。
 

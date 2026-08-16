@@ -49,7 +49,8 @@ const API = {
     const r = await fetchWithTimeout(path, options);
     return this.parseResponse(r);
   },
-  async post(path) {
+  async post(path, data) {
+    if (data !== undefined && data !== null) return this.postJson(path, data);
     const r = await fetchWithTimeout(path, {method:'POST', keepalive:true});
     return this.parseResponse(r);
   },
@@ -786,7 +787,14 @@ async function loadArtists() {
     const artists = await API.get('/api/artists');
     // Python returned a bare array; Rust briefly wrapped {artists:[]}. asArray accepts both.
     state.artists = asArray(artists);
-    await loadDuplicateFolders();
+    // Duplicate-folder warnings are cosmetic; their failure must not wipe the
+    // successfully loaded artist list.
+    try {
+      await loadDuplicateFolders();
+    } catch (e) {
+      state.duplicateFolders = [];
+      renderDuplicateFolders();
+    }
     if (state.currentArtist) {
       state.currentArtist = state.artists.find(a => a.id === state.currentArtist.id) || null;
     }

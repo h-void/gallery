@@ -1089,14 +1089,21 @@ function startCharacterImportPolling() {
 async function pollCharacterImportJob() {
   try {
     const job = await API.get('/api/characters/import-from-tags/jobs/current');
+    state.characterImportPollFailures = 0;
     rememberCharacterImportJob(job);
     if (!job || !['pending', 'running'].includes(job.status)) {
       stopCharacterImportPolling();
       await finishCharacterImportJob(job);
     }
   } catch (e) {
-    stopCharacterImportPolling();
-    toast('读取角色库导入进度失败: ' + (e.message || e), 'error');
+    if (isAbortError(e)) return;
+    // One transient poll failure must not freeze the progress bar while the
+    // import keeps running server-side; give up only after several in a row.
+    state.characterImportPollFailures = (state.characterImportPollFailures || 0) + 1;
+    if (state.characterImportPollFailures >= 5) {
+      stopCharacterImportPolling();
+      toast('读取角色库导入进度失败: ' + (e.message || e), 'error');
+    }
   }
 }
 
@@ -1481,7 +1488,7 @@ function renderArchiveWorkbench() {
   if (settings?.error) {
     ruleStatus.textContent = `读取 Default 规则失败: ${settings.error}`;
   } else if (profile) {
-    ruleStatus.textContent = `Default · ${profile.collision_strategy === 'reject' ? '冲突跳过' : '冲突自动编号'}`;
+    ruleStatus.textContent = `Default \u00b7 ${profile.collision_strategy === 'reject' ? '冲突跳过' : '冲突自动编号'}`;
   } else {
     ruleStatus.textContent = 'Default 规则不可用';
   }

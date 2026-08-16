@@ -32,7 +32,9 @@ function applyMode(mode) {
   renderLibraryEmptyState();
   if (isMoves) {
     setMaintenanceView(state.maintenanceView || 'overview');
-    loadMoveWorkbench();
+    loadMoveWorkbench().catch(e => {
+      if (!isAbortError(e)) toast('维护页面刷新失败: ' + (e.message || e), 'error');
+    });
     startMaintenanceAutoRefresh();
   } else {
     stopMaintenanceAutoRefresh();
@@ -311,7 +313,11 @@ function bindEvents() {
     }
   });
 
-  $('#moveRefreshBtn').addEventListener('click', () => loadMoveWorkbench({preserveScroll: true}));
+  $('#moveRefreshBtn').addEventListener('click', () => {
+    loadMoveWorkbench({preserveScroll: true}).catch(e => {
+      if (!isAbortError(e)) toast('维护页面刷新失败: ' + (e.message || e), 'error');
+    });
+  });
   $('#moveAutoResolveBtn').addEventListener('click', autoResolveMoveCandidates);
   const folderRenameAutoToggle = $('#folderRenameAutoExecuteToggle');
   if (folderRenameAutoToggle) {

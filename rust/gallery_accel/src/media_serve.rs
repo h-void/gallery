@@ -521,6 +521,8 @@ fn move_file_exact_impl(src: &Path, dest: &Path, force_copy: bool) -> std::io::R
                     let _ = remove_created_file(dest, created_identity);
                     return Err(error);
                 }
+                fsync_parent_dir_best_effort(dest);
+                fsync_parent_dir_best_effort(src);
                 return Ok(());
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(error),
@@ -558,6 +560,8 @@ fn move_file_exact_impl(src: &Path, dest: &Path, force_copy: bool) -> std::io::R
         let _ = remove_created_file(dest, created_identity);
         return Err(error);
     }
+    fsync_parent_dir_best_effort(dest);
+    fsync_parent_dir_best_effort(src);
     Ok(())
 }
 
@@ -715,6 +719,19 @@ fn remove_created_file(path: &Path, expected: Option<(u64, u64)>) -> std::io::Re
     std::fs::remove_file(path)
 }
 
+/// Best-effort fsync of the directory containing `path` so a just-completed
+/// publish (link, create, rename, unlink) survives power loss. File data is
+/// already fsynced by the move paths and SQLite by its own commit; the
+/// directory entry is the remaining durability gap. Fails open because some
+/// filesystems refuse directory fsync after the move already succeeded.
+pub(crate) fn fsync_parent_dir_best_effort(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
 fn move_into_recycle(full: &Path) -> Result<PathBuf> {
     let base = full
         .file_name()
@@ -751,40 +768,13 @@ fn move_into_recycle(full: &Path) -> Result<PathBuf> {
     move_file_no_overwrite(full, &flat)
 }
 
-fn record_delete_reconciliation(
-    conn: &rusqlite::Connection,
-    item_id: i64,
-    item_snapshot: &Value,
-    tag_ids: &[i64],
-    tag_single_refs: &str,
-    non_tag_single_ref_ids: &str,
-    original_path: &str,
-    recycled_path: &str,
-    error: &str,
-) -> bool {
-    conn.execute(
-        "INSERT INTO recycle_entries
-         (original_item_id, artist_id, original_path, recycled_path, item_snapshot,
-          tag_ids_snapshot, tag_single_refs_snapshot, non_tag_single_ref_ids, last_error)
-         VALUES (?,?,?,?,?,?,?,?,?)",
-        rusqlite::params![
-            item_id,
-            item_snapshot["artist_id"].as_i64().unwrap_or_default(),
-            original_path,
-            recycled_path,
-            item_snapshot.to_string(),
-            serde_json::to_string(tag_ids).unwrap_or_else(|_| "[]".into()),
-            tag_single_refs,
-            non_tag_single_ref_ids,
-            error,
-        ],
-    )
-    .is_ok()
-}
-
 /// Delete an active library item: recycle file then remove DB row + auto character refs.
 ///
 /// Returns success only when FS + DB agree. On DB failure, tries to restore the file.
+#[cfg(test)]
+static DELETE_TEST_PAUSE_AFTER_MOVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn delete_item_to_recycle(
     conn: &rusqlite::Connection,
     path: &str,
@@ -816,21 +806,67 @@ pub fn delete_item_to_recycle(
     if let Some(object) = item_snapshot.as_object_mut() {
         object.insert("favorite".to_string(), Value::Bool(favorite));
     }
-    let recycled = move_into_recycle(&full).map_err(internal)?;
-    let recycled_s = recycled.display().to_string();
     let original_s = original.display().to_string();
+    let artist_id: i64 = conn
+        .query_row("SELECT artist_id FROM items WHERE id=?", [item_id], |row| {
+            row.get(0)
+        })
+        .map_err(internal)?;
 
+    // Phase 1: record the delete intent before touching the filesystem. A
+    // crash between the file move and the DB commit then leaves a recoverable
+    // 'moving' marker (reconciled at next startup) instead of an untracked
+    // file in trash that fnOS retention could purge silently.
+    conn.execute(
+        "INSERT INTO recycle_entries
+         (original_item_id, artist_id, original_path, recycled_path, item_snapshot,
+          tag_ids_snapshot, tag_single_refs_snapshot, non_tag_single_ref_ids, status)
+         VALUES (?,?,?,?,?,?,?,?, 'moving')",
+        rusqlite::params![
+            item_id,
+            artist_id,
+            original_s,
+            "",
+            serde_json::to_string(&item_snapshot).map_err(internal)?,
+            serde_json::to_string(&tag_ids).map_err(internal)?,
+            &tag_single_refs,
+            &non_tag_single_ref_ids,
+        ],
+    )
+    .map_err(internal)?;
+    let moving_id = conn.last_insert_rowid();
+
+    // Phase 2: move the file into recycle storage (dir fsyncs inside).
+    let recycled = match move_into_recycle(&full) {
+        Ok(recycled) => recycled,
+        Err(error) => {
+            let _ = conn.execute(
+                "DELETE FROM recycle_entries WHERE id=? AND status='moving'",
+                rusqlite::params![moving_id],
+            );
+            return Err(internal(error));
+        }
+    };
+    let recycled_s = recycled.display().to_string();
+
+    // Test-only pause point between the file move and the DB commit.
+    #[cfg(test)]
+    while DELETE_TEST_PAUSE_AFTER_MOVE.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Phase 3: finalize the record and remove the item row atomically.
     let db_result = (|| -> Result<(i64, i64)> {
         conn.execute("BEGIN IMMEDIATE", [])?;
         let tx = (|| -> Result<(i64, i64)> {
-            let artist_id: i64 =
-                conn.query_row("SELECT artist_id FROM items WHERE id=?", [item_id], |row| {
-                    row.get(0)
-                })?;
-            conn.execute(
-                "INSERT INTO recycle_entries (original_item_id, artist_id, original_path, recycled_path, item_snapshot, tag_ids_snapshot, tag_single_refs_snapshot, non_tag_single_ref_ids) VALUES (?,?,?,?,?,?,?,?)",
-                rusqlite::params![item_id, artist_id, original_s, recycled_s, serde_json::to_string(&item_snapshot)?, serde_json::to_string(&tag_ids)?, &tag_single_refs, &non_tag_single_ref_ids],
+            let changed = conn.execute(
+                "UPDATE recycle_entries SET status='recycled', recycled_path=?, last_error=''
+                 WHERE id=? AND status='moving'",
+                rusqlite::params![recycled_s, moving_id],
             )?;
+            if changed != 1 {
+                return Err(anyhow!("recycle record changed during delete"));
+            }
             let deleted_refs = conn.execute(
                 "DELETE FROM character_references WHERE item_id=? AND source_type='tag_single'",
                 rusqlite::params![item_id],
@@ -868,29 +904,35 @@ pub fn delete_item_to_recycle(
             }))
         }
         Err(db_err) => match move_file_exact_no_overwrite(&recycled, &original) {
-            Ok(()) => Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({
-                    "error": format!("database delete failed; file restored: {db_err}"),
-                    "item_id": item_id,
-                    "original_path": original_s,
-                }),
-            )),
+            Ok(()) => {
+                // File is back at its original path and the item row survived
+                // the rolled-back transaction; the moving marker is void.
+                let _ = conn.execute(
+                    "DELETE FROM recycle_entries WHERE id=? AND status='moving'",
+                    rusqlite::params![moving_id],
+                );
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({
+                        "error": format!("database delete failed; file restored: {db_err}"),
+                        "item_id": item_id,
+                        "original_path": original_s,
+                    }),
+                ))
+            }
             Err(restore_err) => {
                 let error = format!(
                     "database delete failed and restore failed: db={db_err}; restore={restore_err}"
                 );
-                let recorded = record_delete_reconciliation(
-                    conn,
-                    item_id,
-                    &item_snapshot,
-                    &tag_ids,
-                    &tag_single_refs,
-                    &non_tag_single_ref_ids,
-                    &original_s,
-                    &recycled_s,
-                    &error,
-                );
+                // The file stays in trash under the phase-1 record: promote it
+                // to a visible 'recycled' entry carrying the failure reason.
+                let recorded = conn
+                    .execute(
+                        "UPDATE recycle_entries SET status='recycled', recycled_path=?, last_error=?
+                         WHERE id=? AND status='moving'",
+                        rusqlite::params![recycled_s, error, moving_id],
+                    )
+                    .is_ok();
                 Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     json!({
@@ -1257,7 +1299,10 @@ fn marker_is_fresh(marker: &Path) -> bool {
 }
 
 fn claim_transcode_marker(marker: &Path) -> Result<bool> {
-    loop {
+    // Bounded retries: a stale marker whose removal keeps failing (read-only
+    // moment on the NAS) must degrade to "not claimed" instead of spinning
+    // forever on the request thread.
+    for _ in 0..3 {
         match OpenOptions::new().write(true).create_new(true).open(marker) {
             Ok(_) => return Ok(true),
             Err(error)
@@ -1266,11 +1311,14 @@ fn claim_transcode_marker(marker: &Path) -> Result<bool> {
                 return Ok(false)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = std::fs::remove_file(marker);
+                if std::fs::remove_file(marker).is_err() {
+                    return Ok(false);
+                }
             }
             Err(error) => return Err(error.into()),
         }
     }
+    Ok(false)
 }
 
 fn transcode_error_marker(marker: &Path) -> PathBuf {
@@ -1981,9 +2029,8 @@ mod tests {
             .join("a")
             .join("same.jpg");
         let path = original.to_string_lossy().replace('\\', "/");
-        let lock_conn = rusqlite::Connection::open(dir.path().join("g.db")).unwrap();
         let worker_conn = rusqlite::Connection::open(dir.path().join("g.db")).unwrap();
-        lock_conn.execute("BEGIN IMMEDIATE", []).unwrap();
+        DELETE_TEST_PAUSE_AFTER_MOVE.store(true, Ordering::SeqCst);
 
         let worker =
             std::thread::spawn(move || delete_item_to_recycle(&worker_conn, &path, &roots));
@@ -1995,7 +2042,7 @@ mod tests {
         }
         assert!(!original.exists(), "delete did not reach recycle move");
         std::fs::write(&original, b"concurrent").unwrap();
-        lock_conn.execute("COMMIT", []).unwrap();
+        DELETE_TEST_PAUSE_AFTER_MOVE.store(false, Ordering::SeqCst);
 
         let error = worker.join().unwrap().unwrap_err();
         assert_eq!(error.1["needs_reconciliation"], true);

@@ -37,6 +37,84 @@ const ITEM_COLUMNS: &[&str] = &[
     "scanned_at",
 ];
 
+/// Finalize or drop recycle rows left in the pre-commit `'moving'` state by an
+/// interrupted delete (crash or power loss between the filesystem move and the
+/// database commit). Called once at writable startup; per-row failures never
+/// abort startup. Returns (finalized, dropped, marked_missing).
+pub fn reconcile_moving_recycle_entries(conn: &Connection) -> (usize, usize, usize) {
+    let rows: Vec<(i64, i64, String, String)> = match conn
+        .prepare(
+            "SELECT id, original_item_id, original_path, recycled_path
+             FROM recycle_entries WHERE status='moving'",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        }) {
+        Ok(rows) => rows,
+        Err(_) => return (0, 0, 0),
+    };
+    let mut finalized = 0;
+    let mut dropped = 0;
+    let mut missing = 0;
+    for (id, item_id, original, recycled) in rows {
+        if !recycled.is_empty() && Path::new(&recycled).is_file() {
+            // The file reached recycle storage before the crash; finish the
+            // delete the interrupted transaction would have committed.
+            let done = (|| -> Result<()> {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute(
+                    "DELETE FROM character_references WHERE item_id=? AND source_type='tag_single'",
+                    params![item_id],
+                )?;
+                tx.execute("DELETE FROM items WHERE id=?", params![item_id])?;
+                tx.execute(
+                    "UPDATE recycle_entries SET status='recycled',
+                        last_error='finalized after interrupted delete'
+                     WHERE id=? AND status='moving'",
+                    params![id],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })()
+            .is_ok();
+            if done {
+                finalized += 1;
+            }
+        } else if Path::new(&original).is_file() {
+            // Crash before the file moved: nothing happened on disk, and the
+            // item row is still active — drop the stale marker entirely.
+            if conn
+                .execute(
+                    "DELETE FROM recycle_entries WHERE id=? AND status='moving'",
+                    params![id],
+                )
+                .is_ok()
+            {
+                dropped += 1;
+            }
+        } else if conn
+            .execute(
+                "UPDATE recycle_entries SET status='recycled',
+                    last_error='interrupted delete: file missing from original and recycle locations'
+                 WHERE id=? AND status='moving'",
+                params![id],
+            )
+            .is_ok()
+        {
+            missing += 1;
+        }
+    }
+    (finalized, dropped, missing)
+}
+
 pub fn ensure_recycle_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS recycle_entries (
@@ -438,6 +516,113 @@ mod tests {
 
     use super::*;
     use crate::{delete_item_to_recycle, DbConfig, DbPool};
+
+    fn insert_moving_entry(conn: &Connection, original: &str, recycled: &str) -> i64 {
+        ensure_recycle_schema(conn).unwrap();
+        conn.execute(
+            "INSERT INTO recycle_entries
+             (original_item_id, artist_id, original_path, recycled_path, item_snapshot, status)
+             VALUES (1, 1, ?, ?, '{}', 'moving')",
+            params![original, recycled],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn delete_success_leaves_no_moving_rows() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (_dir, pool, roots, original, data_dir) = fixture();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", data_dir);
+        let conn = pool.get().unwrap();
+        delete_item_to_recycle(&conn, &original.to_string_lossy(), &roots).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM recycle_entries WHERE status='moving'"
+            ),
+            0,
+            "a completed delete must not keep the moving marker"
+        );
+        let recycled_path: String = conn
+            .query_row(
+                "SELECT recycled_path FROM recycle_entries WHERE status='recycled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!recycled_path.is_empty());
+        assert!(Path::new(&recycled_path).is_file());
+    }
+
+    #[test]
+    fn reconcile_drops_moving_entry_when_crash_preceded_file_move() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (_dir, pool, _roots, original, _data_dir) = fixture();
+        let conn = pool.get().unwrap();
+        insert_moving_entry(&conn, &original.to_string_lossy().replace('\\', "/"), "");
+
+        let (finalized, dropped, missing) = reconcile_moving_recycle_entries(&conn);
+
+        assert_eq!((finalized, dropped, missing), (0, 1, 0));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM recycle_entries"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM items"), 1);
+        assert!(original.is_file(), "untouched file must stay in place");
+    }
+
+    #[test]
+    fn reconcile_finalizes_moving_entry_when_crash_followed_file_move() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (dir, pool, _roots, original, _data_dir) = fixture();
+        let conn = pool.get().unwrap();
+        let trash = dir.path().join("trash-store").join("same.jpg");
+        std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+        std::fs::rename(&original, &trash).unwrap();
+        insert_moving_entry(
+            &conn,
+            &original.to_string_lossy().replace('\\', "/"),
+            &trash.to_string_lossy().replace('\\', "/"),
+        );
+
+        let (finalized, dropped, missing) = reconcile_moving_recycle_entries(&conn);
+
+        assert_eq!((finalized, dropped, missing), (1, 0, 0));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM items"), 0);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM recycle_entries WHERE status='recycled'"
+            ),
+            1
+        );
+        assert!(trash.is_file(), "the recycled copy must be preserved");
+    }
+
+    #[test]
+    fn reconcile_marks_moving_entry_when_file_is_lost() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (_dir, pool, _roots, original, _data_dir) = fixture();
+        let conn = pool.get().unwrap();
+        std::fs::remove_file(&original).unwrap();
+        insert_moving_entry(&conn, &original.to_string_lossy().replace('\\', "/"), "");
+
+        let (finalized, dropped, missing) = reconcile_moving_recycle_entries(&conn);
+
+        assert_eq!((finalized, dropped, missing), (0, 0, 1));
+        let last_error: String = conn
+            .query_row(
+                "SELECT last_error FROM recycle_entries WHERE status='recycled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!last_error.is_empty());
+    }
 
     fn fixture() -> (tempfile::TempDir, Arc<DbPool>, MediaRoots, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();

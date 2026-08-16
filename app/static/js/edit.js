@@ -667,6 +667,18 @@ function isCurrentCharacterSuggestionRequest(seq, pageKey) {
     && characterSuggestionPageKey() === pageKey;
 }
 
+// Bound the per-session suggestion cache: long edit sessions otherwise retain
+// every resolved recognition result (predictions included) forever.
+const CHARACTER_SUGGESTION_CACHE_MAX = 200;
+
+function trimCharacterSuggestionCache() {
+  while (state.characterSuggestionCache.size > CHARACTER_SUGGESTION_CACHE_MAX) {
+    const oldestKey = state.characterSuggestionCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    state.characterSuggestionCache.delete(oldestKey);
+  }
+}
+
 async function recognizeCharacterSuggestionItem(item) {
   const key = characterSuggestionItemKey(item);
   if (state.characterSuggestionCache.has(key)) {
@@ -674,6 +686,7 @@ async function recognizeCharacterSuggestionItem(item) {
   }
   const pending = API.postJson(`/api/items/${item.id}/character-recognition?top_k=3`, {});
   state.characterSuggestionCache.set(key, pending);
+  trimCharacterSuggestionCache();
   try {
     const result = await pending;
     state.characterSuggestionCache.set(key, result);
@@ -1405,6 +1418,8 @@ async function classifyItems(ids, tagIds, mode='add') {
   if (isActionBusy('edit-classify-items')) return;
   setActionBusy('edit-classify-items', '', true);
   const artistId = currentEditArtistId();
+  const refreshArtistId = state.currentArtist ? state.currentArtist.id : null;
+  const artistLoadSeq = Number(state.artistLoadSeq || 0);
   const tagNames = selectedEditTagNames(tagIds);
   if (!tagNames.length && !tagIds.length) {
     setActionBusy('edit-classify-items', '', false);
@@ -1439,10 +1454,19 @@ async function classifyItems(ids, tagIds, mode='add') {
     updateEditBar();
     toast('标签已更新', 'success');
 
-    if (state.currentArtist) {
-      state.stats = await API.get(`/api/artists/${state.currentArtist.id}/stats`);
-      state.tags = await API.get(`/api/tags?artist_id=${state.currentArtist.id}`);
-      renderSidebar();
+    if (refreshArtistId) {
+      const [stats, tags] = await Promise.all([
+        API.get(`/api/artists/${refreshArtistId}/stats`),
+        API.get(`/api/tags?artist_id=${refreshArtistId}`),
+      ]);
+      // A concurrent artist switch or view refresh owns newer state now; a
+      // late response here must not overwrite it with the old artist's data.
+      if (state.currentArtist && state.currentArtist.id === refreshArtistId
+          && isCurrentRequestSeq('artistLoadSeq', artistLoadSeq)) {
+        state.stats = stats;
+        state.tags = tags;
+        renderSidebar();
+      }
     } else {
       await ensureEditTagContext();
     }
@@ -1483,6 +1507,8 @@ async function classifyFolder(folder, tagIds, mode='add') {
   if (!state.currentArtist || !folder) return;
   if (isActionBusy('edit-classify-folder', folder)) return;
   setActionBusy('edit-classify-folder', folder, true);
+  const refreshArtistId = state.currentArtist.id;
+  const artistLoadSeq = Number(state.artistLoadSeq || 0);
   const tagNames = selectedEditTagNames(tagIds);
   if (!tagNames.length && !tagIds.length) {
     setActionBusy('edit-classify-folder', folder, false);
@@ -1513,26 +1539,36 @@ async function classifyFolder(folder, tagIds, mode='add') {
     updateEditBar();
     toast(`文件夹标签已更新：${result.updated} 张`, 'success');
 
-    state.stats = await API.get(`/api/artists/${state.currentArtist.id}/stats`);
-    state.tags = await API.get(`/api/tags?artist_id=${state.currentArtist.id}`);
-    state.folders = await API.get(`/api/folders?artist_id=${state.currentArtist.id}`);
-    renderEditTagPicker();
-    renderSidebar();
-    renderFolderTree();
-    await loadItems();
-    const restoreResult = restoreGridScrollAnchor(gridScrollAnchor);
-    logUiAction('edit_apply_layout', collectUiLogContext({
-      target: 'folder',
-      mode,
-      folder,
-      first_visible_id: restoreResult?.first_visible_id ?? null,
-      before_top: restoreResult?.before_top == null ? null : Math.round(restoreResult.before_top),
-      after_top: restoreResult?.after_top == null ? null : Math.round(restoreResult.after_top),
-      top_delta: restoreResult?.top_delta == null ? null : Math.round(restoreResult.top_delta),
-      grid_scroll_top: restoreResult?.grid_scroll_top ?? ($('#gridContainer') ? Math.round($('#gridContainer').scrollTop) : 0),
-      edit_bar_height: restoreResult?.edit_bar_height ?? ($('#editBar') ? Math.round($('#editBar').getBoundingClientRect().height) : 0),
-      restored: Boolean(restoreResult?.restored),
-    }));
+    const [stats, tags, folders] = await Promise.all([
+      API.get(`/api/artists/${refreshArtistId}/stats`),
+      API.get(`/api/tags?artist_id=${refreshArtistId}`),
+      API.get(`/api/folders?artist_id=${refreshArtistId}`),
+    ]);
+    // Skip stale overwrites when the artist changed or a newer load started
+    // while these refetches were in flight.
+    if (state.currentArtist && state.currentArtist.id === refreshArtistId
+        && isCurrentRequestSeq('artistLoadSeq', artistLoadSeq)) {
+      state.stats = stats;
+      state.tags = tags;
+      state.folders = folders;
+      renderEditTagPicker();
+      renderSidebar();
+      renderFolderTree();
+      await loadItems();
+      const restoreResult = restoreGridScrollAnchor(gridScrollAnchor);
+      logUiAction('edit_apply_layout', collectUiLogContext({
+        target: 'folder',
+        mode,
+        folder,
+        first_visible_id: restoreResult?.first_visible_id ?? null,
+        before_top: restoreResult?.before_top == null ? null : Math.round(restoreResult.before_top),
+        after_top: restoreResult?.after_top == null ? null : Math.round(restoreResult.after_top),
+        top_delta: restoreResult?.top_delta == null ? null : Math.round(restoreResult.top_delta),
+        grid_scroll_top: restoreResult?.grid_scroll_top ?? ($('#gridContainer') ? Math.round($('#gridContainer').scrollTop) : 0),
+        edit_bar_height: restoreResult?.edit_bar_height ?? ($('#editBar') ? Math.round($('#editBar').getBoundingClientRect().height) : 0),
+        restored: Boolean(restoreResult?.restored),
+      }));
+    }
   } catch (e) {
     logUiAction('edit_apply_result', {
       target: 'folder',

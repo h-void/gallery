@@ -496,6 +496,66 @@ fn copy_fallback_allowed(error: &std::io::Error) -> bool {
     matches!(error.raw_os_error(), Some(18) | Some(17))
 }
 
+/// When a move has to leave a directory behind for manual reconciliation, the
+/// path used to live only inside the error text and was lost with the toast.
+/// Persist a small JSON record under DATA_DIR/retained-dirs so maintenance can
+/// discover these directories later.
+fn record_retained_directory(retained: &Path, source: &Path, target: &Path, reason: &str) {
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into());
+    let records = Path::new(&data_dir).join("retained-dirs");
+    if std::fs::create_dir_all(&records).is_err() {
+        return;
+    }
+    let recorded_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
+    let record = serde_json::json!({
+        "retained_path": retained.to_string_lossy(),
+        "source": source.to_string_lossy(),
+        "target": target.to_string_lossy(),
+        "reason": reason,
+        "recorded_at": recorded_at,
+    });
+    let _ = std::fs::write(
+        records.join(format!("{}.json", uuid::Uuid::new_v4().simple())),
+        record.to_string(),
+    );
+}
+
+/// Drop bookkeeping for retained directories that have since been removed by
+/// an operator; returns how many live records remain.
+fn prune_retained_directory_records() -> usize {
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into());
+    let records = Path::new(&data_dir).join("retained-dirs");
+    let Ok(entries) = std::fs::read_dir(&records) else {
+        return 0;
+    };
+    let mut live = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let retained = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|record| {
+                record
+                    .get("retained_path")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            });
+        match retained {
+            Some(retained) if Path::new(&retained).exists() => live += 1,
+            _ => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    live
+}
+
 /// Move the artist tree without overwriting anything another process created:
 /// publish via a no-replace rename, or copy to private staging and publish the
 /// staging directory with a no-replace rename before retiring the source.
@@ -535,6 +595,7 @@ fn move_artist_tree(
             let staging_target =
                 target.with_file_name(format!(".gallery-copy-{}", uuid::Uuid::new_v4().simple()));
             if let Err(error) = copy_artist_tree_to_staging(source, &staging_target, roots) {
+                record_retained_directory(&staging_target, source, target, "partial_copy_staging");
                 return Err(error.context(format!(
                     "copy staging retained for manual reconciliation: {}",
                     staging_target.display()
@@ -548,6 +609,12 @@ fn move_artist_tree(
                 staging_target_identity,
             ) {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    record_retained_directory(
+                        &staging_target,
+                        source,
+                        target,
+                        "unpublished_staging",
+                    );
                     bail!(
                         "destination appeared between preview and execute; staging retained for manual reconciliation: {}",
                         staging_target.display()
@@ -565,6 +632,7 @@ fn move_artist_tree(
                 expected_source_identity,
             ) {
                 if let Err(cleanup_error) = remove_owned_dir(target, published_identity) {
+                    record_retained_directory(target, source, target, "published_target_retained");
                     return Err(anyhow!(
                         "source retirement failed: {error}; published target retained for manual reconciliation: {cleanup_error}"
                     ));
@@ -677,6 +745,12 @@ pub fn execute_artist_folder_move(
                         published_identity,
                     )
                 {
+                    record_retained_directory(
+                        &target,
+                        &source,
+                        &target,
+                        "rollback_retained_target",
+                    );
                     return Err(anyhow!(
                         "database update failed: {error}; filesystem rollback failed and needs manual reconciliation: {rollback_error}"
                     ));
@@ -702,6 +776,22 @@ pub fn execute_artist_folder_move(
                     rollback_errors.push(format!("published target retained: {cleanup_error}"));
                 }
                 if !rollback_errors.is_empty() {
+                    if let Some(staging) = staged_source.as_ref().filter(|s| s.is_dir()) {
+                        record_retained_directory(
+                            staging,
+                            &source,
+                            &target,
+                            "rollback_retained_staging",
+                        );
+                    }
+                    if target.is_dir() {
+                        record_retained_directory(
+                            &target,
+                            &source,
+                            &target,
+                            "rollback_retained_target",
+                        );
+                    }
                     return Err(anyhow!(
                         "database update failed: {error}; filesystem rollback needs manual reconciliation: {}",
                         rollback_errors.join("; ")
@@ -715,7 +805,7 @@ pub fn execute_artist_folder_move(
         .and_then(|staging| remove_owned_dir(&staging, staged_source_identity).err())
         .map(|error| error.to_string());
     Ok(
-        json!({"ok": true, "backup": backup, "source": source_text, "target": target_text, "updated_paths": updated, "cleanup_error": cleanup_error}),
+        json!({"ok": true, "backup": backup, "source": source_text, "target": target_text, "updated_paths": updated, "cleanup_error": cleanup_error, "retained_dirs": prune_retained_directory_records()}),
     )
 }
 
@@ -723,6 +813,77 @@ pub fn execute_artist_folder_move(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn retained_directory_records_are_persisted_and_pruned() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+        let retained = dir.path().join("leftover");
+        fs::create_dir_all(&retained).unwrap();
+        record_retained_directory(
+            &retained,
+            &dir.path().join("s"),
+            &dir.path().join("t"),
+            "test",
+        );
+
+        assert_eq!(prune_retained_directory_records(), 1);
+
+        fs::remove_dir_all(&retained).unwrap();
+        assert_eq!(prune_retained_directory_records(), 0);
+        let records_dir = dir.path().join("data").join("retained-dirs");
+        let remaining: Vec<_> = fs::read_dir(&records_dir)
+            .map(|entries| entries.filter_map(|entry| entry.ok()).collect())
+            .unwrap_or_default();
+        assert!(remaining.is_empty(), "pruned records must be removed");
+    }
+
+    #[test]
+    fn occupied_publish_target_records_retained_staging() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _forced = crate::test_support::EnvVar::set("GALLERY_TEST_ARTIST_MOVE_COPY", "1");
+        let dir = tempdir().unwrap();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+        let source = dir.path().join("Artist");
+        fs::create_dir_all(source.join("work")).unwrap();
+        fs::write(source.join("work").join("image.jpg"), b"image").unwrap();
+        let target = dir.path().join("Moved");
+        fs::create_dir_all(&target).unwrap();
+        let roots = MediaRoots::identical(
+            vec![dir.path().to_string_lossy().to_string()],
+            vec!["root".into()],
+        );
+
+        let error = move_artist_tree(&source, &target, &roots, None)
+            .expect_err("occupied target must refuse the publish");
+
+        assert!(error.to_string().contains("staging retained"));
+        let records_dir = dir.path().join("data").join("retained-dirs");
+        let records: Vec<_> = fs::read_dir(&records_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            == Some("json")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(records.len(), 1, "the retained staging must be recorded");
+        let record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(records[0].path()).unwrap()).unwrap();
+        let recorded = Path::new(record["retained_path"].as_str().unwrap());
+        assert!(recorded.is_dir(), "record must point at the staging copy");
+        assert!(recorded
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".gallery-copy-")));
+    }
 
     #[test]
     fn copy_fallback_publishes_tree_and_retires_source_to_staging() {

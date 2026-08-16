@@ -468,7 +468,12 @@ fn rename_artist_dir_no_overwrite(
     source: &str,
     target: &str,
 ) -> std::io::Result<()> {
-    prepare_artist_dir_rename(artist, roots, source, target)?.execute()
+    prepare_artist_dir_rename(artist, roots, source, target)?.execute()?;
+    // The DB commits the rename as executed; make the directory entries
+    // themselves durable so a power cut cannot resurrect the old name.
+    crate::media_serve::fsync_parent_dir_best_effort(&artist.join(source));
+    crate::media_serve::fsync_parent_dir_best_effort(&artist.join(target));
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -484,7 +489,10 @@ fn rename_artist_dir_no_overwrite(
         ensure_target_parent_under_artist(parent, artist)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
     }
-    rename_dir_no_overwrite(&source, &target)
+    rename_dir_no_overwrite(&source, &target)?;
+    crate::media_serve::fsync_parent_dir_best_effort(&source);
+    crate::media_serve::fsync_parent_dir_best_effort(&target);
+    Ok(())
 }
 
 fn rollback_undo_folder_rename(
@@ -1886,8 +1894,14 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
             continue;
         }
         let mut parsed_date = crate::media_type::extract_date_from_folder(&folder);
-        if parsed_date.is_empty() && min_date.len() >= 10 && !min_date.starts_with("0000") {
-            parsed_date = min_date[..10].to_string();
+        // Legacy dates may hold junk text; slicing must not split a multi-byte
+        // char, and only a leading ASCII date is safe to keep.
+        if parsed_date.is_empty() && !min_date.starts_with("0000") {
+            if let Some(head) = min_date.get(..10) {
+                if head.chars().all(|c| c.is_ascii_digit() || c == '-') {
+                    parsed_date = head.to_string();
+                }
+            }
         }
 
         let total_items = items.len();
@@ -2279,22 +2293,29 @@ pub fn execute_folder_renames_with_backup(
         |r| r.get(0),
     )?;
     let artist_root = roots.map_to_real(&artist_path)?;
-    let plans: Vec<(i64, String, String, String, String)> = conn
+    let plans: Vec<(i64, String, String, String, String, i64)> = conn
         .prepare(
-            "SELECT id, source_folder, target_folder, plan_kind, split_actions
+            "SELECT id, source_folder, target_folder, plan_kind, split_actions, file_count
              FROM folder_rename_plans
              WHERE artist_id=? AND status='confirmed'
                AND (target_folder != '' OR (plan_kind='split_by_tag' AND split_actions != '[]'))",
         )?
         .query_map(params![artist_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })?
         .collect::<rusqlite::Result<_>>()?;
 
     if !path_under_authorized_roots(&artist_root, roots) {
         let results = plans
             .iter()
-            .map(|(id, source, target, _, _)| {
+            .map(|(id, source, target, _, _, _)| {
                 if !dry_run {
                     let _ = record_plan_execution_failure(
                         conn,
@@ -2327,7 +2348,7 @@ pub fn execute_folder_renames_with_backup(
         match create_db_backup(conn) {
             Ok(path) => backup_path = path,
             Err(error) => {
-                for (id, source, target, _, _) in &plans {
+                for (id, source, target, _, _, _) in &plans {
                     let _ = record_plan_execution_failure(
                         conn,
                         *id,
@@ -2341,7 +2362,7 @@ pub fn execute_folder_renames_with_backup(
                     "ok": false,
                     "dry_run": false,
                     "backup": "",
-                    "results": plans.into_iter().map(|(id, source, target, _, _)| json!({
+                    "results": plans.into_iter().map(|(id, source, target, _, _, _)| json!({
                         "plan_id": id,
                         "status": "error",
                         "reason": "backup_failed",
@@ -2355,7 +2376,7 @@ pub fn execute_folder_renames_with_backup(
     }
 
     let mut executed = Vec::new();
-    for (id, source_raw, target_raw, plan_kind, split_actions) in plans {
+    for (id, source_raw, target_raw, plan_kind, split_actions, file_count) in plans {
         if plan_kind == "split_by_tag" {
             if dry_run {
                 match prepare_split_file_moves(
@@ -2464,82 +2485,114 @@ pub fn execute_folder_renames_with_backup(
 
         // Revalidate targets produced by a saved format snapshot. Plans from
         // before custom naming had no snapshot and retain their confirmed path.
+        // This block runs per-plan after earlier plans in the same artist may
+        // already have executed and committed, so an error inside it must
+        // demote this one plan — never abort the whole run mid-artist.
         if !dry_run {
-            let dates = effective_item_dates(conn, artist_id, &source_raw)?;
-            if dates.is_empty() {
-                demote_plan_with_log(conn, id, "needs_date", "", "needs_date", &source_raw)?;
-                executed.push(json!({
-                    "plan_id": id, "status": "error", "reason": "needs_date",
-                    "source": source_raw, "target": target_raw,
-                }));
-                continue;
-            }
-            if dates.len() > 1 {
-                demote_plan_with_log(conn, id, "date_conflict", "", "date_conflict", &source_raw)?;
-                executed.push(json!({
-                    "plan_id": id, "status": "error", "reason": "date_conflict",
-                    "source": source_raw, "target": target_raw,
-                }));
-                continue;
-            }
-            let (selected, format_snapshot): (String, String) = conn.query_row(
-                "SELECT selected_tag_ids, format_snapshot FROM folder_rename_plans WHERE id=?",
-                params![id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let profile = serde_json::from_str::<Value>(&format_snapshot)
-                .ok()
-                .and_then(|snapshot| snapshot.get("profile").cloned());
-            if let Some(profile) = profile {
-                let tags = plan_tag_names(conn, artist_id, &source_raw, &selected)?;
-                let original_title: String = conn.query_row(
-                    "SELECT original_title FROM folder_rename_plans WHERE id=?",
+            let recheck = (|| -> anyhow::Result<bool> {
+                let dates = effective_item_dates(conn, artist_id, &source_raw)?;
+                if dates.is_empty() {
+                    demote_plan_with_log(conn, id, "needs_date", "", "needs_date", &source_raw)?;
+                    executed.push(json!({
+                        "plan_id": id, "status": "error", "reason": "needs_date",
+                        "source": source_raw, "target": target_raw,
+                    }));
+                    return Ok(false);
+                }
+                if dates.len() > 1 {
+                    demote_plan_with_log(
+                        conn,
+                        id,
+                        "date_conflict",
+                        "",
+                        "date_conflict",
+                        &source_raw,
+                    )?;
+                    executed.push(json!({
+                        "plan_id": id, "status": "error", "reason": "date_conflict",
+                        "source": source_raw, "target": target_raw,
+                    }));
+                    return Ok(false);
+                }
+                let (selected, format_snapshot): (String, String) = conn.query_row(
+                    "SELECT selected_tag_ids, format_snapshot FROM folder_rename_plans WHERE id=?",
                     params![id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                match render_archive_target(
-                    &profile,
-                    &artist_name,
-                    &dates[0],
-                    &tags,
-                    &original_title,
-                    &source_raw,
-                    id as usize,
-                ) {
-                    Ok(derived)
-                        if derived == target
-                            || (profile["collision_strategy"].as_str() == Some("suffix")
-                                && is_suffixed_archive_target(&target, &derived)) => {}
-                    Ok(derived) => {
-                        demote_plan_with_log(
-                            conn,
-                            id,
-                            "ready",
-                            &derived,
-                            "stale_target",
-                            &source_raw,
-                        )?;
-                        executed.push(json!({
-                            "plan_id": id, "status": "error", "reason": "stale_target",
-                            "source": source_raw, "target": target_raw, "target_folder": derived,
-                        }));
-                        continue;
+                let profile = serde_json::from_str::<Value>(&format_snapshot)
+                    .ok()
+                    .and_then(|snapshot| snapshot.get("profile").cloned());
+                if let Some(profile) = profile {
+                    let tags = plan_tag_names(conn, artist_id, &source_raw, &selected)?;
+                    let original_title: String = conn.query_row(
+                        "SELECT original_title FROM folder_rename_plans WHERE id=?",
+                        params![id],
+                        |row| row.get(0),
+                    )?;
+                    match render_archive_target(
+                        &profile,
+                        &artist_name,
+                        &dates[0],
+                        &tags,
+                        &original_title,
+                        &source_raw,
+                        id as usize,
+                    ) {
+                        Ok(derived)
+                            if derived == target
+                                || (profile["collision_strategy"].as_str() == Some("suffix")
+                                    && is_suffixed_archive_target(&target, &derived)) => {}
+                        Ok(derived) => {
+                            demote_plan_with_log(
+                                conn,
+                                id,
+                                "ready",
+                                &derived,
+                                "stale_target",
+                                &source_raw,
+                            )?;
+                            executed.push(json!({
+                                "plan_id": id, "status": "error", "reason": "stale_target",
+                                "source": source_raw, "target": target_raw, "target_folder": derived,
+                            }));
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            record_plan_execution_failure(
+                                conn,
+                                id,
+                                "bad_target",
+                                &source_raw,
+                                &target_raw,
+                                Some(json!({"error": error.to_string()})),
+                            )?;
+                            executed.push(json!({
+                                "plan_id": id, "status": "error", "reason": "bad_target",
+                                "source": source_raw, "target": target_raw, "error": error.to_string(),
+                            }));
+                            return Ok(false);
+                        }
                     }
-                    Err(error) => {
-                        record_plan_execution_failure(
-                            conn,
-                            id,
-                            "bad_target",
-                            &source_raw,
-                            &target_raw,
-                            Some(json!({"error": error.to_string()})),
-                        )?;
-                        executed.push(json!({
-                            "plan_id": id, "status": "error", "reason": "bad_target",
-                            "source": source_raw, "target": target_raw, "error": error.to_string(),
-                        }));
-                        continue;
-                    }
+                }
+                Ok(true)
+            })();
+            match recheck {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    let _ = record_plan_execution_failure(
+                        conn,
+                        id,
+                        "revalidation_failed",
+                        &source_raw,
+                        &target_raw,
+                        Some(json!({"error": error.to_string()})),
+                    );
+                    executed.push(json!({
+                        "plan_id": id, "status": "error", "reason": "revalidation_failed",
+                        "source": source_raw, "target": target_raw, "error": error.to_string(),
+                    }));
+                    continue;
                 }
             }
         }
@@ -2643,6 +2696,12 @@ pub fn execute_folder_renames_with_backup(
                 &dst_logical,
                 &dst_s,
             )?;
+            // The folder was already renamed on disk; if the stored item paths
+            // match neither prefix, committing would leave every row pointing
+            // at the old location (next scan: mass missing + duplicates).
+            if updated_items == 0 && file_count > 0 {
+                bail!("path rewrite matched no items for a non-empty plan");
+            }
             let log = json!([{
                 "at": now(),
                 "status": "executed",

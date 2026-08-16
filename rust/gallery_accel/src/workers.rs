@@ -169,12 +169,22 @@ fn spawn_hash_loop(
         loop {
             tokio::time::sleep(interval).await;
             let next_at = now() + interval.as_secs_f64();
-            let result = if scan.is_running() {
+            let result = if !scan.try_start() {
+                // Claim the operation slot: hashing while a scan or folder move
+                // rewrites paths reads stale files. Skip this tick instead.
                 Ok(json!({"ok": true, "skipped": "scan_active"}))
             } else {
                 let pool = pool.clone();
                 let roots = roots.clone();
+                let scan = scan.clone();
                 tokio::task::spawn_blocking(move || -> Result<Value> {
+                    struct ScanSlotGuard(Arc<ScanControl>);
+                    impl Drop for ScanSlotGuard {
+                        fn drop(&mut self) {
+                            self.0.set_running(false);
+                        }
+                    }
+                    let _slot = ScanSlotGuard(scan);
                     let conn = pool.get()?;
                     run_hash_batch_with_roots(&conn, &roots, batch_size)
                 })

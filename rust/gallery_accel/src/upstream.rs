@@ -91,9 +91,12 @@ impl Upstream {
                 request = request.header(name.as_str(), v);
             }
         }
-        let upstream = request
-            .send()
+        // Bound only the wait for response headers: an upstream that accepts the
+        // connection but never replies must not park the handler forever. The
+        // response body itself keeps streaming without a timeout (media runs long).
+        let upstream = tokio::time::timeout(Duration::from_secs(30), request.send())
             .await
+            .map_err(|_| anyhow!("proxy {url} timed out waiting for upstream headers"))?
             .with_context(|| format!("proxy {url}"))?;
         let status =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -193,10 +196,12 @@ pub async fn scan_ws_bridge(mut socket: WebSocket, upstream: Upstream) {
 }
 
 pub fn proxy_error(message: impl Into<String>) -> Response {
+    // Serialize through serde_json: raw format! breaks on backslashes, which are
+    // routine in Windows-style error paths and produce invalid JSON escapes.
     (
         StatusCode::BAD_GATEWAY,
         [(header::CONTENT_TYPE, "application/json")],
-        format!(r#"{{"error":"{}"}}"#, message.into().replace('"', "'")),
+        serde_json::json!({"error": message.into()}).to_string(),
     )
         .into_response()
 }
@@ -232,6 +237,20 @@ mod tests {
     fn request_hop_by_hop_keeps_range_header() {
         let range = HeaderName::from_static("range");
         assert!(!is_request_hop_by_hop(&range));
+    }
+
+    #[tokio::test]
+    async fn proxy_error_body_is_valid_json_with_backslashes() {
+        use http_body_util::BodyExt;
+        let response = proxy_error("upstream failed: D:\\media\\file.png unavailable");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: Value = serde_json::from_slice(&body)
+            .expect("proxy error body must stay valid JSON for path-like messages");
+        assert_eq!(
+            parsed["error"].as_str().unwrap(),
+            "upstream failed: D:\\media\\file.png unavailable"
+        );
     }
 
     #[test]

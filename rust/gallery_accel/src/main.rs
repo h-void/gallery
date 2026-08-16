@@ -86,6 +86,29 @@ async fn main() -> anyhow::Result<()> {
         args.primary,
     )?;
 
+    // Finish or discard deletes interrupted by crash/power loss before any
+    // request can observe the half-state ('moving' recycle rows).
+    if !read_only {
+        match rusqlite::Connection::open(&db_path) {
+            Ok(conn) => {
+                let _ = conn.execute_batch("PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL;");
+                match gallery_accel::ensure_recycle_schema(&conn) {
+                    Ok(()) => {
+                        let (finalized, dropped, missing) =
+                            gallery_accel::reconcile_moving_recycle_entries(&conn);
+                        if finalized + dropped + missing > 0 {
+                            eprintln!(
+                                "recycle reconciliation: finalized={finalized} dropped={dropped} marked_missing={missing}"
+                            );
+                        }
+                    }
+                    Err(error) => eprintln!("recycle schema check failed: {error}"),
+                }
+            }
+            Err(error) => eprintln!("recycle reconciliation open failed: {error}"),
+        }
+    }
+
     // Optional character idle import (CHARACTER_IMPORT_IDLE_ENABLED=1 only).
     if args.primary && !read_only {
         let (worker_pool, worker_roots, worker_scan, worker_status) = state.worker_inputs();

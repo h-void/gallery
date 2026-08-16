@@ -1,0 +1,5 @@
+# Keep GitHub's language summary aligned with the product runtime.
+*.rs linguist-language=Rust
+
+# Preserve upstream dependency notices, including intentional trailing whitespace.
+fnpack/app/licenses/** -whitespace

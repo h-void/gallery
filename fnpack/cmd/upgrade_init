@@ -1,0 +1,68 @@
+#!/bin/sh
+set -u
+
+APP_USER="${TRIM_USERNAME:-gallery}"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/tmp/gallery-upgrade-init.log}"
+
+log() {
+    printf '%s\n' "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+copy_legacy_share() {
+    source_dir="$1"
+    target_dir="$2"
+    label="$3"
+    [ -n "$source_dir" ] && [ -d "$source_dir" ] || return 0
+    if ! mkdir -p "$target_dir" || ! cp -a "$source_dir"/. "$target_dir"/; then
+        log "Gallery upgrade aborted: unable to stage legacy $label from $source_dir."
+        return 1
+    fi
+    log "Gallery upgrade staged legacy $label."
+}
+
+stage_legacy_data_shares() {
+    case "${TRIM_DATA_SHARE_PATHS:-}" in
+        *:*:*) ;;
+        *) return 0 ;;
+    esac
+    if [ -z "${TRIM_PKGVAR:-}" ]; then
+        log "Gallery upgrade aborted: TRIM_PKGVAR is required to migrate legacy data shares."
+        return 1
+    fi
+    migration_root="${TRIM_PKGVAR}/legacy-share-migration"
+    old_ifs="$IFS"
+    set -f
+    IFS=:
+    set -- $TRIM_DATA_SHARE_PATHS
+    IFS="$old_ifs"
+    legacy_data_dir="${1:-}"
+    legacy_preview_dir="${2:-}"
+    legacy_model_dir="${3:-}"
+    set +f
+    copy_legacy_share "$legacy_data_dir" "$migration_root/data" "database data" && \
+        copy_legacy_share "$legacy_preview_dir" "$migration_root/cache" "preview cache" && \
+        copy_legacy_share "$legacy_model_dir" "$migration_root/models" "model cache"
+}
+
+gallery_process_pids() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -u "$APP_USER" -x gallery-accel 2>/dev/null || true
+    fi
+}
+
+pids=$(gallery_process_pids)
+if [ -n "$pids" ]; then
+    log "Gallery upgrade stopping legacy gallery-accel pid(s): $(printf '%s' "$pids" | tr '\n' ' ')"
+    pkill -TERM -u "$APP_USER" -x gallery-accel 2>/dev/null || true
+    sleep 2
+    if [ -n "$(gallery_process_pids)" ]; then
+        pkill -KILL -u "$APP_USER" -x gallery-accel 2>/dev/null || true
+        sleep 1
+    fi
+fi
+
+if ! stage_legacy_data_shares; then
+    exit 1
+fi
+
+exit 0

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>画廊</title>
-<link rel="stylesheet" href="/static/style.css?v=1.0.245">
+<link rel="stylesheet" href="/static/style.css?v=1.0.255">
 </head>
 <body>
 
@@ -220,7 +220,7 @@
             <div class="move-subtitle">状态与高级工具</div>
           </div>
           <div class="maintenance-hero-actions">
-            <label class="maintenance-auto-toggle" title="全库扫描完成后，自动执行高置信度的文件夹规范化整理">
+            <label class="maintenance-auto-toggle" title="【全自动整理】开启后，仅在「全库扫描」成功结束时，系统会自动批准并执行所有无冲突的待整理项。关闭时为【手动模式】（默认推荐），必须在下方手动确认后点击「开始整理」才会执行。">
               <input id="folderRenameAutoExecuteToggle" type="checkbox">
               <span>自动整理</span>
             </label>
@@ -352,10 +352,9 @@
               <div class="archive-rule-actions"><button id="archiveProfileNewBtn" class="btn btn-ghost" type="button">新建规则</button><button id="archiveProfileDeleteBtn" class="btn btn-ghost" type="button">删除规则</button><button id="archiveProfileSaveBtn" class="btn btn-primary" type="button">保存整理方式</button></div>
             </div>
             <div class="archive-rule-status" id="archiveRuleStatus"></div>
-            <div class="archive-token-strip" aria-label="可用命名变量"><code>{artist}</code><code>{date}</code><code>{year}</code><code>{month}</code><code>{title}</code><code>{tags}</code><code>{folder}</code><code>{index}</code></div>
+            <div class="archive-token-strip" aria-label="可用命名变量"><code role="button" tabindex="0" title="点击插入变量" data-insert-token="{artist}">{artist}</code><code role="button" tabindex="0" title="点击插入变量" data-insert-token="{date}">{date}</code><code role="button" tabindex="0" title="点击插入变量" data-insert-token="{year}">{year}</code><code role="button" tabindex="0" title="点击插入变量" data-insert-token="{month}">{month}</code><code role="button" tabindex="0" title="点击插入变量" data-insert-token="{title}">{title}</code><code role="button" tabindex="0" title="点击插入变量" data-insert-token="{tags}">{tags}</code><code role="button" tabindex="0" title="点击插入变量" data-insert-token="{folder}">{folder}</code><code role="button" tabindex="0" title="点击插入变量" data-insert-token="{index}">{index}</code></div>
           </div>
-          <div class="archive-plan-head"><div><div class="operation-log-title">待整理的文件夹</div><div class="archive-plan-summary" id="archivePlanSummary">选择画师后读取整理项</div></div><div class="archive-plan-actions"><button id="archivePlansRefreshBtn" class="btn btn-ghost" type="button">刷新整理项</button><button id="archivePlansPreviewBtn" class="btn btn-ghost" type="button">预览改名结果</button><button id="archivePlansApplyBtn" class="btn btn-primary" type="button">更新整理项</button><button id="archivePlansDryRunBtn" class="btn btn-ghost" type="button">检查是否可执行</button><button id="archivePlansExecuteBtn" class="btn btn-danger" type="button">开始整理</button></div></div>
-          <form class="archive-plan-create" id="archivePlanCreateForm"><input id="archivePlanSourceInput" type="text" list="archiveFolderOptions" maxlength="500" autocomplete="off" placeholder="选择或输入来源文件夹..."><datalist id="archiveFolderOptions"></datalist><button class="btn btn-ghost" type="button">添加整理项</button></form>
+          <div class="archive-plan-head"><div><div class="operation-log-title">待整理的文件夹</div><div class="archive-plan-summary" id="archivePlanSummary">选择画师后读取整理项</div></div><div class="archive-plan-actions"><button id="archivePlansRefreshBtn" class="btn btn-ghost" type="button" title="重新读取该画师的所有子文件夹并生成改名预览">刷新整理项</button><button id="archivePlansPreviewBtn" class="btn btn-ghost" type="button" title="预览按照当前规则改名后的效果及冲突检查">预览改名结果</button><button id="archivePlansApplyBtn" class="btn btn-primary" type="button" title="将当前命名规则应用到列表中所有未锁定的整理项">更新整理项</button><button id="archivePlansConfirmAllBtn" class="btn btn-ghost" type="button" title="一键批准所有待整理项（只有处于【已确认】状态的项，在点击「开始整理」时才会被实际改名移动）">全部确认</button><button id="archivePlansDryRunBtn" class="btn btn-ghost" type="button" title="演练检查：模拟运行，不实际修改磁盘">检查是否可执行</button><button id="archivePlansExecuteBtn" class="btn btn-danger" type="button" title="立即在磁盘上执行整理：只对列表中处于【已确认】状态的文件夹执行重命名与移动，未确认项保持原位">开始整理</button></div></div>
           <div class="archive-preview-summary" id="archivePreviewSummary"></div><div class="archive-plan-list" id="archivePlanList"></div>
         </details>
         </div>
@@ -376,6 +375,12 @@
             </div>
           </div>
           <div class="character-library-summary" id="characterLibrarySummary">角色库读取中</div>
+          <div class="character-library-toolbar">
+            <div class="character-library-search">
+              <input id="characterLibrarySearchInput" type="search" placeholder="搜索已建库角色名或可导入标签..." autocomplete="off" aria-label="搜索角色库">
+              <button id="characterLibrarySearchClearBtn" class="btn btn-ghost btn-icon" type="button" aria-label="清空搜索" title="清空搜索" hidden>✕</button>
+            </div>
+          </div>
           <div class="character-library-grid">
             <div class="character-library-column">
               <div class="operation-log-title">可导入的单角色标签</div>
@@ -486,12 +491,21 @@
                 <span>能识别出日期和标签的整个文件夹，会被调整到规范的名字和位置。如果文件夹里部分文件已打标签、部分没有，系统只会移动已打标签的文件，其余保持原位。对于尚未归入画师文件夹、但已打好标签的图片和视频，也会被自动整理到对应的规范路径下。</span>
               </div>
               <div class="maintenance-guide-item">
-                <b>安全吗？会不会丢失文件？</b>
-                <span>整理开始前会自动备份数据库。系统只会执行有十足把握的安全整理规则，任何不确定的项目都会被跳过并记录跳过原因，不会强行修改。清空后的空文件夹会被自动清理，但不会删除画师根目录。你可以在「整理历史」中查看每一步的操作详情。</span>
+                <b>安全吗？会不会丢失文件？支持撤销吗？</b>
+                <span>整理开始前会自动备份数据库。系统只会执行有十足把握的安全整理规则，任何不确定的项目都会被跳过并记录跳过原因，不会强行修改。清空后的空文件夹会被自动清理，但不会删除画师根目录。你可以在「整理历史」中查看每一步的操作详情，已执行整理的文件夹均可在卡片右侧点击「撤销整理」无损还原至原始路径。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>手动整理模式与「确认」机制（核心操作）</b>
+                <span>在「文件整理」工作台中：
+                <br>1. <b>自动列出</b>：选择画师后，系统会自动抓取该画师的所有子文件夹并生成改名预览，此时处于【待确认（未批准）】状态。
+                <br>2. <b>精准把控</b>：点击「开始整理」时，<b>系统只会执行标记为【已确认】的文件夹</b>。
+                <br>3. <b>批准方式</b>：您可以单独点击某一行的「确认」来挑选要整理的文件夹，也可以点击「全部确认」一键批准该画师下的所有项；未确认的文件夹会安全保留原位，绝不会被误改。</span>
               </div>
               <div class="maintenance-guide-item">
                 <b>自动整理开关</b>
-                <span>位于维护页右上角，自动整理默认关闭。打开后，只有全库扫描成功结束才会自动执行上述整理操作；只扫描某个画师或文件夹不会触发。如果不确定，保持关闭即可。</span>
+                <span>位于维护页右上角，<b>默认关闭（推荐）</b>。
+                <br>• <b>关闭时（手动模式）</b>：必须在工作台由您手动确认后点击「开始整理」，才会改动磁盘。
+                <br>• <b>开启时（全自动模式）</b>：仅在执行「全库扫描」成功结束时，后台会自动把所有解析明确、无冲突的待整理项标记为已确认并自动执行整理，无需逐个画师手动进入工作台确认。平时日常浏览、打标签或扫描单个画师时均不会触发。</span>
               </div>
             </section>
 
@@ -502,29 +516,24 @@
                 <span>刚放入新图、改了文件夹结构、或发现列表里少了文件时再扫描。一般情况下无需手动操作。</span>
               </div>
               <div class="maintenance-guide-item">
+                <b>为什么有的文件夹没被整理？</b>
+                <span>文件夹未被整理，通常是因为：尚未点击该行的「确认」或顶部的「全部确认」批准整理；或尚未添加标签/未识别出有效日期（处于待补标签状态）；或目标位置存在同名文件夹冲突。系统出于安全保护原则，只有获得您批准且无冲突的文件夹才会在点击「开始整理」时被移动改名。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>为什么有些文件夹显示「草稿」或「待补标签」？</b>
+                <span>通常是因为该文件夹内的图片尚未添加标签，或者文件夹名中无法识别出有效日期，导致无法生成符合命名模板的目标路径。在编辑模式为图片打上标签后，点击「刷新整理项」即可自动就绪。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>自动整理和扫描有什么区别？</b>
+                <span>扫描只更新列表，不会改动你的文件。自动整理会按所选方式整理文件夹结构。系统大约每 6 小时在后台自动扫描一次，让列表保持最新。只有你打开开关，并且全库扫描完成后才会执行自动整理。</span>
+              </div>
+              <div class="maintenance-guide-item">
                 <b>「找不到」是什么意思？</b>
                 <span>文件被移走、删除了，或系统无法对应路径。记录会保留约 90 天，之后自动清理，不影响正常使用。</span>
               </div>
               <div class="maintenance-guide-item">
                 <b>看到「正在检查相同文件」要做什么？</b>
                 <span>无需操作，系统正在后台比对文件特征以自动迁移标签，等待比对完成即可。</span>
-              </div>
-              <div class="maintenance-guide-item">
-                <b>自动扫描是做什么的？</b>
-                <span>系统大约每 6 小时在后台自动扫描一次，让列表保持最新。每次手动扫描后，6 小时倒计时会重置。</span>
-              </div>
-              <div class="maintenance-guide-item">
-                <b>自动整理和扫描有什么区别？</b>
-                <span>扫描只更新列表，不会改动你的文件。自动整理会按所选方式整理文件夹结构。只有你打开开关，并且全库扫描完成后才会执行。</span>
-              </div>
-              <div class="maintenance-guide-item">
-                <b>为什么有的文件夹没被整理？</b>
-                <span>文件夹未被整理，通常是因为：
-                <br>- 还未添加标签
-                <br>- 无法从文件名或信息中识别出日期
-                <br>- 目标位置已存在同名文件夹（冲突）
-                <br>- 系统评估后认为操作不够安全，主动跳过
-                <br>这些情况都会被跳过，可在「整理历史」中查看具体原因。文件不会被擅自改动。</span>
               </div>
             </section>
           </div>
@@ -669,13 +678,13 @@
   </div>
 </div>
 
-<script src="/static/js/core.js?v=1.0.245"></script>
-<script src="/static/js/layout.js?v=1.0.245"></script>
-<script src="/static/js/maintenance.js?v=1.0.245"></script>
-<script src="/static/js/media.js?v=1.0.245"></script>
-<script src="/static/js/links.js?v=1.0.245"></script>
-<script src="/static/js/edit.js?v=1.0.245"></script>
-<script src="/static/js/events.js?v=1.0.245"></script>
+<script src="/static/js/core.js?v=1.0.255"></script>
+<script src="/static/js/layout.js?v=1.0.255"></script>
+<script src="/static/js/maintenance.js?v=1.0.255"></script>
+<script src="/static/js/media.js?v=1.0.255"></script>
+<script src="/static/js/links.js?v=1.0.255"></script>
+<script src="/static/js/edit.js?v=1.0.255"></script>
+<script src="/static/js/events.js?v=1.0.255"></script>
 
 </body>
 </html>

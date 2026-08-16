@@ -115,13 +115,13 @@ pub use operations::operation_history_response;
 pub use pinyin_search::{search_text_for_values, text_matches_search};
 pub use product_ui::{
     auto_resolve_move_candidates, auto_resolve_move_candidates_with_roots,
-    cancel_character_import_job, cleanup_stale_tag_single_references, confirm_artist_suggestion,
-    delete_character_reference, folder_rename_auto_run, get_character_import_job,
-    merge_move_candidate_group, merge_move_candidate_group_with_roots, operation_log_response,
-    purge_pseudo_tag_single_references, rebuild_character_index, reconfirm_plan,
-    run_idle_character_import_once, spawn_character_import_idle_worker, start_character_import_job,
-    start_character_import_job_with_roots, unconfirm_plan, update_folder_tags_by_name_response,
-    update_folder_tags_response,
+    cancel_character_import_job, cleanup_stale_tag_single_references, confirm_all_artist_plans,
+    confirm_artist_suggestion, delete_character_reference, folder_rename_auto_run,
+    get_character_import_job, merge_move_candidate_group, merge_move_candidate_group_with_roots,
+    operation_log_response, purge_pseudo_tag_single_references, rebuild_character_index,
+    reconfirm_plan, run_idle_character_import_once, spawn_character_import_idle_worker,
+    start_character_import_job, start_character_import_job_with_roots, unconfirm_all_artist_plans,
+    unconfirm_plan, update_folder_tags_by_name_response, update_folder_tags_response,
 };
 pub use recognition_status::{
     artist_recognition_status, character_model_signature, character_recognition_status,

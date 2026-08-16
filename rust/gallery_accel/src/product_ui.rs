@@ -262,8 +262,45 @@ pub fn unconfirm_plan(conn: &Connection, plan_id: i64) -> Result<Value> {
     Ok(json!({"ok": true, "id": plan_id, "status": "ready"}))
 }
 
-/// Confirm ready plans for an artist. Execution remains the full-scan path.
-pub fn folder_rename_auto_run(conn: &Connection, artist_id: i64) -> Result<Value> {
+pub fn confirm_all_artist_plans(
+    conn: &Connection,
+    roots: &MediaRoots,
+    artist_id: i64,
+) -> Result<Value> {
+    crate::folder_archive::ensure_folder_schema(conn)?;
+    let plan_ids: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM folder_rename_plans
+             WHERE artist_id=? AND status IN ('ready', 'needs_tags', 'manual_review', 'draft')
+               AND target_folder != ''",
+        )?
+        .query_map(params![artist_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut confirmed = 0i64;
+    let mut failed = 0i64;
+    for plan_id in plan_ids {
+        match reconfirm_plan(conn, roots, plan_id) {
+            Ok(_) => confirmed += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    Ok(json!({
+        "ok": true,
+        "artist_id": artist_id,
+        "confirmed": confirmed,
+        "failed": failed,
+    }))
+}
+
+pub fn folder_rename_auto_run(
+    conn: &Connection,
+    roots: &crate::media_roots::MediaRoots,
+    artist_id: i64,
+) -> Result<Value> {
+    let auto_named =
+        crate::folder_archive::auto_name_artist_draft_plans(conn, roots, &[artist_id])?;
     let confirmed = conn.execute(
         "UPDATE folder_rename_plans
          SET status='confirmed', confirmed_at=?, confirmation_source='auto', updated_at=?
@@ -275,8 +312,24 @@ pub fn folder_rename_auto_run(conn: &Connection, artist_id: i64) -> Result<Value
         "status": "confirmed",
         "scope": "manual_artist",
         "artist_id": artist_id,
+        "auto_named": auto_named,
         "auto_confirmed": confirmed,
         "message": "confirm_current_artist_plans",
+    }))
+}
+
+pub fn unconfirm_all_artist_plans(conn: &Connection, artist_id: i64) -> Result<Value> {
+    crate::folder_archive::ensure_folder_schema(conn)?;
+    let updated = conn.execute(
+        "UPDATE folder_rename_plans
+         SET status='ready', confirmed_at=NULL, confirmation_source='', updated_at=?
+         WHERE artist_id=? AND status='confirmed'",
+        params![now(), artist_id],
+    )?;
+    Ok(json!({
+        "ok": true,
+        "artist_id": artist_id,
+        "unconfirmed": updated,
     }))
 }
 
@@ -1576,11 +1629,71 @@ mod tests {
         )
         .unwrap();
 
-        let result = folder_rename_auto_run(&conn, 7).unwrap();
+        let roots = crate::media_roots::MediaRoots {
+            roots: Vec::new(),
+            labels: Vec::new(),
+            real_paths: Vec::new(),
+        };
+        let result = folder_rename_auto_run(&conn, &roots, 7).unwrap();
 
         assert_eq!(result["status"], "confirmed");
         assert_eq!(result["message"], "confirm_current_artist_plans");
         assert_eq!(result["auto_confirmed"], 1);
+    }
+
+    #[test]
+    fn folder_rename_auto_run_names_draft_plan_then_confirms() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        let source = artist.join("2026-01-05 测试");
+        std::fs::create_dir_all(&source).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT, missing INTEGER DEFAULT 0);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);",
+        )
+        .unwrap();
+        crate::folder_archive::ensure_folder_schema(&conn).unwrap();
+        let artist_path = artist.to_string_lossy().replace('\\', "/");
+        conn.execute(
+            "INSERT INTO artists (id, name, path, missing) VALUES (1, 'a', ?, 0)",
+            [&artist_path],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO tags (id, name) VALUES (7, '测试')", [])
+            .unwrap();
+        let settings = json!({"version":1,"active_profile_id":"standard","profiles":[{"id":"standard","name":"Standard","template":"{year}/{date}-{tags}","collision_strategy":"suffix"}],"artist_profile_ids":{}});
+        crate::archive_profiles::set_folder_rename_format_settings(&conn, &settings, None)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO folder_rename_plans
+             (artist_id, source_folder, original_title, parsed_date, selected_tag_ids, status, file_count)
+             VALUES (1, '2026-01-05 测试', '2026-01-05 测试', '2026-01-05', '[7]', 'draft', 2)",
+            [],
+        )
+        .unwrap();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+        let roots = MediaRoots {
+            roots: vec![dir.path().to_string_lossy().into()],
+            labels: vec!["r".into()],
+            real_paths: vec![dir.path().to_string_lossy().into()],
+        };
+
+        let result = folder_rename_auto_run(&conn, &roots, 1).unwrap();
+
+        assert_eq!(result["auto_named"], 1);
+        assert_eq!(result["auto_confirmed"], 1);
+        let row: (String, String) = conn
+            .query_row(
+                "SELECT target_folder, status FROM folder_rename_plans WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(row.0.ends_with("2026-01-05-测试"), "target: {}", row.0);
+        assert_eq!(row.1, "confirmed");
+        assert!(artist.join("2026-01-05 测试").exists());
     }
 
     #[test]

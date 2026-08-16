@@ -265,6 +265,7 @@ let state = {
   characterLibrary: null,
   characterLibraryLoading: false,
   characterLibrarySelectedCharacterId: null,
+  characterLibrarySearchQuery: '',
   characterImportJob: null,
   characterImportJobTimer: null,
   characterImportFinishedJobId: null,
@@ -311,6 +312,68 @@ const SIDEBAR_TAG_RATIO_MAX = 80;
 const SIDEBAR_TAG_RATIO_STEP = 5;
 const MOBILE_COLUMNS_STORAGE_KEY = 'gallery.mobileColumns';
 const MOBILE_COLUMNS_DEFAULT = 2;
+const ITEM_SORT_STORAGE_KEY = 'gallery.itemSort';
+const ITEM_DATE_FROM_STORAGE_KEY = 'gallery.itemDateFrom';
+const ITEM_DATE_TO_STORAGE_KEY = 'gallery.itemDateTo';
+const TAG_SORT_STORAGE_KEY = 'gallery.tagSort';
+
+function getSavedItemSort() {
+  try {
+    const saved = localStorage.getItem(ITEM_SORT_STORAGE_KEY);
+    if (saved && BROWSE_SORTS.includes(saved)) return saved;
+  } catch (e) {}
+  return null;
+}
+
+function saveItemSort(sort) {
+  try {
+    if (sort && BROWSE_SORTS.includes(sort) && sort !== 'date_desc') {
+      localStorage.setItem(ITEM_SORT_STORAGE_KEY, String(sort));
+    } else {
+      localStorage.removeItem(ITEM_SORT_STORAGE_KEY);
+    }
+  } catch (e) {}
+}
+
+function getSavedItemDates() {
+  try {
+    const from = localStorage.getItem(ITEM_DATE_FROM_STORAGE_KEY) || '';
+    const to = localStorage.getItem(ITEM_DATE_TO_STORAGE_KEY) || '';
+    const dateFrom = validBrowseDate(from);
+    const dateTo = validBrowseDate(to);
+    if (!dateFrom || !dateTo || dateFrom <= dateTo) {
+      return {from: dateFrom || '', to: dateTo || ''};
+    }
+  } catch (e) {}
+  return {from: '', to: ''};
+}
+
+function saveItemDates(from, to) {
+  try {
+    if (from) localStorage.setItem(ITEM_DATE_FROM_STORAGE_KEY, String(from));
+    else localStorage.removeItem(ITEM_DATE_FROM_STORAGE_KEY);
+    if (to) localStorage.setItem(ITEM_DATE_TO_STORAGE_KEY, String(to));
+    else localStorage.removeItem(ITEM_DATE_TO_STORAGE_KEY);
+  } catch (e) {}
+}
+
+function getSavedTagSort() {
+  try {
+    const saved = localStorage.getItem(TAG_SORT_STORAGE_KEY);
+    if (['default', 'name', 'count'].includes(saved)) return saved;
+  } catch (e) {}
+  return 'default';
+}
+
+function saveTagSort(sort) {
+  try {
+    if (sort && sort !== 'default') {
+      localStorage.setItem(TAG_SORT_STORAGE_KEY, String(sort));
+    } else {
+      localStorage.removeItem(TAG_SORT_STORAGE_KEY);
+    }
+  } catch (e) {}
+}
 const MAX_IMAGE_LOADS = 2;
 const IMAGE_OBSERVER_ROOT_MARGIN = '480px';
 const IMAGE_LOAD_TIMEOUT_MS = 12000;
@@ -642,10 +705,27 @@ async function restoreBrowseUrl() {
   state.searchTarget = params.get('target') === 'tags' ? 'tags' : 'all';
   const restoredSort = params.get('sort');
   const hasRestoredSort = BROWSE_SORTS.includes(restoredSort);
-  state.itemSort = hasRestoredSort ? restoredSort : 'date_desc';
-  state.itemSortExplicit = hasRestoredSort;
-  state.itemDateFrom = validRange ? dateFrom : '';
-  state.itemDateTo = validRange ? dateTo : '';
+  const savedSort = getSavedItemSort();
+  if (hasRestoredSort) {
+    state.itemSort = restoredSort;
+    state.itemSortExplicit = true;
+  } else if (savedSort) {
+    state.itemSort = savedSort;
+    state.itemSortExplicit = true;
+  } else {
+    state.itemSort = 'date_desc';
+    state.itemSortExplicit = false;
+  }
+  const savedDates = getSavedItemDates();
+  const hasParamFrom = params.has('from');
+  const hasParamTo = params.has('to');
+  if (hasParamFrom || hasParamTo) {
+    state.itemDateFrom = validRange ? dateFrom : '';
+    state.itemDateTo = validRange ? dateTo : '';
+  } else {
+    state.itemDateFrom = savedDates.from || '';
+    state.itemDateTo = savedDates.to || '';
+  }
   state.view = BROWSE_VIEWS.includes(params.get('view')) ? params.get('view') : 'grid';
   state.activeRole = null;
   state.activeFolder = null;

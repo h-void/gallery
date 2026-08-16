@@ -133,6 +133,9 @@ function renderArtistFolderMove() {
   panel.dataset.artistId = artistKey;
 
   if (source) source.textContent = artist?.path || '选择画师';
+  if (changedArtist && destination) {
+    destination.value = artist ? artistFolderDefaultName(artist) : '';
+  }
   const selectedRoot = changedArtist
     ? ''
     : String(rootSelect?.value ?? state.artistFolderMovePreview?.target_root_index ?? '');
@@ -267,9 +270,10 @@ const maintenanceLoaders = {
     state.hashStatus = hashStatus;
   },
   organize: async loadOptions => {
+    const auto = loadOptions.reason === 'auto';
     await Promise.all([
       loadArtistFolderMove(loadOptions),
-      loadArchiveWorkbench(loadOptions),
+      loadArchiveWorkbench({...loadOptions, keepPreview: loadOptions.keepPreview || auto, autoPreview: !auto}),
     ]);
   },
   characters: async loadOptions => {
@@ -921,8 +925,25 @@ function renderCharacterLibrary() {
   }
 
   const summary = library.summary || {};
-  const tags = summary.tags || [];
-  const characters = summary.characters || [];
+  const query = String(state.characterLibrarySearchQuery || '').trim().toLowerCase();
+  const searchInput = $('#characterLibrarySearchInput');
+  const searchClearBtn = $('#characterLibrarySearchClearBtn');
+  if (searchInput && document.activeElement !== searchInput && searchInput.value !== (state.characterLibrarySearchQuery || '')) {
+    searchInput.value = state.characterLibrarySearchQuery || '';
+  }
+  if (searchClearBtn) {
+    searchClearBtn.hidden = !query;
+  }
+
+  const rawTags = summary.tags || [];
+  const rawCharacters = summary.characters || [];
+  const tags = query
+    ? rawTags.filter(t => String(t.name || '').toLowerCase().includes(query) || String(t.character_id) === query)
+    : rawTags;
+  const characters = query
+    ? rawCharacters.filter(c => String(c.name || '').toLowerCase().includes(query) || String(c.id) === query)
+    : rawCharacters;
+
   // Auto-select the first character so the reference column is not blank on open.
   if (
     characters.length
@@ -973,7 +994,7 @@ function renderCharacterLibrary() {
         </div>
       </div>
     `;
-  }).join('') : '<div class="character-library-empty">暂无可导入标签</div>';
+  }).join('') : `<div class="character-library-empty">${query ? `未找到匹配的标签 "${escHtml(query)}"` : '暂无可导入标签'}</div>`;
 
   const characterButtons = characters.length ? characters.map(character => {
     const active = selectedCharacterId && Number(character.id) === Number(selectedCharacterId);
@@ -994,7 +1015,7 @@ function renderCharacterLibrary() {
         <button type="button" class="btn btn-danger btn-icon character-card-delete" data-character-delete="${character.id}" title="删除角色" aria-label="删除角色">${buttonIcon('trash')}</button>
       </div>
     `;
-  }).join('') : '<div class="character-library-empty">暂无角色</div>';
+  }).join('') : `<div class="character-library-empty">${query ? `未找到匹配的角色 "${escHtml(query)}"` : '暂无角色'}</div>`;
   const referenceCards = references.length ? references.map(reference => {
     const pathText = reference.display_file_path || reference.file_path || reference.file_name || '未绑定文件';
     const previewUrl = reference.file_path ? API.previewUrl(reference.file_path, characterReferencePreviewVersion(reference), 256) : '';
@@ -1295,6 +1316,7 @@ function archiveStatusLabel(status) {
   const labels = {
     draft: '草稿',
     needs_tags: '待补标签',
+    inconsistent_tags: '标签不一致',
     manual_review: '待检查',
     ready: '待确认',
     confirmed: '已确认',
@@ -1323,6 +1345,7 @@ function archivePreviewReason(row) {
     same_as_source: '目标与来源相同',
     target_is_source: '目标与另一整理项来源冲突',
     bad_folder_path: '目标路径无效',
+    inconsistent_tags: '文件夹内标签不一致',
   };
   return labels[reason] || String(reason || '');
 }
@@ -1361,6 +1384,9 @@ function archivePlanPayload(plan, target, status) {
 }
 
 async function loadArchiveWorkbench(options = {}) {
+  if (!state.currentArtist && asArray(state.artists).length > 0) {
+    state.currentArtist = asArray(state.artists)[0];
+  }
   const artistId = archiveCurrentArtistId();
   const render = options.render !== false;
   const updateState = options.updateState !== false;
@@ -1370,6 +1396,7 @@ async function loadArchiveWorkbench(options = {}) {
       state.archiveSettings = null;
       state.archivePlans = [];
       state.archivePreview = null;
+      state.archiveRun = null;
     }
     if (render) renderArchiveWorkbench();
     return {settings: null, plans: []};
@@ -1384,10 +1411,16 @@ async function loadArchiveWorkbench(options = {}) {
     if (updateState) {
       state.archiveSettings = settings;
       state.archivePlans = plans;
-      if (!options.keepPreview) state.archivePreview = null;
+      if (!options.keepPreview) {
+        state.archivePreview = null;
+        state.archiveRun = null;
+      }
       state.archiveWorkbenchLoading = false;
     }
     if (render) renderArchiveWorkbench();
+    if (options.autoPreview && updateState && !state.archivePreview && archiveCurrentArtistId()) {
+      previewArchivePlans({silent: true});
+    }
     return {settings, plans};
   } catch (e) {
     if (isAbortError(e)) throw e;
@@ -1395,6 +1428,7 @@ async function loadArchiveWorkbench(options = {}) {
       state.archiveSettings = {error: e.message || String(e), profiles: []};
       state.archivePlans = [];
       state.archivePreview = null;
+      state.archiveRun = null;
       state.archiveWorkbenchLoading = false;
     }
     if (render) renderArchiveWorkbench();
@@ -1454,10 +1488,9 @@ function renderArchiveWorkbench() {
     $('#archivePlansRefreshBtn'),
     $('#archivePlansPreviewBtn'),
     $('#archivePlansApplyBtn'),
+    $('#archivePlansConfirmAllBtn'),
     $('#archivePlansDryRunBtn'),
     $('#archivePlansExecuteBtn'),
-    $('#archivePlanSourceInput'),
-    $('#archivePlanCreateForm button'),
   ].filter(Boolean);
 
   profileSelect.innerHTML = profiles.length
@@ -1499,16 +1532,22 @@ function renderArchiveWorkbench() {
   const executed = plans.filter(plan => plan.status === 'executed').length;
   const reverted = plans.filter(plan => plan.status === 'reverted').length;
   planSummary.textContent = joinUiMeta([
-    `${plans.length} 个整理项`,
-    `${ready} 待确认`,
-    `${confirmed} 已确认`,
-    executed ? `${executed} 已执行` : '',
+    `${plans.length} 个文件夹`,
+    ready ? `${ready} 待确认 (未批准)` : '',
+    confirmed ? `${confirmed} 已确认 (将执行)` : '',
+    executed ? `${executed} 已整理` : '',
     reverted ? `${reverted} 已撤销` : '',
   ]);
 
   const previewRows = archivePreviewRows();
   const previewMap = archivePreviewByPlanId();
-  if (state.archivePreview?.error) {
+  if (state.archiveRun?.results?.length) {
+    const blocked = state.archiveRun.results.filter(row => row.status === 'error' || row.reason || row.error).length;
+    previewSummary.textContent = joinUiMeta([
+      `${state.archiveRun.dry_run ? '检查' : '执行'}完成: ${state.archiveRun.results.length} 个整理项`,
+      blocked ? `${blocked} 个需处理` : state.archiveRun.dry_run ? '都可以执行' : '全部成功',
+    ]);
+  } else if (state.archivePreview?.error) {
     previewSummary.textContent = `预览改名结果失败: ${state.archivePreview.error}`;
   } else if (previewRows.length) {
     const blocked = previewRows.filter(row => row.status === 'blocked' || row.ok === false || row.error || row.reason || (row.conflicts || []).length).length;
@@ -1517,9 +1556,34 @@ function renderArchiveWorkbench() {
     previewSummary.textContent = '';
   }
 
+  const isAutoOrganize = Boolean(state.folderRenameAuto?.enabled);
+  const confirmAllBtn = $('#archivePlansConfirmAllBtn');
+  if (confirmAllBtn) {
+    if (isAutoOrganize) {
+      confirmAllBtn.textContent = '自动整理已开启 (无需确认)';
+      confirmAllBtn.disabled = true;
+      confirmAllBtn.title = '自动整理开启时，符合规则的文件夹将在全库扫描时自动处理，无需手动确认';
+    } else {
+      const unconfirmedReady = plans.filter(plan => plan.status !== 'confirmed' && plan.status !== 'executed' && Boolean(plan.target_folder));
+      const confirmedPlans = plans.filter(plan => plan.status === 'confirmed');
+      if (unconfirmedReady.length > 0) {
+        confirmAllBtn.textContent = `全部确认 (${unconfirmedReady.length})`;
+        confirmAllBtn.disabled = !artistId;
+      } else if (confirmedPlans.length > 0) {
+        confirmAllBtn.textContent = `全部取消确认 (${confirmedPlans.length})`;
+        confirmAllBtn.disabled = !artistId;
+      } else {
+        confirmAllBtn.textContent = '全部确认';
+        confirmAllBtn.disabled = true;
+      }
+    }
+  }
+
   planList.innerHTML = plans.length ? plans.map(plan => {
     const planId = Number(plan.id);
     const locked = plan.status === 'executed';
+    const isInconsistent = plan.status === 'inconsistent_tags';
+    const canEditTarget = !locked && !isInconsistent;
     const undoing = isActionBusy('archive-plan-undo', String(planId));
     const canUndo = plan.status === 'executed' && Number.isFinite(planId) && !undoing;
     const preview = previewMap.get(planId);
@@ -1529,22 +1593,25 @@ function renderArchiveWorkbench() {
     const previewClass = previewReason ? ' blocked' : (preview ? ' ready' : '');
     const confirmAction = plan.status === 'confirmed' ? 'unconfirm' : 'confirm';
     const confirmLabel = plan.status === 'confirmed' ? '取消确认' : '确认';
+    const confirmBtnMarkup = isAutoOrganize
+      ? `<button class="btn btn-ghost" type="button" disabled title="自动整理开启时，全库扫描完成后自动处理">自动就绪</button>`
+      : `<button class="btn btn-ghost" type="button" data-archive-plan-confirm="${planId}" ${locked || !target || !canEditTarget ? 'disabled' : ''}>${confirmLabel}</button>`;
     return `
-      <div class="archive-plan-row${plan.status === 'executed' ? ' executed' : ''}${plan.status === 'reverted' ? ' reverted' : ''}" data-archive-plan-id="${planId}">
+      <div class="archive-plan-row${plan.status === 'executed' ? ' executed' : ''}${plan.status === 'reverted' ? ' reverted' : ''}${isInconsistent ? ' inconsistent' : ''}" data-archive-plan-id="${planId}">
         <div class="archive-plan-row-head">
           <code title="${escHtml(String(plan.source_folder || ''))}">${escHtml(String(plan.source_folder || '-'))}</code>
           <span class="archive-plan-status ${escHtml(String(plan.status || 'draft'))}">${escHtml(archiveStatusLabel(plan.status))}</span>
         </div>
         <div class="archive-plan-target">
-          <span>目标</span>
-          <input type="text" data-archive-plan-target="${planId}" value="${escHtml(target)}" maxlength="500" ${locked ? 'disabled' : ''}>
-          <button class="btn btn-ghost" type="button" data-archive-plan-save="${planId}" ${locked ? 'disabled' : ''}>保存</button>
+          <span>整理后名称</span>
+          <input type="text" data-archive-plan-target="${planId}" value="${escHtml(target)}" maxlength="500" ${!canEditTarget ? 'disabled' : ''} placeholder="${isInconsistent ? '需统一文件夹内所有标签方可设置新名称' : ''}">
+          <button class="btn btn-ghost" type="button" data-archive-plan-save="${planId}" ${!canEditTarget ? 'disabled' : ''}>保存</button>
         </div>
-        ${preview ? `<div class="archive-plan-preview${previewClass}">${previewReason ? escHtml(previewReason) : '可以执行'}</div>` : ''}
+        ${isInconsistent ? `<div class="archive-plan-preview blocked">文件夹内文件标签不一致，统一所有文件标签后方可修改目标与整理</div>` : (preview ? `<div class="archive-plan-preview${previewClass}">${previewReason ? escHtml(previewReason) : '可以执行'}</div>` : '')}
         <div class="archive-plan-row-actions">
           <span>${plan.file_count ? `${plan.file_count} 项` : ''}</span>
           <div class="archive-plan-row-controls">
-            <button class="btn btn-ghost" type="button" data-archive-plan-confirm="${planId}" ${locked || !target ? 'disabled' : ''}>${confirmLabel}</button>
+            ${confirmBtnMarkup}
             ${plan.status === 'executed' ? `<button class="btn btn-ops" type="button" data-archive-plan-undo="${planId}" ${canUndo ? '' : 'disabled'} ${undoing ? 'aria-busy="true"' : ''}>${undoing ? '撤销中' : '撤销整理'}</button>` : ''}
           </div>
         </div>
@@ -1636,7 +1703,7 @@ function deleteArchiveProfile() {
   renderArchiveWorkbench();
 }
 
-async function previewArchivePlans() {
+async function previewArchivePlans(options = {}) {
   const artistId = archiveCurrentArtistId();
   if (!artistId || isActionBusy('archive-preview')) return;
   setActionBusy('archive-preview', '', true);
@@ -1650,7 +1717,7 @@ async function previewArchivePlans() {
   } catch (e) {
     state.archivePreview = {error: e.message || String(e)};
     renderArchiveWorkbench();
-    toast('预览改名结果失败: ' + (e.message || e), 'error');
+    if (options.silent !== true) toast('预览改名结果失败: ' + (e.message || e), 'error');
   } finally {
     setActionBusy('archive-preview', '', false);
   }
@@ -1738,6 +1805,30 @@ async function toggleArchivePlanConfirmation(planId) {
   }
 }
 
+async function toggleAllArchivePlansConfirmation() {
+  const artistId = archiveCurrentArtistId();
+  if (!artistId || isActionBusy('archive-confirm-all')) return;
+  const plans = archivePlanRows();
+  const unconfirmedReady = plans.filter(plan => plan.status !== 'confirmed' && plan.status !== 'executed' && Boolean(plan.target_folder));
+  setActionBusy('archive-confirm-all', '', true);
+  try {
+    if (unconfirmedReady.length > 0) {
+      const result = await API.postJson('/api/folder-renames/confirm-all', {artist_id: artistId});
+      const count = Number(result?.confirmed || 0);
+      toast(count ? `已全部确认 ${count} 个整理项` : '没有可确认的整理项', count ? 'success' : 'info');
+    } else {
+      const result = await API.postJson('/api/folder-renames/unconfirm-all', {artist_id: artistId});
+      const count = Number(result?.unconfirmed || 0);
+      toast(`已全部取消确认 (${count} 个整理项)`, 'info');
+    }
+    await loadArchiveWorkbench({keepPreview: true});
+  } catch (e) {
+    toast('批量确认失败: ' + (e.message || e), 'error');
+  } finally {
+    setActionBusy('archive-confirm-all', '', false);
+  }
+}
+
 async function undoArchivePlan(planId) {
   const id = Number(planId);
   const plan = archivePlanRows().find(item => Number(item.id) === id);
@@ -1785,15 +1876,43 @@ function archiveUndoFailureLabel(reason) {
 async function executeArchivePlans(dryRun) {
   const artistId = archiveCurrentArtistId();
   if (!artistId || isActionBusy('archive-plan-execute')) return;
-  if (!dryRun && !window.confirm('确定要执行所有已确认的整理操作吗？\n系统将在执行前自动创建数据库备份，确保数据安全。')) return;
+  const plans = archivePlanRows();
+  const unconfirmedReady = plans.filter(p => p.status === 'ready' && Boolean(p.target_folder));
+  if (!dryRun && !window.confirm('确定要执行整理操作吗？\n系统将在执行前自动创建数据库备份，确保数据安全。')) return;
   setActionBusy('archive-plan-execute', '', true);
   try {
+    const isAuto = Boolean(state.folderRenameAuto?.enabled);
+    if (isAuto) {
+      try {
+        await API.postJson('/api/folder-renames/auto/run?artist_id=' + artistId, {});
+      } catch (_) {}
+    }
+    if (unconfirmedReady.length > 0) {
+      try {
+        await API.postJson('/api/folder-renames/confirm-all', {artist_id: artistId});
+      } catch (_) {}
+    }
     const result = await API.postJson('/api/folder-renames/execute', {artist_id: artistId, dry_run: Boolean(dryRun)});
-    state.archivePreview = {results: result.results || [], execution: result};
+    state.archiveRun = {dry_run: Boolean(dryRun), results: result.results || [], execution: result};
     await loadArchiveWorkbench({keepPreview: true});
     const rows = result.results || [];
     const successful = rows.filter(row => row.status === (dryRun ? 'dry_run' : 'executed')).length;
-    toast(dryRun ? `检查完成: ${successful} 个整理项可执行` : `整理完成: ${successful} 个整理项`, successful ? 'success' : 'info');
+    if (dryRun && successful === 0) {
+      const isAuto = Boolean(state.folderRenameAuto?.enabled);
+      const saved = plans.filter(p => Boolean(p.target_folder) && p.status !== 'executed');
+      const confirmed = plans.filter(p => p.status === 'confirmed' && Boolean(p.target_folder));
+      if (isAuto) {
+        toast('检查完成: 0 个整理项可执行(已尝试自动生成目标名, 剩余计划可能缺少标签或存在冲突, 请按下方原因手动处理)', 'info');
+      } else if (confirmed.length > 0) {
+        toast(`检查完成: 0 个整理项可执行(${confirmed.length} 个已确认但未通过检查, 请查看下方原因)`, 'info');
+      } else if (saved.length > 0) {
+        toast(`检查完成: 0 个整理项可执行(${saved.length} 个已填目标名但未确认, 请先点「全部确认」)`, 'info');
+      } else {
+        toast('检查完成: 0 个整理项可执行(请先在「整理后名称」填写目标并点「保存」, 再点「全部确认」)', 'info');
+      }
+    } else {
+      toast(dryRun ? `检查完成: ${successful} 个整理项可执行` : `整理完成: ${successful} 个整理项`, successful ? 'success' : 'info');
+    }
   } catch (e) {
     toast((dryRun ? '执行检查失败: ' : '整理操作失败: ') + (e.message || e), 'error');
   } finally {

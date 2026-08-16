@@ -1451,7 +1451,20 @@ function moveLightbox(delta) {
 }
 
 function onLightboxKey(e) {
-  if (e.key === 'Escape') closeLightbox();
+  if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target?.tagName) || e.target?.isContentEditable) {
+    if (e.key === 'Escape') {
+      e.target.blur();
+    }
+    return;
+  }
+  if (e.key === 'Escape') {
+    if (state.lightboxZoom > 1) {
+      setLightboxZoom(1);
+    } else {
+      closeLightbox();
+    }
+    return;
+  }
   if (e.key === 'ArrowLeft') moveLightbox(-1);
   if (e.key === 'ArrowRight') moveLightbox(1);
 }
@@ -1461,7 +1474,7 @@ function onLightboxWheel(e) {
   e.preventDefault();
   e.stopPropagation();
 
-  if (e.ctrlKey) {
+  if (e.ctrlKey || state.lightboxZoom > 1) {
     const direction = e.deltaY < 0 ? 1 : -1;
     const zoom = state.lightboxZoom + direction * LIGHTBOX_ZOOM_STEP;
     setLightboxZoom(zoom);
@@ -1476,7 +1489,7 @@ function onLightboxWheel(e) {
 
 function resetLightboxDeleteBtn(btn) {
   if (!btn) return;
-  btn.dataset.confirmStep = '0';
+  delete btn.dataset.confirmStep;
   const label = btn.querySelector('.lightbox-delete-label');
   if (label) label.textContent = '删除';
   btn.classList.remove('deleting', 'confirm1', 'confirm2');
@@ -1484,28 +1497,19 @@ function resetLightboxDeleteBtn(btn) {
 }
 
 async function onLightboxDelete(btn) {
-  const step = parseInt(btn.dataset.confirmStep || '0');
+  if (!btn) return;
   const label = btn.querySelector('.lightbox-delete-label');
-  if (step === 0) {
-    btn.dataset.confirmStep = '1';
-    if (label) label.textContent = '确认删除？';
-    btn.classList.add('confirm1');
-  } else if (step === 1) {
-    btn.dataset.confirmStep = '2';
-    if (label) label.textContent = '再次确认？';
-    btn.classList.remove('confirm1');
-    btn.classList.add('confirm2');
-  } else {
-    if (label) label.textContent = '删除中…';
-    await deleteMediaItem({
-      filePath: btn.dataset.filePath,
-      itemId: parseInt(btn.dataset.itemId),
-      fileName: btn.dataset.fileName || '',
-      button: btn,
-      closeLightboxAfter: true,
-      onError: () => resetLightboxDeleteBtn(btn),
-    });
-  }
+  if (label) label.textContent = '删除中…';
+  await deleteMediaItem({
+    filePath: btn.dataset.filePath,
+    itemId: parseInt(btn.dataset.itemId),
+    fileName: btn.dataset.fileName || '',
+    button: btn,
+    closeLightboxAfter: true,
+    skipConfirm: false,
+    onError: () => resetLightboxDeleteBtn(btn),
+  });
+  resetLightboxDeleteBtn(btn);
 }
 
 async function deleteMediaItem({filePath, itemId, fileName = '', button = null, closeLightboxAfter = false, skipConfirm = false, onError = null, renderAfter = true, toastOnSuccess = true}) {

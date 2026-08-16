@@ -614,7 +614,8 @@ function renderSidebar() {
 
 function sortSidebarTags(tags) {
   const sorted = [...tags];
-  const mode = $('#tagSort').value;
+  const tagSortEl = $('#tagSort');
+  const mode = tagSortEl ? tagSortEl.value : getSavedTagSort();
   if (mode === 'name') {
     sorted.sort((a, b) => mergeTagsByNameCollator.compare(a.name || '', b.name || ''));
   } else if (mode === 'count') {
@@ -664,7 +665,7 @@ function renderFolderNode(node, level) {
   const path = node.path || '';
   const name = path ? node.name : '全部';
   const active = state.activeFolder === path || (!state.activeFolder && !path);
-  const sortBadge = !path && state.itemSortExplicit ? `<span class="folder-sort-badge">${itemSortLabel()}</span>` : '';
+  const sortBadge = !path ? `<span class="folder-sort-badge">${itemSortLabel()}</span>` : '';
   let html = `<div class="folder-item${path ? '' : ' folder-all'}${active ? ' active' : ''}${state.itemSortExplicit && !path ? ' sort-changed' : ''}" data-folder="${escHtml(path)}" title="${escHtml(path || name)}" style="--level:${level}">
     <span class="folder-name">${escHtml(name)}</span>${sortBadge}<span class="count">${node.item_count || 0}</span>
   </div>`;
@@ -686,11 +687,6 @@ function itemSortLabel() {
 
 function selectFolder(folder) {
   state.activeFolder = folder || null;
-  if (!folder) {
-    state.itemSort = 'scanned_desc';
-    state.itemSortExplicit = true;
-    syncItemFilterControls();
-  }
   state.search = '';
   $('#searchInput').value = '';
   state.tagSearchResults = [];
@@ -811,7 +807,7 @@ async function loadItems(options = {}) {
   if (state.search) params.set('search', state.search);
   if (state.itemDateFrom) params.set('date_from', state.itemDateFrom);
   if (state.itemDateTo) params.set('date_to', state.itemDateTo);
-  if (state.search && state.searchTarget === 'tags') params.set('search_tags_only', '1');
+  if (state.search && state.searchTarget === 'tags') params.set('search_tags_only', 'true');
   if (!globalSearch && folderScoped) params.set('folder', state.activeFolder);
   if (!globalSearch && state.duplicatesOnly) params.set('duplicates_only', 'true');
 

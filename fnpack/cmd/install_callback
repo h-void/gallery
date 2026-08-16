@@ -55,5 +55,15 @@ ensure_gpu_groups() {
     log "Gallery GPU authorization requires administrator action: run '$MANUAL_GPU_COMMAND', then restart Gallery."
 }
 
+ensure_data_share_ownership() {
+    data_share_root="${TRIM_DATA_SHARE_PATHS%%:*}"
+    if [ -n "$data_share_root" ] && [ -d "$data_share_root" ]; then
+        if [ "${TRIM_RUN_USERNAME:-}" = "root" ] || [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+            chown -R "$APP_USER" "$data_share_root" 2>/dev/null || true
+        fi
+    fi
+}
+
+ensure_data_share_ownership
 ensure_gpu_groups
 exit 0

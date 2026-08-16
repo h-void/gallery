@@ -104,15 +104,7 @@ async function deleteSelectedMediaItems() {
     toast('请先选择要删除的媒体作品', 'error');
     return;
   }
-  if (btn && btn.dataset.confirmStep !== '1') {
-    btn.dataset.confirmStep = '1';
-    btn.classList.add('confirm1');
-    btn.textContent = `确认删除 ${items.length} 项`;
-    return;
-  }
-
   if (!confirm(`确定要将选中的 ${items.length} 个文件移至回收站吗？\n文件将安全移入系统回收站，可随时恢复。`)) {
-    resetEditDeleteSelectedButton(btn);
     return;
   }
 
@@ -176,6 +168,12 @@ function updateEditBar() {
     } else {
       $('#selectedCount').textContent = '已选 0 项';
     }
+    const selectAllBtn = $('#editSelectAllBtn');
+    if (selectAllBtn) {
+      const taggableCount = (state.allItems || []).filter(isTaggableItem).length;
+      const isAllSelected = taggableCount > 0 && state.selectedIds.size >= taggableCount;
+      selectAllBtn.textContent = isAllSelected ? '取消全选' : '全选';
+    }
   } else {
     bar.classList.remove('visible');
     bar.classList.remove('is-empty-selection');
@@ -189,6 +187,9 @@ function updateEditBar() {
 }
 
 function tagMatchesEditQuery(tag, query) {
+  const needle = (query || '').trim();
+  if (!needle) return true;
+  if (tag.global) return true;
   return searchableTextMatches(query, tag.name, tag.search_text);
 }
 
@@ -427,7 +428,7 @@ function renderCharacterTagSuggestions() {
     return;
   }
   const selectedNameKeys = selectedEditTagNameKeys();
-  list.innerHTML = suggestions.map(suggestion => {
+  const chipsHtml = suggestions.map(suggestion => {
     const name = suggestion.name || '';
     const weak = suggestion.status === 'needs_review' ? ' weak' : '';
     const selected = selectedNameKeys.has(tagNameKey(name));
@@ -439,6 +440,17 @@ function renderCharacterTagSuggestions() {
       </button>
     `;
   }).join('');
+  const acceptAllBtn = suggestions.length > 1
+    ? `<button class="btn btn-ghost character-suggestion-accept-all" type="button" data-character-suggestion-accept-all>全部采纳</button>`
+    : '';
+  list.innerHTML = acceptAllBtn + chipsHtml;
+}
+
+function selectAllCharacterSuggestions() {
+  const suggestions = state.characterTagSuggestions || [];
+  suggestions.forEach(suggestion => {
+    if (suggestion.name) selectCharacterSuggestionTag(suggestion.name);
+  });
 }
 
 function selectCharacterSuggestionTag(tagName) {
@@ -968,6 +980,18 @@ function selectedEditTagNameKeys() {
   return new Set(names.map(tagNameKey));
 }
 
+function selectedItemExistingEditTagKeys() {
+  const keys = new Set();
+  (state.allItems || []).forEach(item => {
+    if (!state.selectedIds.has(item.id)) return;
+    (item.tags || []).forEach(tag => {
+      const key = tagNameKey(tag.name || tag.tag_name || '');
+      if (key) keys.add(key);
+    });
+  });
+  return keys;
+}
+
 function selectedEditTagRecords() {
   const selectedTagIds = new Set([...state.selectedEditTagIds].map(numericTagId).filter(id => id != null));
   const records = [];
@@ -998,7 +1022,9 @@ function renderEditTagPicker() {
   const query = (state.editTagQuery || '').trim();
   const tags = editTagOptions(query);
   const selectedNameKeys = selectedEditTagNameKeys();
-  const rows = tags.map(tag => {
+  const existingNameKeys = selectedItemExistingEditTagKeys();
+  const rows = [];
+  const renderRow = tag => {
     const selected = state.selectedEditTagIds.has(Number(tag.id)) || selectedNameKeys.has(tagNameKey(tag.name));
     const globalAttr = tag.global ? ` data-global-tag-id="${tag.id}"` : '';
     return `
@@ -1007,7 +1033,30 @@ function renderEditTagPicker() {
         <em>${tag.item_count || 0}</em>
       </button>
     `;
-  });
+  };
+  const selectedTags = tags.filter(tag =>
+    state.selectedEditTagIds.has(Number(tag.id)) || selectedNameKeys.has(tagNameKey(tag.name))
+  );
+  const existingTags = tags.filter(tag =>
+    !state.selectedEditTagIds.has(Number(tag.id))
+    && !selectedNameKeys.has(tagNameKey(tag.name))
+    && existingNameKeys.has(tagNameKey(tag.name))
+  );
+  const otherTags = tags.filter(tag =>
+    !state.selectedEditTagIds.has(Number(tag.id))
+    && !selectedNameKeys.has(tagNameKey(tag.name))
+    && !existingNameKeys.has(tagNameKey(tag.name))
+  );
+  const renderGroup = (label, groupTags, hint) => {
+    if (!groupTags.length) return '';
+    return `
+      <div class="tag-picker-group">${escHtml(label)}${hint ? `<em>${escHtml(hint)}</em>` : ''}</div>
+      ${groupTags.map(renderRow).join('')}
+    `;
+  };
+  rows.push(renderGroup('已选标签', selectedTags, '点击移除'));
+  rows.push(renderGroup('图上已有标签', existingTags, '点击移除'));
+  rows.push(renderGroup('其他标签', otherTags, ''));
   if (state.editGlobalTagSearchLoading) {
     rows.push('<div class="tag-picker-empty">正在搜索全局标签</div>');
   }

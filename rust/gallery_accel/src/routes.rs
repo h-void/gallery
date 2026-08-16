@@ -25,9 +25,10 @@ use gallery_accel::{
     artist_stats_response, artists_response, auto_resolve_move_candidates_with_roots,
     cancel_character_import_job, character_model_signature, character_recognition_status,
     character_references_response, character_response, character_summary_response,
-    characters_response, cluster_scores_response, confirm_artist_suggestion, content_hash_allowed,
-    create_artist_profile_link, create_db_backup, create_new_item_response_with_roots, create_tag,
-    delete_artist_profile_link, delete_character_reference, delete_tag, delete_to_recycle,
+    characters_response, cluster_scores_response, confirm_all_artist_plans, confirm_artist_suggestion,
+    content_hash_allowed, create_artist_profile_link, create_db_backup,
+    create_new_item_response_with_roots, create_tag, delete_artist_profile_link,
+    delete_character_reference, delete_tag, delete_to_recycle,
     duplicate_artists_response, env_media_roots, execute_artist_folder_move,
     execute_folder_renames, folder_paths_response, folder_rename_auto_response,
     folder_rename_auto_run, folder_rename_format_settings, folders_response,
@@ -46,8 +47,8 @@ use gallery_accel::{
     serve_video_compatible, serve_video_hls, set_folder_rename_auto,
     set_folder_rename_format_settings, set_item_favorite_response,
     start_character_import_job_with_roots, start_video_transcode, suggest_artists_native,
-    tag_search_response, tags_response, unconfirm_plan, undo_folder_rename_plan,
-    update_folder_tags_by_name_response, update_folder_tags_response,
+    tag_search_response, tags_response, unconfirm_all_artist_plans, unconfirm_plan,
+    undo_folder_rename_plan, update_folder_tags_by_name_response, update_folder_tags_response,
     update_item_tags_by_name_response, update_item_tags_response, update_tag,
     upsert_folder_rename_plans, video_frame_jpeg, video_transcode_status, DbConfig, DbPool,
     MediaRoots, ScanControl, WorkerStatus, MAX_CLUSTER_SCORE_VECTORS,
@@ -340,6 +341,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/folder-renames/plans/{plan_id}/unconfirm",
             post(api_folder_plan_unconfirm),
+        )
+        .route(
+            "/api/folder-renames/confirm-all",
+            post(api_folder_plans_confirm_all),
+        )
+        .route(
+            "/api/folder-renames/unconfirm-all",
+            post(api_folder_plans_unconfirm_all),
         )
         .route(
             "/api/folder-renames/plans/{plan_id}/undo",
@@ -1056,7 +1065,7 @@ async fn api_folder_rename_auto_run(
         )
     })?;
     let conn = state.pool.get().map_err(to_http_error)?;
-    folder_rename_auto_run(&conn, artist_id)
+    folder_rename_auto_run(&conn, &state.roots, artist_id)
         .map(Json)
         .map_err(to_http_error)
 }
@@ -1802,7 +1811,7 @@ async fn api_tag_search(
     Query(query): Query<TagSearchQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conn = state.pool.get().map_err(to_http_error)?;
-    tag_search_response(&conn, query.artist_id)
+    tag_search_response(&conn, query.artist_id, query.search.as_deref(), query.limit)
         .map(Json)
         .map_err(to_http_error)
 }
@@ -2458,6 +2467,49 @@ async fn api_folder_plan_unconfirm(
     }
     let conn = state.pool.get().map_err(to_http_error)?;
     unconfirm_plan(&conn, plan_id)
+        .map(Json)
+        .map_err(to_http_error)
+}
+
+#[derive(serde::Deserialize)]
+struct FolderBatchConfirmBody {
+    artist_id: i64,
+}
+
+async fn api_folder_plans_confirm_all(
+    State(state): State<AppState>,
+    Json(body): Json<FolderBatchConfirmBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error":"write capability is disabled"})),
+        ));
+    }
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        confirm_all_artist_plans(&conn, &roots, body.artist_id)
+            .map(Json)
+            .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
+}
+
+async fn api_folder_plans_unconfirm_all(
+    State(state): State<AppState>,
+    Json(body): Json<FolderBatchConfirmBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error":"write capability is disabled"})),
+        ));
+    }
+    let conn = state.pool.get().map_err(to_http_error)?;
+    unconfirm_all_artist_plans(&conn, body.artist_id)
         .map(Json)
         .map_err(to_http_error)
 }

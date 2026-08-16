@@ -94,28 +94,18 @@ repair_runtime_permissions() {
         return 1
     fi
 
-    if ! find "${DATA_DIR}/logs" -maxdepth 1 -type f -exec chmod u+rw {} +; then
-        log "Gallery startup aborted: unable to restore owner write access on log files."
-        return 1
-    fi
-    if ! find "$CHARACTER_OPENVINO_CACHE_DIR" -maxdepth 1 -type f -exec chmod u+rw {} +; then
-        log "Gallery startup aborted: unable to restore owner write access on OpenVINO cache files."
-        return 1
-    fi
+    find "${DATA_DIR}/logs" -maxdepth 1 -type f -exec chmod u+rw {} + 2>/dev/null || true
+    find "$CHARACTER_OPENVINO_CACHE_DIR" -maxdepth 1 -type f -exec chmod u+rw {} + 2>/dev/null || true
     for sqlite_file in "${DATA_DIR}/gallery.db" "${DATA_DIR}/gallery.db-wal" "${DATA_DIR}/gallery.db-shm"; do
-        if [ -e "$sqlite_file" ] && ! chmod ug+rw "$sqlite_file"; then
-            log "Gallery startup aborted: unable to restore SQLite owner/group write access: $sqlite_file"
-            return 1
+        if [ -e "$sqlite_file" ] && ! chmod ug+rw "$sqlite_file" 2>/dev/null; then
+            if [ ! -w "$sqlite_file" ]; then
+                log "Gallery startup aborted: unable to restore SQLite owner/group write access: $sqlite_file"
+                return 1
+            fi
         fi
     done
-    if ! find "${DATA_DIR}/db-backups" -maxdepth 1 -type d -exec chmod u+rwx {} +; then
-        log "Gallery startup aborted: unable to restore owner access on backup directories."
-        return 1
-    fi
-    if ! find "${DATA_DIR}/db-backups" -maxdepth 2 -type f -exec chmod u+rw {} +; then
-        log "Gallery startup aborted: unable to restore owner write access on backup files."
-        return 1
-    fi
+    find "${DATA_DIR}/db-backups" -maxdepth 1 -type d -exec chmod u+rwx {} + 2>/dev/null || true
+    find "${DATA_DIR}/db-backups" -maxdepth 2 -type f -exec chmod u+rw {} + 2>/dev/null || true
 }
 
 prepare_env() {

@@ -85,6 +85,11 @@ migrate_legacy_data_shares() {
         log "Gallery upgrade aborted: unable to record legacy migration completion."
         return 1
     fi
+    if [ -n "$data_share_root" ] && [ -d "$data_share_root" ]; then
+        if [ "${TRIM_RUN_USERNAME:-}" = "root" ] || [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+            chown -R "$APP_USER" "$data_share_root" 2>/dev/null || true
+        fi
+    fi
     log "Gallery upgrade legacy share migration complete."
 }
 

@@ -829,8 +829,165 @@ fn record_undo_reconciliation_failure(
     Ok(())
 }
 
+pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> Result<()> {
+    ensure_folder_schema(conn)?;
+    let query_only = conn
+        .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0)
+        != 0;
+    if query_only {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT folder_name, COUNT(*), MIN(COALESCE(date, ''))
+         FROM items
+         WHERE artist_id=? AND COALESCE(missing, 0)=0 AND folder_name != ''
+         GROUP BY folder_name",
+    )?;
+    let folders: Vec<(String, i64, String)> = stmt
+        .query_map(params![artist_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (folder, file_count, min_date) in folders {
+        if folder.trim().is_empty() {
+            continue;
+        }
+        let mut parsed_date = crate::media_type::extract_date_from_folder(&folder);
+        if parsed_date.is_empty() && min_date.len() >= 10 && !min_date.starts_with("0000") {
+            parsed_date = min_date[..10].to_string();
+        }
+
+        let mut item_stmt = conn.prepare(
+            "SELECT i.id, (
+                SELECT json_group_array(it.tag_id)
+                FROM (SELECT it.tag_id FROM item_tags it WHERE it.item_id = i.id ORDER BY it.tag_id) it
+             )
+             FROM items i
+             WHERE i.artist_id=? AND i.folder_name=? AND COALESCE(i.missing, 0)=0
+             ORDER BY i.id",
+        )?;
+        let items: Vec<(i64, Vec<i64>)> = item_stmt
+            .query_map(params![artist_id, folder], |row| {
+                let item_id: i64 = row.get(0)?;
+                let raw: Option<String> = row.get(1)?;
+                let tags: Vec<i64> = raw
+                    .and_then(|s| serde_json::from_str::<Vec<i64>>(&s).ok())
+                    .unwrap_or_default();
+                Ok((item_id, tags))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let total_items = items.len();
+        if total_items == 0 {
+            continue;
+        }
+
+        let has_any_tags = items.iter().any(|(_, tags)| !tags.is_empty());
+        if !has_any_tags {
+            // Folders with no tags must not appear in the pending organize list.
+            let _ = conn.execute(
+                "DELETE FROM folder_rename_plans WHERE artist_id=? AND source_folder=? AND status NOT IN ('confirmed', 'executed')",
+                params![artist_id, folder],
+            );
+            continue;
+        }
+
+        let first_tags = &items[0].1;
+        let all_tags_identical = !first_tags.is_empty() && items.iter().all(|(_, tags)| tags == first_tags);
+        let selected_tag_ids_json = if all_tags_identical {
+            serde_json::to_string(first_tags)?
+        } else {
+            let mut union_set = std::collections::BTreeSet::new();
+            for (_, tags) in &items {
+                for tid in tags {
+                    union_set.insert(*tid);
+                }
+            }
+            serde_json::to_string(&union_set.into_iter().collect::<Vec<_>>())?
+        };
+
+        let initial_status = if all_tags_identical { "draft" } else { "inconsistent_tags" };
+
+        let existing: Option<(i64, String, String, String, i64, String)> = conn
+            .query_row(
+                "SELECT id, status, parsed_date, selected_tag_ids, file_count, target_folder
+                 FROM folder_rename_plans
+                 WHERE artist_id=? AND source_folder=?",
+                params![artist_id, folder],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        match existing {
+            None => {
+                let _ = conn.execute(
+                    "INSERT INTO folder_rename_plans
+                     (artist_id, source_folder, original_folder_name, original_title, parsed_date,
+                      selected_tag_ids, status, file_count, target_folder, execution_log, plan_kind,
+                      split_actions, confirmation_source, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '[]', 'rename_folder', '[]', '', ?)",
+                    params![
+                        artist_id,
+                        folder,
+                        folder,
+                        folder,
+                        parsed_date,
+                        selected_tag_ids_json,
+                        initial_status,
+                        file_count,
+                        now()
+                    ],
+                );
+            }
+            Some((plan_id, status, old_date, old_tags, old_count, old_target)) => {
+                if status != "confirmed" && status != "executed" {
+                    let new_status = if all_tags_identical {
+                        if status == "inconsistent_tags" { "draft" } else { status.as_str() }
+                    } else {
+                        "inconsistent_tags"
+                    };
+                    let new_target = if !all_tags_identical { "" } else { old_target.as_str() };
+                    let final_date = if old_date.is_empty() {
+                        parsed_date
+                    } else {
+                        old_date
+                    };
+                    let _ = conn.execute(
+                        "UPDATE folder_rename_plans
+                         SET selected_tag_ids=?, parsed_date=?, file_count=?, status=?, target_folder=?, updated_at=?
+                         WHERE id=?",
+                        params![selected_tag_ids_json, final_date, file_count, new_status, new_target, now(), plan_id],
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn list_folder_renames(conn: &Connection, artist_id: Option<i64>) -> Result<Value> {
     ensure_folder_schema(conn)?;
+    if let Some(aid) = artist_id {
+        let _ = auto_discover_artist_folder_plans(conn, aid);
+    }
     let mut sql = String::from(
         "SELECT id, artist_id, source_folder, target_folder, status, plan_kind, file_count,
                 selected_tag_ids, parsed_date, execution_log, confirmed_at, executed_at
@@ -914,8 +1071,20 @@ pub fn upsert_folder_rename_plans(
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or("needs_tags");
-        if !matches!(status, "draft" | "needs_tags" | "ready" | "manual_review") {
+        if !matches!(status, "draft" | "needs_tags" | "ready" | "manual_review" | "inconsistent_tags") {
             bail!("invalid folder rename plan: invalid editable status");
+        }
+        let existing_status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM folder_rename_plans WHERE artist_id=? AND source_folder=?",
+                params![artist_id, source],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(ref st) = existing_status {
+            if st == "inconsistent_tags" && !target.is_empty() {
+                bail!("invalid folder rename plan: folder tags are inconsistent, cannot modify target");
+            }
         }
         let parsed_tags = match plan.get("selected_tag_ids") {
             Some(Value::String(value)) => serde_json::from_str(value).with_context(|| {
@@ -1498,6 +1667,66 @@ pub fn undo_folder_rename_plan(
     }
 }
 
+/// Generate target folder names for discovered draft plans without requiring a
+/// manual "更新整理项" click. Plans with conflicts (target exists,
+/// inconsistent tags, etc.) are skipped and stay manual. Shared by the
+/// post-scan auto archive and the per-artist manual auto run.
+pub fn auto_name_artist_draft_plans(
+    conn: &Connection,
+    roots: &MediaRoots,
+    artists: &[i64],
+) -> Result<usize> {
+    let mut auto_named = 0usize;
+    for artist_id in artists {
+        match crate::archive_profiles::preview_folder_rename_template(
+            conn,
+            roots,
+            *artist_id,
+            None,
+            None,
+            None,
+            None,
+        ) {
+            Ok(preview) => {
+                let profile = preview["profile"].clone();
+                let format_source = preview["format_source"].as_str().unwrap_or("");
+                let snapshot =
+                    crate::archive_format::rule_snapshot(&profile, format_source).to_string();
+                if let Some(plans) = preview["plans"].as_array() {
+                    for plan in plans {
+                        let Some(id) = plan["id"].as_i64() else { continue };
+                        let Some(target) = plan["target_folder"].as_str() else { continue };
+                        if target.is_empty() {
+                            continue;
+                        }
+                        let has_conflicts = plan["conflicts"]
+                            .as_array()
+                            .map(|conflicts| !conflicts.is_empty())
+                            .unwrap_or(true);
+                        if has_conflicts {
+                            continue;
+                        }
+                        let changed = conn.execute(
+                            "UPDATE folder_rename_plans
+                             SET target_folder=?, format_snapshot=?, status='ready',
+                                 confirmed_at=NULL, confirmation_source='',
+                                 updated_at=strftime('%s','now')
+                             WHERE id=? AND artist_id=? AND status='draft'",
+                            params![target, snapshot, id, artist_id],
+                        )?;
+                        auto_named += changed as usize;
+                    }
+                }
+            }
+            Err(_) => {
+                // Artist path missing / outside roots / no usable profile:
+                // leave the plans as-is for manual review.
+            }
+        }
+    }
+    Ok(auto_named)
+}
+
 /// Run automatic archive only after a successful full-library scan.
 /// Returns an immediate summary for the caller; does not persist a last_run summary.
 pub fn run_folder_rename_auto_after_full_scan(
@@ -1546,6 +1775,11 @@ pub fn run_folder_rename_auto_after_full_scan(
             "errors": []
         }));
     }
+    // Auto-archive must not require a manual "更新整理项" click: generate the
+    // target folder names for discovered draft plans before confirming them,
+    // so a scan + auto execute becomes fully automatic. Plans with conflicts
+    // (target exists, inconsistent tags, etc.) are skipped and stay manual.
+    let auto_named = auto_name_artist_draft_plans(conn, roots, &artists)?;
     let mut executed_count = 0i64;
     let mut skipped_count = 0i64;
     let mut failed_count = 0i64;
@@ -1695,6 +1929,7 @@ pub fn run_folder_rename_auto_after_full_scan(
         "artist_id": Value::Null,
         "at": now(),
         "backup": backup,
+        "auto_named": auto_named,
         "executed_count": executed_count,
         "skipped_count": skipped_count,
         "failed_count": failed_count,
@@ -1951,6 +2186,44 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn auto_discover_filters_untagged_and_checks_tag_consistency() {
+        let conn = create_plan_db();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, artist_id INTEGER, folder_name TEXT, missing INTEGER DEFAULT 0, date TEXT);
+             CREATE TABLE IF NOT EXISTS item_tags (item_id INTEGER, tag_id INTEGER);
+             INSERT INTO items VALUES (1, 1, 'no_tags', 0, '2026-01-01'), (2, 1, 'no_tags', 0, '2026-01-01');
+             INSERT INTO items VALUES (3, 1, 'inconsistent', 0, '2026-01-01'), (4, 1, 'inconsistent', 0, '2026-01-01');
+             INSERT INTO item_tags VALUES (3, 1);
+             INSERT INTO items VALUES (5, 1, 'consistent', 0, '2026-01-01'), (6, 1, 'consistent', 0, '2026-01-01');
+             INSERT INTO item_tags VALUES (5, 1), (6, 1);"
+        ).unwrap();
+
+        auto_discover_artist_folder_plans(&conn, 1).unwrap();
+
+        let no_tags_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM folder_rename_plans WHERE source_folder='no_tags'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(no_tags_count, 0);
+
+        let inconsistent_status: String = conn.query_row(
+            "SELECT status FROM folder_rename_plans WHERE source_folder='inconsistent'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(inconsistent_status, "inconsistent_tags");
+
+        let consistent_status: (String, String) = conn.query_row(
+            "SELECT status, selected_tag_ids FROM folder_rename_plans WHERE source_folder='consistent'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(consistent_status.0, "draft");
+        assert_eq!(serde_json::from_str::<Value>(&consistent_status.1).unwrap(), json!([1]));
     }
 
     #[test]
@@ -2791,6 +3064,130 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "manual_review");
+    }
+
+    #[test]
+    fn auto_archive_generates_target_for_draft_plan_and_executes() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        let source = artist.join("2026-01-05 测试");
+        std::fs::create_dir_all(&source).unwrap();
+        let tag_ids = json!([7]).to_string();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT, missing INTEGER DEFAULT 0);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE items (id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT, file_name TEXT, folder_name TEXT DEFAULT '', missing INTEGER DEFAULT 0);",
+        )
+        .unwrap();
+        ensure_folder_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO app_settings(key, value) VALUES('folder_rename_auto_enabled', '1')",
+            [],
+        )
+        .unwrap();
+        let artist_path = artist.to_string_lossy().replace('\\', "/");
+        conn.execute(
+            "INSERT INTO artists (id, name, path, missing) VALUES (1, 'a', ?, 0)",
+            [&artist_path],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO tags (id, name) VALUES (7, '测试')", [])
+            .unwrap();
+        let settings = json!({"version":1,"active_profile_id":"standard","profiles":[{"id":"standard","name":"Standard","template":"{year}/{date}-{tags}","collision_strategy":"suffix"}],"artist_profile_ids":{}});
+        crate::archive_profiles::set_folder_rename_format_settings(&conn, &settings, None)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO folder_rename_plans
+             (artist_id, source_folder, original_title, parsed_date, selected_tag_ids, status, file_count)
+             VALUES (1, '2026-01-05 测试', '2026-01-05 测试', '2026-01-05', ?, 'draft', 2)",
+            [&tag_ids],
+        )
+        .unwrap();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+        let roots = MediaRoots {
+            roots: vec![dir.path().to_string_lossy().into()],
+            labels: vec!["r".into()],
+            real_paths: vec![dir.path().to_string_lossy().into()],
+        };
+
+        let result = run_folder_rename_auto_after_full_scan(&conn, &roots).unwrap();
+
+        assert_eq!(result["executed_count"], 1);
+        assert_eq!(result["auto_named"], 1);
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT target_folder, status, confirmation_source FROM folder_rename_plans WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(row.0.ends_with("2026-01-05-测试"), "target: {}", row.0);
+        assert_eq!(row.1, "executed");
+        assert_eq!(row.2, "auto");
+        assert!(artist.join("2026/2026-01-05-测试").is_dir());
+        assert!(!artist.join("2026-01-05 测试").exists());
+    }
+
+    #[test]
+    fn auto_archive_keeps_conflicted_draft_plan_manual() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        let source = artist.join("2026-01-05 测试");
+        let taken = artist.join("2026/2026-01-05-测试");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&taken).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT, missing INTEGER DEFAULT 0);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);",
+        )
+        .unwrap();
+        ensure_folder_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO app_settings(key, value) VALUES('folder_rename_auto_enabled', '1')",
+            [],
+        )
+        .unwrap();
+        let artist_path = artist.to_string_lossy().replace('\\', "/");
+        conn.execute(
+            "INSERT INTO artists (id, name, path, missing) VALUES (1, 'a', ?, 0)",
+            [&artist_path],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO tags (id, name) VALUES (7, '测试')", [])
+            .unwrap();
+        let settings = json!({"version":1,"active_profile_id":"standard","profiles":[{"id":"standard","name":"Standard","template":"{year}/{date}-{tags}","collision_strategy":"reject"}],"artist_profile_ids":{}});
+        crate::archive_profiles::set_folder_rename_format_settings(&conn, &settings, None)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO folder_rename_plans
+             (artist_id, source_folder, original_title, parsed_date, selected_tag_ids, status, file_count)
+             VALUES (1, '2026-01-05 测试', '2026-01-05 测试', '2026-01-05', '[7]', 'draft', 2)",
+            [],
+        )
+        .unwrap();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+        let roots = MediaRoots {
+            roots: vec![dir.path().to_string_lossy().into()],
+            labels: vec!["r".into()],
+            real_paths: vec![dir.path().to_string_lossy().into()],
+        };
+
+        let result = run_folder_rename_auto_after_full_scan(&conn, &roots).unwrap();
+
+        assert_eq!(result["executed_count"], 0);
+        assert_eq!(result["auto_named"], 0);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM folder_rename_plans WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "draft");
     }
 
     #[test]

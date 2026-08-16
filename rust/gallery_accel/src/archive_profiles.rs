@@ -122,9 +122,9 @@ pub fn preview_folder_rename_template(
         String::new()
     };
     let sql = if selected.is_empty() {
-        "SELECT p.id,p.source_folder,p.original_title,p.parsed_date,a.name,p.selected_tag_ids FROM folder_rename_plans p JOIN artists a ON a.id=p.artist_id WHERE p.artist_id=? ORDER BY p.id"
+        "SELECT p.id,p.source_folder,p.original_title,p.parsed_date,a.name,p.selected_tag_ids,p.status FROM folder_rename_plans p JOIN artists a ON a.id=p.artist_id WHERE p.artist_id=? ORDER BY p.id"
     } else {
-        "SELECT p.id,p.source_folder,p.original_title,p.parsed_date,a.name,p.selected_tag_ids FROM folder_rename_plans p JOIN artists a ON a.id=p.artist_id WHERE p.artist_id=? AND p.id IN (SELECT value FROM json_each(?)) ORDER BY p.id"
+        "SELECT p.id,p.source_folder,p.original_title,p.parsed_date,a.name,p.selected_tag_ids,p.status FROM folder_rename_plans p JOIN artists a ON a.id=p.artist_id WHERE p.artist_id=? AND p.id IN (SELECT value FROM json_each(?)) ORDER BY p.id"
     };
     let mut stmt = conn.prepare(sql)?;
     let rows = if selected.is_empty() {
@@ -142,19 +142,35 @@ pub fn preview_folder_rename_template(
         let id: i64 = row.get(0)?;
         let folder: String = row.get(1)?;
         let title: String = row.get(2)?;
-        let date: String = row.get(3)?;
+        let mut date: String = row.get(3)?;
         let artist: String = row.get(4)?;
-        let tags: Vec<String> = row
+        let mut tags: Vec<String> = row
             .get::<_, String>(5)
             .ok()
             .and_then(|raw| serde_json::from_str::<Vec<i64>>(&raw).ok())
             .unwrap_or_default()
             .into_iter()
             .map(|id| {
-                conn.query_row("SELECT name FROM tags WHERE id=?", [id], |r| r.get(0))
-                    .unwrap_or_default()
+                conn.query_row("SELECT name FROM tags WHERE id=?", [id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap_or_default()
             })
+            .filter(|n: &String| !n.is_empty())
             .collect();
+        let plan_status: String = row.get(6)?;
+        if date.is_empty() {
+            date = crate::media_type::extract_date_from_folder(&folder);
+        }
+        if tags.is_empty() {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT DISTINCT t.name FROM items i JOIN item_tags it ON it.item_id=i.id JOIN tags t ON t.id=it.tag_id WHERE i.artist_id=? AND i.folder_name=? AND COALESCE(i.missing, 0)=0 ORDER BY t.name"
+            ) {
+                if let Ok(item_tags) = stmt.query_map(params![artist_id, folder], |r| r.get(0)) {
+                    tags = item_tags.filter_map(|r| r.ok()).collect();
+                }
+            }
+        }
         let rendered = archive_format::render_profile(
             &profile,
             &RenderContext {
@@ -180,6 +196,9 @@ pub fn preview_folder_rename_template(
         let source_path = artist_relative_path(&artist_root, &folder)?;
         let target_path = artist_relative_path(&artist_root, &target)?;
         let mut row_conflicts = Vec::new();
+        if plan_status == "inconsistent_tags" {
+            row_conflicts.push(json!({"code":"inconsistent_tags", "source_folder": folder}));
+        }
         if !source_path.is_dir() {
             row_conflicts.push(json!({"code":"source_missing", "source_folder": folder}));
         }
@@ -250,7 +269,12 @@ pub fn apply_folder_rename_template(
             &preview["profile"],
             preview["format_source"].as_str().unwrap_or(""),
         );
-        if let Err(error) = conn.execute("UPDATE folder_rename_plans SET target_folder=?, format_snapshot=?, status='manual_review', confirmed_at=NULL, confirmation_source='', updated_at=strftime('%s','now') WHERE id=? AND artist_id=? AND status NOT IN ('confirmed','executed')", params![plan["target_folder"].as_str().unwrap_or_default(), snapshot.to_string(), plan["id"].as_i64().unwrap_or_default(), artist_id]) {
+        let target_str = plan["target_folder"].as_str().unwrap_or_default();
+        let plan_status = if target_str.is_empty() { "draft" } else { "ready" };
+        if let Err(error) = conn.execute(
+            "UPDATE folder_rename_plans SET target_folder=?, format_snapshot=?, status=?, confirmed_at=NULL, confirmation_source='', updated_at=strftime('%s','now') WHERE id=? AND artist_id=? AND status NOT IN ('confirmed','executed','inconsistent_tags')",
+            params![target_str, snapshot.to_string(), plan_status, plan["id"].as_i64().unwrap_or_default(), artist_id],
+        ) {
             let _ = conn.execute("ROLLBACK", []);
             return Err(error.into());
         }
@@ -365,5 +389,26 @@ mod tests {
             .unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn preview_reports_inconsistent_tags_conflict() {
+        let (conn, _dir, root) = fixture();
+        conn.execute(
+            "UPDATE folder_rename_plans SET status='inconsistent_tags' WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let settings = json!({"version":1,"active_profile_id":"flat","profiles":[{"id":"flat","name":"Flat","template":"{title}","collision_strategy":"reject"}],"artist_profile_ids":{}});
+        set_folder_rename_format_settings(&conn, &settings, None).unwrap();
+        let roots = MediaRoots::identical(
+            vec![root.to_string_lossy().to_string()],
+            vec!["root".into()],
+        );
+        let preview =
+            preview_folder_rename_template(&conn, &roots, 1, None, Some("flat"), None, None)
+                .unwrap();
+        assert_eq!(preview["can_apply"], false);
+        assert!(preview["conflicts"].as_array().unwrap().iter().any(|c| c["code"] == "inconsistent_tags"));
     }
 }

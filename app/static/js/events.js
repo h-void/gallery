@@ -72,7 +72,10 @@ function applyItemFilterControls() {
   state.itemSort = $('#itemSort').value;
   state.itemDateFrom = dateFrom.value;
   state.itemDateTo = dateTo.value;
+  saveItemSort(state.itemSort);
+  saveItemDates(state.itemDateFrom, state.itemDateTo);
   syncItemFilterControls();
+  renderFolderTree();
   state.selectedIds.clear();
   updateEditBar();
   scrollToItemsTop();
@@ -93,7 +96,14 @@ function bindEvents() {
   bindMobileColumnToggle();
   syncItemFilterControls();
   $('#mediaFilter').addEventListener('change', e => selectBrowseRole(e.target.value));
-  $('#tagSort').addEventListener('change', renderSidebar);
+  const tagSortEl = $('#tagSort');
+  if (tagSortEl) {
+    tagSortEl.value = getSavedTagSort();
+    tagSortEl.addEventListener('change', () => {
+      saveTagSort(tagSortEl.value);
+      renderSidebar();
+    });
+  }
   $('#tagFilterReset').addEventListener('click', () => selectBrowseRole(null));
   $('#itemSort').addEventListener('change', () => {
     state.itemSortExplicit = true;
@@ -106,7 +116,10 @@ function bindEvents() {
     state.itemSortExplicit = false;
     state.itemDateFrom = '';
     state.itemDateTo = '';
+    saveItemSort(null);
+    saveItemDates('', '');
     syncItemFilterControls();
+    renderFolderTree();
     scrollToItemsTop();
     syncBrowseUrl('push');
     loadItems();
@@ -146,6 +159,23 @@ function bindEvents() {
     syncBrowseUrl('push');
     loadItems();
   }, 300));
+  $('#searchInput').addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      if (e.target.value) {
+        e.preventDefault();
+        e.target.value = '';
+        state.search = '';
+        logUiAction('search_change', {search: '', scope: state.searchScope, target: state.searchTarget});
+        state.selectedIds.clear();
+        updateEditBar();
+        scrollToItemsTop();
+        syncBrowseUrl('push');
+        loadItems();
+      } else {
+        e.target.blur();
+      }
+    }
+  });
   $('#searchOptionsBtn').addEventListener('click', e => {
     e.stopPropagation();
     toggleSearchOptions();
@@ -261,7 +291,7 @@ function bindEvents() {
     });
   }
   const archiveProfileSelect = $('#archiveProfileSelect');
-  if (archiveProfileSelect) archiveProfileSelect.addEventListener('change', () => { state.archivePreview = null; renderArchiveWorkbench(); });
+  if (archiveProfileSelect) archiveProfileSelect.addEventListener('change', () => { state.archivePreview = null; renderArchiveWorkbench(); previewArchivePlans({silent: true}); });
   const archiveProfileNewBtn = $('#archiveProfileNewBtn');
   if (archiveProfileNewBtn) archiveProfileNewBtn.addEventListener('click', createArchiveProfile);
   const archiveProfileDeleteBtn = $('#archiveProfileDeleteBtn');
@@ -269,19 +299,29 @@ function bindEvents() {
   const archiveProfileSaveBtn = $('#archiveProfileSaveBtn');
   if (archiveProfileSaveBtn) archiveProfileSaveBtn.addEventListener('click', saveArchiveSettings);
   const archivePlansRefreshBtn = $('#archivePlansRefreshBtn');
-  if (archivePlansRefreshBtn) archivePlansRefreshBtn.addEventListener('click', () => loadArchiveWorkbench({keepPreview: false}));
+  if (archivePlansRefreshBtn) archivePlansRefreshBtn.addEventListener('click', () => loadArchiveWorkbench({keepPreview: false, autoPreview: true}));
   const archivePlansPreviewBtn = $('#archivePlansPreviewBtn');
   if (archivePlansPreviewBtn) archivePlansPreviewBtn.addEventListener('click', previewArchivePlans);
   const archivePlansApplyBtn = $('#archivePlansApplyBtn');
   if (archivePlansApplyBtn) archivePlansApplyBtn.addEventListener('click', applyArchiveTemplate);
+  const archivePlansConfirmAllBtn = $('#archivePlansConfirmAllBtn');
+  if (archivePlansConfirmAllBtn) archivePlansConfirmAllBtn.addEventListener('click', toggleAllArchivePlansConfirmation);
+  $$('.archive-token-strip [data-insert-token]').forEach(token => {
+    token.addEventListener('click', () => {
+      const input = $('#archiveTemplateInput');
+      if (!input) return;
+      const val = token.dataset.insertToken || token.textContent || '';
+      const start = input.selectionStart ?? input.value.length;
+      const end = input.selectionEnd ?? input.value.length;
+      input.value = input.value.slice(0, start) + val + input.value.slice(end);
+      input.focus();
+      input.setSelectionRange(start + val.length, start + val.length);
+    });
+  });
   const archivePlansDryRunBtn = $('#archivePlansDryRunBtn');
   if (archivePlansDryRunBtn) archivePlansDryRunBtn.addEventListener('click', () => executeArchivePlans(true));
   const archivePlansExecuteBtn = $('#archivePlansExecuteBtn');
   if (archivePlansExecuteBtn) archivePlansExecuteBtn.addEventListener('click', () => executeArchivePlans(false));
-  const archivePlanCreateForm = $('#archivePlanCreateForm');
-  if (archivePlanCreateForm) archivePlanCreateForm.addEventListener('submit', e => { e.preventDefault(); createArchivePlan($('#archivePlanSourceInput')?.value); });
-  const archivePlanCreateButton = archivePlanCreateForm?.querySelector('button');
-  if (archivePlanCreateButton) archivePlanCreateButton.addEventListener('click', () => createArchivePlan($('#archivePlanSourceInput')?.value));
   const archivePlanList = $('#archivePlanList');
   if (archivePlanList) archivePlanList.addEventListener('click', e => {
     const target = e.target instanceof Element ? e.target : null;
@@ -352,6 +392,30 @@ function bindEvents() {
     });
   });
   $('#characterRebuildIndexBtn').addEventListener('click', rebuildCharacterIndex);
+  const characterLibrarySearchInput = $('#characterLibrarySearchInput');
+  if (characterLibrarySearchInput) {
+    characterLibrarySearchInput.addEventListener('input', e => {
+      state.characterLibrarySearchQuery = e.target.value;
+      renderCharacterLibrary();
+    });
+    characterLibrarySearchInput.addEventListener('keydown', e => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        e.target.value = '';
+        state.characterLibrarySearchQuery = '';
+        renderCharacterLibrary();
+      }
+    });
+  }
+  const characterLibrarySearchClearBtn = $('#characterLibrarySearchClearBtn');
+  if (characterLibrarySearchClearBtn) {
+    characterLibrarySearchClearBtn.addEventListener('click', () => {
+      if (characterLibrarySearchInput) characterLibrarySearchInput.value = '';
+      state.characterLibrarySearchQuery = '';
+      renderCharacterLibrary();
+      if (characterLibrarySearchInput) characterLibrarySearchInput.focus();
+    });
+  }
   const characterTagImportList = $('#characterTagImportList');
   if (characterTagImportList) {
     characterTagImportList.addEventListener('click', e => {
@@ -473,7 +537,13 @@ function bindEvents() {
   });
 
   $('#editSelectAllBtn').addEventListener('click', () => {
-    applySelectionChange((state.allItems || []).filter(isTaggableItem).map(item => item.id), {reason: 'select_all'});
+    const taggable = (state.allItems || []).filter(isTaggableItem);
+    const isAllSelected = taggable.length > 0 && state.selectedIds.size >= taggable.length;
+    if (isAllSelected) {
+      applySelectionChange([], {reason: 'deselect_all'});
+    } else {
+      applySelectionChange(taggable.map(item => item.id), {reason: 'select_all'});
+    }
   });
 
   $('#editDeleteSelectedBtn').addEventListener('click', () => deleteSelectedMediaItems());
@@ -500,7 +570,12 @@ function bindEvents() {
   if (characterSuggestionsList) {
     characterSuggestionsList.addEventListener('click', e => {
       const target = e.target instanceof Element ? e.target : null;
-      const btn = target ? target.closest('[data-character-suggestion-tag]') : null;
+      if (!target) return;
+      const acceptAll = target.closest('[data-character-suggestion-accept-all]');
+      if (acceptAll && characterSuggestionsList.contains(acceptAll)) {
+        return void selectAllCharacterSuggestions();
+      }
+      const btn = target.closest('[data-character-suggestion-tag]');
       if (!btn || !characterSuggestionsList.contains(btn)) return;
       selectCharacterSuggestionTag((btn.dataset.characterSuggestionTag || '').trim());
     });

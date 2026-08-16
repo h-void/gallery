@@ -16,11 +16,21 @@ struct TagSearchRow {
     item_count: i64,
 }
 
-pub fn tag_search_response(conn: &Connection, artist_id: Option<i64>) -> Result<Value> {
-    Ok(json!({ "tags": list_tag_search(conn, artist_id)? }))
+pub fn tag_search_response(
+    conn: &Connection,
+    artist_id: Option<i64>,
+    search: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Value> {
+    Ok(json!({ "tags": list_tag_search(conn, artist_id, search, limit)? }))
 }
 
-fn list_tag_search(conn: &Connection, artist_id: Option<i64>) -> Result<Vec<TagSearchRow>> {
+fn list_tag_search(
+    conn: &Connection,
+    artist_id: Option<i64>,
+    search: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<TagSearchRow>> {
     let where_sql = if artist_id.is_some() {
         "WHERE t.artist_id=?"
     } else {
@@ -60,6 +70,13 @@ fn list_tag_search(conn: &Connection, artist_id: Option<i64>) -> Result<Vec<TagS
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if let Some(query) = search.map(str::trim).filter(|q| !q.is_empty()) {
+        tags.retain(|tag| {
+            crate::pinyin_search::text_matches_search(query, &[&tag.name, &tag.artist_name])
+        });
+    }
+
     tags.sort_by(|left, right| {
         right
             .item_count
@@ -67,5 +84,8 @@ fn list_tag_search(conn: &Connection, artist_id: Option<i64>) -> Result<Vec<TagS
             .then_with(|| natural_compare(&left.name, &right.name))
             .then_with(|| natural_compare(&left.artist_name, &right.artist_name))
     });
+    if let Some(limit) = limit {
+        tags.truncate(limit);
+    }
     Ok(tags)
 }

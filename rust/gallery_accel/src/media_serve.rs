@@ -419,10 +419,10 @@ fn authorized_file_path(
         fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: c_uint) -> c_int;
     }
 
-    const O_RDONLY: c_int = 0;
     const O_CLOEXEC: c_int = 0o2000000;
     const O_DIRECTORY: c_int = 0o200000;
     const O_NOFOLLOW: c_int = 0o400000;
+    const O_PATH: c_int = 0o10000000;
     let root = roots
         .allowed_roots()
         .into_iter()
@@ -440,7 +440,7 @@ fn authorized_file_path(
     let root_fd = unsafe {
         open(
             slash.as_ptr(),
-            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW,
+            O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW,
         )
     };
     if root_fd < 0 {
@@ -462,7 +462,7 @@ fn authorized_file_path(
             openat(
                 current.as_raw_fd(),
                 name.as_ptr(),
-                O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW,
+                O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW,
             )
         };
         let next = if next >= 0 {
@@ -479,7 +479,7 @@ fn authorized_file_path(
                 openat(
                     current.as_raw_fd(),
                     name.as_ptr(),
-                    O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW,
+                    O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW,
                 )
             }
         } else {
@@ -2093,6 +2093,43 @@ mod tests {
         assert!(move_file_to_authorized_path_no_overwrite(&src, &target, &roots).is_err());
         assert_eq!(std::fs::read(&src).unwrap(), b"recycled");
         assert!(!outside.join("restored.bin").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_move_walks_opaque_dirs_without_read_permission() {
+        // fnOS real media roots sit behind `/volN` / `/vol1/1000` stub
+        // directories with mode 000 (searchable, not readable). The walk must
+        // not require READ on intermediate components.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pictures");
+        let src = dir.path().join("recycle.bin");
+        std::fs::create_dir(&root).unwrap();
+        let opaque = root.join("opaque");
+        let nested = opaque.join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::set_permissions(&opaque, std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        std::fs::write(&src, b"recycled").unwrap();
+        let roots = MediaRoots::identical(
+            vec![root.to_string_lossy().to_string()],
+            vec!["pictures".into()],
+        );
+        let target = nested.join("restored.bin");
+
+        let probe = std::fs::OpenOptions::new().read(true).open(&opaque);
+        if probe.is_ok() {
+            // Running as root or with CAP_DAC_OVERRIDE the mode bits are
+            // bypassed, so the regression cannot be exercised here.
+            return;
+        }
+
+        move_file_to_authorized_path_no_overwrite(&src, &target, &roots).unwrap();
+        assert!(target.is_file());
+        assert_eq!(std::fs::read(&target).unwrap(), b"recycled");
+        assert!(!src.exists());
     }
 
     /// Race an aggressive pathname replacement against the mover and assert the

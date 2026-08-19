@@ -237,6 +237,7 @@ const maintenanceLoaders = {
       loadHealthSummary(loadOptions),
       loadHashStatus(loadOptions),
       loadFolderRenameAutoStatus(loadOptions),
+      loadErrorArtistsSummary(loadOptions),
     ]);
     // Lightweight pending count for the overview "接下来做什么" cards.
     try {
@@ -1210,8 +1211,130 @@ function renderFolderRenameAutoStatus() {
   const status = state.folderRenameAuto;
   const hasError = Boolean(status && status.error);
   const saving = Boolean(status && status.saving);
+  const runningAll = isActionBusy('archive-run-all');
   toggle.checked = Boolean(status && status.enabled);
-  toggle.disabled = !status || hasError || saving;
+  toggle.disabled = !status || hasError || saving || runningAll;
+  const runAllButton = $('#folderRenameRunAllBtn');
+  if (runAllButton) {
+    runAllButton.disabled = runningAll;
+    runAllButton.textContent = runningAll ? '正在整理全部...' : '立即整理全部';
+  }
+}
+
+async function loadErrorArtistsSummary(options = {}) {
+  const fetchOptions = options.signal ? {signal: options.signal} : {};
+  try {
+    const result = await API.get('/api/folder-renames/error-artists?limit=1&offset=0', fetchOptions);
+    state.errorArtistsTotal = Number.isFinite(Number(result?.total)) ? Number(result.total) : null;
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    state.errorArtistsTotal = null;
+  }
+  return state.errorArtistsTotal;
+}
+
+function errorArtistsDialog() { return $('#errorArtistsDialog'); }
+
+function renderErrorArtistsDialog() {
+  const list = $('#errorArtistsList');
+  const more = $('#errorArtistsMore');
+  const empty = $('#errorArtistsEmpty');
+  if (!list || !more || !empty) return;
+  list.innerHTML = state.errorArtists.map(row => `<button class="error-artist-row" type="button" data-error-artist-id="${Number(row.artist_id)}" data-error-latest-plan-id="${Number(row.latest_plan_id)}" title="${escHtml(row.reason || row.message || '需要人工处理')}">
+    <span class="error-artist-name">${escHtml(row.artist_name || row.artist_id)}</span><strong>${Number(row.error_count || 0)}</strong><span class="error-artist-reason">${escHtml(row.message || row.reason || '需要人工处理')}</span>
+  </button>`).join('');
+  empty.hidden = state.errorArtistsLoading || state.errorArtists.length > 0;
+  more.hidden = !state.errorArtistsHasMore || state.errorArtistsLoading;
+  more.textContent = state.errorArtistsLoading ? '读取中...' : '加载更多';
+}
+
+function resetErrorArtistsList() {
+  state.errorArtists = [];
+  state.errorArtistsOffset = 0;
+  state.errorArtistsHasMore = false;
+  state.errorArtistsScrollTop = 0;
+  const scrollHost = $('#errorArtistsDialog .artist-links-dialog-body');
+  if (scrollHost) scrollHost.scrollTop = 0;
+  renderErrorArtistsDialog();
+}
+
+async function loadErrorArtistsPage({reset = false} = {}) {
+  if (state.errorArtistsLoading && !reset) return;
+  if (reset) resetErrorArtistsList();
+  if (!reset && !state.errorArtistsHasMore && state.errorArtists.length) return;
+  const seq = ++state.errorArtistsRequestSeq;
+  const scrollHost = $('#errorArtistsDialog .artist-links-dialog-body');
+  const beforeScrollTop = scrollHost?.scrollTop || 0;
+  const beforeScrollHeight = scrollHost?.scrollHeight || 0;
+  state.errorArtistsLoading = true;
+  renderErrorArtistsDialog();
+  try {
+    const params = new URLSearchParams({q: state.errorArtistsQuery, sort: state.errorArtistsSort, offset: String(state.errorArtistsOffset), limit: '50'});
+    const result = await API.get('/api/folder-renames/error-artists?' + params);
+    if (seq !== state.errorArtistsRequestSeq) return;
+    const rows = Array.isArray(result?.artists) ? result.artists : [];
+    const existing = new Set(state.errorArtists.map(row => Number(row.artist_id)));
+    const next = rows.filter(row => !existing.has(Number(row.artist_id)));
+    const removeCount = Math.max(0, state.errorArtists.length + next.length - 500);
+    const removedHeight = removeCount
+      ? Array.from($('#errorArtistsList')?.children || []).slice(0, removeCount).reduce((sum, row) => sum + row.getBoundingClientRect().height + 8, 0)
+      : 0;
+    state.errorArtists = [...state.errorArtists, ...next];
+    if (state.errorArtists.length > 500) state.errorArtists = state.errorArtists.slice(-500);
+    state.errorArtistsOffset = Number(result?.offset || 0) + rows.length;
+    state.errorArtistsTotal = Number(result?.total ?? state.errorArtistsTotal);
+    state.errorArtistsHasMore = Boolean(result?.has_more);
+    if (scrollHost && beforeScrollHeight && removedHeight) {
+      requestAnimationFrame(() => { scrollHost.scrollTop = Math.max(0, beforeScrollTop - removedHeight); });
+    }
+  } catch (error) {
+    if (!isAbortError(error)) toast('读取出错画师失败', 'error');
+  } finally {
+    if (seq === state.errorArtistsRequestSeq) {
+      state.errorArtistsLoading = false;
+      renderErrorArtistsDialog();
+    }
+  }
+}
+
+function openErrorArtistsDialog() {
+  const dialog = errorArtistsDialog();
+  if (!dialog || typeof dialog.showModal !== 'function') return;
+  dialog.showModal();
+  const scrollHost = $('#errorArtistsDialog .artist-links-dialog-body');
+  if (scrollHost) requestAnimationFrame(() => { scrollHost.scrollTop = state.errorArtistsScrollTop || 0; });
+  const search = $('#errorArtistsSearch');
+  if (search) { search.value = state.errorArtistsQuery; search.focus(); }
+  if (!state.errorArtists.length) loadErrorArtistsPage({reset: true}); else renderErrorArtistsDialog();
+}
+
+function closeErrorArtistsDialog() {
+  const dialog = errorArtistsDialog();
+  const scrollHost = $('#errorArtistsDialog .artist-links-dialog-body');
+  if (scrollHost) state.errorArtistsScrollTop = scrollHost.scrollTop;
+  if (dialog?.open) dialog.close();
+}
+
+async function jumpToErrorArtist(row) {
+  const artistId = Number(row?.artist_id);
+  const planId = Number(row?.latest_plan_id);
+  logUiAction('error_artist_jump', {artist_id: artistId, plan_id: planId, at: Date.now() / 1000});
+  closeErrorArtistsDialog();
+  if (!state.artists.length) await loadArtists();
+  const artist = state.artists.find(item => Number(item.id) === artistId);
+  if (!artist) { toast('目标画师已不存在', 'error'); return; }
+  try {
+    await selectArtist(artistId, {history: false, loadItems: false});
+    applyMode('moves');
+    setMaintenanceView('organize');
+    await loadArchiveWorkbench({view: 'organize'});
+    const target = $(`[data-archive-plan-id="${String(planId)}"]`);
+    if (target) {
+      target.classList.add('error-plan-highlight');
+      target.scrollIntoView({block: 'center', behavior: 'smooth'});
+      setTimeout(() => target.classList.remove('error-plan-highlight'), 3500);
+    } else toast('整理计划不在当前列表中', 'error');
+  } catch (error) { toast('打开文件整理失败', 'error'); }
 }
 
 async function loadFolderRenameAutoStatus(options = {}) {
@@ -1248,6 +1371,40 @@ async function setFolderRenameAutoEnabled(enabled) {
   }
 }
 
+async function runFolderRenameAllNow() {
+  if (isActionBusy('archive-run-all')) return;
+  const confirmed = window.confirm('确定立即整理所有画师吗？\n系统会先备份数据库，并重新检查所有待整理项及之前的失败项。');
+  logUiAction('archive_run_all_confirm', {confirmed});
+  if (!confirmed) return;
+  setActionBusy('archive-run-all', '', true);
+  renderFolderRenameAutoStatus();
+  try {
+    const response = await fetch('/api/folder-renames/execute-all', {method: 'POST'});
+    const result = await API.parseResponse(response);
+    await loadMoveWorkbench({preserveScroll: true});
+    const executed = Number(result.executed_count || 0);
+    const failed = Number(result.failed_count || 0);
+    logUiAction('archive_run_all_result', {
+      status: String(result.status || ''),
+      executed_count: executed,
+      failed_count: failed,
+      skipped_count: Number(result.skipped_count || 0),
+      retried_count: Number(result.retried_count || 0),
+    });
+    if (failed) {
+      toast(`全库整理完成: 成功 ${executed} 项，失败 ${failed} 项`, 'error');
+    } else {
+      toast(executed ? `全库整理完成: ${executed} 项` : '当前没有可执行的整理项', executed ? 'success' : 'info');
+    }
+  } catch (e) {
+    logUiAction('archive_run_all_result', {status: 'error', error: e.message || String(e)});
+    toast('全库整理失败: ' + (e.message || e), 'error');
+  } finally {
+    setActionBusy('archive-run-all', '', false);
+    renderFolderRenameAutoStatus();
+  }
+}
+
 function archiveCurrentArtistId() {
   return state.currentArtist ? Number(state.currentArtist.id) : 0;
 }
@@ -1277,7 +1434,7 @@ function populateArchiveProfileEditor(profile) {
   const template = $('#archiveTemplateInput');
   const collision = $('#archiveCollisionSelect');
   if (template) template.value = String(profile?.template || '');
-  if (collision) collision.value = profile?.collision_strategy === 'reject' ? 'reject' : 'suffix';
+  if (collision) collision.value = ['reject', 'merge'].includes(profile?.collision_strategy) ? profile.collision_strategy : 'suffix';
 }
 
 function archiveSettingsFromEditor() {
@@ -1288,11 +1445,18 @@ function archiveSettingsFromEditor() {
   if (!profile || !template) throw new Error('目标文件夹命名不能为空');
   profile.name = 'Default';
   profile.template = template;
-  profile.collision_strategy = $('#archiveCollisionSelect')?.value === 'reject' ? 'reject' : 'suffix';
+  const collision = $('#archiveCollisionSelect')?.value;
+  profile.collision_strategy = ['reject', 'merge'].includes(collision) ? collision : 'suffix';
   settings.active_profile_id = profileId;
   settings.default_profile_id = profileId;
   settings.artist_profile_ids = {};
   return settings;
+}
+
+async function persistArchiveSettings(artistId) {
+  const settings = archiveSettingsFromEditor();
+  const result = await API.putJson('/api/folder-renames/settings', {settings, artist_id: artistId});
+  state.archiveSettings = archiveSettingsPayload(result) || settings;
 }
 
 async function saveArchiveSettings() {
@@ -1300,9 +1464,7 @@ async function saveArchiveSettings() {
   if (!artistId || isActionBusy('archive-settings-save')) return;
   setActionBusy('archive-settings-save', '', true);
   try {
-    const settings = archiveSettingsFromEditor();
-    const result = await API.putJson('/api/folder-renames/settings', {settings, artist_id: artistId});
-    state.archiveSettings = archiveSettingsPayload(result) || settings;
+    await persistArchiveSettings(artistId);
     state.archivePreview = null;
     await loadArchiveWorkbench({keepRun: true});
     toast('整理方式已保存', 'success');
@@ -1318,6 +1480,7 @@ async function previewArchivePlans(options = {}) {
   if (!artistId || isActionBusy('archive-preview')) return;
   setActionBusy('archive-preview', '', true);
   try {
+    await persistArchiveSettings(artistId);
     state.archivePreview = await API.postJson('/api/folder-renames/preview', {
       artist_id: artistId,
       profile_id: archiveSelectedProfileId(),
@@ -1337,6 +1500,7 @@ async function applyArchiveTemplate() {
   if (!artistId || isActionBusy('archive-apply')) return;
   setActionBusy('archive-apply', '', true);
   try {
+    await persistArchiveSettings(artistId);
     const result = await API.postJson('/api/folder-renames/apply-template', {
       artist_id: artistId,
       profile_id: archiveSelectedProfileId(),
@@ -1488,7 +1652,10 @@ function renderArchiveWorkbench() {
   if (settings?.error) {
     ruleStatus.textContent = `读取 Default 规则失败: ${settings.error}`;
   } else if (profile) {
-    ruleStatus.textContent = `Default \u00b7 ${profile.collision_strategy === 'reject' ? '冲突跳过' : '冲突自动编号'}`;
+    const collisionLabel = profile.collision_strategy === 'reject'
+      ? '冲突跳过'
+      : (profile.collision_strategy === 'merge' ? '合并同名目标' : '冲突自动编号');
+    ruleStatus.textContent = `Default \u00b7 ${collisionLabel}`;
   } else {
     ruleStatus.textContent = 'Default 规则不可用';
   }
@@ -1553,7 +1720,8 @@ function renderArchiveWorkbench() {
     const planId = Number(plan.id);
     const locked = plan.status === 'executed';
     const isSplit = plan.plan_kind === 'split_by_tag';
-    const splitTargets = asArray(plan.target_folders).map(value => String(value || '')).filter(Boolean);
+    const splitTargets = (Array.isArray(plan.target_folders) ? plan.target_folders : [])
+      .map(value => String(value || '')).filter(Boolean);
     const hasTarget = archivePlanHasTarget(plan);
     const canConfirm = (plan.status === 'ready' || plan.status === 'confirmed') && hasTarget;
     const undoing = isActionBusy('archive-plan-undo', String(planId));
@@ -1744,6 +1912,7 @@ function operationLogReasonLabel(reason) {
     bad_folder_path: '文件夹路径无效',
     db_update_failed: '数据库路径更新失败',
     outside_artist: '路径不在画师目录内',
+    permission_denied: '文件夹没有改名权限',
     execution_failed: '执行失败',
     blocked: '当前不安全，已跳过',
   };
@@ -1788,28 +1957,9 @@ function renderEmptyFolderCleanup(records) {
   }</div>`;
 }
 
-function renderOperationLog() {
-  const summary = $('#operationLogSummary');
-  const historyList = $('#operationHistoryList');
-  const errorList = $('#operationErrorList');
-  if (!summary || !historyList || !errorList) return;
-  const log = state.operationLog;
-  if (!log) {
-    summary.textContent = '历史读取中';
-    historyList.innerHTML = '<div class="move-empty small">历史读取中</div>';
-    errorList.innerHTML = '<div class="move-empty small">错误读取中</div>';
-    return;
-  }
-  if (log.error) {
-    summary.textContent = '读取历史失败';
-    historyList.innerHTML = `<div class="operation-error">${escHtml(log.error)}</div>`;
-    errorList.innerHTML = '<div class="move-empty small">暂无错误记录</div>';
-    return;
-  }
-  const history = log.history || [];
-  const errors = log.errors || [];
-  summary.textContent = joinUiMeta([`${history.length} 条移动/重命名历史`, `${errors.length} 条最近错误`]);
-  historyList.innerHTML = history.length ? history.map(operation => {
+function renderOperationEntries(operations, emptyText) {
+  if (!operations.length) return `<div class="move-empty small">${escHtml(emptyText)}</div>`;
+  return operations.map(operation => {
     const source = operation.display_source || operation.source || '';
     const target = operation.display_target || operation.target || '';
     const kindClass = operation.kind === 'folder_rename_undo' || operation.reason === 'folder_rename_undo' || operation.reason === 'undo'
@@ -1833,13 +1983,47 @@ function renderOperationLog() {
         ${renderEmptyFolderCleanup(operation.empty_folders || [])}
       </div>
     `;
-  }).join('') : '<div class="move-empty small">暂无移动或重命名历史</div>';
+  }).join('');
+}
+
+function renderOperationLog() {
+  const summary = $('#operationLogSummary');
+  const runtimeSummary = $('#operationRuntimeLogSummary');
+  const successList = $('#operationSuccessList');
+  const failureList = $('#operationFailureList');
+  const errorList = $('#operationErrorList');
+  if (!summary || !runtimeSummary || !successList || !failureList || !errorList) return;
+  const log = state.operationLog;
+  if (!log) {
+    summary.textContent = '历史读取中';
+    runtimeSummary.textContent = '日志读取中';
+    successList.innerHTML = '<div class="move-empty small">成功记录读取中</div>';
+    failureList.innerHTML = '<div class="move-empty small">失败记录读取中</div>';
+    errorList.innerHTML = '<div class="move-empty small">运行日志读取中</div>';
+    return;
+  }
+  if (log.error) {
+    summary.textContent = '读取历史失败';
+    runtimeSummary.textContent = '读取日志失败';
+    successList.innerHTML = `<div class="operation-error">${escHtml(log.error)}</div>`;
+    failureList.innerHTML = '<div class="move-empty small">暂无失败记录</div>';
+    errorList.innerHTML = '<div class="move-empty small">暂无运行错误</div>';
+    return;
+  }
+  const history = log.history || [];
+  const errors = log.errors || [];
+  const failedHistory = history.filter(operation => ['failed', 'error'].includes(String(operation.status || '').toLowerCase()));
+  const successfulHistory = history.filter(operation => !['failed', 'error'].includes(String(operation.status || '').toLowerCase()));
+  summary.textContent = joinUiMeta([`成功 ${successfulHistory.length} 条`, `失败 ${failedHistory.length} 条`]);
+  runtimeSummary.textContent = `${errors.length} 条最近运行错误`;
+  successList.innerHTML = renderOperationEntries(successfulHistory, '暂无成功记录');
+  failureList.innerHTML = renderOperationEntries(failedHistory, '暂无失败记录');
   errorList.innerHTML = errors.length ? errors.map(row => `
     <div class="operation-error">
       <b>${escHtml(row.source || 'log')}</b>
       <code>${escHtml(row.line || '')}</code>
     </div>
-  `).join('') : '<div class="move-empty small">最近没有错误记录</div>';
+  `).join('') : '<div class="move-empty small">最近没有运行错误</div>';
 }
 
 function isHealthObject(value) {
@@ -1938,6 +2122,7 @@ function renderHealthSummary() {
   const databaseKnown = isHealthObject(database);
   const backupsKnown = isHealthObject(backups);
   const folderArchiveKnown = isHealthObject(folderArchive);
+  const errorArtistsCount = state.errorArtistsTotal;
   const logsKnown = isHealthObject(logs) && isHealthObject(galleryLog) && isHealthObject(uiLog);
   const scanKnown = isHealthObject(scan) && Boolean(scan.status || scan.phase);
   const hashKnown = isHealthObject(hash) && isHealthObject(hash.items) && isHealthObject(hash.scan_candidates);
@@ -2025,6 +2210,7 @@ function renderHealthSummary() {
     <div class="maintenance-card status-card ${scanStatus}"><b>扫描</b><span>${escHtml(formatHealthScanStatus(scan))}</span><span class="health-schedule">${escHtml(formatHealthSchedule(scanSchedule, 'next_auto_scan_at'))}</span></div>
     <div class="maintenance-card status-card ${hashStatus}"><b>相同文件检查</b><span>${escHtml(formatHealthHashStatus(hash))}</span></div>
     <div class="maintenance-card status-card ${archiveStatus}"><b>文件夹整理</b><span>${escHtml(archiveFailedPlans == null ? '状态未上报' : (archiveFailedPlans ? `执行失败 ${archiveFailedPlans}` : '无执行失败'))}</span></div>
+    <button class="maintenance-card status-card ${errorArtistsCount ? 'status-danger' : 'status-ok'} error-artists-card" type="button" data-error-artists-open><b>出错画师（按画师）</b><span>${escHtml(errorArtistsCount == null ? '状态未上报' : (errorArtistsCount ? `${errorArtistsCount} 位画师` : '暂无出错画师'))}</span></button>
     <div class="maintenance-card status-card ${logStatus}"><b>日志</b><span>${escHtml(joinUiMeta(logText))}</span></div>
     <div class="maintenance-card status-card ${errorStatus}"><b>最近错误</b><span>${errorHtml}</span></div>
   `;

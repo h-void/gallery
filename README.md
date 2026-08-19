@@ -70,11 +70,11 @@
   - 跨画师移动仅在整组缺失源文件与唯一目标文件哈希完全一致时自动合并标签；其余歧义项转入「维护 - 待判断」看板供人工核对。
 
 ### 5. 📁 规范化文件夹整理与归档规则引擎
-- **结构化模板命名**：支持为画师配置标准化目录模板（如 `{year}/{date} {tags}`、`{artist}/{title}`），自定义命名冲突处理策略（自动追加序号 `-1` 或跳过冲突）。
-- **零风险安全保障**：
+- **结构化模板命名**：提供一个可编辑的 `Default` 模板，初始值为 `{year}/{date} {tags}`；预览目标后再确认执行。
+- **执行安全保障**：
   - **自动备份**：执行任何文件移动前，系统均会自动调用 SQLite 在线备份 API 创建数据库快照。
-  - **预演校验**：提供 Dry-run 预演检查与路径冲突校验，仅在完全安全时执行操作。
-  - **一键撤销**：支持对已执行的整理操作进行一键无损撤销（Undo）。
+  - **执行校验**：预演目标，并在执行时重新校验源路径、目标路径与授权边界；目标已占用时不会覆盖。
+  - **执行记录**：当前成功计划会在同一事务中删除且无法撤销；只有保留的历史已执行计划仍支持撤销。
 - **受控自动整理**：维护页面提供「自动整理」全局开关（默认关闭）。开启后，仅在一次成功的「全库扫描」结束后自动触发高置信度整理操作；单画师或单文件夹扫描绝不触发。
 
 ### 6. 🛡️ 存储边界与数据安全
@@ -124,7 +124,8 @@ docker compose up -d --build
 
 3. **数据持久化与权限说明**：
    - 数据库、图片缓存和模型文件将统一持久化在名为 `gallery-storage` 的 Docker 数据卷中，分别对应 `data/`、`cache/` 和 `models/` 子目录。
-   - Docker 模式默认采用 CPU 进行角色识别；请将模型文件放置在数据卷的 `models/character/ccip-caformer_b36-24/model_feat.onnx` 路径下。
+   - Docker 镜像默认尝试使用 OpenVINO 调用 Intel 核显 GPU 加速角色识别， GPU 不可用时自动回退到 CPU。若需显式启用 GPU 透传，请使用 `docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build`。
+   - 请将模型文件放置在数据卷的 `models/character/ccip-caformer_b36-24/model_feat.onnx` 路径下。
    - 媒体目录默认以只读模式（`:ro`）挂载；若需要启用文件整理、归档或删除功能，请在 `docker-compose.yml` 中将挂载选项 `/media:ro` 修改为 `/media`。
 
 ---
@@ -139,7 +140,7 @@ docker compose up -d --build
 | `DATA_DIR` | `data` | 数据持久化目录（存储 `gallery.db`、日志与数据库快照） |
 | `IMAGE_PREVIEW_CACHE_DIR` | `cache` | 缩略图生成与视频转码切片缓存目录 |
 | `CHARACTER_RECOGNITION_ENABLED` | `1` | 是否启用 AI 角色识别功能（`1` 开启 / `0` 关闭） |
-| `CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK` | `0` | GPU 初始化失败时是否允许回退到 CPU 运行（`1` 允许） |
+| `CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK` | `1` | Docker 模式下 GPU 初始化失败时自动回退到 CPU（`0` 关闭） |
 | `CHARACTER_MODEL_IDLE_TIMEOUT_SECONDS` | `600` | 角色模型空闲自动卸载超时秒数（`0` 为常驻内存） |
 | `SCAN_INTERVAL` | `21600` | 后台定时全库扫描周期（秒，默认 6 小时；`0` 关闭定时扫描） |
 | `HASH_INTERVAL` | `30` | 后台内容哈希计算轮询间隔（秒） |
@@ -188,7 +189,7 @@ gallery/
 
 ## 📄 开源许可证
 
-本项目基于 [GNU General Public License v3.0 only](LICENSE)（`GPL-3.0-only`）开源许可协议发布。  
+本项目基于 [GNU General Public License v3.0 only](LICENSE)（`GPL-3.0-only`）开源许可协议发布。
 Copyright (C) 2026 h-void.
 
 重新分发本项目或其衍生修改版本时，必须完整提供对应源代码，并保持以 GPL-3.0-only 协议授权。

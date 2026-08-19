@@ -161,8 +161,8 @@ pub(crate) fn normalize_profile(input: &Value) -> Result<Value> {
         }
         None => "suffix".to_string(),
     };
-    if !matches!(collision_strategy.as_str(), "reject" | "suffix") {
-        bail!("collision_strategy must be reject or suffix");
+    if !matches!(collision_strategy.as_str(), "reject" | "suffix" | "merge") {
+        bail!("collision_strategy must be reject, suffix, or merge");
     }
 
     Ok(json!({
@@ -565,6 +565,7 @@ mod tests {
     fn default_template_is_year_date_tags() {
         let settings = default_settings();
         let profile = profile_by_id(&settings, "default").unwrap();
+        assert_eq!(profile["collision_strategy"], "suffix");
         let rendered = render_profile(
             &profile,
             &RenderContext {
@@ -666,5 +667,17 @@ mod tests {
         assert_eq!(source, "default");
         assert_eq!(settings["profiles"].as_array().unwrap().len(), 1);
         assert_eq!(settings["artist_profile_ids"], json!({}));
+    }
+
+    #[test]
+    fn merge_collision_strategy_is_accepted() {
+        let profile = normalize_profile(&json!({
+            "id": "merge",
+            "name": "Merge",
+            "template": "{year}/{date} {tags}",
+            "collision_strategy": "merge",
+        }))
+        .unwrap();
+        assert_eq!(profile["collision_strategy"], "merge");
     }
 }

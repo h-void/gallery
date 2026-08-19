@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>画廊</title>
-<link rel="stylesheet" href="/static/style.css?v=1.1.0">
+<link rel="stylesheet" href="/static/style.css?v=1.1.1">
 </head>
 <body>
 
@@ -239,6 +239,7 @@
             <div class="move-subtitle">状态与高级工具</div>
           </div>
           <div class="maintenance-hero-actions">
+            <button id="folderRenameRunAllBtn" class="btn btn-danger" type="button" title="立即重新检查并执行所有画师中可安全处理的整理项">立即整理全部</button>
             <label class="maintenance-auto-toggle" title="【全自动整理】开启后，仅在「全库扫描」成功结束时，系统会自动批准并执行所有无冲突的待整理项。关闭时为【手动模式】（默认推荐），必须在下方手动确认后点击「开始整理」才会执行。">
               <input id="folderRenameAutoExecuteToggle" type="checkbox">
               <span>自动整理</span>
@@ -362,7 +363,7 @@
           <div class="archive-workbench-body">
             <div class="archive-rule-editor">
               <label class="archive-field archive-template-field"><span>Default 文件夹命名</span><input id="archiveTemplateInput" type="text" maxlength="500" autocomplete="off" placeholder="{year}/{date} {tags}"></label>
-              <label class="archive-field"><span>冲突处理</span><select id="archiveCollisionSelect" aria-label="目标冲突处理"><option value="suffix">自动编号</option><option value="reject">跳过冲突</option></select></label>
+              <label class="archive-field"><span>冲突处理</span><select id="archiveCollisionSelect" aria-label="目标冲突处理"><option value="suffix">自动编号</option><option value="merge">合并到同名目标</option><option value="reject">跳过冲突</option></select></label>
               <div class="archive-rule-actions"><button id="archiveProfileSaveBtn" class="btn btn-primary" type="button">保存 Default</button></div>
             </div>
             <div class="archive-rule-status" id="archiveRuleStatus"></div>
@@ -433,25 +434,37 @@
           <div class="recycle-bin-summary" id="recycleBinSummary">回收站读取中</div><div class="recycle-bin-list" id="recycleBinList"></div><div class="recycle-bin-more" id="recycleBinMore"></div>
         </details>
 
-        <details class="maintenance-section operation-log-panel maintenance-advanced-detail" id="operationLogPanel">
-          <summary>操作历史与运行日志</summary>
+        <details class="maintenance-section operation-log-panel maintenance-advanced-detail" id="operationHistoryPanel">
+          <summary>操作历史</summary>
           <div class="maintenance-section-head">
             <div>
-              <div class="move-section-title">文件移动、重命名与异常日志</div>
-              <div class="health-subtitle">查看最近的文件整理历史与系统报错摘要，方便回溯与排查。</div>
+              <div class="move-section-title">文件移动与重命名</div>
+              <div class="health-subtitle">成功与失败记录分开显示，便于确认哪些整理已经完成。</div>
             </div>
           </div>
           <div class="operation-log-summary" id="operationLogSummary">历史读取中</div>
           <div class="operation-log-grid">
             <div class="operation-log-column">
-              <div class="operation-log-title">移动与重命名历史</div>
-              <div class="operation-history-list" id="operationHistoryList"></div>
+              <div class="operation-log-title">成功</div>
+              <div class="operation-history-list" id="operationSuccessList"></div>
             </div>
             <div class="operation-log-column">
-              <div class="operation-log-title">最近错误与异常日志</div>
-              <div class="operation-error-list" id="operationErrorList"></div>
+              <div class="operation-log-title">失败</div>
+              <div class="operation-history-list" id="operationFailureList"></div>
             </div>
           </div>
+        </details>
+
+        <details class="maintenance-section operation-log-panel maintenance-advanced-detail" id="operationRuntimeLogPanel">
+          <summary>运行日志</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">最近错误与异常</div>
+              <div class="health-subtitle">仅显示程序运行错误，不与文件整理结果混在一起。</div>
+            </div>
+          </div>
+          <div class="operation-log-summary" id="operationRuntimeLogSummary">日志读取中</div>
+          <div class="operation-error-list" id="operationErrorList"></div>
         </details>
 
         <details class="maintenance-section maintenance-guide">
@@ -520,7 +533,7 @@
               </div>
               <div class="maintenance-guide-item">
                 <b>安全与撤销</b>
-                <span>整理前会自动备份数据库；有歧义、冲突或检查不通过的项目会被跳过。清空后的空文件夹会被自动清理，但不会删除画师根目录。可在整理历史中查看结果，并对可撤销的整理点击「撤销整理」。</span>
+                <span>整理前会自动备份数据库；有歧义、冲突或检查不通过的项目会被跳过。清空后的空文件夹会被自动清理，但不会删除画师根目录。整理成功后会自动删除对应整理记录，不能撤销；整理历史仅保留失败记录。</span>
               </div>
               <div class="maintenance-guide-item">
                 <b>手动整理</b>
@@ -528,7 +541,7 @@
               </div>
               <div class="maintenance-guide-item">
                 <b>自动整理</b>
-                <span>开关位于维护页右上角，默认关闭。开启后无需手动确认，也无需点击「开始整理」；只有全库扫描成功结束时，系统才会自动执行日期、标签明确且无冲突的整理项。浏览、打标签以及扫描单个画师或文件夹都不会触发。</span>
+                <span>开关位于维护页右上角，默认关闭。开启后无需手动确认，也无需点击「开始整理」；只有全库扫描成功结束时，系统才会自动执行日期、标签明确且无冲突的整理项。需要马上处理所有画师时，可点击旁边的「立即整理全部」。</span>
               </div>
             </section>
 
@@ -636,6 +649,22 @@
   </div>
 </dialog>
 
+<dialog class="artist-links-dialog error-artists-dialog" id="errorArtistsDialog" aria-labelledby="errorArtistsDialogTitle">
+  <div class="artist-links-dialog-head">
+    <h2 id="errorArtistsDialogTitle">出错画师</h2>
+    <button class="btn btn-ghost btn-icon" id="errorArtistsCloseBtn" type="button" aria-label="关闭出错画师" title="关闭出错画师"><span class="btn-glyph" aria-hidden="true">×</span></button>
+  </div>
+  <div class="artist-links-dialog-body">
+    <div class="artist-links-controls error-artists-controls">
+      <input id="errorArtistsSearch" type="search" placeholder="搜索画师名或 ID" maxlength="120" autocomplete="off" aria-label="搜索出错画师">
+      <select id="errorArtistsSort" aria-label="出错画师排序"><option value="recent">最近出错</option><option value="count">错误数量</option></select>
+    </div>
+    <div class="error-artists-list" id="errorArtistsList"></div>
+    <div class="move-empty small" id="errorArtistsEmpty" hidden>暂无出错画师</div>
+    <button class="btn btn-ghost" id="errorArtistsMore" type="button" hidden>加载更多</button>
+  </div>
+</dialog>
+
 <div class="lightbox" id="lightbox" style="display:none">
   <button class="btn btn-ghost btn-icon close" type="button" aria-label="关闭预览" title="关闭预览">
     <span class="btn-glyph" aria-hidden="true">
@@ -693,13 +722,13 @@
   </div>
 </div>
 
-<script src="/static/js/core.js?v=1.1.0"></script>
-<script src="/static/js/layout.js?v=1.1.0"></script>
-<script src="/static/js/maintenance.js?v=1.1.0"></script>
-<script src="/static/js/media.js?v=1.1.0"></script>
-<script src="/static/js/links.js?v=1.1.0"></script>
-<script src="/static/js/edit.js?v=1.1.0"></script>
-<script src="/static/js/events.js?v=1.1.0"></script>
+<script src="/static/js/core.js?v=1.1.1"></script>
+<script src="/static/js/layout.js?v=1.1.1"></script>
+<script src="/static/js/maintenance.js?v=1.1.1"></script>
+<script src="/static/js/media.js?v=1.1.1"></script>
+<script src="/static/js/links.js?v=1.1.1"></script>
+<script src="/static/js/edit.js?v=1.1.1"></script>
+<script src="/static/js/events.js?v=1.1.1"></script>
 
 </body>
 </html>

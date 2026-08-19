@@ -109,7 +109,9 @@ pub(crate) fn operation_folder_rename_history(
                                     | "bad_folder_path"
                                     | "db_update_failed"
                                     | "outside_artist"
+                                    | "permission_denied"
                                     | "execution_failed"
+                                    | "manual_review"
                             )
                         },
                     )
@@ -137,4 +139,44 @@ pub(crate) fn operation_folder_rename_history(
         }
     }
     Ok(history)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media_roots::MediaRoots;
+
+    #[test]
+    fn manual_review_history_uses_failure_message() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE folder_rename_plans (
+                id INTEGER PRIMARY KEY,
+                artist_id INTEGER NOT NULL,
+                source_folder TEXT NOT NULL,
+                target_folder TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'draft',
+                executed_at REAL,
+                execution_log TEXT NOT NULL DEFAULT '[]',
+                plan_kind TEXT NOT NULL DEFAULT 'rename_folder',
+                created_at REAL NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0
+            );
+            INSERT INTO folder_rename_plans
+                (id, artist_id, source_folder, target_folder, status, execution_log)
+            VALUES
+                (1, 1, 'source', 'target', 'manual_review',
+                 '[{"status":"failed","reason":"manual_review"}]');"#,
+        )
+        .unwrap();
+        let roots = MediaRoots {
+            roots: vec![],
+            labels: vec![],
+            real_paths: vec![],
+        };
+
+        let history = operation_folder_rename_history(&conn, &roots, 10, &HashMap::new())
+            .unwrap();
+        assert_eq!(history[0]["message"], "需要人工处理");
+    }
 }

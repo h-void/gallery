@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::archive_format::{self, RenderContext};
-use crate::folder_archive::validate_relative_folder;
+use crate::folder_archive::{recompute_artist_plan_targets, validate_relative_folder};
 use crate::media_roots::{path_under_authorized_roots, MediaRoots};
 
 fn target_key(target: &str) -> String {
@@ -145,6 +145,7 @@ pub fn preview_folder_rename_template(
     let mut seen_targets = HashSet::new();
     let mut conflicts = Vec::new();
     let suffix_collisions = profile["collision_strategy"].as_str() == Some("suffix");
+    let merge_targets = profile["collision_strategy"].as_str() == Some("merge");
     let mut index = index_start.unwrap_or(1).max(1);
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
@@ -213,12 +214,12 @@ pub fn preview_folder_rename_template(
         if !source_path.is_dir() {
             row_conflicts.push(json!({"code":"source_missing", "source_folder": folder}));
         }
-        if target_key == source_key {
+        if target_key == source_key && !merge_targets {
             row_conflicts.push(json!({"code":"same_as_source", "target_folder": target}));
-        } else if target_path.exists() {
+        } else if target_path.exists() && !(merge_targets && target_path.is_dir()) {
             row_conflicts.push(json!({"code":"target_exists", "target_folder": target}));
         }
-        if seen_targets.contains(&target_key) {
+        if seen_targets.contains(&target_key) && !merge_targets {
             row_conflicts.push(json!({"code":"duplicate_target", "target_folder": target}));
         }
         if target_key.starts_with(&(source_key.clone() + "/")) {
@@ -310,6 +311,9 @@ pub fn apply_folder_rename_template(
         }
     }
     conn.execute("COMMIT", [])?;
+    if preview["profile"]["collision_strategy"].as_str() == Some("merge") {
+        recompute_artist_plan_targets(conn, Some(roots), artist_id)?;
+    }
     Ok(json!({"ok": true, "updated": plans.len(), "preview": preview}))
 }
 
@@ -324,7 +328,7 @@ mod tests {
         std::fs::create_dir_all(root.join("old")).unwrap();
         std::fs::create_dir_all(root.join("taken")).unwrap();
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT); CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT); CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at REAL); CREATE TABLE folder_rename_plans (id INTEGER PRIMARY KEY, artist_id INTEGER, source_folder TEXT, original_title TEXT, parsed_date TEXT, selected_tag_ids TEXT, target_folder TEXT DEFAULT '', status TEXT DEFAULT 'draft', format_snapshot TEXT DEFAULT '{}', confirmed_at REAL, confirmation_source TEXT DEFAULT '', updated_at REAL);").unwrap();
+        conn.execute_batch("CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT); CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT); CREATE TABLE items (id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT, file_name TEXT, folder_name TEXT, manual_date TEXT, detected_date TEXT, date TEXT, missing INTEGER DEFAULT 0); CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at REAL); CREATE TABLE folder_rename_plans (id INTEGER PRIMARY KEY, artist_id INTEGER, source_folder TEXT, original_title TEXT, parsed_date TEXT, selected_tag_ids TEXT, target_folder TEXT DEFAULT '', status TEXT DEFAULT 'draft', format_snapshot TEXT DEFAULT '{}', confirmed_at REAL, confirmation_source TEXT DEFAULT '', execution_log TEXT DEFAULT '[]', plan_kind TEXT DEFAULT 'rename_folder', split_actions TEXT DEFAULT '[]', updated_at REAL);").unwrap();
         conn.execute(
             "INSERT INTO artists VALUES (1,'A',?)",
             [root.to_string_lossy().to_string()],
@@ -392,6 +396,43 @@ mod tests {
             .unwrap(),
             "taken (3)"
         );
+    }
+
+    #[test]
+    fn merge_strategy_allows_existing_directory_and_duplicate_targets() {
+        let (conn, _dir, root) = fixture();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        conn.execute("INSERT INTO folder_rename_plans (id,artist_id,source_folder,original_title,parsed_date,selected_tag_ids) VALUES (2,1,'other','taken','2026-01-01','[]')", []).unwrap();
+        conn.execute("INSERT INTO folder_rename_plans (id,artist_id,source_folder,original_title,parsed_date,selected_tag_ids) VALUES (3,1,'taken','taken','2026-01-01','[]')", []).unwrap();
+        let settings = json!({"version":1,"active_profile_id":"flat","profiles":[{"id":"flat","name":"Flat","template":"{title}","collision_strategy":"merge"}],"artist_profile_ids":{}});
+        set_folder_rename_format_settings(&conn, &settings, None).unwrap();
+        let roots = MediaRoots::identical(
+            vec![root.to_string_lossy().to_string()],
+            vec!["root".into()],
+        );
+
+        let preview =
+            preview_folder_rename_template(&conn, &roots, 1, None, Some("flat"), None, None)
+                .unwrap();
+        assert_eq!(preview["can_apply"], true);
+        assert_eq!(preview["plans"][0]["target_folder"], "taken");
+        assert_eq!(preview["plans"][1]["target_folder"], "taken");
+        assert_eq!(preview["plans"][2]["target_folder"], "taken");
+        let applied =
+            apply_folder_rename_template(&conn, &roots, 1, None, Some("flat"), None, None).unwrap();
+        assert_eq!(applied["updated"], 3);
+
+        std::fs::remove_dir_all(root.join("taken")).unwrap();
+        std::fs::write(root.join("taken"), b"occupied").unwrap();
+        let preview =
+            preview_folder_rename_template(&conn, &roots, 1, None, Some("flat"), None, None)
+                .unwrap();
+        assert_eq!(preview["can_apply"], false);
+        assert!(preview["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|conflict| conflict["code"] == "target_exists"));
     }
 
     #[test]

@@ -104,11 +104,20 @@ fn is_error_log_line(line: &str) -> bool {
         || lower.contains("frontend_rejection")
 }
 
+fn log_line_timestamp_millis(line: &str) -> Option<i64> {
+    let timestamp = line.get(line.find("20")?..)?.get(..23)?;
+    ["%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%d %H:%M:%S.%f"]
+        .iter()
+        .find_map(|format| chrono::NaiveDateTime::parse_from_str(timestamp, format).ok())
+        .map(|value| value.and_utc().timestamp_millis())
+}
+
 pub fn recent_log_errors(log_dir: &Path, limit: usize) -> Vec<Value> {
     if limit == 0 {
         return Vec::new();
     }
     let mut out = Vec::new();
+    let mut sequence = 0usize;
     for name in ["gallery.log", "startup.log", "ui-actions.log"] {
         let path = log_dir.join(name);
         let Ok((lines, _truncated)) =
@@ -116,20 +125,34 @@ pub fn recent_log_errors(log_dir: &Path, limit: usize) -> Vec<Value> {
         else {
             continue;
         };
-        for line in lines.into_iter().rev() {
+        let mut timestamp = path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_millis().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
+        for line in lines {
+            if let Some(value) = log_line_timestamp_millis(&line) {
+                timestamp = value;
+            }
             if !is_error_log_line(&line) {
                 continue;
             }
-            out.push(json!({
-                "source": name,
-                "line": line.chars().take(500).collect::<String>(),
-            }));
-            if out.len() >= limit {
-                return out;
-            }
+            out.push((
+                timestamp,
+                sequence,
+                json!({
+                    "source": name,
+                    "line": line.chars().take(500).collect::<String>(),
+                }),
+            ));
+            sequence += 1;
         }
     }
-    out
+    out.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    out.truncate(limit);
+    out.into_iter().map(|(_, _, value)| value).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -247,9 +270,15 @@ pub fn update_folder_tags_by_name_response(
 pub fn reconfirm_plan(conn: &Connection, roots: &MediaRoots, plan_id: i64) -> Result<Value> {
     let check = crate::folder_archive::check_plan_paths(conn, roots, plan_id)?;
     if let Some(reason) = check.reason {
+        let permission_path = check
+            .permission_path
+            .as_deref()
+            .map(|path| format!(": {path}"))
+            .unwrap_or_default();
         return Err(anyhow!(
-            "plan is not physically ready for reconfirmation: {}",
-            crate::folder_archive::archive_failure_message(&reason)
+            "plan is not physically ready for reconfirmation: {}{}",
+            crate::folder_archive::archive_failure_message(&reason),
+            permission_path,
         ));
     }
     let n = conn.execute(
@@ -624,7 +653,7 @@ pub fn delete_character_reference(
 
 pub fn rebuild_character_index(conn: &Connection) -> Result<Value> {
     #[cfg(test)]
-    REBUILD_INDEX_CALLS_FOR_TESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    REBUILD_INDEX_CALLS_FOR_TESTS.with(|c| c.set(c.get() + 1));
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM character_references", [], |r| {
             r.get(0)
@@ -892,8 +921,9 @@ static FAKE_EMBEDDING_FOR_TESTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
-static REBUILD_INDEX_CALLS_FOR_TESTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static REBUILD_INDEX_CALLS_FOR_TESTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
 
 /// Serializes import tests that toggle fake embedding (avoids parallel env races).
 #[cfg(test)]
@@ -1815,6 +1845,51 @@ mod tests {
             .all(|row| row["line"].as_str().unwrap().len() <= 500));
     }
 
+    #[test]
+    fn recent_log_errors_sorts_newest_across_log_files() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("gallery.log"),
+            "2026-08-17 06:50:00,000 [ERROR] oldest\n",
+        )
+        .unwrap();
+        std::fs::write(
+            logs.join("startup.log"),
+            "2026-08-18 00:50:00,000 [ERROR] newest\n",
+        )
+        .unwrap();
+
+        let errors = recent_log_errors(&logs, 10);
+
+        assert_eq!(errors[0]["line"], "2026-08-18 00:50:00,000 [ERROR] newest");
+        assert_eq!(errors[1]["line"], "2026-08-17 06:50:00,000 [ERROR] oldest");
+    }
+
+    #[test]
+    fn recent_log_errors_orders_colored_dotted_timestamps_and_tracebacks() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("gallery.log"),
+            "2021-01-01 00:00:00,000 [ERROR] newest\n",
+        )
+        .unwrap();
+        std::fs::write(
+            logs.join("startup.log"),
+            "\x1b[1;31m2020-01-01 00:00:00.031040940 [ERROR] older\nTraceback (most recent call last):\n",
+        )
+        .unwrap();
+
+        let errors = recent_log_errors(&logs, 10);
+
+        assert_eq!(errors[0]["line"], "2021-01-01 00:00:00,000 [ERROR] newest");
+        assert_eq!(errors[1]["line"], "Traceback (most recent call last):");
+        assert!(errors[2]["line"].as_str().unwrap().contains("older"));
+    }
+
     fn fixture_conn() -> (tempfile::TempDir, Connection) {
         let dir = tempdir().unwrap();
         let conn = Connection::open(dir.path().join("g.db")).unwrap();
@@ -2146,7 +2221,7 @@ mod tests {
             .unwrap();
         seed_reference(&conn, 1, 1, 11);
         conn.execute("UPDATE items SET missing=1", []).unwrap();
-        REBUILD_INDEX_CALLS_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        REBUILD_INDEX_CALLS_FOR_TESTS.with(|c| c.set(0));
 
         let result = run_idle_character_import_once(&conn).unwrap();
 
@@ -2155,7 +2230,7 @@ mod tests {
         assert_eq!(result["added"], 0, "{result}");
         assert_eq!(result["auto_deleted_stale_tag_single"], 1, "{result}");
         assert_eq!(
-            REBUILD_INDEX_CALLS_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst),
+            REBUILD_INDEX_CALLS_FOR_TESTS.with(|c| c.get()),
             1
         );
     }
@@ -2303,7 +2378,7 @@ mod tests {
         seed_reference(&conn, 1, 3, 13);
         insert_tag_single_reference(&conn, 1, 4, &fake_embedding_for_item(4)).unwrap();
         conn.execute("DROP TABLE item_tags", []).unwrap();
-        REBUILD_INDEX_CALLS_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        REBUILD_INDEX_CALLS_FOR_TESTS.with(|c| c.set(0));
 
         assert!(start_character_import_job(&conn, &json!({})).is_err());
 
@@ -2314,7 +2389,7 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 3);
         assert_eq!(
-            REBUILD_INDEX_CALLS_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst),
+            REBUILD_INDEX_CALLS_FOR_TESTS.with(|c| c.get()),
             1
         );
         assert_eq!(get_character_import_job()["status"], "failed");
@@ -2334,7 +2409,7 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'forced character insert failure'); END;",
         )
         .unwrap();
-        REBUILD_INDEX_CALLS_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        REBUILD_INDEX_CALLS_FOR_TESTS.with(|c| c.set(0));
 
         let result = run_idle_character_import_once(&conn);
 
@@ -2347,7 +2422,7 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 0);
         assert_eq!(
-            REBUILD_INDEX_CALLS_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst),
+            REBUILD_INDEX_CALLS_FOR_TESTS.with(|c| c.get()),
             1
         );
     }

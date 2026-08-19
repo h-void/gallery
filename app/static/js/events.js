@@ -319,6 +319,8 @@ function bindEvents() {
     });
   });
   $('#moveAutoResolveBtn').addEventListener('click', autoResolveMoveCandidates);
+  const folderRenameRunAllBtn = $('#folderRenameRunAllBtn');
+  if (folderRenameRunAllBtn) folderRenameRunAllBtn.addEventListener('click', runFolderRenameAllNow);
   const folderRenameAutoToggle = $('#folderRenameAutoExecuteToggle');
   if (folderRenameAutoToggle) {
     folderRenameAutoToggle.addEventListener('change', e => {
@@ -501,6 +503,43 @@ function bindEvents() {
       handleMaintenanceJump(card.dataset.maintenanceJump);
     });
   }
+  const healthGrid = $('#healthGrid');
+  if (healthGrid) healthGrid.addEventListener('click', e => {
+    const target = e.target instanceof Element ? e.target.closest('[data-error-artists-open]') : null;
+    if (target && healthGrid.contains(target)) openErrorArtistsDialog();
+  });
+  const errorArtistsDialogEl = $('#errorArtistsDialog');
+  if (errorArtistsDialogEl) {
+    $('#errorArtistsCloseBtn')?.addEventListener('click', closeErrorArtistsDialog);
+    errorArtistsDialogEl.addEventListener('cancel', e => { e.preventDefault(); closeErrorArtistsDialog(); });
+    errorArtistsDialogEl.addEventListener('click', e => { if (e.target === errorArtistsDialogEl) closeErrorArtistsDialog(); });
+  }
+  const errorArtistsScroll = $('#errorArtistsDialog .artist-links-dialog-body');
+  if (errorArtistsScroll) errorArtistsScroll.addEventListener('scroll', () => {
+    if (errorArtistsScroll.scrollTop + errorArtistsScroll.clientHeight >= errorArtistsScroll.scrollHeight - 80) {
+      loadErrorArtistsPage();
+    }
+  });
+  const errorArtistsSearch = $('#errorArtistsSearch');
+  if (errorArtistsSearch) {
+    errorArtistsSearch.addEventListener('input', debounce(e => {
+      state.errorArtistsQuery = e.target.value.trim();
+      state.errorArtistsRequestSeq += 1;
+      loadErrorArtistsPage({reset: true});
+    }, 300));
+  }
+  const errorArtistsSort = $('#errorArtistsSort');
+  if (errorArtistsSort) errorArtistsSort.addEventListener('change', e => {
+    state.errorArtistsSort = e.target.value === 'count' ? 'count' : 'recent';
+    state.errorArtistsRequestSeq += 1;
+    loadErrorArtistsPage({reset: true});
+  });
+  $('#errorArtistsMore')?.addEventListener('click', () => loadErrorArtistsPage());
+  $('#errorArtistsList')?.addEventListener('click', e => {
+    const target = e.target instanceof Element ? e.target.closest('[data-error-artist-id]') : null;
+    if (!target) return;
+    jumpToErrorArtist({artist_id: target.dataset.errorArtistId, latest_plan_id: target.dataset.errorLatestPlanId});
+  });
 
   document.addEventListener('visibilitychange', () => {
     if (state.mode === 'moves' && !document.hidden) {
@@ -1038,6 +1077,7 @@ async function refreshCurrentView({reason = 'manual'} = {}) {
 }
 
 function toast(msg, type) {
+  logUiAction('toast', {message: String(msg ?? ''), type: String(type || '')});
   const el = document.createElement('div');
   el.className = `toast ${type}`;
   el.textContent = msg;

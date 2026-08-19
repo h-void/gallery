@@ -70,11 +70,11 @@ Gallery indexes user-authorized media directories, partitions the entire collect
   - Cross-artist moves automatically consolidate when all missing sources and the unique target share identical hashes; ambiguous conflicts route to the Maintenance workbench for review.
 
 ### 5. 📁 Standardized Folder Archiving & Rule Engine
-- **Template-Based Naming**: Format artist subdirectories according to customizable profiles (e.g. `{year}/{date} {tags}`, `{artist}/{title}`), with configurable collision policies (auto-suffix `-1` or skip).
-- **Zero Data-Loss Safety Guarantee**:
+- **Template-Based Naming**: One editable `Default` template starts as `{year}/{date} {tags}`; preview its targets before confirmation and execution.
+- **Execution Safety**:
   - **Automatic Backups**: Automatically takes a SQLite online backup snapshot prior to executing any directory operations.
-  - **Dry-Run Validation**: Comprehensive pre-flight checks detect path conflicts before moving files.
-  - **One-Click Rollback**: Supports full one-click undo for executed operations.
+  - **Execution Validation**: Preview targets first; execution revalidates source paths, targets, and authorization boundaries, and never overwrites occupied targets.
+  - **Execution Records**: Current successful plans are deleted in the same transaction and cannot be undone; only retained legacy executed plans still support undo.
 - **Automated Archiving Hook**: An "Auto Organize" global toggle in Maintenance allows automated execution of high-confidence archive rules strictly upon the successful completion of a full-library scan.
 
 ### 6. 🛡️ Storage Safety & Isolated State
@@ -124,7 +124,8 @@ docker compose up -d --build
 
 3. **Storage & Permission Notes**:
    - Databases, preview caches, and models are stored in the unified `gallery-storage` Docker volume under `data/`, `cache/`, and `models/`.
-   - Docker uses CPU character recognition by default; place the model at `models/character/ccip-caformer_b36-24/model_feat.onnx` within the volume.
+   - Docker image uses OpenVINO with Intel iGPU acceleration by default, with automatic CPU fallback when the GPU is unavailable. To enable Intel iGPU pass-through, run `docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build`.
+   - Place the model at `models/character/ccip-caformer_b36-24/model_feat.onnx` within the volume.
    - Media is mounted read-only (`:ro`) by default. To enable file organization, archiving, or deletion, change `/media:ro` to `/media` in `docker-compose.yml`.
 
 ---
@@ -139,7 +140,7 @@ The following environment variables can be customized in your environment or Com
 | `DATA_DIR` | `data` | Data directory path (contains `gallery.db`, logs, backups) |
 | `IMAGE_PREVIEW_CACHE_DIR` | `cache` | Thumbnail and video transcode cache directory |
 | `CHARACTER_RECOGNITION_ENABLED` | `1` | Enable AI character recognition (`1` for enabled, `0` for disabled) |
-| `CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK` | `0` | Allow OpenVINO CPU fallback when GPU is unavailable |
+| `CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK` | `1` | Docker: auto-fallback to CPU when OpenVINO GPU init fails (`0` to disable) |
 | `CHARACTER_MODEL_IDLE_TIMEOUT_SECONDS` | `600` | Idle timeout in seconds before unloading the model (`0` to keep resident) |
 | `SCAN_INTERVAL` | `21600` | Background full scan interval in seconds (default 6 hours; `0` disables) |
 | `HASH_INTERVAL` | `30` | Background content hasher poll interval in seconds |
@@ -188,7 +189,7 @@ gallery/
 
 ## 📄 License
 
-This project is licensed under the [GNU General Public License v3.0 only](LICENSE) (`GPL-3.0-only`).  
+This project is licensed under the [GNU General Public License v3.0 only](LICENSE) (`GPL-3.0-only`).
 Copyright (C) 2026 h-void.
 
 Redistributing this project or modified derivatives requires providing corresponding source code under GPL-3.0-only.

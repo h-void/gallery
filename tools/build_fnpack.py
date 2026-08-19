@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
 import shutil
 import stat
 import subprocess
+import tarfile
 from pathlib import Path
 
 
@@ -34,6 +36,8 @@ FNPACK_BINARY_ENV = "FNPACK_BINARY"
 GZIP_MAGIC = b"\x1f\x8b"
 ZIP_MAGIC = b"PK"
 MIN_FNPACK_SIZE = 64
+REQUIRED_FPK_FILES = frozenset(("manifest", "cmd/main", "app.tgz"))
+REQUIRED_APP_FILES = frozenset(("bin/gallery-accel", "ui/config"))
 
 
 def _copy_tree(source: Path, target: Path) -> None:
@@ -313,8 +317,8 @@ def validate_fnpack_artifact(artifact: Path, metadata: dict) -> None:
     """Fail closed on an invalid FPK artifact.
 
     Shared by ``build_with_fnpack`` and ``build_release`` so both code paths
-    enforce the same rules: correct normalized name, non-trivial size, gzip
-    magic, and an explicit rejection of zip-renamed payloads.
+    enforce the same rules: correct normalized name, non-trivial size, valid
+    gzip/tar structure, required command metadata, and the Rust binary.
     """
     if not artifact.is_file():
         raise FileNotFoundError(f"expected artifact missing: {artifact}")
@@ -332,7 +336,8 @@ def validate_fnpack_artifact(artifact: Path, metadata: dict) -> None:
             f"(minimum {MIN_FNPACK_SIZE})"
         )
 
-    head = artifact.read_bytes()[:2]
+    with artifact.open("rb") as source:
+        head = source.read(2)
     if head == ZIP_MAGIC:
         raise ValueError(
             f"{artifact.name} begins with ZIP magic bytes; fnOS rejects zip-renamed "
@@ -342,6 +347,58 @@ def validate_fnpack_artifact(artifact: Path, metadata: dict) -> None:
         raise ValueError(
             f"{artifact.name} does not begin with gzip magic bytes (1f8b); "
             "unexpected FPK payload."
+        )
+
+    app_payload = None
+    outer_files = {}
+    try:
+        with artifact.open("rb") as source, tarfile.open(
+            fileobj=source, mode="r|gz"
+        ) as archive:
+            for member in archive:
+                outer_files[member.name] = member
+                if member.name == "app.tgz":
+                    if not member.isfile():
+                        raise ValueError("FPK app.tgz is not a regular file")
+                    app_file = archive.extractfile(member)
+                    if app_file is None:
+                        raise ValueError("FPK app.tgz cannot be read")
+                    app_payload = app_file.read()
+    except ValueError:
+        raise
+    except (OSError, tarfile.TarError) as exc:
+        raise ValueError(f"{artifact.name} has an invalid gzip/tar payload: {exc}") from exc
+
+    missing = sorted(REQUIRED_FPK_FILES.difference(outer_files))
+    if missing:
+        raise ValueError(f"{artifact.name} is missing required files: {', '.join(missing)}")
+    non_files = sorted(name for name in REQUIRED_FPK_FILES if not outer_files[name].isfile())
+    if non_files:
+        raise ValueError(f"{artifact.name} has non-file required entries: {', '.join(non_files)}")
+    empty_files = sorted(name for name in REQUIRED_FPK_FILES if outer_files[name].size <= 0)
+    if empty_files:
+        raise ValueError(f"{artifact.name} has empty required files: {', '.join(empty_files)}")
+
+    try:
+        inner_files = {}
+        with tarfile.open(fileobj=io.BytesIO(app_payload), mode="r|gz") as archive:
+            for member in archive:
+                inner_files[member.name] = member
+    except (OSError, tarfile.TarError) as exc:
+        raise ValueError(f"{artifact.name} has an invalid app.tgz payload: {exc}") from exc
+
+    missing = sorted(REQUIRED_APP_FILES.difference(inner_files))
+    if missing:
+        raise ValueError(f"{artifact.name} app.tgz is missing required files: {', '.join(missing)}")
+    non_files = sorted(name for name in REQUIRED_APP_FILES if not inner_files[name].isfile())
+    if non_files:
+        raise ValueError(
+            f"{artifact.name} app.tgz has non-file required entries: {', '.join(non_files)}"
+        )
+    empty_files = sorted(name for name in REQUIRED_APP_FILES if inner_files[name].size <= 0)
+    if empty_files:
+        raise ValueError(
+            f"{artifact.name} app.tgz has empty required files: {', '.join(empty_files)}"
         )
 
 

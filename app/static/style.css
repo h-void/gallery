@@ -1288,6 +1288,18 @@ body.mode-edit .edit-bar.visible{
 .health-grid b{color:#f8fafc;font-size:var(--fs-sm);font-weight:700;letter-spacing:.01em}
 .health-grid span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-2)}
 .health-grid code{font-size:var(--fs-xs);color:#a5b4c8}
+.error-artists-card{width:100%;text-align:left;color:inherit;cursor:pointer}
+.error-artists-card:hover,.error-artists-card:focus-visible{border-color:rgba(248,113,113,.6);outline:none}
+.error-artists-dialog{width:min(720px,calc(100vw - 32px))}
+.error-artists-dialog .artist-links-dialog-body{max-height:calc(100dvh - 160px);overflow-y:auto}
+.error-artists-controls{display:flex;align-items:center;gap:8px}
+.error-artists-controls input{flex:1 1 auto;min-width:0}
+.error-artists-list{display:flex;flex-direction:column;gap:8px}
+.error-artist-row{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(140px,.8fr);gap:10px;align-items:center;width:100%;padding:10px 12px;text-align:left;color:var(--text);background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius);cursor:pointer}
+.error-artist-row:hover,.error-artist-row:focus-visible{border-color:rgba(248,113,113,.55);outline:none}
+.error-artist-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.error-artist-reason{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-2);font-size:var(--fs-xs)}
+.error-plan-highlight{border-color:#f87171!important;box-shadow:0 0 0 3px rgba(248,113,113,.28),0 12px 30px rgba(0,0,0,.28)!important}
 .health-schedule{font-family:inherit;font-size:var(--fs-xs);color:var(--text-3);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .operation-log-summary{padding:10px 14px 0;color:var(--text2);font-size:var(--fs-sm)}
 .operation-log-grid{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(260px,.8fr);gap:12px;padding:12px 14px 14px}
@@ -2150,5 +2162,8 @@ body.mode-edit .edit-bar.visible{
     left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));
     text-align:center;
   }
+  .error-artist-row{grid-template-columns:minmax(0,1fr) auto}
+  .error-artist-reason{grid-column:1 / -1}
+  .error-artists-controls{align-items:stretch;flex-direction:column}
 
 }

@@ -19,8 +19,14 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg libgomp1 tini \
+# Intel iGPU support: OpenVINO GPU plugin needs the Intel OpenCL ICD (non-free).
+# With CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK=1 the service falls back to CPU
+# when no /dev/dri device is available (e.g. on CPU-only hosts).
+RUN echo "deb http://deb.debian.org/debian bookworm non-free" \
+        > /etc/apt/sources.list.d/non-free.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl ffmpeg libgomp1 tini intel-opencl-icd \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 gallery \
     && useradd --uid 10001 --gid gallery --create-home gallery
@@ -34,7 +40,7 @@ COPY fnpack/app/licenses/ONNXRUNTIME_LICENSE.txt fnpack/app/licenses/ONNXRUNTIME
 
 RUN mkdir -p /gallery/data/logs /gallery/data/db-backups \
         /gallery/cache/video-frames /gallery/cache/transcode-cache \
-        /gallery/models/character /gallery/models/artist \
+        /gallery/models/character /gallery/models/artist /gallery/models/openvino-cache \
     && chown -R gallery:gallery /gallery /opt/gallery
 
 ENV DATA_DIR=/gallery/data \
@@ -52,7 +58,9 @@ ENV DATA_DIR=/gallery/data \
     MODEL_CACHE_ROOT=/gallery/models \
     CHARACTER_MODEL_DIR=/gallery/models/character \
     ARTIST_MODEL_DIR=/gallery/models/artist \
-    CHARACTER_RECOGNITION_PROVIDER=cpu \
+    CHARACTER_RECOGNITION_PROVIDER=openvino \
+    CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK=1 \
+    CHARACTER_OPENVINO_CACHE_DIR=/gallery/models/openvino-cache \
     CHARACTER_IMPORT_IDLE_ENABLED=0 \
     ARTIST_RECOGNITION_ENABLED=0 \
     SCAN_ON_START=0 \

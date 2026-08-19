@@ -1,8 +1,8 @@
 {
   "appname": "gallery",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "display_name": "画廊",
-  "desc": "Local media library (pure Rust runtime) for browsing, tagging, previewing, and maintaining NAS media.",
+  "desc": "纯 Rust 本地媒体库：浏览、标记、预览并维护 NAS 媒体。 Local media library (pure Rust runtime) for browsing, tagging, previewing, and maintaining NAS media.",
   "arch": "x86_64",
   "platform": "all",
   "source": "thirdparty",
@@ -16,7 +16,7 @@
   "runtime_dependency": "",
   "ui": {
     "title": "画廊",
-    "icon": "images/gallery-icon-v1_1_0_{0}.png",
+    "icon": "images/gallery-icon-v1_1_1_{0}.png",
     "protocol": "http",
     "url": "/",
     "allUsers": true

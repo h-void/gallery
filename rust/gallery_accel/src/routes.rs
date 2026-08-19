@@ -29,7 +29,8 @@ use gallery_accel::{
     confirm_artist_suggestion, content_hash_allowed, create_artist_profile_link, create_db_backup,
     create_new_item_response_with_roots, create_tag, delete_artist_profile_link,
     delete_character_reference, delete_tag, delete_to_recycle, duplicate_artists_response,
-    env_media_roots, execute_artist_folder_move, execute_folder_renames, folder_paths_response,
+    env_media_roots, execute_artist_folder_move, execute_folder_renames,
+    folder_archive_failed_plans_count, folder_error_artists, folder_paths_response,
     folder_rename_auto_response, folder_rename_auto_run, folder_rename_format_settings,
     folders_response, get_character_import_job, get_scan_state, hash_status_response,
     health_summary, ignore_move_candidate_response, item_detail_response,
@@ -41,10 +42,10 @@ use gallery_accel::{
     preview_jpeg_allowed, propagate_hash_tags_response, rebuild_character_index, recheck_plan,
     recognize_character_native_topk_with_roots, reconfirm_plan, recycle_entries_response,
     reindex_artist_links, resolve_existing_scan_candidate_response_with_roots, resolve_scan_scope,
-    restore_recycle_entry, run_full_library_scan, run_hash_batch_with_roots, run_scan,
-    scan_candidates_response, serve_file_response, serve_text, serve_transcoded_hls,
-    serve_transcoded_hls_segment, serve_video_compatible, serve_video_hls, set_folder_rename_auto,
-    set_folder_rename_format_settings, set_item_favorite_response,
+    restore_recycle_entry, run_folder_rename_all_now, run_full_library_scan,
+    run_hash_batch_with_roots, run_scan, scan_candidates_response, serve_file_response, serve_text,
+    serve_transcoded_hls, serve_transcoded_hls_segment, serve_video_compatible, serve_video_hls,
+    set_folder_rename_auto, set_folder_rename_format_settings, set_item_favorite_response,
     start_character_import_job_with_roots, start_video_transcode, suggest_artists_native,
     tag_search_response, tags_response, unconfirm_all_artist_plans, unconfirm_plan,
     undo_folder_rename_plan, update_folder_tags_by_name_response, update_folder_tags_response,
@@ -312,6 +313,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/folder-renames", get(api_folder_renames_list))
         .route(
+            "/api/folder-renames/error-artists",
+            get(api_folder_rename_error_artists),
+        )
+        .route(
             "/api/folder-renames/settings",
             get(api_folder_renames_settings).put(api_folder_renames_settings_put),
         )
@@ -326,6 +331,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/folder-renames/execute",
             post(api_folder_renames_execute),
+        )
+        .route(
+            "/api/folder-renames/execute-all",
+            post(api_folder_renames_execute_all),
         )
         .route("/api/folder-renames/auto", put(api_folder_renames_auto_put))
         .route(
@@ -542,7 +551,7 @@ async fn api_health(State(state): State<AppState>) -> Json<Value> {
         "next_run_at",
     );
     if let Some(conn) = conn.as_ref().map(|c| &**c) {
-        match folder_archive_failed_plans(conn) {
+        match folder_archive_failed_plans_count(conn) {
             Ok(count) => {
                 body["folder_archive"] = json!({"failed_plans": count});
                 if count > 0 {
@@ -605,23 +614,6 @@ fn mark_degraded(body: &mut Value, reason: &str) {
         body["degraded_reasons"] = json!([reason]);
     }
     body["degraded"] = json!(true);
-}
-
-fn folder_archive_failed_plans(conn: &rusqlite::Connection) -> anyhow::Result<i64> {
-    let exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='folder_rename_plans'",
-        [],
-        |row| row.get(0),
-    )?;
-    if exists == 0 {
-        return Ok(0);
-    }
-    Ok(conn.query_row(
-        "SELECT COUNT(*) FROM folder_rename_plans
-         WHERE status='manual_review' AND execution_log LIKE '%\"status\":\"failed\"%'",
-        [],
-        |row| row.get(0),
-    )?)
 }
 
 fn now_seconds() -> f64 {
@@ -2308,6 +2300,31 @@ async fn api_folder_renames_list(
 }
 
 #[derive(serde::Deserialize)]
+struct FolderErrorArtistsQuery {
+    q: Option<String>,
+    sort: Option<String>,
+    offset: Option<i64>,
+    limit: Option<i64>,
+}
+
+async fn api_folder_rename_error_artists(
+    State(state): State<AppState>,
+    Query(q): Query<FolderErrorArtistsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let conn = state.pool.get().map_err(to_http_error)?;
+    let sort = if q.sort.as_deref() == Some("count") {
+        "count"
+    } else {
+        "recent"
+    };
+    let offset = q.offset.unwrap_or(0).max(0);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    folder_error_artists(&conn, q.q.as_deref(), Some(sort), offset, limit)
+        .map(Json)
+        .map_err(to_http_error)
+}
+
+#[derive(serde::Deserialize)]
 struct FolderRenameSettingsBody {
     settings: Value,
     artist_id: Option<i64>,
@@ -2434,6 +2451,37 @@ async fn api_folder_renames_execute(
         let _guard = guard;
         let conn = pool.get().map_err(to_http_error)?;
         execute_folder_renames(&conn, &roots, body.artist_id, body.dry_run)
+            .map(Json)
+            .map_err(to_http_error)
+    })
+    .await;
+    result.map_err(blocking_http_error)?
+}
+
+async fn api_folder_renames_execute_all(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error":"write capability is disabled"})),
+        ));
+    }
+    if !state.scan.try_start() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "a scan or file operation is already running"})),
+        ));
+    }
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    let guard = OperationGuard {
+        control: Arc::clone(&state.scan),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        let conn = pool.get().map_err(to_http_error)?;
+        run_folder_rename_all_now(&conn, &roots)
             .map(Json)
             .map_err(to_http_error)
     })
@@ -3301,7 +3349,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(folder_archive_failed_plans(&conn).unwrap(), 1);
+        assert_eq!(folder_archive_failed_plans_count(&conn).unwrap(), 1);
     }
 
     fn tag_test_app() -> (tempfile::TempDir, Router) {

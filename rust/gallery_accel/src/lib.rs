@@ -84,8 +84,9 @@ pub use content_hash::content_hash_response;
 pub use db::{env_db_path, DbConfig, DbPool, PooledConn};
 pub use duplicate_artists::duplicate_artists_response;
 pub use folder_archive::{
-    create_db_backup, execute_folder_renames, folder_rename_auto_enabled, list_folder_renames,
-    recheck_plan, run_folder_rename_auto_after_full_scan, set_folder_rename_auto,
+    create_db_backup, execute_folder_renames, folder_archive_failed_plans_count,
+    folder_error_artists, folder_rename_auto_enabled, list_folder_renames, recheck_plan,
+    run_folder_rename_all_now, run_folder_rename_auto_after_full_scan, set_folder_rename_auto,
     undo_folder_rename_plan, upsert_folder_rename_plans,
 };
 pub use folder_paths::folder_paths_response;

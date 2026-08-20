@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>画廊</title>
+<link rel="stylesheet" href="/static/style.css?v=1.1.2">
+</head>
+<body>
+
+<div class="scan-progress" id="progressPanel" aria-live="polite">
+  <div class="scan-progress-meta">
+    <span id="progressTitle">扫描中</span>
+    <span id="progressCount"></span>
+  </div>
+  <div class="scan-progress-track"><div class="fill" id="progressFill" style="width:0%"></div></div>
+  <div class="scan-progress-path" id="progressPath"></div>
+</div>
+
+<header id="appHeader" class="mobile-tools-collapsed">
+  <h1>画廊</h1>
+  <div class="artist-picker" id="artistPicker">
+    <input type="text" id="artistSearch" placeholder="搜索画师名称 / 拼音..." autocomplete="off" maxlength="256">
+    <div class="artist-dropdown" id="artistDropdown"></div>
+  </div>
+  <button id="mobileHeaderToggle" class="btn btn-ghost mobile-header-toggle" type="button" aria-expanded="false" aria-label="展开搜索与快捷操作" title="展开搜索与快捷操作">搜索</button>
+  <div class="mode-tabs" role="tablist" aria-label="模式切换">
+    <button class="btn btn-segment active" type="button" data-mode="browse" aria-pressed="true">浏览</button>
+    <button class="btn btn-segment" type="button" data-mode="edit" aria-pressed="false">编辑</button>
+    <button class="btn btn-segment" type="button" data-mode="moves" aria-pressed="false">维护</button>
+  </div>
+  <div class="search-control" id="searchControl">
+    <input type="text" id="searchInput" placeholder="搜索标签或文件名" maxlength="256">
+    <button id="searchOptionsBtn" class="btn btn-ghost search-options-btn" type="button" aria-expanded="false" aria-controls="searchOptionsMenu" title="搜索范围">范围</button>
+    <div class="search-options-menu" id="searchOptionsMenu" hidden>
+      <div class="search-options-title">搜索范围</div>
+      <div class="search-scope-list" role="group" aria-label="搜索范围">
+        <button class="btn btn-segment active" type="button" data-search-scope="auto" aria-pressed="true">自动</button>
+        <button class="btn btn-segment" type="button" data-search-scope="artist" aria-pressed="false">当前画师</button>
+        <button class="btn btn-segment" type="button" data-search-scope="folder" aria-pressed="false">当前文件夹</button>
+        <button class="btn btn-segment" type="button" data-search-scope="global" aria-pressed="false">全局</button>
+      </div>
+      <label class="search-tags-only">
+        <input type="checkbox" id="tagsOnlyToggle">
+        <span>仅标签精确匹配</span>
+      </label>
+    </div>
+  </div>
+  <button id="scanBtn" class="btn btn-ghost" type="button" title="扫描全库">扫描全库</button>
+  <button id="scanFolderBtn" class="btn btn-ghost scan-folder-btn" type="button" style="display:none">扫描文件夹</button>
+  <button id="stopScanBtn" class="btn btn-danger" type="button" title="停止扫描" style="display:none">停止</button>
+</header>
+
+<main>
+  <div class="filter-backdrop" id="filterBackdrop" hidden></div>
+  <aside class="sidebar" id="filterSidebar">
+    <div class="sidebar-mobile-head">
+      <span>筛选</span>
+      <button id="filterDrawerClose" class="btn btn-ghost btn-icon" type="button" aria-label="关闭筛选" title="关闭筛选">
+        <span class="btn-glyph" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M6 6l12 12"></path>
+            <path d="M18 6 6 18"></path>
+          </svg>
+        </span>
+      </button>
+    </div>
+    <div class="sidebar-mobile-columns">
+      <div class="sidebar-header">
+        <span>列数</span>
+      </div>
+      <div class="view-toggle mobile-column-toggle" id="mobileColumnToggle" aria-label="选择列数">
+        <button class="btn btn-segment" type="button" data-mobile-columns="1" aria-pressed="false">1列</button>
+        <button class="btn btn-segment active" type="button" data-mobile-columns="2" aria-pressed="true">2列</button>
+        <button class="btn btn-segment" type="button" data-mobile-columns="3" aria-pressed="false">3列</button>
+      </div>
+    </div>
+    <div class="sidebar-section duplicate-section" id="duplicateSection" data-sidebar-section="duplicates" style="display:none">
+      <div class="sidebar-header">
+        <button id="duplicateToggle" class="sidebar-section-toggle" data-sidebar-section-toggle="duplicates" type="button" aria-expanded="false" aria-controls="duplicateList">
+          <span>重复文件夹</span>
+          <span class="count" id="duplicateCount">0</span>
+        </button>
+        <button id="duplicateChevronToggle" class="sidebar-chevron-toggle" data-sidebar-chevron-toggle="duplicates" type="button" aria-expanded="false" aria-controls="duplicateList" aria-label="展开重复文件夹">
+          <span class="sidebar-section-chevron" aria-hidden="true"></span>
+        </button>
+      </div>
+      <div class="sidebar-section-body" id="duplicateList" hidden></div>
+    </div>
+    <div class="sidebar-section item-filter-section" id="itemFilterSection" data-sidebar-section="filters" aria-label="排序与日期">
+      <div class="sidebar-header">
+        <button id="itemFiltersToggle" class="sidebar-section-toggle" data-sidebar-section-toggle="filters" type="button" aria-expanded="true" aria-controls="itemFiltersBody">
+          <span>排序与日期</span>
+        </button>
+        <button id="itemFiltersChevronToggle" class="sidebar-chevron-toggle" data-sidebar-chevron-toggle="filters" type="button" aria-expanded="true" aria-controls="itemFiltersBody" aria-label="折叠排序与日期">
+          <span class="sidebar-section-chevron" aria-hidden="true"></span>
+        </button>
+      </div>
+      <div class="sidebar-section-body" id="itemFiltersBody">
+        <div class="item-filter-dates">
+          <label class="item-filter-field">
+            <span>开始日期</span>
+            <input id="itemDateFrom" type="date">
+          </label>
+          <label class="item-filter-field">
+            <span>结束日期</span>
+            <input id="itemDateTo" type="date">
+          </label>
+        </div>
+        <div class="item-filter-date-actions">
+          <button id="itemDateReset" class="item-filter-reset item-date-reset-btn" type="button" disabled>重置日期</button>
+        </div>
+        <label class="item-filter-field item-filter-sort-field">
+          <span>排序</span>
+          <select id="itemSort">
+            <option value="date_desc">日期从新到旧</option>
+            <option value="date_asc">日期从旧到新</option>
+            <option value="name">文件名</option>
+            <option value="size">文件大小</option>
+            <option value="scanned_desc">最近入库</option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <div class="sidebar-section tag-section" id="tagSection" data-sidebar-section="tags">
+      <div class="sidebar-header">
+        <button id="tagSectionToggle" class="sidebar-section-toggle" data-sidebar-section-toggle="tags" type="button" aria-expanded="true" aria-controls="tagSectionBody">
+          <span>标签</span>
+        </button>
+        <button id="tagFilterReset" class="item-filter-reset" type="button" disabled>清空筛选</button>
+        <select id="tagSort" class="tag-sort" aria-label="标签排序：默认 / 按名称升序 / 按作品数量降序" title="默认：系统顺序；名称：自然升序；数量：从多到少">
+          <option value="default">默认</option>
+          <option value="name">名称</option>
+          <option value="count">数量</option>
+        </select>
+        <button id="tagSectionChevronToggle" class="sidebar-chevron-toggle" data-sidebar-chevron-toggle="tags" type="button" aria-expanded="true" aria-controls="tagSectionBody" aria-label="折叠标签">
+          <span class="sidebar-section-chevron" aria-hidden="true"></span>
+        </button>
+      </div>
+      <div class="sidebar-section-body" id="tagSectionBody">
+        <div class="sidebar-list" id="sidebarList"></div>
+      </div>
+    </div>
+    <div id="sidebarTagDivider" class="sidebar-tag-divider" role="separator" aria-orientation="horizontal" tabindex="0" aria-label="拖动调整标签与文件夹列表高度比例" aria-valuemin="20" aria-valuemax="80" aria-valuenow="46"></div>
+    <div class="sidebar-section folder-section" id="folderSection" data-sidebar-section="folders">
+      <div class="sidebar-header">
+        <button id="folderSectionToggle" class="sidebar-section-toggle" data-sidebar-section-toggle="folders" type="button" aria-expanded="true" aria-controls="folderSectionBody">
+          <span>文件夹</span>
+        </button>
+        <button id="folderSectionChevronToggle" class="sidebar-chevron-toggle" data-sidebar-chevron-toggle="folders" type="button" aria-expanded="true" aria-controls="folderSectionBody" aria-label="折叠文件夹">
+          <span class="sidebar-section-chevron" aria-hidden="true"></span>
+        </button>
+      </div>
+      <div class="sidebar-section-body" id="folderSectionBody">
+        <div class="folder-tree" id="folderTree"></div>
+      </div>
+    </div>
+    <div class="sidebar-empty-hint" id="sidebarEmptyHint" hidden>
+      请在上方选择画师，即可查看其标签与文件夹列表
+    </div>
+  </aside>
+  <div id="sidebarResizer" class="sidebar-resizer" role="separator" aria-orientation="vertical" tabindex="0" aria-label="拖动调整侧边栏宽度"></div>
+
+  <div class="content">
+    <div class="toolbar">
+      <button id="mobileFilterBtn" class="btn btn-ghost mobile-filter-btn" type="button" aria-expanded="false" aria-controls="filterSidebar">筛选</button>
+      <select id="mediaFilter" class="media-filter-select" aria-label="媒体筛选" title="媒体筛选" disabled>
+        <option value="">全部媒体</option>
+      </select>
+      <div id="duplicateFilesToggle" class="view-toggle duplicate-files-toggle" style="display:none" role="group" aria-label="文件范围">
+        <button class="btn btn-segment active" type="button" data-duplicates="all" aria-pressed="true">全部</button>
+        <button class="btn btn-segment" type="button" data-duplicates="duplicates" aria-pressed="false">重复</button>
+      </div>
+      <div class="view-toggle desktop-view-toggle" id="desktopViewToggle">
+        <button class="btn btn-segment active" type="button" data-view="grid" aria-pressed="true">网格</button>
+        <button class="btn btn-segment" type="button" data-view="compact" aria-pressed="false">紧凑</button>
+        <button class="btn btn-segment" type="button" data-view="list" aria-pressed="false">列表</button>
+      </div>
+      <div class="artist-links-launcher">
+        <button class="btn btn-ghost artist-links-entry" id="artistProfileLinksOpenBtn" type="button" aria-haspopup="dialog" aria-controls="artistProfileLinksDialog" hidden>
+          <span class="artist-links-entry-title">社交与订阅</span>
+          <span class="artist-links-summary" id="artistProfileLinksSummary">等待读取</span>
+        </button>
+        <button class="btn btn-ghost artist-links-entry" id="artistLinksOpenBtn" type="button" aria-haspopup="dialog" aria-controls="artistLinksDialog" hidden>
+          <span class="artist-links-entry-title">网盘与文本链接</span>
+          <span class="artist-links-summary" id="artistLinksSummary">等待读取</span>
+        </button>
+      </div>
+    </div>
+    <div class="edit-bar" id="editBar">
+      <div class="edit-bar-main">
+        <div class="edit-bar-group" data-group="select" role="group" aria-label="选择控制">
+          <span class="selected-count" id="selectedCount">已选 0 项</span>
+          <button id="editSelectAllBtn" class="btn btn-ghost" type="button">全选</button>
+        </div>
+        <div class="edit-bar-group" data-group="tag" role="group" aria-label="标签与角色编辑">
+          <div class="tag-picker" id="editTagPicker">
+            <input type="text" id="editTagSearch" placeholder="搜索或选择标签..." autocomplete="off" maxlength="256">
+            <div class="tag-picker-panel" id="editTagPickerPanel"></div>
+          </div>
+          <span class="tag-picker-summary" id="editTagPickerSummary">未选标签</span>
+          <div class="character-suggestions" id="characterSuggestions" hidden aria-hidden="true" aria-live="polite">
+            <span class="character-suggestions-label">角色建议</span>
+            <span class="character-suggestions-status" id="characterSuggestionsStatus">未识别</span>
+            <div class="character-suggestions-list" id="characterSuggestionsList"></div>
+          </div>
+          <div class="artist-suggestions" id="artistSuggestions" hidden aria-hidden="true" aria-live="polite">
+            <span class="artist-suggestions-label">画师建议</span>
+            <span class="artist-suggestions-status" id="artistSuggestionsStatus">未检查</span>
+            <div class="artist-suggestions-list" id="artistSuggestionsList"></div>
+          </div>
+          <button class="btn btn-primary" id="editApplyBtn" type="button">添加标签</button>
+          <button class="btn btn-ghost" id="editDeleteRoleBtn" type="button">移除标签</button>
+        </div>
+        <div class="edit-bar-group" data-group="date" role="group" aria-label="日期编辑">
+          <div class="edit-date-picker" id="editDatePicker">
+            <select id="editDatePrecision" aria-label="日期精度" title="选择日期精度">
+              <option value="month">年月</option>
+              <option value="day">精确日期</option>
+            </select>
+            <input type="month" id="editDateMonth" aria-label="选择年月 (YYYY-MM)" title="选择年月">
+            <input type="date" id="editDateDay" aria-label="精确日期 (YYYY-MM-DD)" title="YYYY-MM-DD" hidden>
+            <span class="date-picker-summary" id="editDateSummary"></span>
+            <button class="btn btn-soft-primary" id="editDateApplyBtn" type="button" disabled>设置日期</button>
+            <button class="btn btn-ghost" id="editDateResetBtn" type="button" disabled title="清除手动日期，恢复扫描检测到的日期">↺ 恢复检测</button>
+          </div>
+        </div>
+        <div class="edit-bar-group" data-group="action" role="group" aria-label="退出与删除">
+          <button class="btn btn-ghost" id="editCancelBtn" type="button">取消</button>
+          <button class="btn btn-danger edit-delete-selected" id="editDeleteSelectedBtn" type="button">删除所选</button>
+        </div>
+      </div>
+    </div>
+    <div class="move-panel" id="movePanel">
+      <div class="maintenance-dashboard">
+        <section class="maintenance-hero">
+          <div class="maintenance-hero-copy">
+            <div class="move-title">维护</div>
+            <div class="move-subtitle">状态与高级工具</div>
+          </div>
+          <div class="maintenance-hero-actions">
+            <button id="folderRenameRunAllBtn" class="btn btn-danger" type="button" title="重新检查并执行所有画师的安全整理项">立即整理全部</button>
+            <label class="maintenance-auto-toggle" title="开启后，仅全库扫描成功结束时自动执行无冲突整理项；默认关闭，需手动确认后点「开始整理」。【不可撤销】">
+              <input id="folderRenameAutoExecuteToggle" type="checkbox">
+              <span>自动整理</span>
+            </label>
+            <button id="moveRefreshBtn" class="btn btn-ghost" type="button">刷新</button>
+          </div>
+        </section>
+
+        <div class="maintenance-view-tabs" role="tablist" aria-label="维护视图">
+          <button class="btn btn-segment active" type="button" data-maintenance-view="overview" role="tab" aria-selected="true">状态</button>
+          <button class="btn btn-segment" type="button" data-maintenance-view="paths" role="tab" aria-selected="false">待判断</button>
+          <button class="btn btn-segment" type="button" data-maintenance-view="organize" role="tab" aria-selected="false">文件整理</button>
+          <button class="btn btn-segment" type="button" data-maintenance-view="characters" role="tab" aria-selected="false">角色库</button>
+          <button class="btn btn-segment" type="button" data-maintenance-view="records" role="tab" aria-selected="false">记录</button>
+        </div>
+
+        <div class="maintenance-view-panel active" data-maintenance-view-panel="overview">
+        <section class="maintenance-section health-panel" id="healthPanel">
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">状态总览</div>
+              <div class="health-subtitle">数据库健康 &#183; 备份 &#183; 扫描 &#183; 查重</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <button id="manualBackupBtn" class="btn btn-ops" type="button">立即备份数据库</button>
+              <span id="backupResult"></span>
+            </div>
+          </div>
+          <div class="health-grid" id="healthGrid">
+            <div class="maintenance-card status-card status-muted move-empty small">等待读取健康状态</div>
+          </div>
+        </section>
+
+        <section class="maintenance-section maintenance-advanced-collapsible ml-runtime-detail" id="mlRuntimePanel">
+          <details open>
+            <summary>
+              <span class="ml-runtime-summary-title">模型与推理</span>
+              <span class="ml-runtime-summary-status" id="mlRuntimeSummaryStatus">等待读取</span>
+            </summary>
+            <div class="maintenance-advanced-body">
+              <div class="maintenance-advanced-form-row">
+                <label for="mlDownloadSourceSelect">下载源</label>
+                <select id="mlDownloadSourceSelect">
+                  <option value="official">官方源</option>
+                  <option value="china">国内镜像</option>
+                </select>
+                <span class="maintenance-advanced-hint">切换后仅影响下一次下载/重试</span>
+              </div>
+              <div class="maintenance-advanced-form-row">
+                <button id="mlRuntimeRetryBtn" class="btn btn-ops" type="button" disabled>重试准备</button>
+              </div>
+              <details class="maintenance-advanced-detail">
+                <summary>高级信息</summary>
+                <span class="maintenance-advanced-hint">字符识别模型与 NVIDIA CUDA 运行时会在服务启动后后台自动准备</span>
+                <div class="ml-runtime-status" id="mlRuntimeStatus">
+                  <div class="status-muted small">等待读取运行状态</div>
+                </div>
+              </details>
+            </div>
+          </details>
+        </section>
+
+        <section class="maintenance-section maintenance-overview-actions" id="overviewActionsPanel">
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">快捷操作指引</div>
+            </div>
+          </div>
+          <div class="maintenance-overview-cards" id="overviewActionCards">
+            <button type="button" class="maintenance-overview-card" data-maintenance-jump="paths">
+              <b>待确认的移动与改名</b>
+              <span id="overviewPathsHint">仅歧义或冲突时需确认</span>
+            </button>
+            <button type="button" class="maintenance-overview-card" data-maintenance-jump="history">
+              <b>文件整理记录</b>
+              <span>查看重命名与整理历史</span>
+            </button>
+            <button type="button" class="maintenance-overview-card" data-maintenance-jump="characters">
+              <b>角色特征库</b>
+              <span>管理单角色参考特征图，提升智能识别准确率</span>
+            </button>
+          </div>
+        </section>
+        </div>
+
+        <div class="maintenance-view-panel" data-maintenance-view-panel="paths" hidden>
+        <section class="maintenance-section maintenance-actions">
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">待处理事项</div>
+              <div class="health-subtitle">仅需你确认歧义或冲突的路径</div>
+            </div>
+          </div>
+          <div class="move-summary">
+            <div class="maintenance-card action-card metric-card metric-alert"><strong id="movePendingCount">0</strong><span>需要你确认</span></div>
+            <div class="maintenance-card action-card metric-card metric-info"><strong id="moveWaitingHashCount">0</strong><span>系统处理中</span></div>
+            <div class="maintenance-card action-card metric-card metric-ok"><strong id="movePreviewCount">0</strong><span>已自动确认</span></div>
+          </div>
+        </section>
+
+        <section class="maintenance-section maintenance-workbench">
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">待判断的路径</div>
+              <div class="health-subtitle">仅展示需手动确认的歧义项</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <button id="moveAutoResolveBtn" class="btn btn-ops" type="button">一键自动确认安全项</button>
+            </div>
+          </div>
+          <div class="hash-status maintenance-command-strip">
+            <div>
+              <span class="hash-label">相同文件检查</span>
+              <span id="hashStatusText">等待检查</span>
+            </div>
+          </div>
+          <div class="move-group-list" id="moveCandidateGroupList"></div>
+          <div class="move-list" id="moveCandidateList"></div>
+        </section>
+
+        <section class="maintenance-section move-history-panel" id="moveHistoryPanel">
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">历史自动确认记录</div>
+              <div class="health-subtitle">系统此前已自动确认并迁移的路径记录</div>
+            </div>
+          </div>
+          <div class="move-history">
+            <div class="move-history-list" id="moveHistoryList"></div>
+          </div>
+        </section>
+        </div>
+
+        <div class="maintenance-view-panel" data-maintenance-view-panel="organize" hidden>
+        <div class="maintenance-tools-dock">
+        <details class="maintenance-section artist-folder-move-panel maintenance-advanced-detail" id="artistFolderMovePanel">
+          <summary>迁移画师整目录</summary>
+          <form class="artist-folder-move-form" id="artistFolderMoveForm">
+            <label class="artist-folder-move-source"><span>当前路径</span><output id="artistFolderMoveSource">选择画师</output></label>
+            <label><span>目标媒体目录</span><select id="artistFolderMoveRoot" aria-label="目标媒体目录"></select></label>
+            <label><span>目标文件夹</span><div class="artist-folder-move-destination"><input id="artistFolderMoveDestination" type="text" maxlength="500" autocomplete="off" placeholder="画师文件夹名"><button id="artistFolderMoveBrowseBtn" class="btn btn-ghost" type="button">选择目录</button></div></label>
+            <div class="artist-folder-move-actions"><button id="artistFolderMovePreviewBtn" class="btn btn-ghost" type="button">预览</button><button id="artistFolderMoveExecuteBtn" class="btn btn-danger" type="button" disabled>移动文件夹</button></div>
+          </form>
+          <div class="artist-folder-move-result" id="artistFolderMoveResult"></div>
+        </details>
+
+        <details class="maintenance-section archive-workbench-panel maintenance-advanced-detail" id="archiveWorkbenchPanel">
+          <summary>文件夹整理</summary>
+          <div class="archive-workbench-body">
+            <div class="archive-rule-editor">
+              <label class="archive-field archive-template-field"><span>Default 文件夹命名</span><input id="archiveTemplateInput" type="text" maxlength="500" autocomplete="off" placeholder="{year}/{date} {tags}"></label>
+              <label class="archive-field"><span>冲突处理</span><select id="archiveCollisionSelect" aria-label="目标冲突处理"><option value="suffix">自动编号</option><option value="merge">合并到同名目标</option><option value="reject">跳过冲突</option></select></label>
+              <div class="archive-rule-actions"><button id="archiveProfileSaveBtn" class="btn btn-primary" type="button">保存 Default</button></div>
+            </div>
+            <div class="archive-rule-status" id="archiveRuleStatus"></div>
+            <div class="archive-token-strip" aria-label="可用命名变量"><code role="button" tabindex="0" title="插入变量" data-insert-token="{year}">{year}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{date}">{date}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{tags}">{tags}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{artist}">{artist}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{title}">{title}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{folder}">{folder}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{index}">{index}</code></div>
+          </div>
+          <div class="archive-plan-head">
+            <div>
+              <div class="operation-log-title">待整理的文件夹</div>
+              <div class="archive-plan-summary" id="archivePlanSummary">选择画师后读取整理项</div>
+            </div>
+            <div class="archive-plan-actions">
+              <button id="archivePlansRefreshBtn" class="btn btn-ghost" type="button" title="重新读取子文件夹并生成预览">刷新整理项</button>
+              <button id="archivePlansPreviewBtn" class="btn btn-ghost" type="button" title="预览目标路径及冲突">预览目标</button>
+              <button id="archivePlansApplyBtn" class="btn btn-primary" type="button" title="应用 Default 规则到未锁定项">更新整理项</button>
+              <button id="archivePlansConfirmAllBtn" class="btn btn-ghost" type="button" title="一键确认所有待整理项">全部确认</button>
+              <button id="archivePlansDryRunBtn" class="btn btn-ghost" type="button" title="模拟运行，不修改磁盘">检查是否可执行</button>
+              <button id="archivePlansExecuteBtn" class="btn btn-danger" type="button" title="执行【已确认】项的改名与移动">开始整理</button>
+            </div>
+          </div>
+          <div class="archive-preview-summary" id="archivePreviewSummary"></div>
+          <div class="archive-plan-list" id="archivePlanList"></div>
+        </details>
+        </div>
+        </div>
+
+        <div class="maintenance-view-panel" data-maintenance-view-panel="characters" hidden>
+        <details class="maintenance-section character-library-panel maintenance-advanced-detail" id="characterLibraryPanel" open>
+          <summary>角色库</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">角色库</div>
+              <div class="health-subtitle">用单角色作品建库，提升识别准确率</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <button id="characterImportAllBtn" class="btn btn-ops" type="button">导入全库单角色标签</button>
+              <button id="characterImportCurrentArtistBtn" class="btn btn-ops" type="button">导入当前画师单角色标签</button>
+              <button id="characterRebuildIndexBtn" class="btn btn-ops" type="button">重新计算特征索引</button>
+            </div>
+          </div>
+          <div class="character-library-summary" id="characterLibrarySummary">角色库读取中</div>
+          <div class="character-library-toolbar">
+            <div class="character-library-search">
+              <input id="characterLibrarySearchInput" type="search" placeholder="搜索已建库角色名或可导入标签..." autocomplete="off" aria-label="搜索角色库">
+              <button id="characterLibrarySearchClearBtn" class="btn btn-ghost btn-icon" type="button" aria-label="清空搜索" title="清空搜索" hidden>✕</button>
+            </div>
+          </div>
+          <div class="character-library-grid">
+            <div class="character-library-column">
+              <div class="operation-log-title">可导入的单角色标签</div>
+              <div class="character-tag-import-list" id="characterTagImportList"></div>
+            </div>
+            <div class="character-library-column">
+              <div class="operation-log-title">已建特征库角色</div>
+              <div class="character-list" id="characterList"></div>
+            </div>
+            <div class="character-library-column">
+              <div class="operation-log-title">参考特征图</div>
+              <div class="character-reference-list" id="characterReferenceList"></div>
+            </div>
+          </div>
+        </details>
+        </div>
+
+        <div class="maintenance-view-panel" data-maintenance-view-panel="records" hidden>
+        <details class="maintenance-section recycle-bin-panel maintenance-advanced-detail" id="recycleBinPanel" open>
+          <summary>回收站（已删除作品）</summary>
+          <div class="maintenance-section-head"><div><div class="move-section-title">已删除文件列表</div><div class="health-subtitle">支持一键恢复至原位置</div></div><div class="maintenance-section-actions"><button id="recycleRefreshBtn" class="btn btn-ghost" type="button">刷新列表</button></div></div>
+          <div class="recycle-bin-summary" id="recycleBinSummary">回收站读取中</div><div class="recycle-bin-list" id="recycleBinList"></div><div class="recycle-bin-more" id="recycleBinMore"></div>
+        </details>
+
+        <details class="maintenance-section operation-log-panel maintenance-advanced-detail" id="operationHistoryPanel">
+          <summary>操作历史</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">文件移动与重命名</div>
+              <div class="health-subtitle">成功 / 失败分开显示</div>
+            </div>
+          </div>
+          <div class="operation-log-summary" id="operationLogSummary">历史读取中</div>
+          <div class="operation-log-grid">
+            <div class="operation-log-column">
+              <div class="operation-log-title">成功</div>
+              <div class="operation-history-list" id="operationSuccessList"></div>
+            </div>
+            <div class="operation-log-column">
+              <div class="operation-log-title">失败</div>
+              <div class="operation-history-list" id="operationFailureList"></div>
+            </div>
+          </div>
+        </details>
+
+        <details class="maintenance-section operation-log-panel maintenance-advanced-detail" id="operationRuntimeLogPanel">
+          <summary>运行日志</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">最近错误与异常</div>
+              <div class="health-subtitle">仅显示运行错误</div>
+            </div>
+          </div>
+          <div class="operation-log-summary" id="operationRuntimeLogSummary">日志读取中</div>
+          <div class="operation-error-list" id="operationErrorList"></div>
+        </details>
+
+        <details class="maintenance-section maintenance-guide">
+          <summary>快速指南</summary>
+          <div class="maintenance-guide-body">
+            <section class="maintenance-guide-block">
+              <h3>第一次使用</h3>
+              <div class="maintenance-guide-item">
+                <b>首次建库或一次加入很多作品</b>
+                <span>点击顶部「扫描全库」，等待完成即可。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>只新增一位画师或一个文件夹</b>
+                <span>先选画师或文件夹，再点「扫描画师」或「扫描文件夹」，无需扫描全库。</span>
+              </div>
+            </section>
+
+            <section class="maintenance-guide-block">
+              <h3>找图、看图</h3>
+              <ul class="maintenance-guide-list">
+                <li>按画师、文件夹、标签筛选，或搜索标签/文件名。</li>
+                <li>画师支持全名、拼音、部分名搜索。</li>
+                <li>图片看大图，视频即点即播，文本（.txt/.md/.html）可阅读，源文件/压缩包可下载原文件。</li>
+                <li>缩略图按需生成并缓存，再次打开更快。</li>
+              </ul>
+            </section>
+
+            <section class="maintenance-guide-block">
+              <h3>整理与标签</h3>
+              <div class="maintenance-guide-item">
+                <b>加标签</b>
+                <span>桌面端切到编辑模式，选中作品或整个文件夹后批量加标签；之后可按一或多个标签筛选。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>角色识别</b>
+                <span>角色识别依赖同一标签下积累的一定数量单角色参考图片；样本太少可能不稳定。选中图片/视频后，建议需你点击确认才成为标签。</span>
+              </div>
+            </section>
+
+            <section class="maintenance-guide-block">
+              <h3>状态与记录</h3>
+              <p class="maintenance-guide-lead">维护页集中显示运行状态、备份和最近操作：</p>
+              <div class="maintenance-guide-item">
+                <b>运行状态</b>
+                <span>查看数据库健康、扫描进度、自动备份与相同文件检查。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>操作记录</b>
+                <span>在「记录」页查看近期文件整理、路径变更与错误摘要。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>备份</b>
+                <span>点「立即备份数据库」创建快照，保存标签/路径等，不含图片与视频。</span>
+              </div>
+            </section>
+
+            <section class="maintenance-guide-block">
+              <h3>文件夹整理在做什么</h3>
+              <div class="maintenance-guide-item">
+                <b>整理目标</b>
+                <span>整理为「年 / 日期 标签」结构；已符合规则者保持不动。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>会移动哪些文件</b>
+                <span>日期与标签明确的文件夹移至规范路径；同一文件夹内不一致时，文件会按各自的有效月份和标签分开整理；未打标签的文件保留原处。尚未归入画师文件夹、但已有标签的图片和视频也会归入对应路径。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>安全与撤销</b>
+                <span>整理前自动备份数据库；歧义/冲突/检查不通过项跳过。空文件夹自动清理，但不会删除画师根目录。整理成功后自动删除对应记录，不能撤销；整理历史仅保留失败记录。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>手动整理</b>
+                <span>自动整理关闭时，在「文件整理」中选画师、刷新整理项、确认项目，再点「开始整理」；未确认者保持原位。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>自动整理</b>
+                <span>开关位于维护页右上角，默认关闭。开启后无需手动确认，也无需点击「开始整理」；只有全库扫描成功结束时，系统才会自动执行日期、标签明确且无冲突的整理项。需要马上处理所有画师时，可点击旁边的「立即整理全部」。</span>
+              </div>
+            </section>
+
+            <section class="maintenance-guide-block">
+              <h3>常见疑问</h3>
+              <div class="maintenance-guide-item">
+                <b>什么时候需要手动扫描？</b>
+                <span>新放作品、改结构或列表缺文件时再手动扫描；平时由系统约每 6 小时自动扫描。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>为什么有的文件夹没被整理？</b>
+                <span>常见：缺标签、日期无法识别、目标冲突或安全检查未通过；手动模式还可能未确认。自动整理不需确认，仍会跳过不明确或有冲突项。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>自动整理和扫描有什么区别？</b>
+                <span>扫描只更新列表和路径信息，不会改动文件；自动整理会移动并规范文件夹。开启后也只有全库扫描成功结束才执行自动整理。</span>
+              </div>
+              <div class="maintenance-guide-item">
+                <b>「找不到」是什么意思？</b>
+                <span>文件已被移走、删除，或当前路径无法对应。记录会保留 90 天用于找回路径和标签；超过 90 天且没有待判断路径时，系统会自动从数据库清理，不会删除任何磁盘文件。</span>
+              </div>
+            </section>
+          </div>
+        </details>
+        </div>
+      </div>
+    </div>
+      <div class="grid-container" id="gridContainer">
+      <div class="library-empty" id="libraryEmptyState" style="display:none">
+        <div class="library-empty-kicker" id="libraryEmptyKicker">画廊</div>
+        <h2 id="libraryEmptyTitle">画廊还是空的</h2>
+        <p id="libraryEmptyText">请点击下方「扫描全库」，系统将自动发现并整理媒体目录中的画师、文件夹与作品。</p>
+        <div class="library-empty-actions">
+          <button id="emptySelectArtistBtn" class="btn btn-primary" type="button" style="display:none">选择画师</button>
+          <button id="emptyScanBtn" class="btn btn-primary" type="button">扫描全库</button>
+          <span id="libraryEmptyMeta">扫描将在后台自动运行，顶部会实时显示扫描进度。</span>
+        </div>
+      </div>
+      <div class="grid" id="grid"></div>
+    </div>
+  </div>
+</main>
+
+<dialog class="artist-folder-picker-dialog" id="artistFolderMoveDirectoryDialog" aria-labelledby="artistFolderMoveDirectoryDialogTitle">
+  <div class="artist-links-dialog-head">
+    <h2 id="artistFolderMoveDirectoryDialogTitle">选择目标存储目录</h2>
+    <button class="btn btn-ghost btn-icon" id="artistFolderMoveDirectoryCloseBtn" type="button" aria-label="关闭目录选择" title="关闭目录选择">
+      <span class="btn-glyph" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12"></path><path d="M18 6 6 18"></path></svg></span>
+    </button>
+  </div>
+  <div class="artist-folder-picker-body">
+    <div class="artist-folder-picker-path" id="artistFolderMoveDirectoryPath"></div>
+    <div class="artist-folder-picker-actions"><button class="btn btn-ghost" id="artistFolderMoveDirectoryUpBtn" type="button">上一级</button></div>
+    <div class="artist-folder-picker-list" id="artistFolderMoveDirectoryList"></div>
+    <div class="artist-folder-picker-footer"><button class="btn btn-primary" id="artistFolderMoveDirectorySelectBtn" type="button">确定选择此目录</button></div>
+  </div>
+</dialog>
+
+<dialog class="artist-links-dialog" id="artistProfileLinksDialog" aria-labelledby="artistProfileLinksDialogTitle">
+  <div class="artist-links-dialog-head">
+    <h2 id="artistProfileLinksDialogTitle">画师社交主页与订阅平台</h2>
+    <button class="btn btn-ghost btn-icon" type="button" data-artist-links-dialog-close="artistProfileLinksDialog" aria-label="关闭社交与订阅" title="关闭社交与订阅">
+      <span class="btn-glyph" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path d="M6 6l12 12"></path>
+          <path d="M18 6 6 18"></path>
+        </svg>
+      </span>
+    </button>
+  </div>
+  <div class="artist-links-dialog-body">
+    <form class="artist-links-controls" id="artistProfileLinksForm">
+      <select id="artistProfileLinkKind" aria-label="地址类别"><option value="social">社交媒体</option><option value="subscription">赞助与订阅平台</option></select>
+      <input id="artistProfileLinkPlatform" type="text" placeholder="平台名称（如 Pixiv, Fanbox, Patreon, Twitter/X, Bilibili）" maxlength="120" autocomplete="off" aria-label="平台名称">
+      <input id="artistProfileLinkUrl" type="url" placeholder="https://" maxlength="4096" required aria-label="地址">
+      <button class="btn btn-ghost" type="submit">添加地址</button>
+    </form>
+    <div class="artist-links-status" id="artistProfileLinksStatus"></div>
+    <div class="artist-profile-links-list" id="artistProfileLinksList"></div>
+  </div>
+</dialog>
+
+<dialog class="artist-links-dialog" id="artistLinksDialog" aria-labelledby="artistLinksDialogTitle">
+  <div class="artist-links-dialog-head">
+    <h2 id="artistLinksDialogTitle">作品资源与网盘提取码</h2>
+    <button class="btn btn-ghost btn-icon" type="button" data-artist-links-dialog-close="artistLinksDialog" aria-label="关闭网盘与文本链接" title="关闭网盘与文本链接">
+      <span class="btn-glyph" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path d="M6 6l12 12"></path>
+          <path d="M18 6 6 18"></path>
+        </svg>
+      </span>
+    </button>
+  </div>
+  <div class="artist-links-dialog-body">
+    <div class="artist-links-controls">
+      <input id="artistLinksSearch" type="search" placeholder="搜索链接、提取码、服务商或来源文本..." maxlength="256">
+      <select id="artistLinksCategory" aria-label="链接分类"><option value="all">全部链接</option></select>
+      <select id="artistLinksProvider" aria-label="网盘或域名"><option value="all">全部服务</option></select>
+      <select id="artistLinksAvailability" aria-label="链接状态"><option value="all">全部状态</option><option value="unverified">未校验</option></select>
+      <button class="btn btn-ghost" id="artistLinksReindexBtn" type="button">重新提取链接</button>
+    </div>
+    <div class="artist-links-status" id="artistLinksStatus"></div>
+    <div class="artist-links-list" id="artistLinksList"></div>
+  </div>
+</dialog>
+
+<dialog class="artist-links-dialog error-artists-dialog" id="errorArtistsDialog" aria-labelledby="errorArtistsDialogTitle">
+  <div class="artist-links-dialog-head">
+    <h2 id="errorArtistsDialogTitle">出错画师</h2>
+    <button class="btn btn-ghost btn-icon" id="errorArtistsCloseBtn" type="button" aria-label="关闭出错画师" title="关闭出错画师"><span class="btn-glyph" aria-hidden="true">×</span></button>
+  </div>
+  <div class="artist-links-dialog-body">
+    <div class="artist-links-controls error-artists-controls">
+      <input id="errorArtistsSearch" type="search" placeholder="搜索画师名或 ID" maxlength="120" autocomplete="off" aria-label="搜索出错画师">
+      <select id="errorArtistsSort" aria-label="出错画师排序"><option value="recent">最近出错</option><option value="count">错误数量</option></select>
+    </div>
+    <div class="error-artists-list" id="errorArtistsList"></div>
+    <div class="move-empty small" id="errorArtistsEmpty" hidden>暂无出错画师</div>
+    <button class="btn btn-ghost" id="errorArtistsMore" type="button" hidden>加载更多</button>
+  </div>
+</dialog>
+
+<div class="lightbox" id="lightbox" style="display:none">
+  <button class="btn btn-ghost btn-icon close" type="button" aria-label="关闭预览" title="关闭预览">
+    <span class="btn-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <path d="M6 6l12 12"></path>
+        <path d="M18 6 6 18"></path>
+      </svg>
+    </span>
+  </button>
+  <a class="lightbox-download btn btn-ghost btn-icon" id="lightboxDownloadBtn" href="#" download title="下载文件" aria-label="下载文件">
+    <span class="btn-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3v10"></path>
+        <path d="M8 9l4 4 4-4"></path>
+        <path d="M5 21h14"></path>
+      </svg>
+    </span>
+  </a>
+  <button class="btn btn-ghost btn-icon lightbox-favorite" id="lightboxFavoriteBtn" type="button" title="收藏" aria-label="收藏" aria-pressed="false">
+    <span data-favorite-glyph aria-hidden="true">☆</span>
+  </button>
+  <button class="btn btn-ghost btn-icon lightbox-delete" id="lightboxDeleteBtn" type="button" title="删除文件" aria-label="删除文件">
+    <span class="btn-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 6h18"></path><path d="M8 6V4h8v2"></path>
+        <path d="M19 6l-1 14H6L5 6"></path>
+        <path d="M10 11v5"></path><path d="M14 11v5"></path>
+      </svg>
+    </span>
+    <span class="lightbox-delete-label">删除</span>
+  </button>
+  <button class="btn btn-ghost btn-icon nav prev" type="button" aria-label="上一张" title="上一张">
+    <span class="btn-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M15 18 9 12l6-6"></path>
+      </svg>
+    </span>
+  </button>
+  <div class="lightbox-stage" id="lightboxStage">
+    <img id="lightboxImg" alt="" style="display:none">
+    <video id="lightboxVideo" controls preload="metadata" playsinline webkit-playsinline style="display:none"></video>
+    <div id="lightboxFile" class="lightbox-file" style="display:none"></div>
+    <div id="lightboxText" class="lightbox-text" style="display:none"></div>
+  </div>
+  <button class="btn btn-ghost btn-icon nav next" type="button" aria-label="下一张" title="下一张">
+    <span class="btn-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 18 15 12 9 6"></path>
+      </svg>
+    </span>
+  </button>
+  <div class="lightbox-caption" id="lightboxCaption">
+    <div class="lightbox-path-wrap" id="lightboxPath"></div>
+    <div class="info-bar" id="lightboxInfo"></div>
+  </div>
+</div>
+
+<script src="/static/js/core.js?v=1.1.2"></script>
+<script src="/static/js/layout.js?v=1.1.2"></script>
+<script src="/static/js/maintenance.js?v=1.1.2"></script>
+<script src="/static/js/media.js?v=1.1.2"></script>
+<script src="/static/js/links.js?v=1.1.2"></script>
+<script src="/static/js/edit.js?v=1.1.2"></script>
+<script src="/static/js/events.js?v=1.1.2"></script>
+
+</body>
+</html>

@@ -1,0 +1,8 @@
+{
+  "defaults": {
+    "run-as": "package"
+  },
+  "username": "gallery",
+  "groupname": "gallery",
+  "join-groups": ["render", "video"]
+}

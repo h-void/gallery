@@ -305,7 +305,9 @@ def find_fnpack(explicit_binary: str | None = None) -> str:
     if resolved:
         return resolved
     path = Path(candidate)
-    if path.exists():
+    # A directory named like the CLI (e.g. the repo's fnpack/ source dir)
+    # must never resolve as the executable.
+    if path.is_file():
         return str(path.resolve())
     raise FileNotFoundError(
         "fnpack CLI was not found. Install/download the official fnpack binary "

@@ -42,16 +42,14 @@ pub fn run_housekeeping_batch(
         params![missing_item_cutoff, batch_size],
     )?;
     let scan_seen_deleted = tx.execute(
-        &format!(
-            "DELETE FROM scan_seen
+        "DELETE FROM scan_seen
              WHERE id IN (
                  SELECT ss.id
                  FROM scan_seen ss
                  WHERE ss.created_at <= ?
                  ORDER BY ss.id
                  LIMIT ?
-             )"
-        ),
+             )",
         params![scan_seen_cutoff, batch_size],
     )?;
     let scan_candidates_deleted = tx.execute(

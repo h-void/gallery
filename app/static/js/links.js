@@ -189,7 +189,7 @@ function artistLinkMarkup(link) {
   const provider = artistLinkProviderKey(link);
   const passcodes = Array.isArray(link.passcodes) ? link.passcodes.filter(Boolean) : [];
   const copyWithCode = passcodes.length
-    ? `<button class="btn btn-ghost btn-sm" type="button" data-artist-link-copy-code="${escHtml(`${link.url}\n提取码: ${passcodes[0]}`)}">复制含码</button>`
+    ? `<button class="btn btn-ghost btn-sm" type="button" data-artist-link-copy-code="${escHtml(`${link.url}\n提取码: ${passcodes[0]}`)}">复制链接和提取码</button>`
     : '';
   const sourceCount = Number(link.source_count || (link.sources || []).length || 0);
   const sources = (link.sources || []).map(artistLinkSourceMarkup).join('');
@@ -242,8 +242,8 @@ function renderArtistLinks() {
   const counts = data.summary || {};
   updateArtistLinkFilters(links);
   if (state.artistLinksLoading) {
-    summary.textContent = '读取中...';
-    status.textContent = '正在读取画师说明文件与提取网盘链接...';
+    summary.textContent = '读取中';
+    status.textContent = '正在读取画师说明文件与提取网盘链接';
     list.innerHTML = '';
     return;
   }
@@ -400,7 +400,7 @@ async function loadArtistProfileLinks(artistId = state.currentArtist?.id, artist
 }
 
 function artistProfileLinkKindLabel(kind) {
-  return kind === 'subscription' ? '订阅支持' : '社交媒体';
+  return kind === 'subscription' ? '赞助订阅' : '社交媒体';
 }
 
 function artistProfileLinkRowMarkup(link) {
@@ -483,8 +483,8 @@ function renderArtistProfileLinks() {
   const links = Array.isArray(data.links) ? data.links : [];
   const counts = data.summary || {};
   if (state.artistProfileLinksLoading) {
-    summary.textContent = '读取中...';
-    status.textContent = '正在读取社交主页与订阅链接...';
+    summary.textContent = '读取中';
+    status.textContent = '正在读取社交主页与订阅链接';
     list.innerHTML = '';
     return;
   }

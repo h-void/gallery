@@ -32,9 +32,12 @@ impl Upstream {
             return Err(anyhow!("empty upstream URL"));
         }
         // No default response-body timeout: media streams can run longer than 120s.
+        // Redirects stay disabled: a compromised upstream must not be able to
+        // turn the proxy into an SSRF springboard toward internal addresses.
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .pool_max_idle_per_host(8)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("build upstream client")?;
         Ok(Self { base, client })

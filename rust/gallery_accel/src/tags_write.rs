@@ -14,17 +14,28 @@ pub fn create_tag(conn: &Connection, artist_id: i64, name: &str) -> Result<Value
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("begin tag creation")?;
-    let artist_exists = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM artists WHERE id = ?1)",
-            [artist_id],
-            |row| row.get::<_, bool>(0),
-        )
-        .context("check tag artist")?;
-    if !artist_exists {
-        return Err(anyhow!("artist not found"));
+    let row = create_tag_in_tx(&tx, artist_id, name)?;
+    tx.commit().context("commit tag creation")?;
+    Ok(row)
+}
+
+/// Tag creation core without its own BEGIN/COMMIT so the multi-artist batch
+/// can call it inside one shared transaction. Safe standalone too: with no
+/// open transaction each statement autocommits.
+fn create_tag_in_tx(conn: &Connection, artist_id: i64, name: &str) -> Result<Value> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("tag name must not be empty"));
     }
-    let max_order: i64 = tx
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM artists WHERE id = ?1)",
+        [artist_id],
+        |row| row.get::<_, bool>(0),
+    )
+    .context("check tag artist")?
+    .then_some(())
+    .ok_or_else(|| anyhow!("artist not found"))?;
+    let max_order: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(sort_order), 0) FROM tags WHERE artist_id = ?1",
             rusqlite::params![artist_id],
@@ -33,27 +44,24 @@ pub fn create_tag(conn: &Connection, artist_id: i64, name: &str) -> Result<Value
         .context("find next tag sort order")?;
     let new_order = max_order + 1;
 
-    tx.execute(
+    conn.execute(
         "INSERT OR IGNORE INTO tags (artist_id, name, sort_order) VALUES (?1, ?2, ?3)",
         rusqlite::params![artist_id, name, new_order],
     )
     .context("insert tag")?;
 
     // Fetch the inserted or existing row.
-    let row = tx
-        .query_row(
-            "SELECT id, name, sort_order FROM tags WHERE artist_id = ?1 AND name = ?2",
-            rusqlite::params![artist_id, name],
-            |row| {
-                let id: i64 = row.get(0)?;
-                let n: String = row.get(1)?;
-                let sort_order: i64 = row.get(2)?;
-                Ok(json!({"id": id, "name": n, "sort_order": sort_order}))
-            },
-        )
-        .context("fetch tag after insert")?;
-    tx.commit().context("commit tag creation")?;
-    Ok(row)
+    conn.query_row(
+        "SELECT id, name, sort_order FROM tags WHERE artist_id = ?1 AND name = ?2",
+        rusqlite::params![artist_id, name],
+        |row| {
+            let id: i64 = row.get(0)?;
+            let n: String = row.get(1)?;
+            let sort_order: i64 = row.get(2)?;
+            Ok(json!({"id": id, "name": n, "sort_order": sort_order}))
+        },
+    )
+    .context("fetch tag after insert")
 }
 
 /// Update a tag's name and/or sort_order.  Returns `None` when the tag does
@@ -166,7 +174,10 @@ pub fn delete_tag(conn: &Connection, artist_id: i64, tag_id: i64) -> Result<Opti
 /// Apply tags by name across items that may belong to multiple artists.
 /// Mirrors Python `update_item_tags_by_name_detailed`: groups by artist_id,
 /// creates missing tags for set/add, resolves existing tags for remove, then
-/// reuses `update_item_tags_response` per artist.
+/// applies the tag change per artist.
+///
+/// The whole batch runs in ONE transaction: a failure part-way rolls back
+/// every artist instead of leaving a half-applied batch.
 pub fn update_item_tags_by_name_response(
     conn: &Connection,
     item_ids: &[i64],
@@ -194,13 +205,15 @@ pub fn update_item_tags_by_name_response(
     let mut propagated = 0i64;
     let mut changed_item_ids = BTreeSet::new();
 
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .context("begin batch tag update")?;
     for (artist_id, ids) in by_artist.iter() {
         let tag_ids = if names.is_empty() {
             Vec::new()
         } else if matches!(mode, "set" | "add") {
             let mut ids_for_artist = Vec::with_capacity(names.len());
             for name in &names {
-                let created = create_tag(conn, *artist_id, name)?;
+                let created = create_tag_in_tx(&tx, *artist_id, name)?;
                 let tag_id = created
                     .get("id")
                     .and_then(|v| v.as_i64())
@@ -209,10 +222,10 @@ pub fn update_item_tags_by_name_response(
             }
             ids_for_artist
         } else {
-            tag_ids_for_names(conn, *artist_id, &names)?
+            tag_ids_for_names(&tx, *artist_id, &names)?
         };
 
-        let result = update_item_tags_response(conn, *artist_id, ids, &tag_ids, mode)?;
+        let result = update_item_tags_in_tx(&tx, ids, &tag_ids, mode)?;
         updated += result.get("updated").and_then(|v| v.as_i64()).unwrap_or(0);
         propagated += result
             .get("propagated")
@@ -226,6 +239,7 @@ pub fn update_item_tags_by_name_response(
             }
         }
     }
+    tx.commit().context("commit batch tag update")?;
 
     Ok(json!({
         "updated": updated,
@@ -260,7 +274,22 @@ pub fn update_item_tags_response(
 
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("begin item tag update")?;
-    let before_by_item = item_tag_sets(&tx, &ids)?;
+    let result = update_item_tags_in_tx(&tx, &ids, &valid_tags, mode)?;
+    tx.commit().context("commit item tag update")?;
+    Ok(result)
+}
+
+/// Tag-change core shared by the single-artist and batch-by-name paths.
+///
+/// Runs inside the caller's transaction (no BEGIN/COMMIT here) so a
+/// multi-artist batch can stay atomic.
+fn update_item_tags_in_tx(
+    tx: &Transaction,
+    ids: &[i64],
+    valid_tags: &[i64],
+    mode: &str,
+) -> Result<Value> {
+    let before_by_item = item_tag_sets(tx, ids)?;
 
     if mode == "set" {
         let placeholders = placeholders(ids.len());
@@ -275,8 +304,8 @@ pub fn update_item_tags_response(
         let mut insert = tx
             .prepare("INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?1, ?2)")
             .context("prepare item tag insert")?;
-        for item_id in &ids {
-            for tag_id in &valid_tags {
+        for item_id in ids {
+            for tag_id in valid_tags {
                 insert
                     .execute(rusqlite::params![item_id, tag_id])
                     .context("insert item tag")?;
@@ -285,8 +314,8 @@ pub fn update_item_tags_response(
     } else if mode == "remove" && !valid_tags.is_empty() {
         let item_placeholders = placeholders(ids.len());
         let tag_placeholders = placeholders(valid_tags.len());
-        let mut params = ids.clone();
-        params.extend_from_slice(&valid_tags);
+        let mut params = ids.to_vec();
+        params.extend_from_slice(valid_tags);
         tx.execute(
             &format!(
                 "DELETE FROM item_tags WHERE item_id IN ({item_placeholders}) AND tag_id IN ({tag_placeholders})"
@@ -296,7 +325,7 @@ pub fn update_item_tags_response(
         .context("remove item tags")?;
     }
 
-    let after_by_item = item_tag_sets(&tx, &ids)?;
+    let after_by_item = item_tag_sets(tx, ids)?;
     let mut changed_item_ids: BTreeSet<i64> = ids
         .iter()
         .copied()
@@ -305,12 +334,11 @@ pub fn update_item_tags_response(
 
     let mut propagated = 0usize;
     if matches!(mode, "set" | "add") && !valid_tags.is_empty() {
-        let propagation = propagate_hash_tags_for_items(&tx, &ids)?;
+        let propagation = propagate_hash_tags_for_items(tx, ids)?;
         propagated = propagation.0;
         changed_item_ids.extend(propagation.1);
     }
 
-    tx.commit().context("commit item tag update")?;
     Ok(json!({
         "updated": ids.len(),
         "propagated": propagated,
@@ -405,10 +433,7 @@ fn tag_ids_for_names(conn: &Connection, artist_id: i64, names: &[String]) -> Res
 }
 
 fn placeholders(len: usize) -> String {
-    std::iter::repeat("?")
-        .take(len)
-        .collect::<Vec<_>>()
-        .join(",")
+    std::iter::repeat_n("?", len).collect::<Vec<_>>().join(",")
 }
 
 fn valid_item_ids(conn: &Connection, artist_id: i64, item_ids: &[i64]) -> Result<Vec<i64>> {

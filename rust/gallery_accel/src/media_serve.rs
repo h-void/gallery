@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
@@ -25,11 +26,56 @@ use crate::recycle::{capture_item_snapshot, ensure_recycle_schema};
 
 const TEXT_PREVIEW_MAX_BYTES: u64 = 512 * 1024;
 const TRANSCODE_MARKER_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+/// Single-frame extraction is a seek + one decode; anything longer means the
+/// input is broken and the request should fail bounded instead of hanging.
+const VIDEO_FRAME_EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 const VIDEO_FRAME_CACHE_VERSION: u32 = 1;
 const DEFAULT_VIDEO_FRAME_CACHE_MAX_BYTES: u64 = 2_000_000_000;
 const DEFAULT_VIDEO_TRANSCODE_CACHE_MAX_BYTES: u64 = 900_000_000;
 const VIDEO_FRAME_CACHE_CLEANUP_INTERVAL: u64 = 300;
 static VIDEO_FRAME_CACHE_LAST_CLEANUP: AtomicU64 = AtomicU64::new(0);
+
+fn ffmpeg_gate() -> &'static (StdMutex<usize>, Condvar) {
+    static GATE: OnceLock<(StdMutex<usize>, Condvar)> = OnceLock::new();
+    GATE.get_or_init(|| (StdMutex::new(0), Condvar::new()))
+}
+
+fn ffmpeg_max_concurrency() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("FFMPEG_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2)
+    })
+}
+
+/// Bounds concurrent ffmpeg child processes across every spawn site. Requests
+/// queue for a free slot instead of being rejected, so a burst of uncached
+/// videos cannot fan out into unbounded transcode/frame processes.
+struct FfmpegSlotGuard;
+
+impl FfmpegSlotGuard {
+    fn acquire_blocking() -> Self {
+        let (lock, condvar) = ffmpeg_gate();
+        let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= ffmpeg_max_concurrency() {
+            active = condvar.wait(active).unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+        FfmpegSlotGuard
+    }
+}
+
+impl Drop for FfmpegSlotGuard {
+    fn drop(&mut self) {
+        let (lock, condvar) = ffmpeg_gate();
+        let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *active -= 1;
+        condvar.notify_one();
+    }
+}
 
 fn normalize_slashes(path: &str) -> String {
     path.replace('\\', "/")
@@ -131,6 +177,48 @@ pub fn resolve_allowed_path(path: &str, roots: &MediaRoots) -> Result<PathBuf> {
     Err(anyhow!("file not found or not allowed"))
 }
 
+/// Content types the browser may render inline. Media directories are
+/// user-writable, so only whitelisted image/video/audio extensions keep a
+/// renderable type; everything else (HTML family, SVG, XML, unknown binaries)
+/// is served as `application/octet-stream` with `Content-Disposition:
+/// attachment`, so a planted `.html`/`.svg` can never execute script in this
+/// app's origin.
+fn inline_media_headers(full: &Path) -> (String, Option<String>) {
+    const INLINE_AUDIO: &[&str] = &["mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac"];
+    let name = full
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let category = media_type_for_file(&name);
+    if category == Some("image")
+        || category == Some("video")
+        || INLINE_AUDIO.contains(&ext.as_str())
+    {
+        let mime = mime_guess::from_path(full)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string();
+        (mime, None)
+    } else {
+        ("application/octet-stream".to_string(), Some(name))
+    }
+}
+
+fn attachment_disposition(name: &str) -> String {
+    let fallback: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '(' | ')' | ' ') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("attachment; filename=\"{fallback}\"")
+}
+
 pub async fn serve_file_response(
     path: &str,
     roots: &MediaRoots,
@@ -142,10 +230,7 @@ pub async fn serve_file_response(
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, json!({"error": e.to_string()})))?;
     let len = meta.len();
-    let mime = mime_guess::from_path(&full)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string();
+    let (mime, disposition) = inline_media_headers(&full);
 
     if let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
         if let Some((start, end)) = parse_bytes_range(range, len) {
@@ -156,27 +241,31 @@ pub async fn serve_file_response(
             let limited = file.take(take);
             let stream = ReaderStream::new(limited);
             let body = Body::from_stream(stream);
-            return Response::builder()
+            let mut builder = Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, mime)
+                .header(header::CONTENT_TYPE, &mime)
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
-                .header(header::CONTENT_LENGTH, take)
-                .body(body)
-                .map_err(internal);
+                .header(header::CONTENT_LENGTH, take);
+            if let Some(name) = &disposition {
+                builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
+            }
+            return builder.body(body).map_err(internal);
         }
     }
 
     let file = File::open(&full).await.map_err(internal)?;
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_TYPE, &mime)
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_LENGTH, len)
-        .body(body)
-        .map_err(internal)
+        .header(header::CONTENT_LENGTH, len);
+    if let Some(name) = &disposition {
+        builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
+    }
+    builder.body(body).map_err(internal)
 }
 
 fn parse_bytes_range(header: &str, len: u64) -> Option<(u64, u64)> {
@@ -196,9 +285,12 @@ fn parse_bytes_range(header: &str, len: u64) -> Option<(u64, u64)> {
 }
 
 fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, Value) {
+    // Details (including server paths) stay in the process log; the response
+    // body is generic so absolute paths never leak to clients.
+    eprintln!("media request failed: {e}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        json!({"error": e.to_string()}),
+        json!({"error": "internal server error"}),
     )
 }
 
@@ -981,6 +1073,9 @@ pub async fn video_frame_jpeg(
     if let Some(bytes) = cached {
         return Ok(bytes);
     }
+    let _ffmpeg_slot = tokio::task::spawn_blocking(FfmpegSlotGuard::acquire_blocking)
+        .await
+        .map_err(|error| internal(error.to_string()))?;
     let mut child = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -1000,6 +1095,9 @@ pub async fn video_frame_jpeg(
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        // A dropped future (client disconnect) or timeout must not leak a
+        // running child process.
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| {
             (
@@ -1007,21 +1105,38 @@ pub async fn video_frame_jpeg(
                 json!({"error": format!("ffmpeg unavailable: {e}")}),
             )
         })?;
-    let mut stdout = child.stdout.take().ok_or_else(|| {
+    let stdout = child.stdout.take().ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"error": "ffmpeg stdout missing"}),
         )
     })?;
-    let mut buf = Vec::new();
-    stdout.read_to_end(&mut buf).await.map_err(internal)?;
-    let status = child.wait().await.map_err(internal)?;
+    let outcome = tokio::time::timeout(VIDEO_FRAME_EXTRACT_TIMEOUT, async move {
+        let mut stdout = stdout;
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).await?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((buf, status))
+    })
+    .await;
+    let (buf, status) = match outcome {
+        Ok(result) => result.map_err(internal)?,
+        Err(_) => {
+            // The inner future was dropped with the child inside; kill_on_drop
+            // already reaped it. Report a bounded failure instead of hanging.
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                json!({"error": "ffmpeg frame extraction timed out"}),
+            ));
+        }
+    };
     if !status.success() || buf.is_empty() {
         return Err((
             StatusCode::BAD_GATEWAY,
             json!({"error": "ffmpeg failed to extract frame"}),
         ));
     }
+    let mut buf = buf;
     if let Some(cache) = cache_path {
         buf = tokio::task::spawn_blocking(move || {
             write_video_frame_cache(&cache, &buf);
@@ -1129,9 +1244,25 @@ fn cleanup_video_frame_cache(
         .into_iter()
         .filter_map(Result::ok)
     {
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("jpg")
-        {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let extension = entry.path().extension().and_then(|ext| ext.to_str());
+        if extension == Some("part") {
+            // Reclaim crash leftovers from interrupted writes.
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .map(|age| age >= Duration::from_secs(300))
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            continue;
+        }
+        if extension != Some("jpg") {
             continue;
         }
         let metadata = entry.metadata()?;
@@ -1347,26 +1478,28 @@ fn finish_video_transcode(
 }
 
 /// Report whether HLS playlist exists for this source path.
+///
+/// Responses never include server-absolute paths; clients address the playlist
+/// through its cache `key` via the segment/playlist routes.
 pub fn video_transcode_status(path: &str, roots: &MediaRoots) -> Value {
     match transcode_paths(path, roots) {
         Ok((key, playlist, _)) if playlist.is_file() => json!({
             "status": "ready",
             "ready": true,
             "key": key,
-            "playlist": playlist.display().to_string(),
             "path": path,
         }),
-        Ok((key, playlist, marker)) => {
+        Ok((key, _playlist, marker)) => {
             if marker.is_file() && marker_is_fresh(&marker) {
-                json!({"status": "processing", "ready": false, "key": key, "playlist": playlist.display().to_string(), "path": path})
+                json!({"status": "processing", "ready": false, "key": key, "path": path})
             } else {
                 let _ = std::fs::remove_file(&marker);
                 match std::fs::read_to_string(transcode_error_marker(&marker)) {
                     Ok(message) => {
-                        json!({"status": "error", "ready": false, "key": key, "playlist": playlist.display().to_string(), "path": path, "message": message})
+                        json!({"status": "error", "ready": false, "key": key, "path": path, "message": message})
                     }
                     Err(_) => {
-                        json!({"status": "pending", "ready": false, "key": key, "playlist": playlist.display().to_string(), "path": path, "message": "transcode_pending_or_not_started"})
+                        json!({"status": "pending", "ready": false, "key": key, "path": path, "message": "transcode_pending_or_not_started"})
                     }
                 }
             }
@@ -1399,16 +1532,15 @@ pub fn start_video_transcode(path: &str, roots: &MediaRoots) -> Result<Value> {
             "ok": true,
             "status": "ready",
             "ready": true,
-            "key": key,
-            "playlist": playlist.display().to_string()
+            "key": key
         }));
     }
     let _ = std::fs::remove_file(transcode_error_marker(&marker));
     if !claim_transcode_marker(&marker)? {
-        return Ok(
-            json!({"ok": true, "key": key, "playlist": playlist.display().to_string(), "status": "processing", "ready": false}),
-        );
+        return Ok(json!({"ok": true, "key": key, "status": "processing", "ready": false}));
     }
+    // Hold the ffmpeg slot from spawn until the waiter thread reaps the child.
+    let ffmpeg_slot = FfmpegSlotGuard::acquire_blocking();
     let spawned = std::process::Command::new("ffmpeg")
         .args([
             "-y",
@@ -1432,6 +1564,7 @@ pub fn start_video_transcode(path: &str, roots: &MediaRoots) -> Result<Value> {
     let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
+            drop(ffmpeg_slot);
             let _ = std::fs::remove_file(&marker);
             return Err(error.into());
         }
@@ -1439,13 +1572,16 @@ pub fn start_video_transcode(path: &str, roots: &MediaRoots) -> Result<Value> {
     let waiter_marker = marker.clone();
     let waiter_playlist = playlist.clone();
     std::thread::spawn(move || {
-        finish_video_transcode(child.wait(), &waiter_playlist, &waiter_marker);
+        // Keep the slot until the transcode finishes, not just until this
+        // function returns.
+        let _slot = ffmpeg_slot;
+        let status = child.wait();
+        finish_video_transcode(status, &waiter_playlist, &waiter_marker);
     });
     // ponytail: stale markers permit a duplicate only if a broken ffmpeg process outlives one hour; add PID tracking if observed.
     Ok(json!({
         "ok": true,
         "key": key,
-        "playlist": playlist.display().to_string(),
         "status": "started",
         "ready": false
     }))
@@ -1530,10 +1666,7 @@ pub async fn serve_transcoded_hls_segment(
         return Err((StatusCode::NOT_FOUND, json!({"error": "segment not found"})));
     }
     let len = tokio::fs::metadata(&full).await.map_err(internal)?.len();
-    let mime = mime_guess::from_path(&full)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string();
+    let (mime, disposition) = inline_media_headers(&full);
     if let Some(range) = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
@@ -1543,22 +1676,30 @@ pub async fn serve_transcoded_hls_segment(
             let mut file = File::open(&full).await.map_err(internal)?;
             file.seek(SeekFrom::Start(start)).await.map_err(internal)?;
             let take = end - start + 1;
-            return Response::builder()
+            let mut builder = Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, mime)
+                .header(header::CONTENT_TYPE, &mime)
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
-                .header(header::CONTENT_LENGTH, take)
+                .header(header::CONTENT_LENGTH, take);
+            if let Some(name) = &disposition {
+                builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
+            }
+            return builder
                 .body(Body::from_stream(ReaderStream::new(file.take(take))))
                 .map_err(internal);
         }
     }
     let file = File::open(&full).await.map_err(internal)?;
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_TYPE, &mime)
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_LENGTH, len)
+        .header(header::CONTENT_LENGTH, len);
+    if let Some(name) = &disposition {
+        builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
+    }
+    builder
         .body(Body::from_stream(ReaderStream::new(file)))
         .map_err(internal)
 }

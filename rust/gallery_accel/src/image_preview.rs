@@ -1,7 +1,7 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use image::DynamicImage;
@@ -149,39 +149,99 @@ fn exif_orientation(path: &Path) -> u8 {
 /// Minimal dependency-free reader for the EXIF `Orientation` tag (0x0112) of a
 /// JPEG file. Returns 1 when no orientation is present or parsing fails, which
 /// matches the "normal" orientation.
+///
+/// Only a bounded prefix of the file is read: EXIF lives in segments before
+/// the JPEG scan data, so megabyte-scale sources never need a full read.
 fn read_jpeg_exif_orientation(path: &Path) -> Option<u8> {
-    let data = std::fs::read(path).ok()?;
-    if data.len() < 4 || &data[0..2] != &[0xFF, 0xD8] {
-        return None;
+    let file_len = std::fs::metadata(path).ok()?.len();
+    let mut data = read_file_prefix(path, EXIF_HEAD_INITIAL_BYTES)?;
+    loop {
+        match scan_jpeg_exif_orientation(&data) {
+            ExifScan::Value(value) => return Some(value),
+            ExifScan::Missing => return None,
+            ExifScan::Truncated => {
+                if data.len() as u64 >= file_len || data.len() >= EXIF_HEAD_MAX_BYTES {
+                    return None;
+                }
+                let next = (data.len() * 4).clamp(EXIF_HEAD_INITIAL_BYTES, EXIF_HEAD_MAX_BYTES);
+                data = read_file_prefix(path, next)?;
+            }
+        }
+    }
+}
+
+const EXIF_HEAD_INITIAL_BYTES: usize = 64 * 1024;
+const EXIF_HEAD_MAX_BYTES: usize = 1024 * 1024;
+
+fn read_file_prefix(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; max_bytes];
+    let mut filled = 0usize;
+    while filled < max_bytes {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return None,
+        }
+    }
+    buf.truncate(filled);
+    Some(buf)
+}
+
+enum ExifScan {
+    Value(u8),
+    Missing,
+    Truncated,
+}
+
+fn scan_jpeg_exif_orientation(data: &[u8]) -> ExifScan {
+    if data.len() < 4 || data[0..2] != [0xFF, 0xD8] {
+        return ExifScan::Missing;
     }
     let mut pos = 2usize;
     while pos + 4 <= data.len() {
         if data[pos] != 0xFF {
-            return None;
+            return ExifScan::Missing;
         }
         let marker = data[pos + 1];
         let seg_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
-        let segment_end = pos.checked_add(2)?.checked_add(seg_len)?;
-        if seg_len < 2 || segment_end > data.len() {
-            return None;
+        let segment_end = match pos
+            .checked_add(2)
+            .and_then(|value| value.checked_add(seg_len))
+        {
+            Some(end) => end,
+            None => return ExifScan::Missing,
+        };
+        if seg_len < 2 {
+            return ExifScan::Missing;
         }
         if marker == 0xDA {
-            return None;
+            return ExifScan::Missing;
+        }
+        if segment_end > data.len() {
+            return ExifScan::Truncated;
         }
         if marker == 0xE1 {
             let exif_start = pos + 4;
-            let exif_end = exif_start.checked_add(6)?;
+            let exif_end = match exif_start.checked_add(6) {
+                Some(end) => end,
+                None => return ExifScan::Missing,
+            };
             if exif_end > segment_end {
-                return None;
+                return ExifScan::Missing;
             }
             if data[exif_start..exif_end].iter().eq(b"Exif\0\0".iter()) {
-                return parse_tiff_orientation(&data[exif_start + 6..]);
+                return match parse_tiff_orientation(&data[exif_start + 6..]) {
+                    Some(value) => ExifScan::Value(value),
+                    None => ExifScan::Missing,
+                };
             }
-            return None;
+            return ExifScan::Missing;
         }
         pos = segment_end;
     }
-    None
+    ExifScan::Truncated
 }
 
 fn parse_tiff_orientation(tiff: &[u8]) -> Option<u8> {
@@ -430,15 +490,33 @@ fn cleanup_preview_cache(
 ) -> std::io::Result<usize> {
     let mut total = 0u64;
     let mut entries = Vec::new();
+    let now = SystemTime::now();
     for entry in walkdir::WalkDir::new(root)
         .max_depth(3)
         .follow_links(false)
         .into_iter()
         .filter_map(|entry| entry.ok())
     {
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("jpg")
-        {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let extension = entry.path().extension().and_then(|ext| ext.to_str());
+        if extension == Some("part") {
+            // Crash leftovers from interrupted `*.jpg.part` writes never
+            // become cache entries; reclaim them once clearly stale.
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|modified| now.duration_since(modified).ok())
+                .map(|age| age >= Duration::from_secs(300))
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            continue;
+        }
+        if extension != Some("jpg") {
             continue;
         }
         let metadata = entry.metadata()?;

@@ -51,6 +51,44 @@ def _normalize(path: str | Path) -> str:
     return str(path).replace("\\", "/").removeprefix("./")
 
 
+# The private tree ships Rust unit tests (src/tests.rs, src/test_support.rs,
+# src/tests/) that are stripped from the public snapshot. Their `mod`
+# declarations must be stripped too, or the public tree fails `cargo test`.
+_TEST_MOD_FILES = {
+    "rust/gallery_accel/src/lib.rs",
+    "rust/gallery_accel/src/main.rs",
+}
+
+
+def strip_test_mod_declarations(relative: str, text: str) -> str:
+    """Remove test-module declarations (and their cfg attribute lines)."""
+    if relative not in _TEST_MOD_FILES:
+        return text
+    kept: list[str] = []
+    pending_cfg = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped == "#[cfg(test)]":
+            # Attribute may belong to something else; remember and re-emit
+            # unless the next meaningful line declares a test module.
+            pending_cfg = True
+            kept.append(line)
+            continue
+        is_test_mod = (
+            stripped.startswith("mod tests;")
+            or stripped.startswith("mod test_support;")
+            or stripped.startswith("pub(crate) mod test_support;")
+        )
+        if is_test_mod:
+            if pending_cfg:
+                kept.pop()
+            pending_cfg = False
+            continue
+        kept.append(line)
+        pending_cfg = False
+    return "".join(kept)
+
+
 def is_public_file(path: str | Path) -> bool:
     """Return whether a tracked path belongs in the public source snapshot."""
     path = _normalize(path)
@@ -109,7 +147,17 @@ def stage_public_release(output: Path, tracked_files: Iterable[str | Path] | Non
             raise FileNotFoundError(f"tracked public file is missing: {source}")
         destination = output.joinpath(*relative.split("/"))
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+        if relative in _TEST_MOD_FILES:
+            # Strip the declarations of the removed test modules so the
+            # public tree compiles (and `cargo test` passes) out of the box.
+            text = source.read_text(encoding="utf-8")
+            destination.write_text(
+                strip_test_mod_declarations(relative, text),
+                encoding="utf-8",
+                newline="",
+            )
+        else:
+            shutil.copy2(source, destination)
     return selected
 
 

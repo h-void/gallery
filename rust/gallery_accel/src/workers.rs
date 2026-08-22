@@ -36,11 +36,28 @@ fn now() -> f64 {
 }
 
 fn interval_env(name: &str) -> Option<Duration> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
+    match std::env::var(name) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            match trimmed.parse::<u64>() {
+                // `0` and an empty value mean "disabled"; anything else that
+                // fails to parse is a misconfiguration worth surfacing (e.g.
+                // "60s" would otherwise silently disable the loop).
+                Ok(_) if trimmed.is_empty() => None,
+                Ok(seconds) if seconds > 0 => Some(Duration::from_secs(seconds)),
+                Ok(_) => None,
+                Err(_) => {
+                    if !trimmed.is_empty() {
+                        eprintln!(
+                            "workers: ignoring invalid {name}={value:?}; expected seconds, loop disabled"
+                        );
+                    }
+                    None
+                }
+            }
+        }
+        Err(_) => None,
+    }
 }
 
 fn enabled_env(name: &str) -> bool {
@@ -58,6 +75,13 @@ fn run_backup(pool: &Arc<DbPool>) -> Result<Value> {
     let conn = pool.get()?;
     let backup = create_db_backup(&conn)?;
     Ok(json!({"ok": true, "backup": backup}))
+}
+
+struct ScanSlotGuard(Arc<ScanControl>);
+impl Drop for ScanSlotGuard {
+    fn drop(&mut self) {
+        self.0.set_running(false);
+    }
 }
 
 pub fn spawn_configured_workers(
@@ -134,6 +158,7 @@ fn spawn_scan_loop(
                 let roots = roots.clone();
                 let scan = scan.clone();
                 tokio::task::spawn_blocking(move || -> Result<Value> {
+                    let _slot = ScanSlotGuard(scan.clone());
                     let conn = pool.get()?;
                     run_full_library_scan(&conn, &roots, &scan)
                 })
@@ -178,12 +203,6 @@ fn spawn_hash_loop(
                 let roots = roots.clone();
                 let scan = scan.clone();
                 tokio::task::spawn_blocking(move || -> Result<Value> {
-                    struct ScanSlotGuard(Arc<ScanControl>);
-                    impl Drop for ScanSlotGuard {
-                        fn drop(&mut self) {
-                            self.0.set_running(false);
-                        }
-                    }
                     let _slot = ScanSlotGuard(scan);
                     let conn = pool.get()?;
                     run_hash_batch_with_roots(&conn, &roots, batch_size)

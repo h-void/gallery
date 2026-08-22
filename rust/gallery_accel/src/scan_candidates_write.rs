@@ -171,11 +171,47 @@ fn candidate_file_is_current_path(path: &Path, candidate: &MoveTargetCandidate) 
     };
     let hash_matches = candidate.hash_status != "done"
         || (!candidate.content_hash.is_empty()
-            && hash_file(&path, 1024 * 1024).is_ok_and(|digest| digest == candidate.content_hash));
+            && hash_file(path, 1024 * 1024).is_ok_and(|digest| digest == candidate.content_hash));
     if metadata_matches && identity_matches && hash_matches {
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Stat-only identity check for use INSIDE a write transaction.
+///
+/// The full content hash runs outside the lock (`candidate_file_is_current`);
+/// inside BEGIN IMMEDIATE we only confirm size/mtime/dev/ino are unchanged,
+/// which shrinks the write-lock hold time from seconds-long hashes to stat
+/// calls. This narrows the TOCTOU window; it is not an atomic file snapshot.
+fn candidate_stat_is_current(roots: Option<&MediaRoots>, candidate: &MoveTargetCandidate) -> bool {
+    let path = match roots {
+        Some(roots) => authorized_media_path(roots, &candidate.file_path),
+        None => Ok(Path::new(&candidate.file_path).to_path_buf()),
+    };
+    let Ok(path) = path else {
+        return false;
+    };
+    let Some(metadata) = std::fs::metadata(path).ok().filter(|m| m.is_file()) else {
+        return false;
+    };
+    let file_size = metadata.len() as i64;
+    let file_mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
+    if candidate.file_size != file_size || (candidate.file_mtime - file_mtime).abs() >= 1.0 {
+        return false;
+    }
+    let identity = metadata_identity(&metadata);
+    match ((candidate.st_dev, candidate.st_ino), identity) {
+        ((Some(expected_dev), Some(expected_ino)), Some(actual)) => {
+            (expected_dev, expected_ino) == actual
+        }
+        _ => true,
+    }
 }
 
 fn supersede_candidate(
@@ -183,54 +219,69 @@ fn supersede_candidate(
     roots: Option<&MediaRoots>,
     candidate: &MoveTargetCandidate,
 ) -> Result<()> {
-    // A rescan may already have replaced this row with fresh evidence. Do not
-    // supersede that new work merely because the caller still holds an old row.
-    if !candidate_row_is_unchanged(conn, candidate)? {
-        return Ok(());
-    }
-    let path = match roots {
-        Some(roots) => authorized_media_path(roots, &candidate.file_path),
-        None => Ok(Path::new(&candidate.file_path).to_path_buf()),
-    };
-    match path.ok().and_then(|path| std::fs::metadata(path).ok()) {
-        Some(metadata) if metadata.is_file() => {
-            // The file was replaced: keep the row eligible for a fresh hash of
-            // the new content once a rescan requeues it.
-            let file_size = metadata.len() as i64;
-            let file_mtime = metadata
-                .modified()
-                .ok()
-                .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_secs_f64())
-                .unwrap_or(0.0);
-            let (st_dev, st_ino) = metadata_identity(&metadata)
-                .map(|value| (Some(value.0), Some(value.1)))
-                .unwrap_or((candidate.st_dev, candidate.st_ino));
-            conn.execute(
-                "UPDATE scan_candidates
-                 SET file_size=?, file_mtime=?, content_hash='', hash_status='pending',
-                     st_dev=?, st_ino=?, status='superseded',
-                     resolved_at=strftime('%s','now')
-                 WHERE id=? AND status IN ('pending','candidate')",
-                params![file_size, file_mtime, st_dev, st_ino, candidate.id],
-            )?;
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .context("begin scan-candidate supersede")?;
+    let result = (|| -> Result<()> {
+        // Guard and UPDATE share one write transaction: a concurrent rescan
+        // rewriting this row must flip the guard before it can be clobbered.
+        if !candidate_row_is_unchanged(conn, candidate)? {
+            return Ok(());
         }
-        _ => {
-            conn.execute(
-                "UPDATE scan_candidates
-                 SET content_hash='', hash_status='error', status='superseded',
-                     resolved_at=strftime('%s','now')
-                 WHERE id=? AND status IN ('pending','candidate')",
-                params![candidate.id],
-            )?;
+        let path = match roots {
+            Some(roots) => authorized_media_path(roots, &candidate.file_path),
+            None => Ok(Path::new(&candidate.file_path).to_path_buf()),
+        };
+        match path.ok().and_then(|path| std::fs::metadata(path).ok()) {
+            Some(metadata) if metadata.is_file() => {
+                // The file was replaced: keep the row eligible for a fresh hash of
+                // the new content once a rescan requeues it.
+                let file_size = metadata.len() as i64;
+                let file_mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs_f64())
+                    .unwrap_or(0.0);
+                let (st_dev, st_ino) = metadata_identity(&metadata)
+                    .map(|value| (Some(value.0), Some(value.1)))
+                    .unwrap_or((candidate.st_dev, candidate.st_ino));
+                conn.execute(
+                    "UPDATE scan_candidates
+                     SET file_size=?, file_mtime=?, content_hash='', hash_status='pending',
+                         st_dev=?, st_ino=?, status='superseded',
+                         resolved_at=strftime('%s','now')
+                     WHERE id=? AND status IN ('pending','candidate')",
+                    params![file_size, file_mtime, st_dev, st_ino, candidate.id],
+                )?;
+            }
+            _ => {
+                conn.execute(
+                    "UPDATE scan_candidates
+                     SET content_hash='', hash_status='error', status='superseded',
+                         resolved_at=strftime('%s','now')
+                     WHERE id=? AND status IN ('pending','candidate')",
+                    params![candidate.id],
+                )?;
+            }
+        }
+        conn.execute(
+            "UPDATE move_candidates SET status='superseded', resolved_at=strftime('%s','now')
+             WHERE scan_candidate_id=? AND status='pending'",
+            params![candidate.id],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")
+                .context("commit scan-candidate supersede")?;
+            Ok(())
+        }
+        Err(error) => {
+            rollback(conn);
+            Err(error)
         }
     }
-    conn.execute(
-        "UPDATE move_candidates SET status='superseded', resolved_at=strftime('%s','now')
-         WHERE scan_candidate_id=? AND status='pending'",
-        params![candidate.id],
-    )?;
-    Ok(())
 }
 
 fn candidate_row_is_unchanged(conn: &Connection, candidate: &MoveTargetCandidate) -> Result<bool> {
@@ -407,6 +458,13 @@ fn resolve_existing_scan_candidate_response_inner(
     conn.execute_batch("BEGIN IMMEDIATE")
         .context("begin same-path scan-candidate resolution")?;
     let result = (|| -> Result<Option<i64>> {
+        // Revalidate inside the write lock like the sibling paths: metadata
+        // collected outside the transaction may already be stale.
+        if !candidate_row_is_unchanged(conn, &candidate)?
+            || !candidate_stat_is_current(roots, &candidate)
+        {
+            bail!("candidate_stale");
+        }
         let item_id = conn
             .query_row(
                 "SELECT id FROM items WHERE file_path = ?1 LIMIT 1",
@@ -452,6 +510,11 @@ fn resolve_existing_scan_candidate_response_inner(
         }
         Ok(None) => {
             rollback(conn);
+            Ok(json!({"action": "no_match"}))
+        }
+        Err(error) if error.to_string() == "candidate_stale" => {
+            rollback(conn);
+            supersede_candidate(conn, roots, &candidate)?;
             Ok(json!({"action": "no_match"}))
         }
         Err(error) => {
@@ -561,7 +624,7 @@ fn apply_hash_unique_scan_candidate_response_inner(
         .context("begin hash-unique move")?;
     let result = (|| -> Result<Option<String>> {
         if !candidate_row_is_unchanged(conn, &candidate)?
-            || !candidate_file_is_current(roots, &candidate)?
+            || !candidate_stat_is_current(roots, &candidate)
         {
             bail!("candidate_stale");
         }
@@ -724,7 +787,7 @@ fn create_new_item_response_inner(
         .context("begin scan-candidate create-new-item")?;
     let result = (|| -> Result<Option<i64>> {
         if !candidate_row_is_unchanged(conn, &candidate)?
-            || !candidate_file_is_current(roots, &candidate)?
+            || !candidate_stat_is_current(roots, &candidate)
         {
             bail!("candidate_stale");
         }
@@ -1067,8 +1130,11 @@ fn create_scan_move_candidate(
 }
 
 fn waiting_for_hash(conn: &Connection, candidate_id: i64, reason: &str) -> Result<Value> {
+    // Status guard: a concurrent resolver may have just moved this row to
+    // resolved/new; never flip such rows back to pending.
     conn.execute(
-        "UPDATE scan_candidates SET status='pending', resolved_at=NULL WHERE id=?1",
+        "UPDATE scan_candidates SET status='pending', resolved_at=NULL
+         WHERE id=?1 AND status IN ('pending','candidate')",
         params![candidate_id],
     )?;
     Ok(json!({"action": "waiting_hash", "reason": reason}))
@@ -1229,7 +1295,7 @@ fn apply_scan_candidate_move_response_inner(
         .context("begin scan-candidate move")?;
     let result = (|| -> Result<Option<String>> {
         if !candidate_row_is_unchanged(conn, &candidate)?
-            || !candidate_file_is_current(roots, &candidate)?
+            || !candidate_stat_is_current(roots, &candidate)
         {
             bail!("candidate_stale");
         }
@@ -1409,6 +1475,10 @@ fn path_file_name(path: &str) -> &str {
 /// applied. Cross-artist moves are declined (`no_match`) so Python can run the
 /// tag-migration path. Returns `{"action":"moved",...}` on success or
 /// `{"action":"no_match"}` for Python fallback.
+///
+/// Successful apply outcome: (item_id, reason, old_path, new_path, tag_count).
+type AppliedMoveOutcome = (i64, String, String, String, i64);
+
 pub fn apply_move_candidate_response(conn: &Connection, move_candidate_id: i64) -> Result<Value> {
     apply_move_candidate_response_inner(conn, move_candidate_id, None)
 }
@@ -1494,9 +1564,9 @@ fn apply_move_candidate_response_inner_with_roots(
 
     conn.execute_batch("BEGIN IMMEDIATE")
         .context("begin move-candidate apply")?;
-    let result = (|| -> Result<Option<(i64, String, String, String, i64)>> {
+    let result = (|| -> Result<Option<AppliedMoveOutcome>> {
         if !candidate_row_is_unchanged(conn, &candidate)?
-            || !candidate_file_is_current(roots, &candidate)?
+            || !candidate_stat_is_current(roots, &candidate)
         {
             bail!("candidate_stale");
         }
@@ -1693,7 +1763,7 @@ fn apply_move_candidate_response_inner_with_roots(
         // SQLite now prevents candidate-row changes; repeat the filesystem
         // check immediately before the durable path update.
         if !candidate_row_is_unchanged(conn, &candidate)?
-            || !candidate_file_is_current(roots, &candidate)?
+            || !candidate_stat_is_current(roots, &candidate)
         {
             bail!("candidate_stale");
         }

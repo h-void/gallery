@@ -278,8 +278,33 @@ fn nvidia_gpu_nodes_at(dev_dir: &Path) -> (bool, bool) {
     (has_ctl && has_gpu_node, has_uvm)
 }
 
+/// WSL2 (including Docker Desktop containers) exposes NVIDIA GPUs through
+/// `/dev/dxg` plus a driver-injected `libcuda` instead of the native
+/// `/dev/nvidiactl` and `/dev/nvidia[0-9]+` character nodes.
+fn injected_libcuda_present() -> bool {
+    for path in [
+        "/usr/lib/wsl/lib/libcuda.so.1",
+        "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+        "/usr/lib64/libcuda.so.1",
+    ] {
+        if Path::new(path).exists() {
+            return true;
+        }
+    }
+    false
+}
+
+fn nvidia_gpu_state_with(dev_dir: &Path, libcuda: bool) -> (bool, bool) {
+    let (nodes, uvm) = nvidia_gpu_nodes_at(dev_dir);
+    (nodes || (libcuda && dev_dir.join("dxg").exists()), uvm)
+}
+
+fn nvidia_gpu_state_at(dev_dir: &Path) -> (bool, bool) {
+    nvidia_gpu_state_with(dev_dir, injected_libcuda_present())
+}
+
 fn has_nvidia_gpu() -> bool {
-    nvidia_gpu_nodes_at(Path::new("/dev")).0
+    nvidia_gpu_state_at(Path::new("/dev")).0
 }
 
 /// Intel detection reads the DRM PCI vendor from `/sys/class/drm/card*/device/vendor`
@@ -808,6 +833,14 @@ fn prepare_model(shared: &std::sync::Arc<Shared>, source: &str, progress: Progre
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let _ = std::fs::create_dir_all(&parent);
+    if let Err(error) = ensure_disk_space(&parent, CCIP_MODEL_SIZE) {
+        let mut s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.model.end_epoch = Some(now_epoch());
+        s.model.state = ArtifactState::Error;
+        s.model.last_error = Some(error.to_string());
+        shared.condvar.notify_all();
+        return;
+    }
     let url = ccip_model_url(source);
     let mut last_err = None;
     let mut published = false;
@@ -890,6 +923,14 @@ fn prepare_cuda(shared: &std::sync::Arc<Shared>, source: &str, progress: Progres
     }
     let ort = ort_dir();
     let _ = std::fs::create_dir_all(&ort);
+    if let Err(error) = ensure_disk_space(&ort, CUDA_WHEEL_SIZE) {
+        let mut s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.cuda.end_epoch = Some(now_epoch());
+        s.cuda.state = ArtifactState::Error;
+        s.cuda.last_error = Some(error.to_string());
+        shared.condvar.notify_all();
+        return;
+    }
     let url = cuda_wheel_url(source);
     let mut last_err = None;
     let mut published = false;
@@ -1002,10 +1043,101 @@ fn spawn_worker(source: String, db_path: Option<PathBuf>) -> Result<()> {
                 .as_deref()
                 .map(|path| persisted_download_source_at(path, source.clone()))
                 .unwrap_or(source);
-            worker_loop(source);
+            // Panic isolation: without this, any panic in the download /
+            // extraction paths would silently kill the thread with
+            // WORKER_RUNNING still set, making every retry report busy and
+            // the first inference wait forever. A panicked worker recovers
+            // exactly like a failed-to-start one.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_loop(source);
+            }));
+            if result.is_err() {
+                eprintln!("gallery-accel: runtime preparation worker panicked; marking failed");
+                mark_worker_start_failed("runtime preparation worker panicked");
+            }
         })
         .map(|_| ())
         .context("spawn runtime preparation worker")
+}
+
+/// Delete staging leftovers (`*.part` files, `.tmp`/`.old.*` directories and
+/// files) from interrupted downloads or publishes. Anything modified within
+/// the threshold is assumed to belong to a live download and is kept.
+fn sweep_stale_staging(dir: &Path) {
+    const STAGING_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_staging =
+            name.ends_with(".part") || name.ends_with(".tmp") || name.contains(".old.");
+        if !is_staging {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .map(|age| age >= STAGING_STALE_AFTER)
+            .unwrap_or(false);
+        if !stale {
+            continue;
+        }
+        let path = entry.path();
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(error) = result {
+            eprintln!(
+                "runtime prep: failed to remove stale staging {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Available bytes on the filesystem holding `dir` (POSIX `df -Pk`), used as
+/// an ENOSPC precheck before large downloads. `None` when the probe is
+/// unavailable (e.g. non-Linux development hosts) and the precheck stays
+/// advisory.
+fn available_disk_bytes(dir: &Path) -> Option<u64> {
+    let output = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().last()?;
+    let mut fields = line.split_whitespace();
+    fields.next()?; // device
+    fields.next()?; // total
+    fields.next()?; // used
+    let available_kb: u64 = fields.next()?.parse().ok()?;
+    Some(available_kb.saturating_mul(1024))
+}
+
+/// Refuse to start a large download when the target volume cannot hold the
+/// artifact plus headroom; ENOSPC mid-download would otherwise threaten the
+/// gallery database on the same volume.
+fn ensure_disk_space(dir: &Path, expected_bytes: u64) -> Result<()> {
+    const MIN_SLACK_BYTES: u64 = 256 * 1024 * 1024;
+    match available_disk_bytes(dir) {
+        Some(free) if free < expected_bytes.saturating_add(MIN_SLACK_BYTES) => bail!(
+            "insufficient disk space for {} MiB download (plus headroom): only {} MiB available at {}",
+            expected_bytes / (1024 * 1024),
+            free / (1024 * 1024),
+            dir.display()
+        ),
+        _ => Ok(()),
+    }
 }
 
 fn start_preparation(source: String, db_path: Option<PathBuf>) -> bool {
@@ -1039,6 +1171,14 @@ fn worker_loop(source: String) {
         s.download_source = source.clone();
         shared.condvar.notify_all();
     }
+
+    sweep_stale_staging(
+        &character_model_path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    );
+    sweep_stale_staging(&ort_dir());
 
     let model_progress = ProgressSink {
         shared: shared.clone(),
@@ -1210,7 +1350,7 @@ pub fn ml_runtime_status(conn: &rusqlite::Connection) -> Value {
     let shared = shared();
     let s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
     let gpus = detect_gpus();
-    let (nvidia, uvm) = nvidia_gpu_nodes_at(Path::new("/dev"));
+    let (nvidia, uvm) = nvidia_gpu_state_at(Path::new("/dev"));
     let model_path = character_model_path();
     let provider = requested_provider();
     let model_present = model_path.is_file();
@@ -1721,6 +1861,24 @@ mod tests {
         symlink("/dev/null", dir.path().join("nvidia0")).unwrap();
         let (detected, uvm) = nvidia_gpu_nodes_at(dir.path());
         assert!(detected);
+        assert!(!uvm);
+    }
+
+    #[test]
+    fn wsl_dxg_with_libcuda_counts_as_nvidia() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!nvidia_gpu_state_with(dir.path(), true).0);
+        std::fs::File::create(dir.path().join("dxg")).unwrap();
+        assert!(nvidia_gpu_state_with(dir.path(), true).0);
+        assert!(!nvidia_gpu_state_with(dir.path(), false).0);
+    }
+
+    #[test]
+    fn wsl_dxg_detection_keeps_uvm_flag_false() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(dir.path().join("dxg")).unwrap();
+        let (nvidia, uvm) = nvidia_gpu_state_with(dir.path(), true);
+        assert!(nvidia);
         assert!(!uvm);
     }
 

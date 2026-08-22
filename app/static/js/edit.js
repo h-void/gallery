@@ -141,7 +141,7 @@ async function deleteSelectedMediaItems() {
       failed_count: failedItemIds.length,
     });
     if (failedItemIds.length) {
-      toast(`已移到回收站 ${deletedItemIds.length} 项，${failedItemIds.length} 项处理失败`, 'error');
+      toast(`已移入回收站 ${deletedItemIds.length} 项，${failedItemIds.length} 项处理失败`, 'error');
     } else {
       toast(`已成功将 ${deletedItemIds.length} 项移入回收站`, 'success');
     }
@@ -299,7 +299,7 @@ async function applyItemDateBatch(manualDate) {
       item_ids: ids,
       error: message,
     });
-    toast('设置日期失败: ' + message, 'error');
+    toast('设置日期失败：' + message, 'error');
     return {failed: true, error: message};
   } finally {
     setActionBusy('edit-date-batch', '', false);
@@ -467,10 +467,6 @@ function characterSuggestionCandidateSelection() {
   };
 }
 
-function characterSuggestionCandidates() {
-  return characterSuggestionCandidateSelection().items;
-}
-
 function characterSuggestionPageKey() {
   const selection = characterSuggestionCandidateSelection();
   return [
@@ -513,7 +509,7 @@ function characterSuggestionSampleText() {
 function characterSuggestionStatusText() {
   const sampleText = characterSuggestionSampleText();
   if (state.mode !== 'edit') return '未识别';
-  if (state.characterSuggestionLoading) return sampleText ? `正在识别${UI_FIELD_SEPARATOR}${sampleText}` : '正在识别...';
+  if (state.characterSuggestionLoading) return sampleText ? `正在识别${UI_FIELD_SEPARATOR}${sampleText}` : '正在识别';
   if (state.characterSuggestionStatus === 'unavailable') return '角色识别不可用';
   if (state.characterSuggestionStatus === 'empty') return '无可识别媒体';
   if (state.characterSuggestionStatus === 'none') return sampleText ? `暂无建议${UI_FIELD_SEPARATOR}${sampleText}` : '暂无建议';
@@ -849,7 +845,7 @@ function resetArtistSuggestions() {
 
 function artistSuggestionStatusText() {
   if (state.mode !== 'edit') return '未检查';
-  if (state.artistSuggestionLoading) return '正在匹配...';
+  if (state.artistSuggestionLoading) return '正在匹配';
   if (state.selectedIds.size !== 1) return '需选择单个作品';
   if (state.artistSuggestionStatus === 'unavailable') return '归属建议不可用';
   if (state.artistSuggestionStatus === 'none') return '暂无建议';
@@ -1052,6 +1048,7 @@ async function ensureEditTagContext() {
   state.editContextArtistId = artistIds.length === 1 ? artistIds[0] : null;
   if (!artistIds.length) {
     editTagContextLoadToken++;
+    editTagContextInFlight = null;
     state.editTagContextLoading = false;
     state.editContextKey = '';
     renderEditTagPicker();
@@ -1061,37 +1058,53 @@ async function ensureEditTagContext() {
     state.currentArtist &&
     artistIds.length === 1 &&
     artistIds[0] === Number(state.currentArtist.id) &&
-    state.editContextKey === contextKey &&
-    (state.tags || []).length
+    state.editContextKey === contextKey
   ) {
+    // A zero-tag artist caches an empty list too: without this early return
+    // every updateEditBar (each pointermove during drag-select) would re-hit
+    // /api/tags.
     state.editTagContextLoading = false;
     pruneSelectedEditTags();
     renderEditTagPicker();
     return;
   }
 
+  // Reuse one in-flight load per context key instead of firing duplicate
+  // concurrent requests.
+  if (editTagContextInFlight && editTagContextInFlight.contextKey === contextKey) {
+    await editTagContextInFlight.promise;
+    return;
+  }
+
   const token = ++editTagContextLoadToken;
   state.editTagContextLoading = true;
   renderEditTagPicker();
-  try {
-    const groups = await Promise.all(
-      artistIds.map(id => API.get(`/api/tags?artist_id=${id}`).catch(() => []))
-    );
-    if (token !== editTagContextLoadToken) return;
-    state.tags = mergeTagsByName(groups);
-    state.editContextKey = contextKey;
-    pruneSelectedEditTags();
-    logUiAction('edit_tag_context_loaded', {
-      artist_ids: artistIds,
-      tag_count: state.tags.length,
-      selected_count: state.selectedIds.size,
-    });
-  } finally {
-    if (token === editTagContextLoadToken) {
-      state.editTagContextLoading = false;
-      renderEditTagPicker();
+  const promise = (async () => {
+    try {
+      const groups = await Promise.all(
+        artistIds.map(id => API.get(`/api/tags?artist_id=${id}`).catch(() => []))
+      );
+      if (token !== editTagContextLoadToken) return;
+      state.tags = mergeTagsByName(groups);
+      state.editContextKey = contextKey;
+      pruneSelectedEditTags();
+      logUiAction('edit_tag_context_loaded', {
+        artist_ids: artistIds,
+        tag_count: state.tags.length,
+        selected_count: state.selectedIds.size,
+      });
+    } finally {
+      if (editTagContextInFlight && editTagContextInFlight.token === token) {
+        editTagContextInFlight = null;
+      }
+      if (token === editTagContextLoadToken) {
+        state.editTagContextLoading = false;
+        renderEditTagPicker();
+      }
     }
-  }
+  })();
+  editTagContextInFlight = {contextKey, token, promise};
+  await promise;
 }
 
 function pruneSelectedEditTags() {
@@ -1123,24 +1136,6 @@ function selectedItemExistingEditTagKeys() {
     });
   });
   return keys;
-}
-
-function selectedEditTagRecords() {
-  const selectedTagIds = new Set([...state.selectedEditTagIds].map(numericTagId).filter(id => id != null));
-  const records = [];
-  const seen = new Set();
-  [state.tags || [], state.editGlobalTagResults || []].flat().forEach(tag => {
-    if (!tag) return;
-    if (tag.tag_records && !Array.isArray(tag.tag_records)) return;
-    tagRecordsForTag(tag).forEach(record => {
-      if (!selectedTagIds.has(record.tag_id)) return;
-      const key = `${record.artist_id}:${record.tag_id}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      records.push(record);
-    });
-  });
-  return records;
 }
 
 function renderEditTagPicker() {
@@ -1343,9 +1338,15 @@ async function createOrSelectEditTag(name = '') {
   const busyId = tagName.toLowerCase();
   if (isActionBusy('edit-create-tag', busyId)) return null;
   setActionBusy('edit-create-tag', busyId, true);
+  // Both awaits below must not clobber a different artist's tag list when
+  // the user switches artists mid-request (selectArtist refreshes tags).
+  const artistLoadSeqAtStart = Number(state.artistLoadSeq || 0);
+  const artistChanged = () => Number(state.artistLoadSeq || 0) !== artistLoadSeqAtStart;
   try {
     const created = await API.post(`/api/tags?artist_id=${artistId}&name=${encodeURIComponent(tagName)}`);
-    state.tags = await API.get(`/api/tags?artist_id=${artistId}`);
+    if (artistChanged()) return null;
+    const refreshedTags = await API.get(`/api/tags?artist_id=${artistId}`);
+    if (!artistChanged()) state.tags = refreshedTags;
     if (created && created.id) selectEditTag(Number(created.id), created.name || tagName);
     setSelectedEditTagName(tagName, true);
     clearEditTagQuery();
@@ -1410,7 +1411,7 @@ function characterSuggestionCoverageWarning(itemIds, tagNames) {
   if (!suggestion) return '';
   const hitIds = new Set((suggestion.item_ids || []).map(Number));
   const hitCount = selectedItemIds.filter(id => hitIds.has(Number(id))).length;
-  return `角色建议命中 ${hitCount}/${selectedItemIds.length} 项，仍会应用到全部 ${selectedItemIds.length} 项；是否继续？`;
+  return `角色建议命中 ${hitCount}/${selectedItemIds.length} 项，标签仍会应用到全部 ${selectedItemIds.length} 项；是否继续？`;
 }
 
 async function classifyItems(ids, tagIds, mode='add') {
@@ -1496,7 +1497,7 @@ async function classifyItems(ids, tagIds, mode='add') {
       tag_names: tagNames,
       error: message,
     });
-    toast((mode === 'remove' ? '移除标签失败: ' : '添加标签失败: ') + message, 'error');
+    toast((mode === 'remove' ? '移除标签失败：' : '添加标签失败：') + message, 'error');
     return {failed: true, error: message};
   } finally {
     setActionBusy('edit-classify-items', '', false);
@@ -1576,7 +1577,7 @@ async function classifyFolder(folder, tagIds, mode='add') {
       folder,
       error: e.message,
     });
-    toast('更新文件夹标签失败: ' + e.message, 'error');
+    toast('更新文件夹标签失败：' + e.message, 'error');
   } finally {
     setActionBusy('edit-classify-folder', folder, false);
   }
@@ -1630,7 +1631,7 @@ async function removeSelectedTagsFromItems() {
       tag_names: tagNames,
       error: e.message,
     });
-    toast('移除标签失败: ' + e.message, 'error');
+    toast('移除标签失败：' + e.message, 'error');
   } finally {
     setActionBusy('edit-remove-tags', '', false);
   }

@@ -26,10 +26,10 @@ fn list_characters(conn: &Connection, search: Option<&str>) -> Result<Vec<Charac
             "
             SELECT id, name, created_at
             FROM characters
-            WHERE name LIKE ?
+            WHERE name LIKE ? ESCAPE '\\'
             ",
         )?;
-        let pattern = format!("%{search}%");
+        let pattern = format!("%{}%", crate::product_ui::escape_like(search));
         let rows = stmt
             .query_map([pattern], character_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;

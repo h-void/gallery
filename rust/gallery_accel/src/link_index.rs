@@ -1018,10 +1018,9 @@ fn html_attribute(attributes: &str, wanted: &str) -> Option<String> {
                     index += 1;
                 }
             } else {
-                while index < bytes.len()
-                    && !bytes[index].is_ascii_whitespace()
-                    && bytes[index] != b'/'
-                {
+                // Unquoted attribute values may contain `/` per the HTML spec
+                // (e.g. href=https://x.com/a); only whitespace terminates.
+                while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
                     index += 1;
                 }
                 value = Some(&attributes[value_start..index]);

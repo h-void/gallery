@@ -1,21 +1,84 @@
 name: gallery
 
+x-gallery-base: &gallery-base
+  build:
+    context: .
+    # Last Dockerfile stage; docker-compose.test.yml builds the same target
+    # and must stay GPU-free.
+    target: runtime
+  image: crpi-hwq9kgccbg8v0l26.cn-hangzhou.personal.cr.aliyuncs.com/hczhr/gallery:stable
+  restart: unless-stopped
+  ports:
+    - "${GALLERY_PORT:-8899}:8899"
+  read_only: true
+  tmpfs:
+    - /tmp:size=512m,mode=1777
+  volumes:
+    # 改成你的真实媒体目录（Windows 用 /d/Pictures 这种形式，或 C:\ 绝对路径）
+    - "${GALLERY_MEDIA_DIR:-./media}:/media:ro"
+    - gallery-storage:/gallery
+  environment:
+    PICTURES_ROOT_LABELS: "${GALLERY_MEDIA_LABEL:-media}"
+    # Runtime tuning. Compose values are usable as-is or can be overridden
+    # from the host environment/.env without changing the image.
+    CHARACTER_RECOGNITION_ENABLED: "${CHARACTER_RECOGNITION_ENABLED:-1}"
+    CHARACTER_RECOGNITION_PROVIDER: "${CHARACTER_RECOGNITION_PROVIDER:-auto}"
+    CHARACTER_OPENVINO_DEVICE: "${CHARACTER_OPENVINO_DEVICE:-GPU}"
+    CHARACTER_ALLOW_CPU_FALLBACK: "${CHARACTER_ALLOW_CPU_FALLBACK:-1}"
+    CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK: "${CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK:-1}"
+    ONNXRUNTIME_AUTO_DOWNLOAD: "${ONNXRUNTIME_AUTO_DOWNLOAD:-1}"
+    ONNXRUNTIME_AUTO_DOWNLOAD_DIR: "${ONNXRUNTIME_AUTO_DOWNLOAD_DIR:-/gallery/models/ort}"
+    OPENVINO_RUNTIME_AUTO_DOWNLOAD: "${OPENVINO_RUNTIME_AUTO_DOWNLOAD:-1}"
+    CHARACTER_CUDA_RUNTIME_DIR: "${CHARACTER_CUDA_RUNTIME_DIR:-/gallery/models/ort/cuda-1.24.1}"
+    CHARACTER_IMPORT_IDLE_ENABLED: "${CHARACTER_IMPORT_IDLE_ENABLED:-0}"
+    SCAN_ON_START: "${SCAN_ON_START:-0}"
+    SCAN_INTERVAL: "${SCAN_INTERVAL:-21600}"
+    HASH_INTERVAL: "${HASH_INTERVAL:-30}"
+    HASH_BATCH_SIZE: "${HASH_BATCH_SIZE:-500}"
+    DB_BACKUP_INTERVAL: "${DB_BACKUP_INTERVAL:-43200}"
+    DB_BACKUP_RETENTION: "${DB_BACKUP_RETENTION:-8}"
+    DB_BACKUP_ON_START: "${DB_BACKUP_ON_START:-0}"
+    DB_BACKUP_START_DELAY: "${DB_BACKUP_START_DELAY:-120}"
+
 services:
   gallery:
-    build: .
-    image: crpi-hwq9kgccbg8v0l26.cn-hangzhou.personal.cr.aliyuncs.com/hczhr/gallery:stable
-    restart: unless-stopped
-    ports:
-      - "${GALLERY_PORT:-8899}:8899"
-    read_only: true
-    tmpfs:
-      - /tmp:size=512m,mode=1777
-    volumes:
-      # 改成你的真实媒体目录（Windows 用 /d/Pictures 这种形式，或 C:\ 绝对路径）
-      - "${GALLERY_MEDIA_DIR:-./media}:/media:ro"
-      - gallery-storage:/gallery
-    environment:
-      PICTURES_ROOT_LABELS: "${GALLERY_MEDIA_LABEL:-media}"
+    <<: *gallery-base
+
+  # Intel GPU 需要明确指定此服务，避免与默认 gallery 服务抢端口。
+  # docker compose --profile gpu up -d --build gallery-gpu
+  # /dev/dri 的设备节点按 Linux 宿主机的 render/video 组授权。
+  # GID 是组编号，不是 GPU 编号；不同发行版可能不同。检查：
+  # stat -c '%n gid=%g' /dev/dri/renderD128 /dev/dri/card0
+  # 再用 GALLERY_RENDER_GID/GALLERY_VIDEO_GID 覆盖下面的默认值。
+  gallery-gpu:
+    <<: *gallery-base
+    profiles: [gpu]
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      # 常见 Debian 值；必须按宿主机 /dev/dri 的实际 GID 覆盖
+      - ${GALLERY_RENDER_GID:-109}
+      - ${GALLERY_VIDEO_GID:-44}
+
+  # NVIDIA CUDA profile. Requires NVIDIA Container Toolkit on the host.
+  # The application keeps fnOS selection order: CUDA -> OpenVINO -> CPU.
+  # The runtime-cuda target additionally bundles the CUDA 12.x / cuDNN 9.x
+  # user-mode libraries the onnxruntime-gpu provider dlopens at session init.
+  # docker compose --profile cuda up -d --build gallery-cuda
+  gallery-cuda:
+    <<: *gallery-base
+    profiles: [cuda]
+    build:
+      context: .
+      target: runtime-cuda
+    image: crpi-hwq9kgccbg8v0l26.cn-hangzhou.personal.cr.aliyuncs.com/hczhr/gallery:stable-cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
 volumes:
   gallery-storage:

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -23,7 +24,25 @@ pub struct DbConfig {
 pub struct DbPool {
     db_path: PathBuf,
     config: DbConfig,
-    conns: Mutex<Vec<Connection>>,
+    conns: Mutex<PoolState>,
+    available: Condvar,
+}
+
+#[derive(Debug)]
+struct PoolState {
+    idle: Vec<Connection>,
+    /// Total live connections (idle + checked out). Never exceeds
+    /// `config.pool_size`, so a request burst cannot grow the pool without
+    /// bound and re-run WAL PRAGMAs per open.
+    live: usize,
+}
+
+fn pool_acquire_timeout() -> Duration {
+    env::var("DB_POOL_ACQUIRE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(10))
 }
 
 pub struct PooledConn {
@@ -52,7 +71,7 @@ impl DbPool {
     }
 
     pub fn with_config(db_path: PathBuf, config: DbConfig) -> Result<Self> {
-        let size = config.pool_size.max(1).min(MAX_POOL_SIZE);
+        let size = config.pool_size.clamp(1, MAX_POOL_SIZE);
         let fresh_database = !db_path.is_file()
             || std::fs::metadata(&db_path)
                 .map(|metadata| metadata.len() == 0)
@@ -82,7 +101,11 @@ impl DbPool {
                 read_only: config.read_only,
                 pool_size: size,
             },
-            conns: Mutex::new(conns),
+            conns: Mutex::new(PoolState {
+                idle: conns,
+                live: size,
+            }),
+            available: Condvar::new(),
         })
     }
 
@@ -91,19 +114,46 @@ impl DbPool {
     }
 
     pub fn get(self: &Arc<Self>) -> Result<PooledConn> {
-        let conn = self
-            .conns
-            .lock()
-            .map_err(|_| anyhow!("db pool mutex poisoned"))?
-            .pop();
-        let conn = match conn {
-            Some(conn) => conn,
-            None => open_db(&self.db_path, self.config.read_only)?,
-        };
-        Ok(PooledConn {
-            pool: Arc::clone(self),
-            conn: Some(conn),
-        })
+        let deadline = Instant::now() + pool_acquire_timeout();
+        let mut state = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(conn) = state.idle.pop() {
+                return Ok(PooledConn {
+                    pool: Arc::clone(self),
+                    conn: Some(conn),
+                });
+            }
+            // Pool fully checked out: wait for a return instead of opening an
+            // unbounded extra connection (each writable open re-runs WAL
+            // PRAGMAs and competes with the scanner for locks).
+            if state.live >= self.config.pool_size {
+                let now = Instant::now();
+                if now >= deadline {
+                    anyhow::bail!(
+                        "database connection pool busy: {} live connections",
+                        state.live
+                    );
+                }
+                let (next, wait) = self
+                    .available
+                    .wait_timeout(state, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner());
+                state = next;
+                if wait.timed_out() && state.idle.is_empty() {
+                    anyhow::bail!(
+                        "database connection pool busy: {} live connections",
+                        state.live
+                    );
+                }
+                continue;
+            }
+            let conn = open_db(&self.db_path, self.config.read_only)?;
+            state.live += 1;
+            return Ok(PooledConn {
+                pool: Arc::clone(self),
+                conn: Some(conn),
+            });
+        }
     }
 }
 impl std::ops::Deref for PooledConn {
@@ -117,12 +167,16 @@ impl std::ops::Deref for PooledConn {
 impl Drop for PooledConn {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            if let Ok(mut conns) = self.pool.conns.lock() {
-                // Do not grow the pool unbounded beyond configured size.
-                if conns.len() < self.pool.config.pool_size {
-                    conns.push(conn);
+            if let Ok(mut state) = self.pool.conns.lock() {
+                // Do not grow the idle list beyond configured size; a surplus
+                // connection is closed instead (and stops counting as live).
+                if state.idle.len() < self.pool.config.pool_size {
+                    state.idle.push(conn);
+                } else {
+                    state.live = state.live.saturating_sub(1);
                 }
             }
+            self.pool.available.notify_one();
         }
     }
 }
@@ -376,6 +430,9 @@ fn ensure_product_schema(conn: &Connection, create_indexes: bool) -> Result<()> 
     .context("initialize product schema")?;
     ensure_character_reference_columns(conn)?;
     ensure_item_date_columns(conn)?;
+    // Folder-archive schema (including its repair UPDATE) belongs to writable
+    // startup so list endpoints never perform DDL/DML on read paths.
+    crate::folder_archive::ensure_folder_schema(conn)?;
     if create_indexes {
         conn.execute_batch(
             r#"
@@ -596,7 +653,7 @@ fn cleanup_legacy_missing_archive_plans(conn: &Connection) -> Result<()> {
             && bytes[5..7].iter().all(u8::is_ascii_digit);
         let year_month_day =
             bytes.len() >= 11 && bytes[10] == b'-' && bytes[8..10].iter().all(u8::is_ascii_digit);
-        let legacy_format = year_month && (year_month_day || bytes[8] != b' ');
+        let legacy_format = year_month && (year_month_day || bytes.get(8) != Some(&b' '));
         let source_missing = serde_json::from_str::<Value>(&raw_log)
             .ok()
             .and_then(|value| value.as_array().and_then(|rows| rows.last()).cloned())
@@ -669,9 +726,14 @@ fn has_virtual_paths(conn: &Connection, roots: &MediaRoots) -> Result<bool> {
             let hit: i64 = conn
                 .query_row(
                     &format!(
-                        "SELECT COUNT(1) FROM {table} WHERE {column}=? OR {column} LIKE ? LIMIT 1"
+                        // Exact-prefix match: LIKE is case-insensitive and
+                        // treats `_` as a wildcard, so a root like
+                        // /volume1/my_pictures would also match sibling dirs.
+                        "SELECT COUNT(1) FROM {table}
+                         WHERE {column}=? OR substr({column}, 1, length(?) + 1) = ? || '/'
+                         LIMIT 1"
                     ),
-                    rusqlite::params![&root_n, format!("{root_n}/%")],
+                    rusqlite::params![&root_n, &root_n, &root_n],
                     |r| r.get(0),
                 )
                 .with_context(|| format!("count virtual paths in {table}.{column}"))?;
@@ -946,12 +1008,12 @@ fn read_artist_suggestion_merge_rows(
     ))?;
     let rows = stmt
         .query_map(rusqlite::params![source_id], |row| {
-            let mut index = 5usize;
             let mut dino_score = None;
             let mut wd14_score = None;
             let mut fused_score = None;
             let mut matched_ref_id = None;
-            for name in &optional {
+            for (offset, name) in optional.iter().enumerate() {
+                let index = 5usize + offset;
                 match name.as_str() {
                     "dino_score" => dino_score = row.get(index)?,
                     "wd14_score" => wd14_score = row.get(index)?,
@@ -959,7 +1021,6 @@ fn read_artist_suggestion_merge_rows(
                     "matched_ref_id" => matched_ref_id = row.get(index)?,
                     _ => {}
                 }
-                index += 1;
             }
             Ok(ArtistSuggestionMergeRow {
                 artist_id: row.get(1)?,
@@ -1149,8 +1210,7 @@ fn remap_folder_plan_tag_ids(
     {
         return Ok(());
     }
-    let placeholders = std::iter::repeat("?")
-        .take(artist_ids.len())
+    let placeholders = std::iter::repeat_n("?", artist_ids.len())
         .collect::<Vec<_>>()
         .join(",");
     let mut stmt = conn.prepare(&format!(
@@ -1251,7 +1311,7 @@ fn merge_artist_folder_plans(
             values.push(json!(row.get::<_, i64>(0)?));
             values.push(json!(row.get::<_, String>(1)?));
             for index in 0..semantic.len() {
-                values.push(column_value_json(&row, 2 + index)?);
+                values.push(column_value_json(row, 2 + index)?);
             }
             Ok(values)
         })?
@@ -1271,7 +1331,7 @@ fn merge_artist_folder_plans(
                     values.push(json!(row.get::<_, i64>(0)?));
                     values.push(json!(row.get::<_, String>(1)?));
                     for index in 0..semantic.len() {
-                        values.push(column_value_json(&row, 2 + index)?);
+                        values.push(column_value_json(row, 2 + index)?);
                     }
                     Ok(values)
                 },
@@ -1728,169 +1788,216 @@ pub fn normalize_configured_media_paths(conn: &Connection, roots: &MediaRoots) -
         return Ok(json!({"updated": 0, "skipped": "no_pairs"}));
     }
 
-    let tx = conn.unchecked_transaction()?;
     let mut updated = 0i64;
     let mut merged_artists = 0i64;
     let mut merged_items = 0i64;
+    let mut merged_link_documents = 0i64;
+
+    // Batched migration: each phase commits separately so a big library does
+    // not hold the single SQLite write lock for minutes at a time (other
+    // writers' 30s busy timeouts would expire). The signature marker is only
+    // written after every phase succeeds: a crash mid-way leaves the migration
+    // to re-run at next startup, which converges because already-migrated rows
+    // no longer match the virtual prefixes.
+    fn migration_tx<T>(
+        conn: &Connection,
+        phase: &str,
+        work: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .with_context(|| format!("begin media path migration: {phase}"))?;
+        match work() {
+            Ok(value) => {
+                conn.execute_batch("COMMIT")
+                    .with_context(|| format!("commit media path migration: {phase}"))?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
 
     // Artists first: resolve unique path conflicts by merging source into target.
-    for (root_n, real_n) in &pairs {
-        let rows = tx
-            .prepare("SELECT id, path FROM artists WHERE path=? OR path LIKE ? ORDER BY id")?
-            .query_map(rusqlite::params![root_n, format!("{root_n}/%")], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (artist_id, old_path) in rows {
-            let new_path = format!("{real_n}{}", &old_path[root_n.len()..]);
-            if new_path == old_path {
-                continue;
-            }
-            let existing_id: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM artists WHERE path=? AND id<>?",
-                    rusqlite::params![&new_path, artist_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .with_context(|| format!("probe artist path conflict for {new_path}"))?;
-            if let Some(target_id) = existing_id {
-                // Merge tags onto the real-path artist. A source tag sharing a
-                // name with a target tag cannot be reassigned because of
-                // UNIQUE(artist_id, name): attach the source tag's item links
-                // to the target tag first, then delete the alias tag row only
-                // after every link is moved.
-                let mut tag_map: HashMap<i64, i64> = HashMap::new();
-                let source_tags = tx
-                    .prepare("SELECT id, name FROM tags WHERE artist_id=? ORDER BY id")?
-                    .query_map(rusqlite::params![artist_id], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                for (tag_id, tag_name) in source_tags {
-                    let target_tag_id: Option<i64> = tx
-                        .query_row(
-                            "SELECT id FROM tags WHERE artist_id=? AND name=?",
-                            rusqlite::params![target_id, tag_name],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                        .with_context(|| format!("probe tag {tag_name} of artist {target_id}"))?;
-                    if let Some(target_tag_id) = target_tag_id {
-                        tx.execute(
-                            "INSERT OR IGNORE INTO item_tags (item_id, tag_id)
-                             SELECT item_id, ? FROM item_tags WHERE tag_id=?",
-                            rusqlite::params![target_tag_id, tag_id],
-                        )
-                        .with_context(|| {
-                            format!("merge item_tags from tag {tag_id} onto tag {target_tag_id}")
-                        })?;
-                        tx.execute("DELETE FROM tags WHERE id=?", rusqlite::params![tag_id])
-                            .with_context(|| format!("drop duplicate source tag {tag_id}"))?;
-                        tag_map.insert(tag_id, target_tag_id);
-                    } else {
-                        tx.execute(
-                            "UPDATE tags SET artist_id=? WHERE id=?",
-                            rusqlite::params![target_id, tag_id],
-                        )
-                        .with_context(|| format!("reassign tag {tag_id} to artist {target_id}"))?;
-                        tag_map.insert(tag_id, tag_id);
-                    }
+    migration_tx(conn, "artists", || {
+        for (root_n, real_n) in &pairs {
+            let rows = conn
+                .prepare(
+                    // Exact-prefix match, not LIKE: `_` is a wildcard and LIKE
+                    // is case-insensitive for ASCII.
+                    "SELECT id, path FROM artists
+                     WHERE path=? OR substr(path, 1, length(?) + 1) = ? || '/'
+                     ORDER BY id",
+                )?
+                .query_map(rusqlite::params![root_n, root_n, root_n], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (artist_id, old_path) in rows {
+                let new_path = format!("{real_n}{}", &old_path[root_n.len()..]);
+                if new_path == old_path {
+                    continue;
                 }
-                remap_folder_plan_tag_ids(&tx, &tag_map, &[artist_id])?;
-                remap_recycle_tag_ids(&tx, &tag_map, artist_id)?;
-                // Items: reassign or merge on path conflict.
-                let items = tx
-                    .prepare("SELECT id, file_path FROM items WHERE artist_id=?")?
-                    .query_map(rusqlite::params![artist_id], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                for (item_id, file_path) in items {
-                    let mapped =
-                        if file_path == *root_n || file_path.starts_with(&format!("{root_n}/")) {
+                let existing_id: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM artists WHERE path=? AND id<>?",
+                        rusqlite::params![&new_path, artist_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .with_context(|| format!("probe artist path conflict for {new_path}"))?;
+                if let Some(target_id) = existing_id {
+                    // Merge tags onto the real-path artist. A source tag sharing a
+                    // name with a target tag cannot be reassigned because of
+                    // UNIQUE(artist_id, name): attach the source tag's item links
+                    // to the target tag first, then delete the alias tag row only
+                    // after every link is moved.
+                    let mut tag_map: HashMap<i64, i64> = HashMap::new();
+                    let source_tags = conn
+                        .prepare("SELECT id, name FROM tags WHERE artist_id=? ORDER BY id")?
+                        .query_map(rusqlite::params![artist_id], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    for (tag_id, tag_name) in source_tags {
+                        let target_tag_id: Option<i64> = conn
+                            .query_row(
+                                "SELECT id FROM tags WHERE artist_id=? AND name=?",
+                                rusqlite::params![target_id, tag_name],
+                                |r| r.get(0),
+                            )
+                            .optional()
+                            .with_context(|| {
+                                format!("probe tag {tag_name} of artist {target_id}")
+                            })?;
+                        if let Some(target_tag_id) = target_tag_id {
+                            conn.execute(
+                                "INSERT OR IGNORE INTO item_tags (item_id, tag_id)
+                             SELECT item_id, ? FROM item_tags WHERE tag_id=?",
+                                rusqlite::params![target_tag_id, tag_id],
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "merge item_tags from tag {tag_id} onto tag {target_tag_id}"
+                                )
+                            })?;
+                            conn.execute("DELETE FROM tags WHERE id=?", rusqlite::params![tag_id])
+                                .with_context(|| format!("drop duplicate source tag {tag_id}"))?;
+                            tag_map.insert(tag_id, target_tag_id);
+                        } else {
+                            conn.execute(
+                                "UPDATE tags SET artist_id=? WHERE id=?",
+                                rusqlite::params![target_id, tag_id],
+                            )
+                            .with_context(|| {
+                                format!("reassign tag {tag_id} to artist {target_id}")
+                            })?;
+                            tag_map.insert(tag_id, tag_id);
+                        }
+                    }
+                    remap_folder_plan_tag_ids(conn, &tag_map, &[artist_id])?;
+                    remap_recycle_tag_ids(conn, &tag_map, artist_id)?;
+                    // Items: reassign or merge on path conflict.
+                    let items = conn
+                        .prepare("SELECT id, file_path FROM items WHERE artist_id=?")?
+                        .query_map(rusqlite::params![artist_id], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    for (item_id, file_path) in items {
+                        let mapped = if file_path == *root_n
+                            || file_path.starts_with(&format!("{root_n}/"))
+                        {
                             format!("{real_n}{}", &file_path[root_n.len()..])
                         } else {
                             roots.normalize_db_path(&file_path)
                         };
-                    let conflict: Option<i64> = tx
-                        .query_row(
-                            "SELECT id FROM items WHERE file_path=? AND id<>?",
-                            rusqlite::params![&mapped, item_id],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                        .with_context(|| format!("probe item path conflict for {mapped}"))?;
-                    if let Some(keep_id) = conflict {
-                        merge_item_into(&tx, item_id, keep_id, Some(target_id))?;
-                        tx.execute("DELETE FROM items WHERE id=?", rusqlite::params![item_id])
+                        let conflict: Option<i64> = conn
+                            .query_row(
+                                "SELECT id FROM items WHERE file_path=? AND id<>?",
+                                rusqlite::params![&mapped, item_id],
+                                |r| r.get(0),
+                            )
+                            .optional()
+                            .with_context(|| format!("probe item path conflict for {mapped}"))?;
+                        if let Some(keep_id) = conflict {
+                            merge_item_into(conn, item_id, keep_id, Some(target_id))?;
+                            conn.execute(
+                                "DELETE FROM items WHERE id=?",
+                                rusqlite::params![item_id],
+                            )
                             .with_context(|| format!("drop merged item {item_id}"))?;
-                        merged_items += 1;
-                    } else {
-                        tx.execute(
-                            "UPDATE items SET artist_id=?, file_path=? WHERE id=?",
-                            rusqlite::params![target_id, mapped, item_id],
+                            merged_items += 1;
+                        } else {
+                            conn.execute(
+                                "UPDATE items SET artist_id=?, file_path=? WHERE id=?",
+                                rusqlite::params![target_id, mapped, item_id],
+                            )
+                            .with_context(|| {
+                                format!("reassign item {item_id} to artist {target_id}")
+                            })?;
+                            updated += 1;
+                        }
+                    }
+                    for table in [
+                        "scan_seen",
+                        "scan_candidates",
+                        "move_candidates",
+                        "move_history",
+                    ] {
+                        if !table_exists(conn, table)? {
+                            continue;
+                        }
+                        conn.execute(
+                            &format!("UPDATE {table} SET artist_id=? WHERE artist_id=?"),
+                            rusqlite::params![target_id, artist_id],
                         )
-                        .with_context(|| {
-                            format!("reassign item {item_id} to artist {target_id}")
-                        })?;
-                        updated += 1;
+                        .with_context(|| format!("reassign {table} rows to artist {target_id}"))?;
                     }
-                }
-                for table in [
-                    "scan_seen",
-                    "scan_candidates",
-                    "move_candidates",
-                    "move_history",
-                ] {
-                    if !table_exists(&tx, table)? {
-                        continue;
-                    }
-                    tx.execute(
-                        &format!("UPDATE {table} SET artist_id=? WHERE artist_id=?"),
-                        rusqlite::params![target_id, artist_id],
-                    )
-                    .with_context(|| format!("reassign {table} rows to artist {target_id}"))?;
-                }
-                merge_artist_folder_plans(&tx, artist_id, target_id)?;
-                merge_artist_relationships(&tx, artist_id, target_id)?;
-                if column_exists(&tx, "artists", "missing")? {
-                    let (source_missing, target_missing): (i64, i64) = tx
-                        .query_row(
-                            "SELECT
+                    merge_artist_folder_plans(conn, artist_id, target_id)?;
+                    merge_artist_relationships(conn, artist_id, target_id)?;
+                    if column_exists(conn, "artists", "missing")? {
+                        let (source_missing, target_missing): (i64, i64) = conn
+                            .query_row(
+                                "SELECT
                                (SELECT missing FROM artists WHERE id=?),
                                (SELECT missing FROM artists WHERE id=?)",
-                            rusqlite::params![artist_id, target_id],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
-                        )
-                        .with_context(|| {
-                            format!("probe missing state of artists {artist_id}/{target_id}")
-                        })?;
-                    if source_missing == 0 || target_missing == 0 {
-                        let sql = if column_exists(&tx, "artists", "missing_at")? {
-                            "UPDATE artists SET missing=0, missing_at=NULL WHERE id=?"
-                        } else {
-                            "UPDATE artists SET missing=0 WHERE id=?"
-                        };
-                        tx.execute(sql, rusqlite::params![target_id])
-                            .with_context(|| format!("keep merged artist {target_id} active"))?;
+                                rusqlite::params![artist_id, target_id],
+                                |r| Ok((r.get(0)?, r.get(1)?)),
+                            )
+                            .with_context(|| {
+                                format!("probe missing state of artists {artist_id}/{target_id}")
+                            })?;
+                        if source_missing == 0 || target_missing == 0 {
+                            let sql = if column_exists(conn, "artists", "missing_at")? {
+                                "UPDATE artists SET missing=0, missing_at=NULL WHERE id=?"
+                            } else {
+                                "UPDATE artists SET missing=0 WHERE id=?"
+                            };
+                            conn.execute(sql, rusqlite::params![target_id])
+                                .with_context(|| {
+                                    format!("keep merged artist {target_id} active")
+                                })?;
+                        }
                     }
+                    conn.execute(
+                        "DELETE FROM artists WHERE id=?",
+                        rusqlite::params![artist_id],
+                    )
+                    .with_context(|| format!("drop merged alias artist {artist_id}"))?;
+                    merged_artists += 1;
+                } else {
+                    conn.execute(
+                        "UPDATE artists SET path=? WHERE id=?",
+                        rusqlite::params![&new_path, artist_id],
+                    )?;
+                    updated += 1;
                 }
-                tx.execute(
-                    "DELETE FROM artists WHERE id=?",
-                    rusqlite::params![artist_id],
-                )
-                .with_context(|| format!("drop merged alias artist {artist_id}"))?;
-                merged_artists += 1;
-            } else {
-                tx.execute(
-                    "UPDATE artists SET path=? WHERE id=?",
-                    rusqlite::params![&new_path, artist_id],
-                )?;
-                updated += 1;
             }
         }
-    }
+        Ok(())
+    })?;
 
     // Bulk-rewrite remaining path columns (non-conflicting rows first for UNIQUE columns).
     let path_columns = [
@@ -1904,7 +2011,7 @@ pub fn normalize_configured_media_paths(conn: &Connection, roots: &MediaRoots) -
         ("move_history", "new_path", false),
     ];
     for (table, column, unique) in path_columns {
-        let exists: i64 = tx
+        let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name=?",
                 rusqlite::params![table],
@@ -1914,93 +2021,151 @@ pub fn normalize_configured_media_paths(conn: &Connection, roots: &MediaRoots) -
         if exists == 0 {
             continue;
         }
-        for (root_n, real_n) in &pairs {
-            let sql = if unique {
-                format!(
-                    "UPDATE {table}
-                     SET {column} = ? || substr({column}, length(?) + 1)
-                     WHERE ({column}=? OR {column} LIKE ?)
-                       AND {column} NOT LIKE '%/../%'
-                       AND {column} NOT LIKE '%/..'
-                       AND NOT EXISTS (
-                         SELECT 1 FROM {table} AS existing
-                         WHERE existing.{column} = ? || substr({table}.{column}, length(?) + 1)
-                           AND existing.rowid <> {table}.rowid
-                       )"
-                )
-            } else {
-                format!(
-                    "UPDATE {table}
-                     SET {column} = ? || substr({column}, length(?) + 1)
-                     WHERE ({column}=? OR {column} LIKE ?)
-                       AND {column} NOT LIKE '%/../%'
-                       AND {column} NOT LIKE '%/..'"
-                )
-            };
-            let n = if unique {
-                tx.execute(
-                    &sql,
-                    rusqlite::params![
-                        real_n,
-                        root_n,
-                        root_n,
-                        format!("{root_n}/%"),
-                        real_n,
-                        root_n
-                    ],
-                )?
-            } else {
-                tx.execute(
-                    &sql,
-                    rusqlite::params![real_n, root_n, root_n, format!("{root_n}/%")],
-                )?
-            };
-            updated += n as i64;
-        }
-        // Remaining unique conflicts on items: merge into the real path row.
-        if unique && table == "items" {
+        migration_tx(conn, &format!("rewrite {table}.{column}"), || {
             for (root_n, real_n) in &pairs {
-                let rows = tx
-                    .prepare(&format!(
-                        "SELECT id, file_path FROM {table} WHERE {column}=? OR {column} LIKE ?"
-                    ))?
-                    .query_map(rusqlite::params![root_n, format!("{root_n}/%")], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                for (item_id, old_path) in rows {
-                    let new_path = format!("{real_n}{}", &old_path[root_n.len()..]);
-                    let conflict: Option<i64> = tx
-                        .query_row(
-                            "SELECT id FROM items WHERE file_path=? AND id<>?",
-                            rusqlite::params![&new_path, item_id],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                        .with_context(|| format!("probe item path conflict for {new_path}"))?;
-                    if let Some(keep_id) = conflict {
-                        merge_item_into(&tx, item_id, keep_id, None)?;
-                        tx.execute("DELETE FROM items WHERE id=?", rusqlite::params![item_id])
+                // Exact-prefix match, not LIKE: `_` is a wildcard and LIKE is
+                // case-insensitive for ASCII, so sibling roots could be
+                // rewritten by mistake.
+                let sql = if unique {
+                    format!(
+                        "UPDATE {table}
+                         SET {column} = ? || substr({column}, length(?) + 1)
+                         WHERE ({column}=? OR substr({column}, 1, length(?) + 1) = ? || '/')
+                           AND {column} NOT LIKE '%/../%'
+                           AND {column} NOT LIKE '%/..'
+                           AND NOT EXISTS (
+                             SELECT 1 FROM {table} AS existing
+                             WHERE existing.{column} = ? || substr({table}.{column}, length(?) + 1)
+                               AND existing.rowid <> {table}.rowid
+                           )"
+                    )
+                } else {
+                    format!(
+                        "UPDATE {table}
+                         SET {column} = ? || substr({column}, length(?) + 1)
+                         WHERE ({column}=? OR substr({column}, 1, length(?) + 1) = ? || '/')
+                           AND {column} NOT LIKE '%/../%'
+                           AND {column} NOT LIKE '%/..'"
+                    )
+                };
+                let n = if unique {
+                    conn.execute(
+                        &sql,
+                        rusqlite::params![real_n, root_n, root_n, root_n, root_n, real_n, root_n],
+                    )?
+                } else {
+                    conn.execute(
+                        &sql,
+                        rusqlite::params![real_n, root_n, root_n, root_n, root_n],
+                    )?
+                };
+                updated += n as i64;
+            }
+            // Remaining unique conflicts on items: merge into the real path row.
+            if unique && table == "items" {
+                for (root_n, real_n) in &pairs {
+                    let rows = conn
+                        .prepare(&format!(
+                            "SELECT id, file_path FROM {table}
+                         WHERE {column}=? OR substr({column}, 1, length(?) + 1) = ? || '/'"
+                        ))?
+                        .query_map(rusqlite::params![root_n, root_n, root_n], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    for (item_id, old_path) in rows {
+                        let new_path = format!("{real_n}{}", &old_path[root_n.len()..]);
+                        let conflict: Option<i64> = conn
+                            .query_row(
+                                "SELECT id FROM items WHERE file_path=? AND id<>?",
+                                rusqlite::params![&new_path, item_id],
+                                |r| r.get(0),
+                            )
+                            .optional()
+                            .with_context(|| format!("probe item path conflict for {new_path}"))?;
+                        if let Some(keep_id) = conflict {
+                            merge_item_into(conn, item_id, keep_id, None)?;
+                            conn.execute(
+                                "DELETE FROM items WHERE id=?",
+                                rusqlite::params![item_id],
+                            )
                             .with_context(|| format!("drop merged item {item_id}"))?;
-                        merged_items += 1;
-                    } else {
-                        tx.execute(
-                            "UPDATE items SET file_path=? WHERE id=?",
-                            rusqlite::params![&new_path, item_id],
-                        )?;
-                        updated += 1;
+                            merged_items += 1;
+                        } else {
+                            conn.execute(
+                                "UPDATE items SET file_path=? WHERE id=?",
+                                rusqlite::params![&new_path, item_id],
+                            )?;
+                            updated += 1;
+                        }
                     }
                 }
             }
-        }
+            // Remaining unique conflicts on link documents: the real-path row is
+            // the canonical parse of the same physical file, so drop the stale
+            // virtual-path duplicate (occurrences cascade). Without this channel
+            // the skipped row would keep a dead `/picturesN/...` path forever.
+            if unique && table == "artist_link_documents" {
+                for (root_n, real_n) in &pairs {
+                    let rows = conn
+                        .prepare(&format!(
+                            "SELECT id, file_path FROM {table}
+                         WHERE {column}=? OR substr({column}, 1, length(?) + 1) = ? || '/'"
+                        ))?
+                        .query_map(rusqlite::params![root_n, root_n, root_n], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    for (doc_id, old_path) in rows {
+                        let new_path = format!("{real_n}{}", &old_path[root_n.len()..]);
+                        let conflict: Option<i64> = conn
+                            .query_row(
+                                &format!(
+                                    "SELECT id FROM {table}
+                                 WHERE artist_id=(SELECT artist_id FROM {table} WHERE id=?)
+                                   AND {column}=? AND id<>?"
+                                ),
+                                rusqlite::params![doc_id, &new_path, doc_id],
+                                |r| r.get(0),
+                            )
+                            .optional()
+                            .with_context(|| {
+                                format!("probe link document conflict for {new_path}")
+                            })?;
+                        if conflict.is_some() {
+                            conn.execute(
+                                &format!("DELETE FROM {table} WHERE id=?"),
+                                rusqlite::params![doc_id],
+                            )
+                            .with_context(|| {
+                                format!("drop stale virtual-path link document {doc_id}")
+                            })?;
+                            merged_link_documents += 1;
+                        } else {
+                            updated += conn.execute(
+                                &format!("UPDATE {table} SET {column}=? WHERE id=?"),
+                                rusqlite::params![&new_path, doc_id],
+                            )? as i64;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        eprintln!("media path migration: {table}.{column} phase committed");
     }
 
-    set_migration_signature(&tx, &signature)?;
-    tx.commit()?;
+    set_migration_signature(conn, &signature)?;
+    if merged_link_documents > 0 {
+        eprintln!(
+            "media path migration: dropped {merged_link_documents} stale virtual-path link document(s)"
+        );
+    }
     Ok(json!({
         "updated": updated,
         "merged_artists": merged_artists,
         "merged_items": merged_items,
+        "merged_link_documents": merged_link_documents,
     }))
 }
 
@@ -2409,6 +2574,9 @@ mod tests {
         for (target, status, reason_log) in [
             ("2024-01-02-tag", "manual_review", log),
             ("2024-01-tag", "manual_review", log),
+            // Regression: an 8-byte "YYYY-MM-" basename must not index past the
+            // buffer during startup cleanup.
+            ("2024-01-", "manual_review", log),
             ("2024-01-02 tag", "manual_review", log),
             (
                 "2024-01-02-other",
@@ -2646,6 +2814,75 @@ mod tests {
         assert!(
             !signature.is_empty(),
             "successful migration commits its signature"
+        );
+    }
+
+    /// Regression: a configured root containing `_` (or differing in case)
+    /// must not let prefix matching rewrite sibling directories.
+    #[test]
+    fn media_path_migration_underscore_root_leaves_sibling_paths_untouched() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_product_schema(&conn, true).unwrap();
+        let roots = MediaRoots {
+            roots: vec!["/vol/my_pictures".into()],
+            labels: vec!["my_pictures".into()],
+            real_paths: vec!["/real/my_pictures".into()],
+        };
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (1, 'a', '/vol/my_pictures/a')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name)
+             VALUES (1, 1, '/vol/my_pictures/a/x.jpg', 'x.jpg')",
+            [],
+        )
+        .unwrap();
+        // A `LIKE '/vol/my_pictures/%'` pattern would wrongly match these:
+        // `_` is a single-char wildcard and LIKE folds ASCII case.
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (2, 's', '/vol/myXpictures/s')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name)
+             VALUES (2, 2, '/vol/myXpictures/s/y.jpg', 'y.jpg')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (3, 'c', '/vol/MY_PICTURES/c')",
+            [],
+        )
+        .unwrap();
+
+        normalize_configured_media_paths(&conn, &roots).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT path FROM artists ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(paths[0], "/real/my_pictures/a", "in-root artist migrated");
+        assert_eq!(paths[1], "/vol/myXpictures/s", "wildcard sibling untouched");
+        assert_eq!(
+            paths[2], "/vol/MY_PICTURES/c",
+            "case-similar sibling untouched"
+        );
+        let item_path: String = conn
+            .query_row("SELECT file_path FROM items WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(item_path, "/real/my_pictures/a/x.jpg");
+        let sibling_item: String = conn
+            .query_row("SELECT file_path FROM items WHERE id=2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            sibling_item, "/vol/myXpictures/s/y.jpg",
+            "sibling item untouched"
         );
     }
 

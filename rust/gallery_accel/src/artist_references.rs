@@ -36,7 +36,7 @@ fn list_artist_references(
     artist_id: i64,
     limit: Option<i64>,
 ) -> Result<Vec<ArtistReferenceRow>> {
-    let limit = limit.unwrap_or(200).max(1);
+    let limit = limit.unwrap_or(200).clamp(1, 500);
     let mut stmt = conn.prepare(
         "
         SELECT

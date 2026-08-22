@@ -28,7 +28,7 @@ pub fn move_candidates_response(
         "total": total,
         "limit": limit,
         "offset": offset,
-        "has_more": offset + limit < total,
+        "has_more": offset.saturating_add(limit) < total,
         "waiting_hash_count": waiting_hash_count,
     }))
 }

@@ -37,7 +37,7 @@ fn list_character_references(
     character_id: i64,
     limit: Option<i64>,
 ) -> Result<Vec<CharacterReferenceRow>> {
-    let limit = limit.unwrap_or(200).max(1);
+    let limit = limit.unwrap_or(200).clamp(1, 500);
     let mut stmt = conn.prepare(
         "
         SELECT cr.id, cr.character_id, c.name as character_name, cr.source_type,

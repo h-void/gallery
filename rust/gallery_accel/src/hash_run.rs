@@ -58,7 +58,9 @@ pub fn run_hash_batch_with_roots(
     let mut resolved = 0i64;
     let mut link_artist_ids = BTreeSet::new();
 
-    // Hash pending scan candidates first.
+    // Hash pending scan candidates first. Errored rows retry only after the
+    // pending backlog, so permanently failing low-id rows cannot starve the
+    // rest of the queue.
     let cand_ids: Vec<i64> = conn
         .prepare(
             "
@@ -70,7 +72,7 @@ pub fn run_hash_batch_with_roots(
                   WHERE mc.scan_candidate_id = scan_candidates.id
                     AND mc.status = 'pending'
               )
-            ORDER BY id LIMIT ?
+            ORDER BY (hash_status = 'error') ASC, id LIMIT ?
             ",
         )?
         .query_map(params![limit], |r| r.get(0))?
@@ -144,9 +146,14 @@ pub fn run_hash_batch_with_roots(
                     continue;
                 }
                 cand_done += 1;
-                if let Ok(v) = resolve_scan_candidate_response_with_roots(conn, roots, id) {
-                    if record_resolution(conn, &v, &mut link_artist_ids)? {
-                        resolved += 1;
+                match resolve_scan_candidate_response_with_roots(conn, roots, id) {
+                    Ok(v) => {
+                        if record_resolution(conn, &v, &mut link_artist_ids)? {
+                            resolved += 1;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("hash: resolve scan candidate {id} failed: {error:#}");
                     }
                 }
             }
@@ -180,9 +187,14 @@ pub fn run_hash_batch_with_roots(
             .query_map(params![history_limit], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for id in ready_ids {
-            if let Ok(v) = resolve_scan_candidate_response_with_roots(conn, roots, id) {
-                if record_resolution(conn, &v, &mut link_artist_ids)? {
-                    resolved += 1;
+            match resolve_scan_candidate_response_with_roots(conn, roots, id) {
+                Ok(v) => {
+                    if record_resolution(conn, &v, &mut link_artist_ids)? {
+                        resolved += 1;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("hash: resolve historical scan candidate {id} failed: {error:#}");
                 }
             }
         }
@@ -193,7 +205,7 @@ pub fn run_hash_batch_with_roots(
             "
             SELECT id FROM items
             WHERE missing=0 AND hash_status IN ('pending','error','')
-            ORDER BY id LIMIT ?
+            ORDER BY (hash_status = 'error') ASC, id LIMIT ?
             ",
         )?
         .query_map(params![limit], |r| r.get(0))?

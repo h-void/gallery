@@ -59,7 +59,15 @@ pub fn reconcile_moving_recycle_entries(conn: &Connection) -> (usize, usize, usi
             .collect::<rusqlite::Result<Vec<_>>>()
         }) {
         Ok(rows) => rows,
-        Err(_) => return (0, 0, 0),
+        Err(error) => {
+            // A missing recycle table is normal for pre-recycle databases;
+            // any other query failure must surface so interrupted 'moving'
+            // rows are never silently skipped.
+            if !error.to_string().contains("no such table") {
+                eprintln!("recycle reconciliation: failed to list 'moving' rows: {error}");
+            }
+            return (0, 0, 0);
+        }
     };
     let mut finalized = 0;
     let mut dropped = 0;
@@ -406,8 +414,7 @@ pub fn restore_recycle_entry(
     let restored = (|| -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         let columns = ITEM_COLUMNS.join(",");
-        let placeholders = std::iter::repeat("?")
-            .take(ITEM_COLUMNS.len())
+        let placeholders = std::iter::repeat_n("?", ITEM_COLUMNS.len())
             .collect::<Vec<_>>()
             .join(",");
         let values = ITEM_COLUMNS

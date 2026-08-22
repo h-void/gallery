@@ -70,10 +70,10 @@ impl MediaRoots {
             if root_n.is_empty() {
                 continue;
             }
-            if cleaned_trim == root_n || cleaned_trim.starts_with(&(root_n.clone() + "/")) {
-                if best.as_ref().map(|(_, r)| r.len()).unwrap_or(0) < root_n.len() {
-                    best = Some((i, root_n));
-                }
+            if (cleaned_trim == root_n || cleaned_trim.starts_with(&(root_n.clone() + "/")))
+                && best.as_ref().map(|(_, r)| r.len()).unwrap_or(0) < root_n.len()
+            {
+                best = Some((i, root_n));
             }
         }
         if let Some((i, root_n)) = best {

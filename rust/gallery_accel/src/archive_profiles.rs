@@ -229,7 +229,13 @@ pub fn preview_folder_rename_template(
         for conflict in &row_conflicts {
             conflicts.push(json!({"plan_id": id, "code": conflict["code"], "detail": conflict}));
         }
-        previews.push(json!({"id": id, "source_folder": folder, "target_folder": target, "tokens": rendered.tokens, "format_source": source, "conflicts": row_conflicts, "can_apply": false}));
+        // Apply skips plans whose status is no longer editable; surface that
+        // here so the preview matches what apply will actually change.
+        let will_apply = !matches!(
+            plan_status.as_str(),
+            "confirmed" | "executed" | "inconsistent_tags"
+        );
+        previews.push(json!({"id": id, "source_folder": folder, "target_folder": target, "tokens": rendered.tokens, "format_source": source, "status": plan_status, "will_apply": will_apply, "conflicts": row_conflicts, "can_apply": false}));
         index += 1;
     }
     let can_apply = conflicts.is_empty();
@@ -282,6 +288,7 @@ pub fn apply_folder_rename_template(
         return Ok(json!({"ok": false, "applied": 0, "preview": preview, "conflicts": conflicts}));
     }
     conn.execute("BEGIN IMMEDIATE", [])?;
+    let mut updated = 0i64;
     for plan in plans {
         let snapshot = archive_format::rule_snapshot(
             &preview["profile"],
@@ -293,7 +300,7 @@ pub fn apply_folder_rename_template(
         } else {
             "ready"
         };
-        if let Err(error) = conn.execute(
+        match conn.execute(
             "UPDATE folder_rename_plans
              SET target_folder=?, format_snapshot=?, status=?, confirmed_at=NULL,
                  confirmation_source='', updated_at=strftime('%s','now')
@@ -306,15 +313,21 @@ pub fn apply_folder_rename_template(
                 artist_id
             ],
         ) {
-            let _ = conn.execute("ROLLBACK", []);
-            return Err(error.into());
+            Ok(count) => updated += count as i64,
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", []);
+                return Err(error.into());
+            }
         }
     }
     conn.execute("COMMIT", [])?;
     if preview["profile"]["collision_strategy"].as_str() == Some("merge") {
         recompute_artist_plan_targets(conn, Some(roots), artist_id)?;
     }
-    Ok(json!({"ok": true, "updated": plans.len(), "preview": preview}))
+    // `updated` counts only rows the UPDATE actually changed; plans skipped by
+    // their status are reported separately so the UI never overcounts.
+    let skipped = plans.len() as i64 - updated;
+    Ok(json!({"ok": true, "updated": updated, "skipped": skipped, "preview": preview}))
 }
 
 #[cfg(test)]

@@ -31,6 +31,9 @@ fn list_tag_search(
     search: Option<&str>,
     limit: Option<usize>,
 ) -> Result<Vec<TagSearchRow>> {
+    // Type-ahead fires this per keystroke; the aggregate is tags×item_tags×
+    // items, so an absent or oversized limit must not scan unbounded rows.
+    let limit = limit.unwrap_or(100).clamp(1, 500);
     let where_sql = if artist_id.is_some() {
         "WHERE t.artist_id=?"
     } else {
@@ -84,8 +87,6 @@ fn list_tag_search(
             .then_with(|| natural_compare(&left.name, &right.name))
             .then_with(|| natural_compare(&left.artist_name, &right.artist_name))
     });
-    if let Some(limit) = limit {
-        tags.truncate(limit);
-    }
+    tags.truncate(limit);
     Ok(tags)
 }

@@ -24,9 +24,9 @@ struct ArtistReferenceEmbeddingRow {
     artist_name: String,
     reference_item_id: Option<i64>,
     dino_embedding: Vec<u8>,
-    dino_embedding_dim: i64,
+    dino_embedding_dim: Option<i64>,
     wd14_embedding: Vec<u8>,
-    wd14_embedding_dim: i64,
+    wd14_embedding_dim: Option<i64>,
 }
 
 pub fn artist_reference_scores_response(
@@ -66,13 +66,21 @@ pub fn artist_reference_scores_response(
 
     for row in rows {
         let row = row?;
-        if row.dino_embedding_dim as usize != query_dino.len()
-            || row.wd14_embedding_dim as usize != query_wd14.len()
-        {
+        let (Some(dino_dim), Some(wd14_dim)) = (row.dino_embedding_dim, row.wd14_embedding_dim)
+        else {
+            continue;
+        };
+        if dino_dim as usize != query_dino.len() || wd14_dim as usize != query_wd14.len() {
             continue;
         }
-        let ref_dino = f32_blob_to_vec(&row.dino_embedding)?;
-        let ref_wd14 = f32_blob_to_vec(&row.wd14_embedding)?;
+        // A malformed blob degrades to a skipped reference (same policy as a
+        // dimension mismatch) instead of failing the whole endpoint.
+        let Ok(ref_dino) = f32_blob_to_vec(&row.dino_embedding) else {
+            continue;
+        };
+        let Ok(ref_wd14) = f32_blob_to_vec(&row.wd14_embedding) else {
+            continue;
+        };
         if ref_dino.len() != query_dino.len() || ref_wd14.len() != query_wd14.len() {
             continue;
         }
@@ -117,7 +125,7 @@ pub fn artist_reference_scores_response(
 }
 
 fn f32_blob_to_vec(blob: &[u8]) -> Result<Vec<f32>> {
-    if blob.len() % 4 != 0 {
+    if !blob.len().is_multiple_of(4) {
         return Err(anyhow!("invalid f32 blob length: {}", blob.len()));
     }
     Ok(blob

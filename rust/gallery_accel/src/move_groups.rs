@@ -18,7 +18,7 @@ pub fn move_candidate_groups_response(
     status: &str,
     sample_limit: Option<i64>,
 ) -> Result<Value> {
-    let sample_limit = sample_limit.unwrap_or(5);
+    let sample_limit = sample_limit.unwrap_or(5).clamp(0, 50);
     let groups = list_move_candidate_groups(conn, roots, status, sample_limit)?;
     Ok(json!({
         "count": groups.len() as i64,
@@ -64,6 +64,7 @@ fn list_move_candidate_groups(
         LEFT JOIN artists candidate_artist ON candidate_artist.id = mc.artist_id
         WHERE {where_sql}
         ORDER BY mc.created_at, mc.id
+        LIMIT 5000
         "
     ))?;
     let rows: Vec<GroupSourceRow> = stmt
@@ -106,6 +107,7 @@ fn list_move_candidate_groups(
                 sample_candidates: Vec::new(),
                 sample_ids: Vec::new(),
                 move_ids: Vec::new(),
+                blocked_move_ids: Vec::new(),
             });
         group.candidate_count += 1;
         group.move_ids.push(row.id);
@@ -134,6 +136,12 @@ fn list_move_candidate_groups(
         if group_duplicate_count > 0 {
             group.blocked_reason = "duplicate_target_candidates".to_string();
             group.blocked_candidate_count = group_duplicate_count;
+            group.blocked_move_ids = group
+                .move_ids
+                .iter()
+                .filter(|id| duplicate_ids.contains(id))
+                .copied()
+                .collect();
             group.applicable_candidate_count =
                 (group.candidate_count - group_duplicate_count).max(0);
             group.can_apply = group.can_apply && group.applicable_candidate_count > 0;

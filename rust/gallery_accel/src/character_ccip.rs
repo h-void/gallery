@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,11 @@ static ORT_INIT_LOCK: Mutex<()> = Mutex::new(());
 
 static ACTIVE_PROVIDER: OnceLock<String> = OnceLock::new();
 static ACTIVE_DEVICE: OnceLock<String> = OnceLock::new();
+
+/// True while a thread is building the ORT session (possibly waiting minutes
+/// for a model/CUDA download). Read without the session-slot lock so status
+/// endpoints can report `preparing` instead of blocking behind the builder.
+static SESSION_BUILDING: AtomicBool = AtomicBool::new(false);
 
 fn env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
@@ -574,31 +579,71 @@ fn append_fallback_reason(slot: &mut Option<String>, reason: String) {
 
 fn load_session() -> Result<&'static Mutex<CcipSessionSlot>> {
     let slot = session_slot();
-    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.session.is_none() {
+    // Fast path: a session (or cached failure) is already recorded.
+    {
+        let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.session.is_some() {
+            drop(guard);
+            start_session_idle_unloader();
+            return Ok(slot);
+        }
+    }
+    // Slow path: build OUTSIDE the slot lock. Model/CUDA waits can run for
+    // minutes; holding the lock here would stall /api/ml-runtime/status,
+    // recognition reads, and the idle unloader for the whole wait.
+    if SESSION_BUILDING.swap(true, Ordering::SeqCst) {
+        // Another thread is already building; fall through once it finishes
+        // and its result is visible in the slot.
+        while SESSION_BUILDING.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        start_session_idle_unloader();
+        return Ok(slot);
+    }
+    let loaded = (|| -> Result<CcipSession> {
+        // Give the background preparation round a chance to conclude
+        // before deciding the provider (never blocks a running service).
         let path = character_model_path();
-        let loaded = (|| -> Result<CcipSession> {
-            // Give the background preparation round a chance to conclude
-            // before deciding the provider (never blocks a running service).
-            if !path.is_file() {
-                crate::runtime_prepare::wait_for_character_model();
+        if !path.is_file() {
+            crate::runtime_prepare::wait_for_character_model();
+        }
+        if want_cuda() {
+            crate::runtime_prepare::wait_for_cuda_runtime();
+        }
+        if !path.is_file() {
+            return Err(anyhow!("model file missing: {}", path.display()));
+        }
+        if force_cpu_only() {
+            return build_cpu_session(&path);
+        }
+        let (core, mut fallback_reason) = ensure_ort_loaded()?;
+        let auto_provider = provider_lower() == "auto";
+        // auto/cuda: CUDA session when the process is locked to the CUDA
+        // core; failures fall back to CPU only (never OpenVINO on a CUDA
+        // core).
+        if want_cuda() && core == OrtCoreType::Cuda {
+            match build_cuda_session(&path) {
+                Ok(mut sess) => {
+                    sess.fallback_reason = fallback_reason;
+                    return Ok(sess);
+                }
+                Err(e) if allow_cpu_fallback() => {
+                    append_fallback_reason(
+                        &mut fallback_reason,
+                        format!("CUDAExecutionProvider failed: {e}"),
+                    );
+                    eprintln!("gallery-accel: CUDA EP failed ({e}); falling back to CPU EP");
+                }
+                Err(e) => return Err(e),
             }
-            if want_cuda() {
-                crate::runtime_prepare::wait_for_cuda_runtime();
-            }
-            if !path.is_file() {
-                return Err(anyhow!("model file missing: {}", path.display()));
-            }
-            if force_cpu_only() {
-                return build_cpu_session(&path);
-            }
-            let (core, mut fallback_reason) = ensure_ort_loaded()?;
-            let auto_provider = provider_lower() == "auto";
-            // auto/cuda: CUDA session when the process is locked to the CUDA
-            // core; failures fall back to CPU only (never OpenVINO on a CUDA
-            // core).
-            if want_cuda() && core == OrtCoreType::Cuda {
-                match build_cuda_session(&path) {
+        }
+        // auto/openvino: OpenVINO session on the bundled core. In `auto`
+        // mode this is only attempted when an Intel GPU was detected, so
+        // AMD-only machines never take the OpenVINO path.
+        if want_openvino() && core != OrtCoreType::Cuda {
+            let intel_gpu = crate::runtime_prepare::has_intel_gpu();
+            if !auto_provider || intel_gpu {
+                match build_openvino_session(&path) {
                     Ok(mut sess) => {
                         sess.fallback_reason = fallback_reason;
                         return Ok(sess);
@@ -606,50 +651,33 @@ fn load_session() -> Result<&'static Mutex<CcipSessionSlot>> {
                     Err(e) if allow_cpu_fallback() => {
                         append_fallback_reason(
                             &mut fallback_reason,
-                            format!("CUDAExecutionProvider failed: {e}"),
+                            format!("OpenVINOExecutionProvider failed: {e}"),
                         );
-                        eprintln!("gallery-accel: CUDA EP failed ({e}); falling back to CPU EP");
+                        eprintln!(
+                            "gallery-accel: OpenVINO GPU failed ({e}); falling back to CPU EP"
+                        );
                     }
                     Err(e) => return Err(e),
                 }
             }
-            // auto/openvino: OpenVINO session on the bundled core. In `auto`
-            // mode this is only attempted when an Intel GPU was detected, so
-            // AMD-only machines never take the OpenVINO path.
-            if want_openvino() && core != OrtCoreType::Cuda {
-                let intel_gpu = crate::runtime_prepare::has_intel_gpu();
-                if !auto_provider || intel_gpu {
-                    match build_openvino_session(&path) {
-                        Ok(mut sess) => {
-                            sess.fallback_reason = fallback_reason;
-                            return Ok(sess);
-                        }
-                        Err(e) if allow_cpu_fallback() => {
-                            append_fallback_reason(
-                                &mut fallback_reason,
-                                format!("OpenVINOExecutionProvider failed: {e}"),
-                            );
-                            eprintln!(
-                                "gallery-accel: OpenVINO GPU failed ({e}); falling back to CPU EP"
-                            );
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-            let mut session = build_cpu_session(&path)?;
-            session.fallback_reason = fallback_reason;
-            Ok(session)
-        })()
-        .map_err(|e| e.to_string());
-        if let Ok(ref sess) = loaded {
-            let _ = ACTIVE_PROVIDER.set(sess.provider.clone());
-            let _ = ACTIVE_DEVICE.set(sess.active_device.clone());
         }
-        guard.session = Some(loaded);
-        guard.last_used = Some(Instant::now());
+        let mut session = build_cpu_session(&path)?;
+        session.fallback_reason = fallback_reason;
+        Ok(session)
+    })()
+    .map_err(|e| e.to_string());
+    SESSION_BUILDING.store(false, Ordering::SeqCst);
+    if let Ok(ref sess) = loaded {
+        let _ = ACTIVE_PROVIDER.set(sess.provider.clone());
+        let _ = ACTIVE_DEVICE.set(sess.active_device.clone());
     }
-    drop(guard);
+    {
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.session.is_none() {
+            guard.session = Some(loaded);
+            guard.last_used = Some(Instant::now());
+        }
+    }
     start_session_idle_unloader();
     Ok(slot)
 }
@@ -746,17 +774,20 @@ pub fn session_status() -> Value {
             "idle_seconds": idle_seconds,
             "idle_timeout_seconds": timeout.as_secs(),
         }),
-        None => json!({
-            "session_loaded": false,
-            "reason": "idle_unloaded",
-            "actual_provider": "not_initialized",
-            "model_path": path.display().to_string(),
-            "backend": "onnxruntime",
-            "requested_provider": requested_provider_raw(),
-            "allow_cpu_fallback": allow_cpu_fallback(),
-            "openvino_device": openvino_device_type(),
-            "idle_timeout_seconds": timeout.as_secs(),
-        }),
+        None => {
+            let preparing = SESSION_BUILDING.load(Ordering::SeqCst);
+            json!({
+                "session_loaded": false,
+                "reason": if preparing { "preparing" } else { "idle_unloaded" },
+                "actual_provider": "not_initialized",
+                "model_path": path.display().to_string(),
+                "backend": "onnxruntime",
+                "requested_provider": requested_provider_raw(),
+                "allow_cpu_fallback": allow_cpu_fallback(),
+                "openvino_device": openvino_device_type(),
+                "idle_timeout_seconds": timeout.as_secs(),
+            })
+        }
     }
 }
 
@@ -790,6 +821,9 @@ fn open_rgb_for_recognition(path: &Path) -> Result<(image::RgbImage, &'static st
 }
 
 /// NCHW float32 /255 plane, shape (1, 3, 384, 384).
+// The `channel * plane_size` idiom is kept explicit for all three channels;
+// clippy flags the channel-0 `0 * h * w` term as an erasing operation.
+#[allow(clippy::erasing_op, clippy::identity_op)]
 fn preprocess_rgb(img: &image::RgbImage) -> Vec<f32> {
     let resized = image::imageops::resize(img, IMAGE_SIZE, IMAGE_SIZE, FilterType::CatmullRom);
     let h = IMAGE_SIZE as usize;
@@ -944,7 +978,11 @@ pub(crate) const CCIP_EMBEDDING_DIM: usize = EMBEDDING_DIM;
 
 fn extract_video_frame_jpeg(path: &Path, t: f64) -> Result<Vec<u8>> {
     use std::process::{Command, Stdio};
-    let output = Command::new("ffmpeg")
+    // Bounded extraction: a broken/truncated video must not park the
+    // recognition path indefinitely. The child runs on a helper thread with a
+    // kill handle so the timeout actually stops ffmpeg.
+    const FRAME_EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
+    let mut child = Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
@@ -963,12 +1001,30 @@ fn extract_video_frame_jpeg(path: &Path, t: f64) -> Result<Vec<u8>> {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .context("spawn ffmpeg")?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Err(anyhow!("ffmpeg failed to extract video frame"));
+    let mut stdout = child.stdout.take().context("ffmpeg stdout missing")?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let read_result = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        let _ = sender.send((buf, read_result));
+    });
+    match receiver.recv_timeout(FRAME_EXTRACT_TIMEOUT) {
+        Ok((buf, Ok(_read))) => {
+            let status = child.wait().context("wait for ffmpeg")?;
+            if !status.success() || buf.is_empty() {
+                return Err(anyhow!("ffmpeg failed to extract video frame"));
+            }
+            Ok(buf)
+        }
+        Ok((_, Err(error))) => Err(anyhow!("read ffmpeg output: {error}")),
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(anyhow!("ffmpeg frame extraction timed out"))
+        }
     }
-    Ok(output.stdout)
 }
 
 fn parse_embedding_blob(blob: &[u8], dim: i64) -> Option<Vec<f32>> {
@@ -998,6 +1054,7 @@ fn parse_embedding_blob(blob: &[u8], dim: i64) -> Option<Vec<f32>> {
     l2_normalize(out).ok()
 }
 
+#[derive(Clone)]
 struct RefMeta {
     character_id: i64,
     character_name: String,
@@ -1006,7 +1063,70 @@ struct RefMeta {
     vector: Vec<f32>,
 }
 
+/// Parsed-reference cache: recognition used to re-read and re-parse every
+/// embedded blob on each request. Keyed by a table fingerprint so imports,
+/// cleanups, and restores self-invalidate without explicit hooks.
+type ReferenceIndexCache = Mutex<Option<(String, Vec<RefMeta>)>>;
+
+static REFERENCE_INDEX_CACHE: OnceLock<ReferenceIndexCache> = OnceLock::new();
+
+fn reference_index_cache_slot() -> &'static ReferenceIndexCache {
+    REFERENCE_INDEX_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Fingerprint covering inserts (MAX(id)), deletes (COUNT), and item_id
+/// remaps (item_id aggregates). Embedding blobs are written together with a
+/// new row id in this codebase, so no update-only mutation exists.
+fn reference_table_signature(conn: &Connection) -> Result<String> {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(id), 0),
+                COALESCE(MAX(COALESCE(item_id, 0)), 0),
+                COALESCE(SUM(COALESCE(item_id, 0)), 0)
+         FROM character_references",
+        [],
+        |row| {
+            Ok(format!(
+                "{}:{}:{}:{}",
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?
+            ))
+        },
+    )
+    .map_err(Into::into)
+}
+
+fn cached_reference_index(conn: &Connection, signature: &str) -> Option<Vec<RefMeta>> {
+    // Only file-backed databases are cached: tests share the process-wide
+    // slot across distinct in-memory databases.
+    let path = conn.path()?;
+    let key = format!("{}|{}", path.replace('\\', "/"), signature);
+    let guard = reference_index_cache_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .filter(|(cached_key, _)| *cached_key == key)
+        .map(|(_, vectors)| vectors.clone())
+}
+
+fn store_reference_index(conn: &Connection, signature: &str, vectors: &[RefMeta]) {
+    let Some(path) = conn.path() else {
+        return;
+    };
+    let key = format!("{}|{}", path.replace('\\', "/"), signature);
+    let mut guard = reference_index_cache_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = Some((key, vectors.to_vec()));
+}
+
 fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
+    let signature = reference_table_signature(conn)?;
+    if let Some(cached) = cached_reference_index(conn, &signature) {
+        return Ok(cached);
+    }
     let repo = model_repo_id();
     let variant = model_variant();
     let file = model_file();
@@ -1050,8 +1170,15 @@ fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
             });
         }
     }
-    // Fallback: if signature filter empty, use any 768-d non-zero embedding.
+    // Fallback: when the signature filter is empty, loading arbitrary 768-dim
+    // rows would mix incompatible model spaces — a cross-model cosine can pass
+    // the threshold and persist as accepted. Return an empty index instead
+    // (matching character_cleanup's strict signature matching); an explicit
+    // env switch restores the legacy permissive load.
     if out.is_empty() {
+        if !env_bool("CHARACTER_EMBEDDING_LEGACY_FALLBACK", false) {
+            return Ok(out);
+        }
         let mut stmt = conn.prepare(
             "SELECT cr.id, cr.character_id, c.name, cr.item_id, cr.embedding, cr.embedding_dim
              FROM character_references cr
@@ -1081,6 +1208,7 @@ fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
             }
         }
     }
+    store_reference_index(conn, &signature, &out);
     Ok(out)
 }
 

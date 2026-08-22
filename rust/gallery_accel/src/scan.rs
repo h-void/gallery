@@ -219,11 +219,11 @@ fn map_media_path(path: &str, roots: &MediaRoots) -> PathBuf {
 }
 
 fn is_category_dir_name(name: &str) -> bool {
-    name.starts_with('-') || CATEGORY_DIR_NAMES.iter().any(|n| *n == name)
+    name.starts_with('-') || CATEGORY_DIR_NAMES.contains(&name)
 }
 
 fn is_collection_wrapper(name: &str) -> bool {
-    COLLECTION_WRAPPER_DIR_NAMES.iter().any(|n| *n == name)
+    COLLECTION_WRAPPER_DIR_NAMES.contains(&name)
 }
 
 fn count_media_files(directory: &Path) -> usize {
@@ -314,11 +314,11 @@ fn file_identity(_meta: &std::fs::Metadata) -> Option<(i64, i64)> {
     None
 }
 
+/// One sampled file identity: (dev/ino, normalized path, media category).
+type SampledMediaIdentity = (Option<(i64, i64)>, String, String);
+
 /// Sample media identities from a discovered artist directory for relocation matching.
-fn sample_dir_media_identities(
-    dir: &Path,
-    limit: usize,
-) -> Vec<(Option<(i64, i64)>, String, String)> {
+fn sample_dir_media_identities(dir: &Path, limit: usize) -> Vec<SampledMediaIdentity> {
     let mut out = Vec::new();
     for entry in WalkDir::new(dir)
         .into_iter()
@@ -693,29 +693,18 @@ fn reconcile_missing(
     }
     Ok(())
 }
+/// Per-scan canonicalized artist index: `real_path_key` → artist row.
+///
+/// Building this once per full-library discovery keeps artist registration
+/// O(artists + directories) instead of re-canonicalizing the whole artists
+/// table for every discovered directory.
+struct ArtistIndex {
+    by_key: std::collections::HashMap<String, (i64, String, String)>,
+}
 
-/// Register or relocate a discovered artist path. Returns (id, path) for scanning.
-fn register_discovered_artist(
-    conn: &Connection,
-    roots: &MediaRoots,
-    artist_name: &str,
-    artist_path: &str,
-) -> Result<(i64, String)> {
-    let path_norm = normalize_slashes(artist_path)
-        .trim_end_matches('/')
-        .to_string();
-    let path_key = real_path_key(&path_norm, roots);
-
-    // Exact path hit (including virtual/real alias equivalence).
-    let mut existing: Option<(i64, String, String)> = conn
-        .query_row(
-            "SELECT id, name, path FROM artists WHERE path=?",
-            params![&path_norm],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    if existing.is_none() {
-        let candidates = conn
+impl ArtistIndex {
+    fn load(conn: &Connection, roots: &MediaRoots) -> Result<Self> {
+        let all = conn
             .prepare("SELECT id, name, path FROM artists")?
             .query_map([], |r| {
                 Ok((
@@ -725,13 +714,34 @@ fn register_discovered_artist(
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (id, name, path) in candidates {
-            if real_path_key(&path, roots) == path_key {
-                existing = Some((id, name, path));
-                break;
-            }
+        let mut by_key = std::collections::HashMap::with_capacity(all.len());
+        for (id, name, path) in all {
+            by_key.insert(real_path_key(&path, roots), (id, name, path));
         }
+        Ok(Self { by_key })
     }
+
+    fn reload(&mut self, conn: &Connection, roots: &MediaRoots) -> Result<()> {
+        *self = Self::load(conn, roots)?;
+        Ok(())
+    }
+}
+
+/// Register or relocate a discovered artist path. Returns (id, path) for scanning.
+fn register_discovered_artist(
+    conn: &Connection,
+    roots: &MediaRoots,
+    index: &mut ArtistIndex,
+    artist_name: &str,
+    artist_path: &str,
+) -> Result<(i64, String)> {
+    let path_norm = normalize_slashes(artist_path)
+        .trim_end_matches('/')
+        .to_string();
+    let path_key = real_path_key(&path_norm, roots);
+
+    // Exact path hit (including virtual/real alias equivalence).
+    let existing = index.by_key.get(&path_key).cloned();
 
     if let Some((id, name, old_path)) = existing {
         if name != artist_name {
@@ -739,12 +749,22 @@ fn register_discovered_artist(
                 "UPDATE artists SET name=? WHERE id=?",
                 params![artist_name, id],
             )?;
+            index.by_key.insert(
+                path_key.clone(),
+                (id, artist_name.to_string(), old_path.clone()),
+            );
         }
         if old_path != path_norm {
             conn.execute(
                 "UPDATE artists SET path=? WHERE id=?",
                 params![&path_norm, id],
             )?;
+            // The row moved under the same identity key; keep the stored path
+            // form in sync with the database.
+            index.by_key.insert(
+                path_key.clone(),
+                (id, artist_name.to_string(), path_norm.clone()),
+            );
         }
         conn.execute(
             "UPDATE artists SET missing=0, missing_at=NULL WHERE id=?",
@@ -755,6 +775,9 @@ fn register_discovered_artist(
 
     // New path: try high-confidence directory relocation before creating a new row.
     if let Some(relocated) = try_relocate_artist_dir(conn, roots, artist_name, &path_norm)? {
+        // Relocation rewrote another artist's path; rebuild so later lookups
+        // see the new identity mapping.
+        index.reload(conn, roots)?;
         return Ok(relocated);
     }
 
@@ -762,7 +785,11 @@ fn register_discovered_artist(
         "INSERT INTO artists (name, path) VALUES (?, ?)",
         params![artist_name, &path_norm],
     )?;
-    Ok((conn.last_insert_rowid(), path_norm))
+    let id = conn.last_insert_rowid();
+    index
+        .by_key
+        .insert(path_key, (id, artist_name.to_string(), path_norm.clone()));
+    Ok((id, path_norm))
 }
 
 /// High-confidence directory move: ≥2 independent file identities uniquely point to one old artist.
@@ -1010,9 +1037,12 @@ fn list_artists_for_scan(
     discovered.extend(by_key.into_values());
     discovered.sort_by(|a, b| a.1.cmp(&b.1));
 
+    let mut index = ArtistIndex::load(conn, roots)?;
     let mut rows = Vec::new();
     for (name, path) in discovered {
-        rows.push(register_discovered_artist(conn, roots, &name, &path)?);
+        rows.push(register_discovered_artist(
+            conn, roots, &mut index, &name, &path,
+        )?);
     }
     Ok(rows)
 }
@@ -1080,7 +1110,7 @@ fn walk_artist(
         .to_string();
     let mut new_candidates = 0i64;
     let mut updated = 0i64;
-    let mut seen_batch: Vec<(String, i64, String, String, i64, f64, String, String)> = Vec::new();
+    let mut seen_batch: Vec<ScanSeenBatchRow> = Vec::new();
     let mut stopped = false;
     let mut walk_error = false;
 
@@ -1113,7 +1143,12 @@ fn walk_artist(
         let full = normalize_slashes(&entry.path().to_string_lossy());
         let meta = match std::fs::metadata(entry.path()) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => {
+                // A discoverable file whose metadata cannot be read right now
+                // must not be treated as deleted by this round's reconcile.
+                walk_error = true;
+                continue;
+            }
         };
         let (st_dev, st_ino) = file_identity(&meta)
             .map(|(dev, ino)| (Some(dev), Some(ino)))
@@ -1321,10 +1356,11 @@ fn walk_artist(
     Ok((new_candidates, updated, stopped, walk_error))
 }
 
-fn flush_scan_seen(
-    conn: &Connection,
-    rows: &[(String, i64, String, String, i64, f64, String, String)],
-) -> Result<()> {
+/// One `scan_seen` batch row: (file_path, artist_id, scan_id, media category,
+/// is_archive, mtime, folder_name, detected date raw).
+type ScanSeenBatchRow = (String, i64, String, String, i64, f64, String, String);
+
+fn flush_scan_seen(conn: &Connection, rows: &[ScanSeenBatchRow]) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     {
         let mut stmt = tx.prepare(

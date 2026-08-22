@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, Row};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use crate::media_roots::MediaRoots;
-use crate::move_context::{artist_context, query_optional_i64};
+use crate::move_context::{ArtistContext, ArtistContextStore};
 use crate::normalize_pagination;
 use crate::path_display::display_path;
 
@@ -66,7 +67,7 @@ pub fn move_history_response(
         "total": total,
         "limit": limit,
         "offset": offset,
-        "has_more": offset + limit < total,
+        "has_more": offset.saturating_add(limit) < total,
     }))
 }
 
@@ -107,64 +108,96 @@ fn list_move_history(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
+    let item_ids: Vec<i64> = rows.iter().map(|row| row.item_id).collect();
+    let artist_by_item = batch_item_artist_lookup(conn, &item_ids)?;
+    let store = ArtistContextStore::load(
+        conn,
+        rows.iter().map(|row| {
+            artist_by_item
+                .get(&row.item_id)
+                .copied()
+                .flatten()
+                .or(Some(row.artist_id))
+        }),
+    )?;
     rows.drain(..)
-        .map(|row| attach_history_context(conn, roots, row))
+        .map(|row| {
+            let item_artist_id = artist_by_item.get(&row.item_id).copied().flatten();
+            let candidate_artist_id = Some(row.artist_id);
+            let item_artist = store.get(item_artist_id);
+            let candidate_artist = store.get(candidate_artist_id);
+            Ok(build_history_row(
+                roots,
+                row,
+                item_artist,
+                candidate_artist,
+                item_artist_id,
+                candidate_artist_id,
+            ))
+        })
         .collect()
 }
 
-fn basic_history_from_row(row: &Row<'_>) -> rusqlite::Result<BasicHistoryRow> {
-    Ok(BasicHistoryRow {
-        id: row.get("id")?,
-        item_id: row.get("item_id")?,
-        artist_id: row.get("artist_id")?,
-        old_path: row.get("old_path")?,
-        new_path: row.get("new_path")?,
-        reason: row.get("reason")?,
-        status: row.get("status")?,
-        details: row.get("details")?,
-        created_at: row.get("created_at")?,
-        applied_at: row.get("applied_at")?,
-        reverted_at: row.get("reverted_at")?,
-    })
+/// `item_id -> artist_id` resolved with one `IN (...)` query per 500-id chunk.
+fn batch_item_artist_lookup(
+    conn: &Connection,
+    item_ids: &[i64],
+) -> Result<HashMap<i64, Option<i64>>> {
+    use std::collections::BTreeSet;
+    let mut map: HashMap<i64, Option<i64>> = HashMap::new();
+    let unique: BTreeSet<i64> = item_ids.iter().copied().collect();
+    let unique: Vec<i64> = unique.into_iter().collect();
+    for chunk in unique.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, artist_id FROM items WHERE id IN ({placeholders})"
+        ))?;
+        let found: Vec<(i64, i64)> = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (item_id, artist_id) in found {
+            map.insert(item_id, Some(artist_id));
+        }
+    }
+    for id in unique {
+        map.entry(id).or_insert(None);
+    }
+    Ok(map)
 }
 
-fn attach_history_context(
-    conn: &Connection,
+#[allow(clippy::too_many_arguments)]
+fn build_history_row(
     roots: &MediaRoots,
     row: BasicHistoryRow,
-) -> Result<HistoryRow> {
-    let item_artist_id = query_optional_i64(
-        conn,
-        "SELECT artist_id FROM items WHERE id=?",
-        [row.item_id],
-    )?;
-    let candidate_artist_id = Some(row.artist_id);
-    let item_artist = artist_context(conn, item_artist_id)?;
-    let candidate_artist = artist_context(conn, candidate_artist_id)?;
+    item_artist: Option<&ArtistContext>,
+    candidate_artist: Option<&ArtistContext>,
+    item_artist_id: Option<i64>,
+    candidate_artist_id: Option<i64>,
+) -> HistoryRow {
     let item_artist_name = item_artist
-        .as_ref()
         .map(|artist| artist.name.clone())
         .unwrap_or_default();
     let candidate_artist_name = candidate_artist
-        .as_ref()
         .map(|artist| artist.name.clone())
         .unwrap_or_default();
     let item_artist_path = item_artist
-        .as_ref()
         .map(|artist| artist.path.clone())
         .unwrap_or_default();
     let candidate_artist_path = candidate_artist
-        .as_ref()
         .map(|artist| artist.path.clone())
         .unwrap_or_default();
-    let is_cross_artist = match (item_artist.as_ref(), candidate_artist.as_ref()) {
+    let is_cross_artist = match (item_artist, candidate_artist) {
         (Some(item), Some(candidate)) => item.id != candidate.id,
         _ => false,
     };
     let same_artist_name = !item_artist_name.is_empty()
         && !candidate_artist_name.is_empty()
         && item_artist_name.to_lowercase() == candidate_artist_name.to_lowercase();
-    Ok(HistoryRow {
+    HistoryRow {
         id: row.id,
         item_id: row.item_id,
         artist_id: row.artist_id,
@@ -205,5 +238,21 @@ fn attach_history_context(
         is_cross_artist,
         same_artist_name,
         can_confirm: !is_cross_artist,
+    }
+}
+
+fn basic_history_from_row(row: &Row<'_>) -> rusqlite::Result<BasicHistoryRow> {
+    Ok(BasicHistoryRow {
+        id: row.get("id")?,
+        item_id: row.get("item_id")?,
+        artist_id: row.get("artist_id")?,
+        old_path: row.get("old_path")?,
+        new_path: row.get("new_path")?,
+        reason: row.get("reason")?,
+        status: row.get("status")?,
+        details: row.get("details")?,
+        created_at: row.get("created_at")?,
+        applied_at: row.get("applied_at")?,
+        reverted_at: row.get("reverted_at")?,
     })
 }

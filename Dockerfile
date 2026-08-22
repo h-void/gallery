@@ -17,7 +17,27 @@ COPY rust/gallery_accel/Cargo.toml rust/gallery_accel/Cargo.lock ./
 COPY rust/gallery_accel/src/ ./src/
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim
+# CUDA 12.x / cuDNN 9.x user-mode runtime libraries for the optional
+# runtime-cuda target. The onnxruntime-gpu wheel ships only the ORT core and
+# the CUDA execution provider; the provider dlopens cudart/cublas/cudnn/etc.
+# at session init, while the driver injection (WSL2 or NVIDIA Container
+# Toolkit) supplies only libcuda.
+FROM python:3.12-slim-bookworm AS cuda-libs
+RUN pip install --no-cache-dir --no-deps --target /wheels \
+        nvidia-cuda-nvrtc-cu12 \
+        nvidia-cuda-runtime-cu12 \
+        nvidia-cublas-cu12 \
+        nvidia-cudnn-cu12 \
+        nvidia-cufft-cu12 \
+        nvidia-curand-cu12 \
+        nvidia-cusolver-cu12 \
+        nvidia-cusparse-cu12 \
+        nvidia-nvjitlink-cu12 \
+        nvidia-nccl-cu12 \
+    && mkdir -p /opt/nvidia-libs \
+    && cp -a /wheels/nvidia/*/lib/. /opt/nvidia-libs/
+
+FROM debian:bookworm-slim AS runtime-base
 
 # Intel iGPU support: OpenVINO GPU plugin needs the Intel OpenCL ICD (non-free).
 # Default auto provider selects NVIDIA CUDA when an NVIDIA GPU is present,
@@ -86,3 +106,12 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=20s \
 
 ENTRYPOINT ["/usr/bin/tini", "--", "gallery-accel"]
 CMD ["--primary", "--enable-ml", "--db", "/gallery/data/gallery.db", "--static-dir", "/opt/gallery/static"]
+
+# CUDA-flavored runtime for the compose cuda profile. The default build target
+# is the plain `runtime` stage below; docker-compose.test.yml also builds the
+# last stage and must stay GPU-free.
+FROM runtime-base AS runtime-cuda
+COPY --from=cuda-libs /opt/nvidia-libs /opt/nvidia-libs
+ENV LD_LIBRARY_PATH=/opt/gallery/lib:/opt/nvidia-libs
+
+FROM runtime-base AS runtime

@@ -28,7 +28,7 @@ pub(crate) fn display_path(path: &str, roots: &MediaRoots) -> String {
             }
         }
     }
-    candidates.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    candidates.sort_by_key(|(index, root)| (std::cmp::Reverse(root.len()), *index));
     for (index, root) in candidates {
         if normalized == root || normalized.starts_with(&(root.clone() + "/")) {
             let rel = normalized[root.len()..].trim_start_matches('/');

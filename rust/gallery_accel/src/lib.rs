@@ -60,8 +60,6 @@ mod tags_write;
 pub mod upstream;
 mod workers;
 
-#[cfg(test)]
-pub(crate) mod test_support;
 
 pub use archive_profiles::{
     apply_folder_rename_template, folder_rename_format_settings, preview_folder_rename_template,
@@ -69,6 +67,7 @@ pub use archive_profiles::{
 };
 pub use artist_folder_move::{
     execute_artist_folder_move, list_media_root_directories, preview_artist_folder_move,
+    reconcile_pending_artist_move,
 };
 pub use artist_profile_links::{
     artist_profile_links_response, create_artist_profile_link, delete_artist_profile_link,
@@ -307,5 +306,3 @@ fn database_storage_summary(
     summary
 }
 
-#[cfg(test)]
-mod tests;

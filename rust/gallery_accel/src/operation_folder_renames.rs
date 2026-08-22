@@ -99,22 +99,22 @@ pub(crate) fn operation_folder_rename_history(
                 .filter(|value| !value.is_empty())
                 .or_else(|| {
                     let code = reason.as_str();
-                    Some(crate::folder_archive::archive_failure_message(code).to_string()).filter(
-                        |_| {
-                            matches!(
-                                code,
-                                "backup_failed"
-                                    | "source_missing"
-                                    | "target_exists"
-                                    | "bad_folder_path"
-                                    | "db_update_failed"
-                                    | "outside_artist"
-                                    | "permission_denied"
-                                    | "execution_failed"
-                                    | "manual_review"
-                            )
-                        },
-                    )
+                    if matches!(
+                        code,
+                        "backup_failed"
+                            | "source_missing"
+                            | "target_exists"
+                            | "bad_folder_path"
+                            | "db_update_failed"
+                            | "outside_artist"
+                            | "permission_denied"
+                            | "execution_failed"
+                            | "manual_review"
+                    ) {
+                        Some(crate::folder_archive::archive_failure_message(code).to_string())
+                    } else {
+                        None
+                    }
                 })
                 .unwrap_or_default();
             history.push(json!({

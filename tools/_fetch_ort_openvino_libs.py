@@ -9,6 +9,7 @@ stores one copy of each real shared object.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import platform
 import shutil
 import subprocess
@@ -21,6 +22,7 @@ WHEEL_URL = (
     "onnxruntime_openvino-1.24.1-cp312-cp312-manylinux_2_28_x86_64.whl"
 )
 WHEEL_NAME = "onnxruntime_openvino-1.24.1-cp312-cp312-manylinux_2_28_x86_64.whl"
+WHEEL_SHA256 = "d617fac2f59a6ab5ea59a788c3e1592240a129642519aaeaa774761dfe35150e"
 
 # One real file per library (SONAME links created afterward).
 KEEP_EXACT = {
@@ -64,6 +66,16 @@ def _should_keep(name: str) -> bool:
     return base in KEEP_EXACT
 
 
+def _valid_wheel(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size < 1_000_000:
+        return False
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest() == WHEEL_SHA256
+
+
 def _windows_path_as_wsl(path: Path) -> str:
     resolved = path.resolve()
     drive = resolved.drive.rstrip(":").lower()
@@ -103,9 +115,13 @@ def extract(dest: Path, cache_dir: Path) -> list[Path]:
     dest.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
     whl = cache_dir / WHEEL_NAME
-    if not whl.is_file() or whl.stat().st_size < 1_000_000:
+    if not _valid_wheel(whl):
+        whl.unlink(missing_ok=True)
         print(f"downloading {WHEEL_URL}")
         urllib.request.urlretrieve(WHEEL_URL, whl)
+    if not _valid_wheel(whl):
+        whl.unlink(missing_ok=True)
+        raise RuntimeError(f"downloaded wheel sha256 mismatch: {whl}")
     print(f"wheel {whl} ({whl.stat().st_size} bytes)")
 
     written: list[Path] = []

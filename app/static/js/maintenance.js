@@ -70,7 +70,7 @@ function renderArtistFolderMoveDirectoryDialog() {
   path.textContent = [root?.label || root?.path || '媒体目录', currentPath].filter(Boolean).join(' / ');
   up.disabled = state.artistFolderMoveDirectoryLoading || !currentPath;
   select.disabled = state.artistFolderMoveDirectoryLoading;
-  select.textContent = state.artistFolderMoveDirectoryLoading ? '读取中' : '选这个目录';
+  select.textContent = state.artistFolderMoveDirectoryLoading ? '读取中' : '确定选择此目录';
   list.innerHTML = state.artistFolderMoveDirectoryLoading
     ? '<div class="move-empty small">读取目录中</div>'
     : (state.artistFolderMoveDirectoryEntries.length
@@ -91,7 +91,7 @@ async function loadArtistFolderMoveDirectories(path = '') {
     state.artistFolderMoveDirectoryEntries = Array.isArray(result?.directories) ? result.directories : [];
   } catch (error) {
     state.artistFolderMoveDirectoryEntries = [];
-    toast('读取目录失败: ' + (error.message || error), 'error');
+    toast('读取目录失败：' + (error.message || error), 'error');
   } finally {
     state.artistFolderMoveDirectoryLoading = false;
     renderArtistFolderMoveDirectoryDialog();
@@ -478,13 +478,13 @@ function renderOverviewActions() {
   const waiting = Number(state.moveWaitingHashCount || 0)
     + Number(state.hashStatus?.scan_candidates?.remaining || 0);
   const hints = [];
-  if (pending > 0) hints.push(`${pending} 项需要你确认`);
+  if (pending > 0) hints.push(`${pending} 项待确认`);
   if (waiting > 0) hints.push(`${waiting} 项正在自动入库`);
   if (hints.length > 0) {
     pathsHint.textContent = hints.join('，');
     pathsHint.classList.toggle('is-attention', pending > 0);
   } else {
-    pathsHint.textContent = '当前没有需要你确认的路径';
+    pathsHint.textContent = '当前没有待确认的路径';
     pathsHint.classList.remove('is-attention');
   }
 }
@@ -645,9 +645,12 @@ function renderMlRuntime() {
   const fallbackText = status.allow_cpu_fallback ? '允许' : '禁止';
 
   const gpuActive = ['CUDAExecutionProvider', 'OpenVINOExecutionProvider'].includes(status.actual_provider);
+  const gpuPlanned = ['cuda', 'openvino'].includes(status.planned_provider);
+  const sessionIdle = ['idle_unloaded', 'preparing'].includes(session.reason);
   const modelReady = model.state === 'ready';
   const modelText = status.download_in_progress ? 'AI 模型准备中' : (modelReady ? 'AI 模型已就绪' : 'AI 模型未就绪');
-  const gpuText = gpuActive ? 'GPU 加速已启用' : 'GPU 加速未启用';
+  const gpuText = gpuActive ? 'GPU 加速已启用'
+    : (gpuPlanned && sessionIdle ? 'GPU 加速待加载' : 'GPU 加速未启用');
   summaryEl.textContent = (status.restart_required ? '需重启后生效，' : '') + `${modelText}，${gpuText}`;
 
   const rows = [
@@ -822,7 +825,7 @@ function renderRecycleBin() {
   const occupied = entries.filter(recycleOriginalExists).length;
   summary.textContent = joinUiMeta([
     `${entries.length}/${total} 项可恢复`,
-    unavailable ? `${unavailable} 个回收文件缺失` : '',
+    unavailable ? `${unavailable} 个文件已缺失` : '',
     occupied ? `${occupied} 个原路径已占用` : '',
   ]);
   list.innerHTML = entries.length ? entries.map(entry => {
@@ -839,7 +842,7 @@ function renderRecycleBin() {
     const restoring = isActionBusy('recycle-restore', String(id));
     const canRestore = Number.isFinite(id) && status === 'recycled' && fileExists && !originalExists && !restoring;
     const fileState = !fileExists
-      ? '回收文件缺失'
+      ? '文件已缺失'
       : (originalExists ? '原路径已被占用' : '可以恢复');
     return `
       <div class="recycle-bin-row${canRestore ? '' : ' blocked'}">
@@ -887,7 +890,7 @@ async function restoreRecycleEntry(entryId) {
     toast(result.message || '文件已恢复到原始路径', 'success');
   } catch (e) {
     if (e.status === 409 || e.status === 404) await loadRecycleBin();
-    toast('恢复失败: ' + (e.message || e), 'error');
+    toast('恢复失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('recycle-restore', String(id), false);
     renderRecycleBin();
@@ -908,6 +911,10 @@ async function loadCharacterLibrary(options = {}) {
   const requestedCharacterId = options.characterId != null
     ? Number(options.characterId)
     : state.characterLibrarySelectedCharacterId;
+  // Direct-click path has no shared AbortController: capture a sequence token
+  // so an older response can never overwrite a newer selection.
+  const seq = nextRequestSeq('characterLibraryLoadSeq');
+  const isCurrent = () => !updateState || isCurrentRequestSeq('characterLibraryLoadSeq', seq);
   const previousLibrary = state.characterLibrary;
   let summary = null;
   try {
@@ -923,15 +930,17 @@ async function loadCharacterLibrary(options = {}) {
         import_job: state.characterImportJob,
         summary_error: summaryError.message || String(summaryError),
       };
+      if (!isCurrent()) return characterLibrary;
       if (updateState) {
         state.characterLibrary = characterLibrary;
         state.characterLibrarySelectedCharacterId = requestedCharacterId;
         state.characterLibraryLoading = false;
       }
       if (render) renderCharacterLibrary();
-      toast('刷新角色库失败: ' + (summaryError.message || summaryError), 'error');
+      toast('刷新角色库失败：' + (summaryError.message || summaryError), 'error');
       return characterLibrary;
     }
+    if (!isCurrent()) return {summary};
     const characters = summary.characters || [];
     const selectedCharacterId = characters.length
       ? (
@@ -949,7 +958,7 @@ async function loadCharacterLibrary(options = {}) {
         if (isAbortError(referenceError)) throw referenceError;
         references = {references: previousLibrary?.references || []};
         referenceErrorMessage = referenceError.message || String(referenceError);
-        toast('读取角色引用失败: ' + referenceErrorMessage, 'error');
+        toast('读取角色引用失败：' + referenceErrorMessage, 'error');
       }
     }
     let importJob = null;
@@ -966,6 +975,7 @@ async function loadCharacterLibrary(options = {}) {
       import_job: importJob,
       reference_error: referenceErrorMessage,
     };
+    if (!isCurrent()) return characterLibrary;
     if (updateState) {
       state.characterLibrary = characterLibrary;
       state.characterLibrarySelectedCharacterId = selectedCharacterId;
@@ -983,6 +993,7 @@ async function loadCharacterLibrary(options = {}) {
       selected_character_id: null,
       references: [],
     };
+    if (!isCurrent()) return characterLibrary;
     if (updateState) {
       state.characterLibrary = characterLibrary;
       state.characterLibrarySelectedCharacterId = null;
@@ -1101,10 +1112,10 @@ function renderCharacterLibrary() {
 
   const library = state.characterLibrary;
   if (!library) {
-    summaryEl.textContent = state.characterLibraryLoading ? '角色库读取中...' : '角色特征库未加载';
+    summaryEl.textContent = state.characterLibraryLoading ? '角色库读取中' : '角色特征库未加载';
     tagList.innerHTML = '<div class="character-library-empty">暂无可导入的单角色标签</div>';
     characterList.innerHTML = '<div class="character-library-empty">暂无已建特征库角色</div>';
-    referenceList.innerHTML = '<div class="character-library-empty">请在中间列表选择角色以查看其参考特征图</div>';
+    referenceList.innerHTML = '<div class="character-library-empty">请先在「已建特征库角色」列表中选择角色</div>';
     return;
   }
   if (library.error) {
@@ -1200,7 +1211,7 @@ function renderCharacterLibrary() {
             <div class="character-card-meta-row">
               <span>${escHtml(joinUiMeta([`${referenceCount} 条参考图`, `#${character.id}`]))}</span>
             </div>
-            <div class="character-card-created">${escHtml(`创建于 ${character.created_at || '未知'}`)}</div>
+            <div class="character-card-created">${character.created_at ? escHtml(`创建于 ${formatHealthTime(character.created_at)}`) : ''}</div>
           </div>
         </button>
         <button type="button" class="btn btn-danger btn-icon character-card-delete" data-character-delete="${character.id}" title="删除角色" aria-label="删除角色">${buttonIcon('trash')}</button>
@@ -1293,7 +1304,7 @@ async function pollCharacterImportJob() {
     state.characterImportPollFailures = (state.characterImportPollFailures || 0) + 1;
     if (state.characterImportPollFailures >= 5) {
       stopCharacterImportPolling();
-      toast('读取角色库导入进度失败: ' + (e.message || e), 'error');
+      toast('读取角色库导入进度失败：' + (e.message || e), 'error');
     }
   }
 }
@@ -1328,7 +1339,7 @@ async function importCharacterLibraryReferences(payload) {
     }
     startCharacterImportPolling();
   } catch (e) {
-    toast('导入角色库失败: ' + (e.message || e), 'error');
+    toast('导入角色库失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('character-library-import', busyScope, false);
   }
@@ -1341,7 +1352,7 @@ async function cancelCharacterImportJob(jobId) {
     const result = await API.post(`/api/characters/import-from-tags/jobs/${jobId}/cancel`);
     rememberCharacterImportJob(result);
   } catch (e) {
-    toast('取消角色库导入失败: ' + (e.message || e), 'error');
+    toast('取消角色库导入失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('character-library-import-cancel', jobId, false);
   }
@@ -1357,7 +1368,7 @@ async function deleteCharacterReference(characterId, referenceId) {
     toast('参考图已删除', 'success');
     await loadCharacterLibrary({characterId});
   } catch (e) {
-    toast('删除参考图失败: ' + (e.message || e), 'error');
+    toast('删除参考图失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('character-library-delete', `${characterId}:${referenceId}`, false);
   }
@@ -1374,7 +1385,7 @@ async function deleteCharacter(characterId) {
     const nextCharacterId = Number(state.characterLibrarySelectedCharacterId) === Number(characterId) ? null : state.characterLibrarySelectedCharacterId;
     await loadCharacterLibrary({characterId: nextCharacterId});
   } catch (e) {
-    toast('删除角色失败: ' + (e.message || e), 'error');
+    toast('删除角色失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('character-library-character-delete', characterId, false);
   }
@@ -1389,7 +1400,7 @@ async function rebuildCharacterIndex() {
     toast(text, result.ok ? 'success' : 'error');
     await loadCharacterLibrary({characterId: state.characterLibrarySelectedCharacterId});
   } catch (e) {
-    toast('刷新角色参考失败: ' + (e.message || e), 'error');
+    toast('刷新角色参考失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('character-library-rebuild', '', false);
   }
@@ -1557,7 +1568,7 @@ async function setFolderRenameAutoEnabled(enabled) {
   } catch (e) {
     state.folderRenameAuto = previous || {enabled: !enabled};
     renderFolderRenameAutoStatus();
-    toast('自动整理设置失败: ' + (e.message || e), 'error');
+    toast('自动整理设置失败：' + (e.message || e), 'error');
   }
 }
 
@@ -1568,8 +1579,15 @@ async function runFolderRenameAllNow() {
   if (!confirmed) return;
   setActionBusy('archive-run-all', '', true);
   renderFolderRenameAutoStatus();
+  // Bounded wait: a hung request previously kept the button stuck at
+  // 整理中 forever. Ten minutes covers large libraries with backups.
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), 10 * 60 * 1000);
   try {
-    const response = await fetch('/api/folder-renames/execute-all', {method: 'POST'});
+    const response = await fetch('/api/folder-renames/execute-all', {
+      method: 'POST',
+      signal: controller.signal,
+    });
     const result = await API.parseResponse(response);
     await loadMoveWorkbench({preserveScroll: true});
     const executed = Number(result.executed_count || 0);
@@ -1582,14 +1600,15 @@ async function runFolderRenameAllNow() {
       retried_count: Number(result.retried_count || 0),
     });
     if (failed) {
-      toast(`全库整理完成: 成功 ${executed} 项，失败 ${failed} 项`, 'error');
+      toast(`全库整理完成：成功 ${executed} 项，失败 ${failed} 项`, 'error');
     } else {
-      toast(executed ? `全库整理完成: ${executed} 项` : '当前没有可执行的整理项', executed ? 'success' : 'info');
+      toast(executed ? `全库整理完成：${executed} 项` : '当前没有可执行的整理项', executed ? 'success' : 'info');
     }
   } catch (e) {
     logUiAction('archive_run_all_result', {status: 'error', error: e.message || String(e)});
-    toast('全库整理失败: ' + (e.message || e), 'error');
+    toast('全库整理失败：' + (e.message || e), 'error');
   } finally {
+    clearTimeout(abortTimer);
     setActionBusy('archive-run-all', '', false);
     renderFolderRenameAutoStatus();
   }
@@ -1659,7 +1678,7 @@ async function saveArchiveSettings() {
     await loadArchiveWorkbench({keepRun: true});
     toast('整理方式已保存', 'success');
   } catch (e) {
-    toast('保存整理方式失败: ' + (e.message || e), 'error');
+    toast('保存整理方式失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('archive-settings-save', '', false);
   }
@@ -1679,7 +1698,7 @@ async function previewArchivePlans(options = {}) {
   } catch (e) {
     state.archivePreview = {error: e.message || String(e)};
     renderArchiveWorkbench();
-    if (!options.silent) toast('预览目标失败: ' + (e.message || e), 'error');
+    if (!options.silent) toast('预览目标失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('archive-preview', '', false);
   }
@@ -1700,7 +1719,7 @@ async function applyArchiveTemplate() {
     const updated = Number(result.updated || result.applied || 0);
     toast(updated ? `已更新 ${updated} 个整理项` : '没有可更新的整理项', updated ? 'success' : 'info');
   } catch (e) {
-    toast('更新整理项失败: ' + (e.message || e), 'error');
+    toast('更新整理项失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('archive-apply', '', false);
   }
@@ -1747,6 +1766,20 @@ function archiveStatusExplanation(plan) {
   if (status === 'manual_review' || status === 'blocked') return '当前路径不能安全整理，原文件夹保持不变';
   if (plan.plan_kind === 'split_by_tag' && status !== 'executed') return '将按每个文件的有效月份和标签分开整理；未打标签的文件保留原处';
   return '';
+}
+
+async function refreshArchivePlans() {
+  const artistId = archiveCurrentArtistId();
+  if (!artistId) {
+    await loadArchiveWorkbench();
+    return;
+  }
+  try {
+    await API.post(`/api/folder-renames/refresh?artist_id=${encodeURIComponent(artistId)}`);
+  } catch (e) {
+    // Read-only deployments cannot refresh; fall back to listing current plans.
+  }
+  await loadArchiveWorkbench();
 }
 
 async function loadArchiveWorkbench(options = {}) {
@@ -1840,7 +1873,7 @@ function renderArchiveWorkbench() {
   }
 
   if (settings?.error) {
-    ruleStatus.textContent = `读取 Default 规则失败: ${settings.error}`;
+    ruleStatus.textContent = `读取 Default 规则失败：${settings.error}`;
   } else if (profile) {
     const collisionLabel = profile.collision_strategy === 'reject'
       ? '冲突跳过'
@@ -1859,7 +1892,7 @@ function renderArchiveWorkbench() {
   planSummary.textContent = joinUiMeta([
     `${plans.length} 个文件夹`,
     ready ? `${ready} 待确认` : '',
-    confirmed ? `${confirmed} 已确认 (将执行)` : '',
+    confirmed ? `${confirmed} 已确认（将执行）` : '',
     needsAttention ? `${needsAttention} 需处理` : '',
     executed ? `${executed} 已整理` : '',
     reverted ? `${reverted} 已撤销` : '',
@@ -1868,13 +1901,13 @@ function renderArchiveWorkbench() {
   if (state.archiveRun?.results?.length) {
     const blocked = state.archiveRun.results.filter(row => row.status === 'error' || row.reason || row.error).length;
     previewSummary.textContent = joinUiMeta([
-      `${state.archiveRun.dry_run ? '检查' : '执行'}完成: ${state.archiveRun.results.length} 个整理项`,
-      blocked ? `${blocked} 个需处理` : state.archiveRun.dry_run ? '都可以执行' : '全部成功',
+      `${state.archiveRun.dry_run ? '检查' : '执行'}完成：${state.archiveRun.results.length} 个整理项`,
+      blocked ? `${blocked} 个需处理` : state.archiveRun.dry_run ? '全部可以执行' : '全部成功',
     ]);
   } else {
     const previewPlans = state.archivePreview?.plans || [];
     if (state.archivePreview?.error) {
-      previewSummary.textContent = `预览失败: ${state.archivePreview.error}`;
+      previewSummary.textContent = `预览失败：${state.archivePreview.error}`;
     } else if (previewPlans.length) {
       const conflicts = state.archivePreview?.conflicts?.length || 0;
       previewSummary.textContent = `${previewPlans.length} 个目标预览${conflicts ? `，${conflicts} 个冲突` : '，均可应用'}`;
@@ -1887,17 +1920,17 @@ function renderArchiveWorkbench() {
   const confirmAllBtn = $('#archivePlansConfirmAllBtn');
   if (confirmAllBtn) {
     if (isAutoOrganize) {
-      confirmAllBtn.textContent = '自动整理已开启 (无需确认)';
+      confirmAllBtn.textContent = '自动整理已开启（无需确认）';
       confirmAllBtn.disabled = true;
       confirmAllBtn.title = '自动整理开启时，符合规则的文件夹将在全库扫描时自动处理，无需手动确认';
     } else {
       const unconfirmedReady = plans.filter(plan => plan.status === 'ready' && archivePlanHasTarget(plan));
       const confirmedPlans = plans.filter(plan => plan.status === 'confirmed');
       if (unconfirmedReady.length > 0) {
-        confirmAllBtn.textContent = `全部确认 (${unconfirmedReady.length})`;
+        confirmAllBtn.textContent = `全部确认（${unconfirmedReady.length}）`;
         confirmAllBtn.disabled = !artistId;
       } else if (confirmedPlans.length > 0) {
-        confirmAllBtn.textContent = `全部取消确认 (${confirmedPlans.length})`;
+        confirmAllBtn.textContent = `全部取消确认（${confirmedPlans.length}）`;
         confirmAllBtn.disabled = !artistId;
       } else {
         confirmAllBtn.textContent = '全部确认';
@@ -1955,7 +1988,7 @@ async function toggleArchivePlanConfirmation(planId) {
     await loadArchiveWorkbench();
     toast(plan.status === 'confirmed' ? '已取消确认' : '整理项已确认', 'success');
   } catch (e) {
-    toast('更新整理项失败: ' + (e.message || e), 'error');
+    toast('更新整理项失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('archive-plan-confirm', String(planId), false);
   }
@@ -1975,11 +2008,11 @@ async function toggleAllArchivePlansConfirmation() {
     } else {
       const result = await API.postJson('/api/folder-renames/unconfirm-all', {artist_id: artistId});
       const count = Number(result?.unconfirmed || 0);
-      toast(`已全部取消确认 (${count} 个整理项)`, 'info');
+      toast(`已全部取消确认（${count} 个整理项）`, 'info');
     }
     await loadArchiveWorkbench();
   } catch (e) {
-    toast('批量确认失败: ' + (e.message || e), 'error');
+    toast('批量确认失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('archive-confirm-all', '', false);
   }
@@ -2007,7 +2040,7 @@ async function undoArchivePlan(planId) {
   } catch (e) {
     const reason = e?.body?.message || e?.body?.reason || e?.body?.error
       || e?.detail?.message || e?.detail?.reason || e?.message || e;
-    toast('撤销整理失败: ' + archiveUndoFailureLabel(reason), 'error');
+    toast('撤销整理失败：' + archiveUndoFailureLabel(reason), 'error');
   } finally {
     setActionBusy('archive-plan-undo', String(id), false);
     renderArchiveWorkbench();
@@ -2058,10 +2091,10 @@ async function executeArchivePlans(dryRun) {
         toast('检查完成：0 个可执行', 'info');
       }
     } else {
-      toast(dryRun ? `检查完成: ${successful} 个整理项可执行` : `整理完成: ${successful} 个整理项`, successful ? 'success' : 'info');
+      toast(dryRun ? `检查完成：${successful} 个整理项可执行` : `整理完成：${successful} 个整理项`, successful ? 'success' : 'info');
     }
   } catch (e) {
-    toast((dryRun ? '执行检查失败: ' : '整理操作失败: ') + (e.message || e), 'error');
+    toast((dryRun ? '执行检查失败：' : '整理操作失败：') + (e.message || e), 'error');
   } finally {
     setActionBusy('archive-plan-execute', '', false);
   }
@@ -2289,7 +2322,7 @@ function renderHealthSummary() {
   if (!grid) return;
   const health = state.healthSummary;
   if (!health) {
-    grid.innerHTML = '<div class="maintenance-card status-card status-muted move-empty small">系统健康状态读取中...</div>';
+    grid.innerHTML = '<div class="maintenance-card status-card status-muted move-empty small">系统健康状态读取中</div>';
     return;
   }
   if (health.error) {
@@ -2519,6 +2552,13 @@ function renderMoveCandidateGroups() {
 function renderMoveCandidates() {
   const list = $('#moveCandidateList');
   const groupedCandidateIds = new Set();
+  (state.moveCandidateGroups || []).forEach(group => {
+    if (!group.can_apply) return;
+    const blocked = new Set((group.blocked_move_ids || []).map(Number));
+    (group.move_ids || []).map(Number).forEach(id => {
+      if (!blocked.has(id)) groupedCandidateIds.add(id);
+    });
+  });
   const groupedCount = (state.moveCandidateGroups || [])
     .filter(group => group.can_apply && Number(group.applicable_candidate_count ?? group.candidate_count ?? 0) > 0)
     .reduce((total, group) => total + Number(group.applicable_candidate_count ?? group.candidate_count ?? 0), 0);
@@ -2528,7 +2568,7 @@ function renderMoveCandidates() {
       list.innerHTML = '<div class="move-empty">已在上方按画师路径分组 ' + groupedCount + ' 项</div>';
       return;
     }
-    list.innerHTML = '<div class="move-empty">没有需要你确认的路径</div>';
+    list.innerHTML = '<div class="move-empty">没有待确认的路径</div>';
     return;
   }
 
@@ -2542,7 +2582,7 @@ function renderMoveCandidates() {
     const isCrossArtist = Boolean(c.is_cross_artist);
     const cannotConfirm = c.can_confirm === false || isCrossArtist;
     const warning = isCrossArtist
-      ? '<div class="move-warning">跨画师路径需要你确认。确定不是同一文件时，再选「作为独立新文件」；暂时不想处理可以忽略。</div>'
+      ? '<div class="move-warning">跨画师路径需要人工确认。确定不是同一文件时，再选「作为独立新文件」；暂时不想处理可以忽略。</div>'
       : (isManual ? '<div class="move-warning">请人工核对旧/新路径；能确定同一文件时再确认。</div>' : '');
     const artistPaths = isCrossArtist ? `
         <div class="move-artist-paths">
@@ -2628,7 +2668,7 @@ async function applyMoveCandidateGroup(oldArtistId, newArtistId) {
     await refreshActiveMaintenanceView({preserveScroll: true, view: 'paths'});
     await loadArtists();
   } catch (e) {
-    toast('批量路径确认失败: ' + e.message, 'error');
+    toast('批量路径确认失败：' + e.message, 'error');
   } finally {
     setActionBusy('move-group-action', busyKey, false);
   }
@@ -2665,7 +2705,7 @@ async function autoResolveMoveCandidates(options = {}) {
     }
     return result;
   } catch (e) {
-    if (!silent) toast('自动确认处理失败: ' + e.message, 'error');
+    if (!silent) toast('自动确认处理失败：' + e.message, 'error');
     return null;
   } finally {
     if (btn && !silent) {
@@ -2708,7 +2748,7 @@ async function runMoveAction(id, action) {
     await refreshActiveMaintenanceView({preserveScroll: true, view: 'paths'});
     await loadArtists();
   } catch (e) {
-    toast('路径候选操作失败: ' + e.message, 'error');
+    toast('路径候选操作失败：' + e.message, 'error');
   } finally {
     setActionBusy('move-action', `${action}:${id}`, false);
   }

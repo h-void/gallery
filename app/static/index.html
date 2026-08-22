@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>画廊</title>
-<link rel="stylesheet" href="/static/style.css?v=1.1.2">
+<link rel="stylesheet" href="/static/style.css?v=1.0.294">
 </head>
 <body>
 
@@ -20,10 +20,10 @@
 <header id="appHeader" class="mobile-tools-collapsed">
   <h1>画廊</h1>
   <div class="artist-picker" id="artistPicker">
-    <input type="text" id="artistSearch" placeholder="搜索画师名称 / 拼音..." autocomplete="off" maxlength="256">
+    <input type="text" id="artistSearch" placeholder="搜索画师名称或拼音" autocomplete="off" maxlength="256">
     <div class="artist-dropdown" id="artistDropdown"></div>
   </div>
-  <button id="mobileHeaderToggle" class="btn btn-ghost mobile-header-toggle" type="button" aria-expanded="false" aria-label="展开搜索与快捷操作" title="展开搜索与快捷操作">搜索</button>
+  <button id="mobileHeaderToggle" class="btn btn-ghost mobile-header-toggle" type="button" aria-expanded="false" aria-label="展开搜索和扫描" title="展开搜索和扫描">搜索</button>
   <div class="mode-tabs" role="tablist" aria-label="模式切换">
     <button class="btn btn-segment active" type="button" data-mode="browse" aria-pressed="true">浏览</button>
     <button class="btn btn-segment" type="button" data-mode="edit" aria-pressed="false">编辑</button>
@@ -195,7 +195,7 @@
         </div>
         <div class="edit-bar-group" data-group="tag" role="group" aria-label="标签与角色编辑">
           <div class="tag-picker" id="editTagPicker">
-            <input type="text" id="editTagSearch" placeholder="搜索或选择标签..." autocomplete="off" maxlength="256">
+            <input type="text" id="editTagSearch" placeholder="搜索或选择标签" autocomplete="off" maxlength="256">
             <div class="tag-picker-panel" id="editTagPickerPanel"></div>
           </div>
           <span class="tag-picker-summary" id="editTagPickerSummary">未选标签</span>
@@ -222,7 +222,7 @@
             <input type="date" id="editDateDay" aria-label="精确日期 (YYYY-MM-DD)" title="YYYY-MM-DD" hidden>
             <span class="date-picker-summary" id="editDateSummary"></span>
             <button class="btn btn-soft-primary" id="editDateApplyBtn" type="button" disabled>设置日期</button>
-            <button class="btn btn-ghost" id="editDateResetBtn" type="button" disabled title="清除手动日期，恢复扫描检测到的日期">↺ 恢复检测</button>
+            <button class="btn btn-ghost" id="editDateResetBtn" type="button" disabled title="清除手动日期，恢复扫描检测到的日期">恢复检测</button>
           </div>
         </div>
         <div class="edit-bar-group" data-group="action" role="group" aria-label="退出与删除">
@@ -330,11 +330,11 @@
           <div class="maintenance-section-head">
             <div>
               <div class="move-section-title">待处理事项</div>
-              <div class="health-subtitle">仅需你确认歧义或冲突的路径</div>
+              <div class="health-subtitle">仅需确认歧义或冲突的路径</div>
             </div>
           </div>
           <div class="move-summary">
-            <div class="maintenance-card action-card metric-card metric-alert"><strong id="movePendingCount">0</strong><span>需要你确认</span></div>
+            <div class="maintenance-card action-card metric-card metric-alert"><strong id="movePendingCount">0</strong><span>待确认</span></div>
             <div class="maintenance-card action-card metric-card metric-info"><strong id="moveWaitingHashCount">0</strong><span>系统处理中</span></div>
             <div class="maintenance-card action-card metric-card metric-ok"><strong id="movePreviewCount">0</strong><span>已自动确认</span></div>
           </div>
@@ -422,7 +422,7 @@
           <summary>角色库</summary>
           <div class="maintenance-section-head">
             <div>
-              <div class="move-section-title">角色库</div>
+              <div class="move-section-title">建库与导入</div>
               <div class="health-subtitle">用单角色作品建库，提升识别准确率</div>
             </div>
             <div class="maintenance-section-actions">
@@ -434,8 +434,8 @@
           <div class="character-library-summary" id="characterLibrarySummary">角色库读取中</div>
           <div class="character-library-toolbar">
             <div class="character-library-search">
-              <input id="characterLibrarySearchInput" type="search" placeholder="搜索已建库角色名或可导入标签..." autocomplete="off" aria-label="搜索角色库">
-              <button id="characterLibrarySearchClearBtn" class="btn btn-ghost btn-icon" type="button" aria-label="清空搜索" title="清空搜索" hidden>✕</button>
+              <input id="characterLibrarySearchInput" type="search" placeholder="搜索角色或可导入标签" autocomplete="off" aria-label="搜索角色库">
+              <button id="characterLibrarySearchClearBtn" class="btn btn-ghost btn-icon" type="button" aria-label="清空搜索" title="清空搜索" hidden><span class="btn-glyph" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12"></path><path d="M18 6 6 18"></path></svg></span></button>
             </div>
           </div>
           <div class="character-library-grid">
@@ -457,8 +457,8 @@
 
         <div class="maintenance-view-panel" data-maintenance-view-panel="records" hidden>
         <details class="maintenance-section recycle-bin-panel maintenance-advanced-detail" id="recycleBinPanel" open>
-          <summary>回收站（已删除作品）</summary>
-          <div class="maintenance-section-head"><div><div class="move-section-title">已删除文件列表</div><div class="health-subtitle">支持一键恢复至原位置</div></div><div class="maintenance-section-actions"><button id="recycleRefreshBtn" class="btn btn-ghost" type="button">刷新列表</button></div></div>
+          <summary>回收站</summary>
+          <div class="maintenance-section-head"><div><div class="move-section-title">已删除作品</div><div class="health-subtitle">支持一键恢复至原位置</div></div><div class="maintenance-section-actions"><button id="recycleRefreshBtn" class="btn btn-ghost" type="button">刷新列表</button></div></div>
           <div class="recycle-bin-summary" id="recycleBinSummary">回收站读取中</div><div class="recycle-bin-list" id="recycleBinList"></div><div class="recycle-bin-more" id="recycleBinMore"></div>
         </details>
 
@@ -528,7 +528,7 @@
               </div>
               <div class="maintenance-guide-item">
                 <b>角色识别</b>
-                <span>角色识别依赖同一标签下积累的一定数量单角色参考图片；样本太少可能不稳定。选中图片/视频后，建议需你点击确认才成为标签。</span>
+                <span>角色识别依赖同一标签下积累的一定数量单角色参考图片；样本太少可能不稳定。选中图片或视频后生成的建议，确认后才会成为标签。</span>
               </div>
             </section>
 
@@ -666,7 +666,7 @@
   </div>
   <div class="artist-links-dialog-body">
     <div class="artist-links-controls">
-      <input id="artistLinksSearch" type="search" placeholder="搜索链接、提取码、服务商或来源文本..." maxlength="256">
+      <input id="artistLinksSearch" type="search" placeholder="搜索链接或提取码" maxlength="256">
       <select id="artistLinksCategory" aria-label="链接分类"><option value="all">全部链接</option></select>
       <select id="artistLinksProvider" aria-label="网盘或域名"><option value="all">全部服务</option></select>
       <select id="artistLinksAvailability" aria-label="链接状态"><option value="all">全部状态</option><option value="unverified">未校验</option></select>
@@ -680,7 +680,7 @@
 <dialog class="artist-links-dialog error-artists-dialog" id="errorArtistsDialog" aria-labelledby="errorArtistsDialogTitle">
   <div class="artist-links-dialog-head">
     <h2 id="errorArtistsDialogTitle">出错画师</h2>
-    <button class="btn btn-ghost btn-icon" id="errorArtistsCloseBtn" type="button" aria-label="关闭出错画师" title="关闭出错画师"><span class="btn-glyph" aria-hidden="true">×</span></button>
+    <button class="btn btn-ghost btn-icon" id="errorArtistsCloseBtn" type="button" aria-label="关闭出错画师" title="关闭出错画师"><span class="btn-glyph" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12"></path><path d="M18 6 6 18"></path></svg></span></button>
   </div>
   <div class="artist-links-dialog-body">
     <div class="artist-links-controls error-artists-controls">
@@ -712,7 +712,7 @@
     </span>
   </a>
   <button class="btn btn-ghost btn-icon lightbox-favorite" id="lightboxFavoriteBtn" type="button" title="收藏" aria-label="收藏" aria-pressed="false">
-    <span data-favorite-glyph aria-hidden="true">☆</span>
+    <span data-favorite-glyph aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3.8l2.5 5.1 5.7.8-4.1 4 1 5.6-5.1-2.7-5.1 2.7 1-5.6-4.1-4 5.7-.8z"/></svg></span>
   </button>
   <button class="btn btn-ghost btn-icon lightbox-delete" id="lightboxDeleteBtn" type="button" title="删除文件" aria-label="删除文件">
     <span class="btn-glyph" aria-hidden="true">
@@ -750,13 +750,13 @@
   </div>
 </div>
 
-<script src="/static/js/core.js?v=1.1.2"></script>
-<script src="/static/js/layout.js?v=1.1.2"></script>
-<script src="/static/js/maintenance.js?v=1.1.2"></script>
-<script src="/static/js/media.js?v=1.1.2"></script>
-<script src="/static/js/links.js?v=1.1.2"></script>
-<script src="/static/js/edit.js?v=1.1.2"></script>
-<script src="/static/js/events.js?v=1.1.2"></script>
+<script src="/static/js/core.js?v=1.0.294"></script>
+<script src="/static/js/layout.js?v=1.0.294"></script>
+<script src="/static/js/maintenance.js?v=1.0.294"></script>
+<script src="/static/js/media.js?v=1.0.294"></script>
+<script src="/static/js/links.js?v=1.0.294"></script>
+<script src="/static/js/edit.js?v=1.0.294"></script>
+<script src="/static/js/events.js?v=1.0.294"></script>
 
 </body>
 </html>

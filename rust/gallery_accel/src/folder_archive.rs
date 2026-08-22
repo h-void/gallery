@@ -428,10 +428,11 @@ fn rename_permission_denied_parent(source: &Path, target: &Path) -> Option<PathB
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rename_permission_denied_parent(source: &Path, _target: &Path) -> Option<PathBuf> {
+fn rename_permission_denied_parent(_source: &Path, _target: &Path) -> Option<PathBuf> {
     #[cfg(test)]
     if FORCE_RENAME_PARENT_PERMISSION_DENIED.with(|force| force.replace(false)) {
-        return source.parent().map(Path::to_path_buf);
+        // Test-only hook: the parameter is otherwise unused on this platform.
+        return _source.parent().map(Path::to_path_buf);
     }
     None
 }
@@ -542,8 +543,7 @@ fn rename_artist_dir_no_overwrite(
     let source = artist.join(source);
     let target = artist.join(target);
     if let Some(parent) = target.parent() {
-        ensure_target_parent_under_artist(parent, artist)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+        ensure_target_parent_under_artist(parent, artist).map_err(std::io::Error::other)?;
     }
     rename_dir_no_overwrite(&source, &target)?;
     crate::media_serve::fsync_parent_dir_best_effort(&source);
@@ -934,11 +934,11 @@ pub fn folder_error_artists(
     }
     let mut stmt = conn.prepare(&sql)?;
     let rows = if escaped.is_empty() {
-        stmt.query_map([], |row| map_error_plan(row))?
+        stmt.query_map([], map_error_plan)?
             .collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         let pattern = format!("%{escaped}%");
-        stmt.query_map([pattern.clone(), pattern], |row| map_error_plan(row))?
+        stmt.query_map([pattern.clone(), pattern], map_error_plan)?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut grouped: HashMap<i64, Value> = HashMap::new();
@@ -1015,9 +1015,7 @@ pub fn folder_error_artists(
     )
 }
 
-fn map_error_plan(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(
+type ErrorPlanRow = (
     i64,
     i64,
     String,
@@ -1026,7 +1024,9 @@ fn map_error_plan(
     Option<f64>,
     String,
     String,
-)> {
+);
+
+fn map_error_plan(row: &rusqlite::Row<'_>) -> rusqlite::Result<ErrorPlanRow> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -1058,12 +1058,31 @@ fn demote_plan_with_log(
         "target": target,
         "automatic": true,
     });
+    // Append to the existing history so earlier failure entries survive.
+    let existing_log: String = conn
+        .query_row(
+            "SELECT execution_log FROM folder_rename_plans WHERE id=?",
+            params![plan_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+    let mut log = serde_json::from_str::<Value>(&existing_log)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    log.push(entry);
     conn.execute(
         "UPDATE folder_rename_plans
          SET status=?, target_folder=?, confirmed_at=NULL, confirmation_source='',
              execution_log=?, updated_at=?
          WHERE id=?",
-        params![status, target, json!([entry]).to_string(), now(), plan_id],
+        params![
+            status,
+            target,
+            Value::Array(log).to_string(),
+            now(),
+            plan_id
+        ],
     )?;
     Ok(())
 }
@@ -1093,12 +1112,25 @@ pub(crate) fn record_plan_execution_failure(
             }
         }
     }
+    // Append to the existing history so earlier failure entries survive.
+    let existing_log: String = conn
+        .query_row(
+            "SELECT execution_log FROM folder_rename_plans WHERE id=?",
+            params![plan_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+    let mut log = serde_json::from_str::<Value>(&existing_log)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    log.push(entry);
     conn.execute(
         "UPDATE folder_rename_plans
          SET status='manual_review', confirmed_at=NULL, confirmation_source='',
              execution_log=?, updated_at=?
          WHERE id=? AND status='confirmed'",
-        params![json!([entry]).to_string(), now(), plan_id],
+        params![Value::Array(log).to_string(), now(), plan_id],
     )?;
     Ok(())
 }
@@ -1165,8 +1197,7 @@ pub fn invalidate_plans_after_item_date_change(
     if folders.is_empty() {
         return Ok(0);
     }
-    let placeholders = std::iter::repeat("?")
-        .take(folders.len())
+    let placeholders = std::iter::repeat_n("?", folders.len())
         .collect::<Vec<_>>()
         .join(",");
     let mut params: Vec<rusqlite::types::Value> = vec![
@@ -1235,37 +1266,64 @@ fn effective_date_key(raw: &str) -> Option<String> {
     }
 }
 
-/// Distinct effective dates of the active items in one source folder.
-fn effective_item_dates(conn: &Connection, artist_id: i64, folder: &str) -> Result<Vec<String>> {
-    let artist_path = artist_plan_path(conn, artist_id)?;
-    let mut dates = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT file_path, folder_name, manual_date, detected_date, date FROM items
-         WHERE artist_id=? AND COALESCE(missing, 0)=0",
-    )?;
-    let rows = stmt.query_map(params![artist_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-        ))
-    })?;
-    for row in rows {
-        let (file_path, folder_name, manual_date, detected_date, legacy_date) = row?;
-        if source_folder_for_item(&artist_path, &file_path, &folder_name).as_deref() != Some(folder)
-        {
-            continue;
+/// Distinct effective dates of the active items per source folder for one
+/// artist, built with a single pass over the artist's items.
+///
+/// Callers that evaluate many plans (recompute, execute recheck) previously
+/// re-ran one full items query per plan; sharing this grouping turns
+/// O(plans × items) work into O(items). The map must be rebuilt whenever item
+/// paths change (after an executed plan rewrote them).
+struct ItemDatesByFolder {
+    by_folder: HashMap<String, Vec<String>>,
+}
+
+impl ItemDatesByFolder {
+    fn build(conn: &Connection, artist_id: i64) -> Result<Self> {
+        // Minimal schemas (tests, pre-scan databases) may lack items entirely;
+        // an empty grouping matches the previous lazy per-plan behavior.
+        let has_items: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='items')",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut by_folder: HashMap<String, Vec<String>> = HashMap::new();
+        if !has_items {
+            return Ok(Self { by_folder });
         }
-        let raw = item_effective_date(manual_date.as_deref(), &detected_date, &legacy_date);
-        if let Some(date) = effective_date_key(&raw) {
-            if !dates.contains(&date) {
-                dates.push(date);
+        let artist_path = artist_plan_path(conn, artist_id)?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path, folder_name, manual_date, detected_date, date FROM items
+             WHERE artist_id=? AND COALESCE(missing, 0)=0",
+        )?;
+        let rows = stmt.query_map(params![artist_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (file_path, folder_name, manual_date, detected_date, legacy_date) = row?;
+            let Some(folder) = source_folder_for_item(&artist_path, &file_path, &folder_name)
+            else {
+                continue;
+            };
+            let raw = item_effective_date(manual_date.as_deref(), &detected_date, &legacy_date);
+            if let Some(date) = effective_date_key(&raw) {
+                let dates = by_folder.entry(folder).or_default();
+                if !dates.contains(&date) {
+                    dates.push(date);
+                }
             }
         }
+        Ok(Self { by_folder })
     }
-    Ok(dates)
+
+    fn get(&self, folder: &str) -> Vec<String> {
+        self.by_folder.get(folder).cloned().unwrap_or_default()
+    }
 }
 
 /// Tag names for a plan: the stored `selected_tag_ids` order when present,
@@ -1992,6 +2050,9 @@ pub fn recompute_artist_plan_targets(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // One items pass for every plan: recompute only rewrites plan targets,
+    // never item paths, so the grouping stays valid across the loop.
+    let item_dates = ItemDatesByFolder::build(conn, artist_id)?;
     let mut changed = 0usize;
     for (
         plan_id,
@@ -2031,7 +2092,7 @@ pub fn recompute_artist_plan_targets(
             )? as usize;
             continue;
         }
-        let dates = effective_item_dates(conn, artist_id, &source_folder)?;
+        let dates = item_dates.get(&source_folder);
         let mut target = if dates.is_empty() || dates.len() > 1 {
             String::new()
         } else {
@@ -2368,15 +2429,27 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
     Ok(())
 }
 
+/// List folder rename plans.
+///
+/// With `refresh=false` this is a pure read: no DDL, no auto-discovery, no
+/// target recompute. Read-only pools can therefore serve the list, and a GET
+/// never mutates data. Pass `refresh=true` (explicit refresh endpoint) to run
+/// discovery and target recomputation for one artist first.
 pub fn list_folder_renames(
     conn: &Connection,
     roots: Option<&MediaRoots>,
     artist_id: Option<i64>,
+    refresh: bool,
 ) -> Result<Value> {
-    ensure_folder_schema(conn)?;
-    if let Some(aid) = artist_id {
-        let _ = auto_discover_artist_folder_plans(conn, aid);
-        let _ = recompute_artist_plan_targets(conn, roots, aid);
+    if refresh {
+        if let Some(aid) = artist_id {
+            if let Err(error) = auto_discover_artist_folder_plans(conn, aid) {
+                eprintln!("folder rename auto-discover failed for artist {aid}: {error:#}");
+            }
+            if let Err(error) = recompute_artist_plan_targets(conn, roots, aid) {
+                eprintln!("folder rename target recompute failed for artist {aid}: {error:#}");
+            }
+        }
     }
     let mut sql = String::from(
         "SELECT id, artist_id, source_folder, target_folder, status, plan_kind, file_count,
@@ -2561,19 +2634,19 @@ pub fn set_folder_rename_auto(conn: &Connection, enabled: bool) -> Result<Value>
     Ok(json!({"enabled": enabled}))
 }
 
+/// Read-only auto-archive toggle lookup.
+///
+/// The historical `folder_rename_auto` key is read as a fallback but never
+/// rewritten here: GET responses must not perform settings migration or any
+/// other DML. Canonicalization happens only in `set_folder_rename_auto`.
 pub fn folder_rename_auto_enabled(conn: &Connection) -> Result<bool> {
-    let query_only = conn.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))? != 0;
-    if query_only {
-        let table_exists = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_settings')",
-            [],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !table_exists {
-            return Ok(false);
-        }
-    } else {
-        ensure_folder_schema(conn)?;
+    let table_exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_settings')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !table_exists {
+        return Ok(false);
     }
     let value: Option<String> = conn
         .query_row(
@@ -2592,14 +2665,10 @@ pub fn folder_rename_auto_enabled(conn: &Connection) -> Result<bool> {
             |row| row.get(0),
         )
         .optional()?;
-    let enabled = legacy
+    Ok(legacy
         .as_deref()
         .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if legacy.is_some() && !query_only {
-        set_folder_rename_auto(conn, enabled)?;
-    }
-    Ok(enabled)
+        .unwrap_or(false))
 }
 
 /// Execute confirmed plans for an artist: online SQLite backup then rename folders + update item paths.
@@ -2714,6 +2783,9 @@ pub fn execute_folder_renames_with_backup(
     }
 
     let mut executed = Vec::new();
+    // Lazily built per-artist item-date grouping; executed plans rewrite item
+    // paths, so the cache is dropped after every plan that moved files.
+    let mut item_dates_cache: Option<ItemDatesByFolder> = None;
     for (id, source_raw, target_raw, plan_kind, split_actions, file_count) in plans {
         if plan_kind == "split_by_tag" {
             if dry_run {
@@ -2755,7 +2827,10 @@ pub fn execute_folder_renames_with_backup(
                 &source_raw,
                 &split_actions,
             ) {
-                Ok(result) => executed.push(result),
+                Ok(result) => {
+                    item_dates_cache = None;
+                    executed.push(result);
+                }
                 Err(error) => {
                     let reason = split_failure_reason(&error);
                     let _ = record_plan_execution_failure(
@@ -2827,7 +2902,13 @@ pub fn execute_folder_renames_with_backup(
         // demote this one plan — never abort the whole run mid-artist.
         if !dry_run {
             let recheck = (|| -> anyhow::Result<bool> {
-                let dates = effective_item_dates(conn, artist_id, &source_raw)?;
+                if item_dates_cache.is_none() {
+                    item_dates_cache = Some(ItemDatesByFolder::build(conn, artist_id)?);
+                }
+                let dates = item_dates_cache
+                    .as_ref()
+                    .expect("item dates cache built above")
+                    .get(&source_raw);
                 if dates.is_empty() {
                     demote_plan_with_log(conn, id, "needs_date", "", "needs_date", &source_raw)?;
                     executed.push(json!({
@@ -3119,8 +3200,12 @@ pub fn execute_folder_renames_with_backup(
             }));
             continue;
         }
-        executed
-            .push(json!({"plan_id": id, "status": "executed", "source": source, "target": target}));
+        executed.push(json!(
+            {"plan_id": id, "status": "executed", "source": source, "target": target}
+        ));
+        // The executed plan rewrote item paths; rebuild the grouping before
+        // the next plan's recheck.
+        item_dates_cache = None;
     }
     Ok(json!({
         "ok": true,
@@ -3373,11 +3458,15 @@ fn run_folder_rename_all(
         }));
     }
     let retried_count = if retry_failed {
+        // rollback_failed plans are excluded: disk and database already
+        // disagree there and the log marks them as needing reconciliation;
+        // blindly re-confirming would re-execute against a stale target.
         conn.execute(
             "UPDATE folder_rename_plans
              SET status='confirmed', confirmed_at=?, confirmation_source='manual', updated_at=?
              WHERE status='manual_review'
                AND (target_folder != '' OR (plan_kind='split_by_tag' AND split_actions != '[]'))
+               AND execution_log NOT LIKE '%\"reason\":\"rollback_failed\"%'
                AND EXISTS (
                  SELECT 1 FROM artists
                  WHERE artists.id=folder_rename_plans.artist_id
@@ -3687,9 +3776,8 @@ pub(crate) fn evaluate_plan_paths(
     };
     let reason = if target == source || target.starts_with(&format!("{source}/")) {
         Some("target_inside_source".into())
-    } else if !path_under_authorized_roots(&artist_root, roots) {
-        Some("outside_artist".into())
-    } else if !path_under_artist(&source_path, &artist_root)
+    } else if !path_under_authorized_roots(&artist_root, roots)
+        || !path_under_artist(&source_path, &artist_root)
         || !target_parent_under_artist(target_path.parent().unwrap_or(&target_path), &artist_root)
     {
         Some("outside_artist".into())
@@ -4471,7 +4559,7 @@ mod tests {
             ]
         );
 
-        let listed = list_folder_renames(&conn, Some(&roots), Some(1)).unwrap();
+        let listed = list_folder_renames(&conn, Some(&roots), Some(1), false).unwrap();
         assert_eq!(listed["total"], 1);
         assert_eq!(listed["plans"][0]["status"], "aligned");
     }
@@ -5393,7 +5481,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_legacy_auto_setting_to_canonical_key() {
+    fn reads_legacy_auto_setting_without_writing_on_read_path() {
         let conn = Connection::open_in_memory().unwrap();
         ensure_folder_schema(&conn).unwrap();
         conn.execute(
@@ -5401,22 +5489,22 @@ mod tests {
             [],
         )
         .unwrap();
+        // The read path reports the historical value without rewriting
+        // settings; canonicalization happens only in set_folder_rename_auto.
         assert!(folder_rename_auto_enabled(&conn).unwrap());
-        let canonical: String = conn
-            .query_row(
+        assert!(conn
+            .query_row::<String, _, _>(
                 "SELECT value FROM app_settings WHERE key='folder_rename_auto_enabled'",
                 [],
                 |row| row.get(0),
             )
-            .unwrap();
-        assert_eq!(canonical, "1");
-        assert!(conn
-            .query_row::<String, _, _>(
-                "SELECT value FROM app_settings WHERE key='folder_rename_auto'",
-                [],
-                |row| row.get(0)
-            )
             .is_err());
+        conn.execute(
+            "DELETE FROM app_settings WHERE key='folder_rename_auto'",
+            [],
+        )
+        .unwrap();
+        assert!(!folder_rename_auto_enabled(&conn).unwrap());
     }
 
     #[test]

@@ -439,6 +439,58 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
     Ok(names.iter().any(|name| name == column))
 }
 
+/// Rewrite active recycle entries (recycled/moving) for one artist during a
+/// whole-artist move: `original_path` and the snapshot's `file_path` both
+/// move from source prefix to target prefix, so a later restore lands inside
+/// the moved tree instead of resurrecting the abandoned source directory.
+fn update_recycle_entries_for_move(
+    conn: &Connection,
+    artist_id: i64,
+    source: &str,
+    target: &str,
+) -> Result<i64> {
+    if !table_has_column(conn, "recycle_entries", "original_path")?
+        || !table_has_column(conn, "recycle_entries", "item_snapshot")?
+    {
+        return Ok(0);
+    }
+    let rows = conn
+        .prepare(
+            "SELECT id, original_path, item_snapshot FROM recycle_entries
+             WHERE artist_id=? AND status IN ('recycled','moving')",
+        )?
+        .query_map(params![artist_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let update = "UPDATE recycle_entries SET original_path=?, item_snapshot=? WHERE id=?";
+    let mut changed = 0;
+    for (id, original_path, snapshot_raw) in rows {
+        let Some(new_original) = remap_path(&original_path, source, target) else {
+            continue;
+        };
+        let mut new_snapshot_raw = snapshot_raw.clone();
+        let mut snapshot: Value = serde_json::from_str(&snapshot_raw).unwrap_or(Value::Null);
+        if let Some(object) = snapshot.as_object_mut() {
+            if let Some(file_path) = object.get("file_path").and_then(Value::as_str) {
+                if let Some(next) = remap_path(file_path, source, target) {
+                    object.insert("file_path".into(), Value::String(next));
+                    if let Ok(encoded) = serde_json::to_string(&snapshot) {
+                        new_snapshot_raw = encoded;
+                    }
+                }
+            }
+        }
+        conn.execute(update, params![new_original, new_snapshot_raw, id])?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
 #[derive(Debug)]
 struct ArtistMoveOutcome {
     renamed: bool,
@@ -651,6 +703,163 @@ fn move_artist_tree(
     }
 }
 
+fn pending_move_intent_path() -> PathBuf {
+    let data_dir = std::env::var("DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data"));
+    data_dir.join("pending-artist-move.json")
+}
+
+/// Persist a pending whole-artist move intent BEFORE touching the filesystem.
+///
+/// If the process dies between the tree rename and the database rewrite, the
+/// intent lets startup reconciliation roll the move forward instead of leaving
+/// disk at the target while every DB row still points at the source.
+fn write_pending_move_intent(artist_id: i64, source: &str, target: &str) -> Result<()> {
+    let path = pending_move_intent_path();
+    if path.exists() {
+        bail!("a pending artist move intent already exists; restart the service to reconcile it first");
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create data dir {}", parent.display()))?;
+    }
+    let payload = json!({
+        "artist_id": artist_id,
+        "source": source,
+        "target": target,
+        "created_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(0),
+    });
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, payload.to_string())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn clear_pending_move_intent() {
+    let _ = std::fs::remove_file(pending_move_intent_path());
+}
+
+/// Shared DB rewrite for a completed whole-artist tree move: repoint the
+/// artist row plus every path-bearing table from source to target.
+fn apply_artist_move_db_updates(
+    conn: &Connection,
+    artist_id: i64,
+    source_text: &str,
+    target_text: &str,
+) -> Result<i64> {
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute(
+        "UPDATE artists SET path=?, missing=0, missing_at=NULL WHERE id=?",
+        params![target_text, artist_id],
+    )?;
+    let mut updated = 0;
+    for (table, column) in [
+        ("items", "file_path"),
+        ("scan_seen", "file_path"),
+        ("scan_candidates", "file_path"),
+        ("artist_link_documents", "file_path"),
+    ] {
+        if table_has_column(&transaction, table, "artist_id")?
+            && table_has_column(&transaction, table, column)?
+        {
+            updated += update_path_column(
+                &transaction,
+                table,
+                column,
+                artist_id,
+                source_text,
+                target_text,
+            )?;
+        }
+    }
+    if table_has_column(&transaction, "move_candidates", "artist_id")? {
+        updated += update_path_column(
+            &transaction,
+            "move_candidates",
+            "old_path",
+            artist_id,
+            source_text,
+            target_text,
+        )?;
+        updated += update_path_column(
+            &transaction,
+            "move_candidates",
+            "new_path",
+            artist_id,
+            source_text,
+            target_text,
+        )?;
+    }
+    // Active recycle entries follow the move so a later restore lands in the
+    // new directory instead of rebuilding the abandoned source path.
+    updated += update_recycle_entries_for_move(&transaction, artist_id, source_text, target_text)?;
+    transaction.commit()?;
+    Ok(updated)
+}
+
+/// Startup reconciliation for an interrupted whole-artist folder move.
+///
+/// Called once at writable startup, mirroring recycle reconciliation: an
+/// intent whose filesystem rename already happened rolls forward; an intent
+/// whose rename never started rolls back (intent dropped); anything ambiguous
+/// stays on disk for manual reconciliation.
+pub fn reconcile_pending_artist_move(conn: &Connection) -> Value {
+    let path = pending_move_intent_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(_) => return json!({"reconciled": false}),
+    };
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("artist move intent unreadable, keeping for inspection: {error}");
+            return json!({"reconciled": true, "outcome": "unreadable_intent"});
+        }
+    };
+    let Some(artist_id) = parsed["artist_id"].as_i64() else {
+        eprintln!("artist move intent missing artist_id, keeping for inspection");
+        return json!({"reconciled": true, "outcome": "unreadable_intent"});
+    };
+    let (Some(source), Some(target)) = (parsed["source"].as_str(), parsed["target"].as_str())
+    else {
+        eprintln!("artist move intent missing paths, keeping for inspection");
+        return json!({"reconciled": true, "outcome": "unreadable_intent"});
+    };
+    let source_dir = PathBuf::from(source);
+    let target_dir = PathBuf::from(target);
+    let outcome = if !source_dir.is_dir() && target_dir.is_dir() {
+        match apply_artist_move_db_updates(conn, artist_id, source, target) {
+            Ok(updated) => {
+                clear_pending_move_intent();
+                eprintln!(
+                    "artist move rolled forward for artist {artist_id}: {updated} db rows updated"
+                );
+                "rolled_forward"
+            }
+            Err(error) => {
+                eprintln!(
+                    "artist move roll-forward failed for artist {artist_id}: {error:#}; intent kept"
+                );
+                "roll_forward_failed"
+            }
+        }
+    } else if source_dir.is_dir() && !target_dir.is_dir() {
+        clear_pending_move_intent();
+        eprintln!("artist move intent dropped: filesystem was never moved");
+        "rolled_back"
+    } else {
+        eprintln!(
+            "artist move intent needs manual reconciliation: source={source} target={target}"
+        );
+        "needs_manual_reconciliation"
+    };
+    json!({"reconciled": true, "outcome": outcome})
+}
+
 pub fn execute_artist_folder_move(
     conn: &Connection,
     roots: &MediaRoots,
@@ -675,7 +884,17 @@ pub fn execute_artist_folder_move(
     let target_text = path_text(&target);
     let backup = create_db_backup(conn)?;
 
-    let outcome = move_artist_tree(&source, &target, roots, expected_source_identity)?;
+    // Record the intent before the first irreversible filesystem step so a
+    // crash inside move_artist_tree (or mid DB rewrite) is recoverable.
+    write_pending_move_intent(artist_id, &source_text, &target_text)?;
+    let outcome = move_artist_tree(&source, &target, roots, expected_source_identity);
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            clear_pending_move_intent();
+            return Err(error);
+        }
+    };
     let ArtistMoveOutcome {
         renamed,
         staged_source,
@@ -683,56 +902,11 @@ pub fn execute_artist_folder_move(
         published_identity,
     } = outcome;
 
-    let transaction = conn.unchecked_transaction()?;
-    let result = (|| -> Result<i64> {
-        transaction.execute(
-            "UPDATE artists SET path=?, missing=0, missing_at=NULL WHERE id=?",
-            params![target_text, artist_id],
-        )?;
-        let mut updated = 0;
-        for (table, column) in [
-            ("items", "file_path"),
-            ("scan_seen", "file_path"),
-            ("scan_candidates", "file_path"),
-            ("artist_link_documents", "file_path"),
-        ] {
-            if table_has_column(&transaction, table, "artist_id")?
-                && table_has_column(&transaction, table, column)?
-            {
-                updated += update_path_column(
-                    &transaction,
-                    table,
-                    column,
-                    artist_id,
-                    &source_text,
-                    &target_text,
-                )?;
-            }
-        }
-        if table_has_column(&transaction, "move_candidates", "artist_id")? {
-            updated += update_path_column(
-                &transaction,
-                "move_candidates",
-                "old_path",
-                artist_id,
-                &source_text,
-                &target_text,
-            )?;
-            updated += update_path_column(
-                &transaction,
-                "move_candidates",
-                "new_path",
-                artist_id,
-                &source_text,
-                &target_text,
-            )?;
-        }
-        transaction.commit()?;
-        Ok(updated)
-    })();
+    let result = apply_artist_move_db_updates(conn, artist_id, &source_text, &target_text);
     let updated = match result {
         Ok(updated) => updated,
         Err(error) => {
+            clear_pending_move_intent();
             // Roll back only through no-replace renames: a concurrently
             // recreated source must never be clobbered; if safe rollback is
             // impossible, report a manual-reconciliation outcome instead.
@@ -801,6 +975,8 @@ pub fn execute_artist_folder_move(
             return Err(error);
         }
     };
+    // DB rewrite committed: the move is durable, drop the crash-recovery intent.
+    clear_pending_move_intent();
     let cleanup_error = staged_source
         .and_then(|staging| remove_owned_dir(&staging, staged_source_identity).err())
         .map(|error| error.to_string());

@@ -116,7 +116,7 @@ function renderItemCards(items, startIndex = 0) {
     const cardMeta = joinUiMeta([renderTagNames(item.tags), recognizedDateHtml]);
     const cardMetaRow = cardMeta ? `<div class="date">${cardMeta}</div>` : '';
     const favoriteLabel = item.favorite ? '取消收藏' : '收藏';
-    const favorite = `<button class="btn btn-ghost btn-icon card-favorite${item.favorite ? ' active' : ''}" type="button" data-favorite="${item.id}" title="${favoriteLabel}" aria-label="${favoriteLabel} ${escHtml(item.file_name)}" aria-pressed="${item.favorite ? 'true' : 'false'}"><span data-favorite-glyph aria-hidden="true">${item.favorite ? '★' : '☆'}</span></button>`;
+    const favorite = `<button class="btn btn-ghost btn-icon card-favorite${item.favorite ? ' active' : ''}" type="button" data-favorite="${item.id}" title="${favoriteLabel}" aria-label="${favoriteLabel} ${escHtml(item.file_name)}" aria-pressed="${item.favorite ? 'true' : 'false'}"><span data-favorite-glyph aria-hidden="true">${buttonIcon(item.favorite ? 'starFilled' : 'star')}</span></button>`;
     const download = `<a class="btn btn-ghost btn-icon card-download" data-download href="${fileUrl}" download="${escHtml(downloadFileName(item))}" title="下载文件" aria-label="下载 ${escHtml(item.file_name)}">${buttonIcon('download')}</a>`;
     const titleRow = `<div class="card-title-row"><div class="role">${escHtml(item.file_name)}</div>${favorite}${download}</div>`;
     const artistJump = isGlobalSearchActive() && item.artist_id
@@ -463,7 +463,7 @@ function syncFavoriteButtons(item) {
     btn.title = label;
     btn.disabled = isActionBusy('item-favorite', item.id);
     const glyph = btn.querySelector('[data-favorite-glyph]');
-    if (glyph) glyph.textContent = favorite ? '★' : '☆';
+    if (glyph) glyph.innerHTML = buttonIcon(favorite ? 'starFilled' : 'star');
   });
 }
 
@@ -796,24 +796,6 @@ function finishVideoPreview(video, loaded, clearSource = false) {
   pumpVideoPreviewQueue();
 }
 
-function releaseVideoPreview(video) {
-  clearVideoPreviewTimer(video);
-  clearVideoPreviewLoadTimer(video);
-  const idx = pendingVideoPreviews.indexOf(video);
-  if (idx >= 0) pendingVideoPreviews.splice(idx, 1);
-  if (video.dataset.loading === '1') {
-    activeVideoPreviewLoads = Math.max(0, activeVideoPreviewLoads - 1);
-  }
-  video.onload = null;
-  video.onerror = null;
-  delete video.dataset.loading;
-  delete video.dataset.loaded;
-  video.classList.remove('ready');
-  video.classList.add('loading');
-  video.removeAttribute('src');
-  pumpVideoPreviewQueue();
-}
-
 function releaseAllVideoPreviewLoads() {
   if (videoPreviewObserver) {
     videoPreviewObserver.disconnect();
@@ -917,10 +899,6 @@ function shouldPreferCompatibleVideoStream() {
   const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const isSafari = /Safari/.test(ua) && /Apple/.test(vendor) && !/Chrome|CriOS|FxiOS|Edg|OPR|Android/.test(ua);
   return isIOS || isSafari;
-}
-
-function shouldUseVideoTranscode() {
-  return shouldPreferCompatibleVideoStream();
 }
 
 function shouldUseVideoHls() {
@@ -1164,13 +1142,12 @@ function showLightboxImage(items) {
   } else if (mediaType === 'text') {
     img.classList.remove('loading');
     const textEl = $('#lightboxText');
-    textEl.innerHTML = `<div class="lightbox-text-loading">读取中…</div>`;
+    textEl.innerHTML = `<div class="lightbox-text-loading">读取中</div>`;
     textEl.style.display = 'flex';
-    fetch(API.textUrl(item.file_path))
-      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    API.get(API.textUrl(item.file_path))
       .then(data => {
         if (loadToken !== state.lightboxLoadToken) return;
-        const truncNote = data.truncated ? `<div class="lightbox-text-truncated">（仅显示前 ${formatSize(data.size)} 中的部分内容）</div>` : '';
+        const truncNote = data.truncated ? `<div class="lightbox-text-truncated">内容较长，仅显示前 ${formatSize(data.size)}</div>` : '';
         textEl.innerHTML = `<pre class="lightbox-text-pre">${escHtml(data.content)}</pre>${truncNote}`;
       })
       .catch(() => {
@@ -1522,6 +1499,7 @@ async function deleteMediaItem({filePath, itemId, fileName = '', button = null, 
   try {
     await API.del(API.deleteFileUrl(filePath));
     state.allItems = state.allItems.filter(i => i.id !== itemId);
+    state.itemsOffset = state.allItems.length;
     state.selectedIds.delete(itemId);
     if (closeLightboxAfter) closeLightbox();
     if (renderAfter) renderGrid();
@@ -1529,7 +1507,7 @@ async function deleteMediaItem({filePath, itemId, fileName = '', button = null, 
     return true;
   } catch (e) {
     if (onError) onError(e);
-    toast('移到回收站失败', 'error');
+    toast('移入回收站失败', 'error');
     return false;
   } finally {
     if (button) button.classList.remove('deleting');

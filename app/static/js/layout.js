@@ -72,7 +72,7 @@ function renderLibraryEmptyState() {
     $('#libraryEmptyKicker').textContent = '画廊';
     $('#libraryEmptyTitle').textContent = '选择一位画师开始浏览';
     $('#libraryEmptyText').textContent = `已有 ${state.artists.length} 位画师。从顶部搜索并选择画师，即可查看其标签、文件夹与媒体作品。`;
-    $('#libraryEmptyMeta').textContent = '你也可以直接在顶部搜索栏全局查找标签或文件名。';
+    $('#libraryEmptyMeta').textContent = '支持全名、拼音与部分名搜索，也可全局查找标签或文件名。';
     return;
   }
 
@@ -98,7 +98,7 @@ function renderLibraryEmptyState() {
     $('#libraryEmptyKicker').textContent = '扫描完成';
     $('#libraryEmptyTitle').textContent = '没有发现媒体文件';
     $('#libraryEmptyText').textContent = '未在当前媒体目录中检测到受支持的图片、视频或压缩包。';
-    $('#libraryEmptyMeta').textContent = '你可以重新发起扫描，或前往系统设置检查媒体目录授权。';
+    $('#libraryEmptyMeta').textContent = '可重新发起扫描，或前往系统设置检查媒体目录授权。';
     return;
   }
 

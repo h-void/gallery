@@ -15,6 +15,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -58,8 +59,11 @@ def _upload(artifact: Path, version: str) -> None:
     remote_url = (remote.stdout or "").strip().lower()
     if remote.returncode != 0 or not remote_url:
         raise RuntimeError("cannot resolve git origin; refusing --upload")
-    # Accept only the gallery package repo (name contains gallery).
-    if "gallery" not in remote_url:
+    if not re.fullmatch(
+        r"(?:https?://|git@)github\.com[:/]h-void/gallery(?:\.git)?/?",
+        remote_url,
+        re.IGNORECASE,
+    ):
         raise RuntimeError(
             f"origin remote does not look like gallery package repo: {remote_url!r}"
         )

@@ -12,6 +12,7 @@ use crate::media_roots::split_csv;
 use crate::tags::compare_tag_order;
 use crate::DEFAULT_LIMIT;
 
+#[allow(clippy::too_many_arguments)]
 pub fn items_page_response(
     conn: &Connection,
     artist_id: i64,
@@ -50,6 +51,7 @@ pub fn items_page_response(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn items_page_query_response(
     conn: &Connection,
     artist_id: Option<i64>,
@@ -92,6 +94,7 @@ pub fn items_page_query_response(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn items_page_cursor_query_response(
     conn: &Connection,
     artist_id: Option<i64>,
@@ -138,6 +141,7 @@ pub fn items_page_cursor_query_response(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn items_page_query_response_inner(
     conn: &Connection,
     artist_id: Option<i64>,
@@ -235,8 +239,15 @@ fn items_page_query_response_inner(
     Ok(body)
 }
 
-fn item_page_where(
+/// Base filter conditions for the items page, generated for one row alias.
+///
+/// Called twice when `duplicates_only` needs a correlated `items d` subquery,
+/// so both aliases are produced by the same builder instead of relying on a
+/// blind text replace that could corrupt future conditions.
+#[allow(clippy::too_many_arguments)]
+fn item_base_conditions(
     conn: &Connection,
+    alias: &str,
     artist_id: Option<i64>,
     media_type: Option<&str>,
     folder: Option<&str>,
@@ -245,79 +256,73 @@ fn item_page_where(
     image_only: Option<bool>,
     untagged: Option<bool>,
     tag_id: Option<i64>,
-    duplicates_only: Option<bool>,
     tag_names: Option<&str>,
     search: Option<&str>,
     search_tags_only: bool,
     favorite_only: Option<bool>,
-    cursor: Option<&ItemCursor>,
-) -> Result<(String, Vec<SqlValue>)> {
-    let mut conditions = vec!["i.missing=0".to_string()];
+) -> Result<(Vec<String>, Vec<SqlValue>)> {
+    let mut conditions = vec![format!("{alias}.missing=0")];
     let mut params = Vec::new();
     if let Some(artist_id) = artist_id {
-        conditions.push("i.artist_id=?".to_string());
+        conditions.push(format!("{alias}.artist_id=?"));
         params.push(SqlValue::Integer(artist_id));
     }
     if favorite_only.unwrap_or(false) {
-        conditions.push("EXISTS (SELECT 1 FROM item_favorites f WHERE f.item_id=i.id)".to_string());
+        conditions.push(format!(
+            "EXISTS (SELECT 1 FROM item_favorites f WHERE f.item_id={alias}.id)"
+        ));
     }
 
     if tag_id.is_some() || tag_names.is_some() || untagged.unwrap_or(false) || search_tags_only {
-        conditions.push(
-            "(i.media_type IN ('image', 'video', 'source', 'archive', 'text') OR i.is_archive=1)"
-                .to_string(),
-        );
+        conditions.push(format!(
+            "({alias}.media_type IN ('image', 'video', 'source', 'archive', 'text') OR {alias}.is_archive=1)"
+        ));
     }
-    if duplicates_only.unwrap_or(false) {
-        conditions.push("i.media_type IN ('image', 'video', 'source')".to_string());
-        conditions.push("i.is_archive=0".to_string());
+    if image_only.unwrap_or(false) && media_type.is_none() {
+        conditions.push(format!(
+            "{alias}.media_type IN ('image', 'video', 'source')"
+        ));
     }
     let media_type = media_type
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
     match media_type.as_deref() {
-        Some("archive") => {
-            conditions.push("(i.media_type='archive' OR i.is_archive=1)".to_string())
-        }
+        Some("archive") => conditions.push(format!(
+            "({alias}.media_type='archive' OR {alias}.is_archive=1)"
+        )),
         Some("image" | "video" | "source" | "text") => {
-            conditions.push("i.media_type=?".to_string());
-            conditions.push("i.is_archive=0".to_string());
+            conditions.push(format!("{alias}.media_type=?"));
+            conditions.push(format!("{alias}.is_archive=0"));
             params.push(SqlValue::Text(media_type.unwrap()));
         }
         Some(_) => conditions.push("1=0".to_string()),
-        None if image_only.unwrap_or(false) => {
-            conditions.push("i.media_type IN ('image', 'video', 'source')".to_string());
-            conditions.push("i.is_archive=0".to_string());
-        }
-        None => conditions.push(
-            "(i.media_type IN ('image', 'video', 'source', 'archive', 'text') OR i.is_archive=1)"
-                .to_string(),
-        ),
+        None => conditions.push(format!(
+            "({alias}.media_type IN ('image', 'video', 'source', 'archive', 'text') OR {alias}.is_archive=1)"
+        )),
     }
 
     if let Some(tag_id) = tag_id {
-        conditions.push(
+        conditions.push(format!(
             "EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id=it.tag_id \
-             WHERE it.item_id=i.id AND it.tag_id=? AND t.artist_id=i.artist_id)"
-                .to_string(),
-        );
+             WHERE it.item_id={alias}.id AND it.tag_id=? AND t.artist_id={alias}.artist_id)"
+        ));
         params.push(SqlValue::Integer(tag_id));
     }
     for name in tag_names
         .into_iter()
         .flat_map(|names| split_csv(names, false))
     {
-        conditions.push(
+        conditions.push(format!(
             "EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id=it.tag_id \
-             WHERE it.item_id=i.id AND t.artist_id=i.artist_id AND t.name=?)"
-                .to_string(),
-        );
+             WHERE it.item_id={alias}.id AND t.artist_id={alias}.artist_id AND t.name=?)"
+        ));
         params.push(SqlValue::Text(name));
     }
     if untagged.unwrap_or(false) {
-        conditions
-            .push("NOT EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id=i.id)".to_string());
+        conditions.push(format!(
+            "NOT EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id={alias}.id)"
+        ));
     }
 
     let folder = normalize_folder(folder.unwrap_or(""));
@@ -336,7 +341,9 @@ fn item_page_where(
                 artist_path.replace('\\', "/").trim_end_matches('/'),
                 folder
             );
-            conditions.push(r#"substr(replace(i.file_path, '\', '/'), 1, ?) = ?"#.to_string());
+            conditions.push(format!(
+                r#"substr(replace({alias}.file_path, '\', '/'), 1, ?) = ?"#
+            ));
             params.push(SqlValue::Integer(prefix.chars().count() as i64));
             params.push(SqlValue::Text(prefix));
         } else {
@@ -349,13 +356,13 @@ fn item_page_where(
         if query.is_empty() {
             conditions.push("1=0".to_string());
         } else {
-            let like = format!("%{query}%");
+            let like = format!("%{}%", crate::product_ui::escape_like(query));
             let tag_ids = matching_tag_ids(conn, query, artist_id)?;
             let tag_clause = if tag_ids.is_empty() {
-                "st.name LIKE ?".to_string()
+                "st.name LIKE ? ESCAPE '\\'".to_string()
             } else {
                 format!(
-                    "st.name LIKE ? OR st.id IN ({})",
+                    "st.name LIKE ? ESCAPE '\\' OR st.id IN ({})",
                     std::iter::repeat_n("?", tag_ids.len())
                         .collect::<Vec<_>>()
                         .join(",")
@@ -363,13 +370,14 @@ fn item_page_where(
             };
             let tag_search = format!(
                 "EXISTS (SELECT 1 FROM item_tags sit JOIN tags st ON st.id=sit.tag_id \
-                 WHERE sit.item_id=i.id AND st.artist_id=i.artist_id AND ({tag_clause}))"
+                 WHERE sit.item_id={alias}.id AND st.artist_id={alias}.artist_id AND ({tag_clause}))"
             );
             if search_tags_only {
                 conditions.push(tag_search);
             } else {
                 conditions.push(format!(
-                    "(i.file_name LIKE ? OR i.folder_name LIKE ? OR i.file_path LIKE ? OR {tag_search})"
+                    "({alias}.file_name LIKE ? ESCAPE '\\' OR {alias}.folder_name LIKE ? ESCAPE '\\' \
+                     OR {alias}.file_path LIKE ? ESCAPE '\\' OR {tag_search})"
                 ));
                 params.extend((0..3).map(|_| SqlValue::Text(like.clone())));
             }
@@ -379,21 +387,76 @@ fn item_page_where(
     }
 
     if let Some(date_from) = date_from.map(str::trim).filter(|value| !value.is_empty()) {
-        conditions.push("i.date >= ?".to_string());
+        conditions.push(format!("{alias}.date >= ?"));
         params.push(SqlValue::Text(date_from.to_string()));
     }
     if let Some(date_to) = date_to.map(str::trim).filter(|value| !value.is_empty()) {
-        conditions.push("i.date <= ?".to_string());
+        conditions.push(format!("{alias}.date <= ?"));
         params.push(SqlValue::Text(date_to.to_string()));
     }
+    Ok((conditions, params))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn item_page_where(
+    conn: &Connection,
+    artist_id: Option<i64>,
+    media_type: Option<&str>,
+    folder: Option<&str>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+    image_only: Option<bool>,
+    untagged: Option<bool>,
+    tag_id: Option<i64>,
+    duplicates_only: Option<bool>,
+    tag_names: Option<&str>,
+    search: Option<&str>,
+    search_tags_only: bool,
+    favorite_only: Option<bool>,
+    cursor: Option<&ItemCursor>,
+) -> Result<(String, Vec<SqlValue>)> {
+    let (mut conditions, mut params) = item_base_conditions(
+        conn,
+        "i",
+        artist_id,
+        media_type,
+        folder,
+        date_from,
+        date_to,
+        image_only,
+        untagged,
+        tag_id,
+        tag_names,
+        search,
+        search_tags_only,
+        favorite_only,
+    )?;
     if duplicates_only.unwrap_or(false) {
+        // Regenerate the same filters under the twin alias instead of a blind
+        // textual replace, then require a second row with identical content
+        // hash satisfying them all.
+        let (mut duplicate_conditions, duplicate_params) = item_base_conditions(
+            conn,
+            "d",
+            artist_id,
+            media_type,
+            folder,
+            date_from,
+            date_to,
+            image_only,
+            untagged,
+            tag_id,
+            tag_names,
+            search,
+            search_tags_only,
+            favorite_only,
+        )?;
+        conditions.push("i.media_type IN ('image', 'video', 'source')".to_string());
+        conditions.push("i.is_archive=0".to_string());
         conditions.push("i.hash_status='done'".to_string());
         conditions.push("i.content_hash != ''".to_string());
-        let duplicate_conditions = conditions
-            .iter()
-            .map(|condition| condition.replace("i.", "d."))
-            .collect::<Vec<_>>();
-        let duplicate_params = params.clone();
+        duplicate_conditions.insert(0, "d.hash_status='done'".to_string());
+        duplicate_conditions.insert(1, "d.content_hash != ''".to_string());
         conditions.push(format!(
             "EXISTS (SELECT 1 FROM items d WHERE d.artist_id=i.artist_id AND d.id != i.id \
              AND d.content_hash=i.content_hash AND {})",

@@ -93,6 +93,30 @@ $env:GALLERY_MEDIA_DIR = 'D:\Pictures'
 docker compose up -d --build
 ```
 
+普通 NAS 或 Windows 部署只使用默认的 `gallery` 服务；它不要求 `/dev/dri` 或 GPU 权限。`gallery-gpu` 仅是可选 profile，不影响普通部署。
+
+Intel GPU 可使用同一份 Compose 文件的可选 profile。先停止默认服务，再明确启动 GPU 服务，避免两个服务占用同一端口：
+
+```powershell
+docker compose stop gallery
+docker compose --profile gpu up -d --build gallery-gpu
+```
+
+常用运行参数已写入 `docker-compose.yml` 的 `environment`，可直接改 yml；也可在项目根目录 `.env` 或主机环境中用同名变量覆盖，例如 `CHARACTER_RECOGNITION_PROVIDER=cpu`、`SCAN_INTERVAL=0`。`DATA_DIR` 固定为容器内 `/gallery/data`，回收站固定为 `/gallery/data/recycle`，随 `gallery-storage` 持久化。
+
+**Docker GPU 说明**：当前 `gallery-gpu` profile 是 Linux 宿主机的 Intel iGPU 配置。它把宿主机 `/dev/dri` 设备映射进容器，再把进程加入设备所属的 `render`/`video` Linux 组；`GALLERY_RENDER_GID` 和 `GALLERY_VIDEO_GID` 是这两个组的数字 GID，不是 GPU 型号。不同宿主机的 GID 可能不同，先在 Linux 宿主机执行 `stat -c '%n gid=%g' /dev/dri/renderD128 /dev/dri/card0`，再把结果写入项目 `.env`，例如 `GALLERY_RENDER_GID=109`、`GALLERY_VIDEO_GID=44`。Windows Docker Desktop 不一定提供 `/dev/dri`；若宿主机没有这个路径，当前 profile 不能直接启用 Intel GPU，使用普通 `gallery` 服务即可。
+
+**Docker CUDA 说明**：NVIDIA 主机使用同一份 Compose 文件的 `cuda` profile，不需要手动填写 GPU 编号。宿主机需要 NVIDIA Container Toolkit（Windows Docker Desktop 需要正常的 WSL2 NVIDIA 支持）：
+
+```powershell
+docker compose stop gallery
+docker compose --profile cuda up -d --build gallery-cuda
+```
+
+Compose 会把 NVIDIA GPU 暴露给容器；`gallery-cuda` 使用独立的 `runtime-cuda` 镜像目标，内置 CUDA 12.x 与 cuDNN 9.x 用户态库，宿主机只需兼容的 NVIDIA 驱动。GPU 检测同时支持原生 `/dev/nvidia*` 节点与 WSL2/Docker Desktop 的 `/dev/dxg` 加注入驱动方式。Gallery 按 fnOS 相同顺序自动选择 CUDA → OpenVINO → CPU，并把校验过的 ONNX Runtime CUDA 运行时下载到 `gallery-storage` 的 `models/ort/cuda-1.24.1`。没有 NVIDIA GPU 时不要启动此 profile，直接使用默认 `gallery`。
+
+**fnOS 参数说明**：当前 FPK 没有通用的环境变量编辑界面，Docker 的 `.env` 不能直接用于 FPK。`TRIM_*` 路径和端口变量由 fnOS 注入；要修改其他默认运行参数（例如识别后端、扫描周期、备份周期），需要修改 `fnpack/cmd/main` 的默认值，重新执行 `tools/build_rust_accel.py` 和 `tools/build_fnpack.py`，安装新的 FPK 后重启 Gallery。
+
 3. **说明**：
    - 数据库、缓存与模型统一持久化于 `gallery-storage` 数据卷（对应 `data/`、`cache/`、`models/`）。
    - 媒体目录默认只读（`:ro`）挂载；应用只读取原文件并在自身索引/数据库中整理，**不会物理移动或重命名你的原文件**。
@@ -102,7 +126,7 @@ docker compose up -d --build
 
 ## ⚙️ 配置参数
 
-可在系统环境变量、fnOS 应用配置或 Docker Compose 中按需覆盖以下配置项：
+以下参数适用于运行时：Docker 可在 Compose 的 `environment`、项目 `.env` 或宿主机环境中覆盖；fnOS FPK 当前没有通用变量编辑入口，需按上面的流程重建 FPK 后生效：
 
 | 环境变量 | 默认值 | 详细说明 |
 | :--- | :--- | :--- |

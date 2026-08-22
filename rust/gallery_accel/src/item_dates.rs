@@ -77,8 +77,7 @@ pub fn update_item_dates_response(
         return Err(anyhow!("artist_id must be positive"));
     }
 
-    let placeholders = std::iter::repeat("?")
-        .take(requested.len())
+    let placeholders = std::iter::repeat_n("?", requested.len())
         .collect::<Vec<_>>()
         .join(",");
     let mut lookup_params: Vec<rusqlite::types::Value> = requested
@@ -161,13 +160,16 @@ pub fn update_item_dates_response(
             ),
         }));
     }
-    tx.commit().context("commit item date update")?;
-
+    // Invalidate stale confirmed plans inside the SAME transaction as the
+    // date updates: committing first would leave a crash window where
+    // confirmed plans keep outdated targets and later execution renames
+    // folders destructively.
     let refreshed = crate::folder_archive::invalidate_plans_after_item_date_change(
-        conn,
+        &tx,
         artist_id,
         &changed_folders,
     )?;
+    tx.commit().context("commit item date update")?;
     Ok(json!({
         "updated": updated.len(),
         "items": updated,

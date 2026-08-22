@@ -7,8 +7,6 @@ use gallery_accel::{env_db_path, spawn_configured_workers};
 
 mod route_params;
 mod routes;
-#[cfg(test)]
-mod test_support;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -103,6 +101,13 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Err(error) => eprintln!("recycle schema check failed: {error}"),
+                }
+                let move_reconciliation = gallery_accel::reconcile_pending_artist_move(&conn);
+                if move_reconciliation["reconciled"] == serde_json::json!(true) {
+                    eprintln!(
+                        "artist move reconciliation: {}",
+                        move_reconciliation["outcome"].as_str().unwrap_or("unknown")
+                    );
                 }
             }
             Err(error) => eprintln!("recycle reconciliation open failed: {error}"),

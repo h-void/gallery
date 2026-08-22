@@ -40,6 +40,27 @@ copy_legacy_share_if_missing() {
     copy_legacy_share "$source_dir" "$target_dir" "$label"
 }
 
+verify_database_integrity() {
+    db_path="$1"
+    [ -n "$db_path" ] && [ -f "$db_path" ] || return 0
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        log "Gallery upgrade aborted: sqlite3 CLI unavailable; cannot validate $db_path."
+        return 1
+    fi
+    quick_check_output="$(sqlite3 "$db_path" 'PRAGMA quick_check;' 2>&1)"
+    sqlite3_rc=$?
+    if [ "$sqlite3_rc" -ne 0 ]; then
+        log "Gallery upgrade aborted: database integrity check failed (rc=$sqlite3_rc): $quick_check_output"
+        return 1
+    fi
+    first_line="$(printf '%s\n' "$quick_check_output" | head -n 1)"
+    if [ "$first_line" != "ok" ]; then
+        log "Gallery upgrade aborted: database integrity check reported: $quick_check_output"
+        return 1
+    fi
+    log "Gallery upgrade database integrity check passed: $db_path"
+}
+
 migrate_legacy_data_shares() {
     data_share_root="${TRIM_DATA_SHARE_PATHS%%:*}"
     [ -n "$data_share_root" ] || return 0
@@ -71,6 +92,9 @@ migrate_legacy_data_shares() {
     if [ -f "$destination_db" ]; then
         log "Gallery upgrade found existing gallery/data/gallery.db; leaving database unchanged."
     elif ! copy_legacy_share "$legacy_data_dir" "$data_share_root/data" "database data"; then
+        return 1
+    fi
+    if ! verify_database_integrity "$destination_db"; then
         return 1
     fi
     if ! copy_legacy_share_if_missing "$legacy_preview_dir" "$data_share_root/cache" "preview cache" || \

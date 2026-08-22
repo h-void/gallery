@@ -9,7 +9,7 @@ use crate::route_params::{
 use axum::body::Body;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, Method, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
@@ -313,6 +313,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/folder-renames", get(api_folder_renames_list))
         .route(
+            "/api/folder-renames/refresh",
+            post(api_folder_renames_refresh),
+        )
+        .route(
             "/api/folder-renames/error-artists",
             get(api_folder_rename_error_artists),
         )
@@ -424,7 +428,20 @@ pub fn router(state: AppState) -> Router {
         state.clone(),
         capability_gate,
     ))
+    .layer(middleware::from_fn(security_headers))
     .with_state(state)
+}
+
+/// Global hardening header: browsers must not sniff content types. Media
+/// responses already carry a strict inline whitelist; this covers every other
+/// response (including errors and static assets).
+pub async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 fn is_media_path(path: &str) -> bool {
@@ -494,19 +511,28 @@ pub fn with_static_ui(router: Router, static_dir: PathBuf) -> Router {
         .route_service("/", ServeFile::new(index.clone()))
         .nest_service("/static", ServeDir::new(static_dir))
         .route_service("/{artist_path}", ServeFile::new(index))
+        .layer(middleware::from_fn(security_headers))
 }
 
-async fn api_health(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.pool.get().ok();
-    let mut body = health_summary(Some(state.db_path.as_path()), conn.as_ref().map(|c| &**c));
-    let workers = state.workers.snapshot();
+/// Blocking portion of `/api/health`: SQLite reads, backup-dir listing,
+/// per-root `is_dir` probes, and bounded log tails. Runs on the blocking
+/// pool so a slow NAS mount cannot stall async workers.
+fn health_body(
+    pool: &std::sync::Arc<DbPool>,
+    db_path: &std::path::Path,
+    data_dir: &std::path::Path,
+    roots: &MediaRoots,
+    workers: &Value,
+) -> Value {
+    let conn = pool.get().ok();
+    let mut body = health_summary(Some(db_path), conn.as_deref());
     body["workers"] = workers.clone();
     for name in ["scan", "hash", "backup"] {
         if workers[name]["last"]["error"].as_str().is_some() {
             mark_degraded(&mut body, &format!("worker_{name}"));
         }
     }
-    let scan = match conn.as_ref().map(|c| &**c) {
+    let scan = match conn.as_deref() {
         Some(conn) => match get_scan_state(conn) {
             Ok(scan) => scan,
             Err(error) => {
@@ -523,22 +549,21 @@ async fn api_health(State(state): State<AppState>) -> Json<Value> {
     };
     body["scan"] = scan;
     body["scan_schedule"] = worker_schedule(
-        &workers,
+        workers,
         "scan",
         env_positive_interval("SCAN_INTERVAL"),
         false,
         "next_auto_scan_at",
     );
-    body["backups"] = backup_summary(&state.data_dir.join("db-backups"));
+    body["backups"] = backup_summary(&data_dir.join("db-backups"));
     if body["backups"]["error"].as_str().is_some() {
         mark_degraded(&mut body, "backup_error");
     }
     // Count of authorized real media roots only — never dump untrusted host paths.
-    let media_root_count = state.roots.real_paths.len().max(state.roots.roots.len());
-    let accessible = (0..state.roots.roots.len())
+    let media_root_count = roots.real_paths.len().max(roots.roots.len());
+    let accessible = (0..roots.roots.len())
         .filter(|&i| {
-            state
-                .roots
+            roots
                 .real_root_at(i)
                 .map(|p| std::path::Path::new(p).is_dir())
                 .unwrap_or(false)
@@ -548,16 +573,16 @@ async fn api_health(State(state): State<AppState>) -> Json<Value> {
         "count": media_root_count as i64,
         "accessible": accessible as i64,
     });
-    body["logs"] = health_logs_summary(&state.data_dir);
-    body["recent_errors"] = json!(recent_log_errors(&state.data_dir.join("logs"), 8));
+    body["logs"] = health_logs_summary(data_dir);
+    body["recent_errors"] = json!(recent_log_errors(&data_dir.join("logs"), 8));
     body["backup_schedule"] = worker_schedule(
-        &workers,
+        workers,
         "backup",
         env_positive_interval("DB_BACKUP_INTERVAL"),
         env_flag("DB_BACKUP_ON_START"),
         "next_run_at",
     );
-    if let Some(conn) = conn.as_ref().map(|c| &**c) {
+    if let Some(conn) = conn.as_deref() {
         match folder_archive_failed_plans_count(conn) {
             Ok(count) => {
                 body["folder_archive"] = json!({"failed_plans": count});
@@ -576,6 +601,26 @@ async fn api_health(State(state): State<AppState>) -> Json<Value> {
     } else {
         body["folder_archive"] = json!({"failed_plans": Value::Null});
     }
+    body
+}
+
+async fn api_health(State(state): State<AppState>) -> Json<Value> {
+    let workers = state.workers.snapshot();
+    let mut body = {
+        let pool = std::sync::Arc::clone(&state.pool);
+        let db_path = state.db_path.clone();
+        let data_dir = state.data_dir.clone();
+        let roots = state.roots.clone();
+        tokio::task::spawn_blocking(move || {
+            health_body(&pool, &db_path, &data_dir, &roots, &workers)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            let mut body = json!({"error": error.to_string()});
+            mark_degraded(&mut body, "health_worker_failed");
+            body
+        })
+    };
     // Native fields are complete in product mode. An optional upstream may only fill gaps.
     if let Some(upstream) = state.upstream.as_ref() {
         // Gap-filling must never stall /api/health itself: a dead upstream answers
@@ -1042,12 +1087,18 @@ async fn api_operation_log(
     State(state): State<AppState>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
     let limit = q.get("limit").and_then(|v| v.parse().ok());
     let error_limit = q.get("error_limit").and_then(|v| v.parse().ok());
-    operation_log_response(&conn, &state.roots, limit, error_limit)
-        .map(Json)
-        .map_err(to_http_error)
+    // Bounded log reads (several hundred KB) are blocking file I/O.
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = state.pool.get().map_err(to_http_error)?;
+        operation_log_response(&conn, &roots, limit, error_limit)
+            .map(Json)
+            .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_folder_rename_auto(
@@ -1377,6 +1428,7 @@ async fn api_items_page(
         ));
     }
     let conn = state.pool.get().map_err(to_http_error)?;
+    let (limit, offset) = gallery_accel::normalize_pagination(query.limit, query.offset);
     let media_type = if query.archive_only.unwrap_or(false) {
         Some("archive".to_string())
     } else {
@@ -1387,8 +1439,8 @@ async fn api_items_page(
         items_page_cursor_query_response(
             &conn,
             query.artist_id,
-            query.limit,
-            query.offset,
+            Some(limit),
+            Some(offset),
             query.sort.as_deref(),
             media_type.as_deref(),
             query.folder.as_deref(),
@@ -1408,8 +1460,8 @@ async fn api_items_page(
         items_page_query_response(
             &conn,
             query.artist_id,
-            query.limit,
-            query.offset,
+            Some(limit),
+            Some(offset),
             query.sort.as_deref(),
             media_type.as_deref(),
             query.folder.as_deref(),
@@ -2298,7 +2350,31 @@ async fn api_folder_renames_list(
     let conn = state.pool.get().map_err(to_http_error)?;
     let roots = state.roots.clone();
     tokio::task::spawn_blocking(move || {
-        list_folder_renames(&conn, Some(&roots), q.artist_id)
+        list_folder_renames(&conn, Some(&roots), q.artist_id, false)
+            .map(Json)
+            .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
+}
+
+/// Explicit refresh: auto-discover plans and recompute targets for one artist,
+/// then return the list. Mutating work lives behind POST and the write gate so
+/// the GET list endpoint stays read-only.
+async fn api_folder_renames_refresh(
+    State(state): State<AppState>,
+    Query(q): Query<ArtistIdQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "write capability is disabled"})),
+        ));
+    }
+    let conn = state.pool.get().map_err(to_http_error)?;
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        list_folder_renames(&conn, Some(&roots), q.artist_id, true)
             .map(Json)
             .map_err(to_http_error)
     })
@@ -2810,22 +2886,28 @@ async fn api_artist_status() -> Json<Value> {
 async fn api_ml_runtime_status(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    let mut status = gallery_accel::runtime_prepare::ml_runtime_status(&conn);
-    if state.capabilities.ml || state.primary {
-        let recognition = gallery_accel::character_ccip::session_status();
-        status["actual_provider"] = recognition
-            .get("actual_provider")
-            .cloned()
-            .unwrap_or_else(|| json!("not_initialized"));
-        status["provider_error"] = recognition
-            .get("fallback_reason")
-            .cloned()
-            .or_else(|| recognition.get("error").cloned())
-            .unwrap_or(Value::Null);
-        status["character_recognition"] = recognition;
-    }
-    Ok(Json(status))
+    // GPU detection scans /dev and /sys; keep it off the async workers.
+    let status = tokio::task::spawn_blocking(move || {
+        let conn = state.pool.get().map_err(to_http_error)?;
+        let mut status = gallery_accel::runtime_prepare::ml_runtime_status(&conn);
+        if state.capabilities.ml || state.primary {
+            let recognition = gallery_accel::character_ccip::session_status();
+            status["actual_provider"] = recognition
+                .get("actual_provider")
+                .cloned()
+                .unwrap_or_else(|| json!("not_initialized"));
+            status["provider_error"] = recognition
+                .get("fallback_reason")
+                .cloned()
+                .or_else(|| recognition.get("error").cloned())
+                .unwrap_or(Value::Null);
+            status["character_recognition"] = recognition;
+        }
+        Ok(status)
+    })
+    .await
+    .map_err(|error| to_http_error(anyhow::anyhow!(error.to_string())))?;
+    status.map(Json)
 }
 
 async fn api_ml_runtime_settings_get(
@@ -3102,14 +3184,12 @@ fn blocking_http_error(error: tokio::task::JoinError) -> (StatusCode, Json<Value
 }
 
 fn to_http_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {
-    let message = error
-        .chain()
-        .map(|cause| cause.to_string())
-        .collect::<Vec<_>>()
-        .join(": ");
+    // Details (including server paths from the anyhow chain) stay in the
+    // process log; the response body is generic so paths never leak to clients.
+    eprintln!("request failed: {error:#}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": message})),
+        Json(json!({"error": "internal server error"})),
     )
 }
 
@@ -3276,11 +3356,22 @@ async fn api_ws_scan(State(state): State<AppState>, ws: WebSocketUpgrade) -> Res
     ws.on_upgrade(move |mut socket| async move {
         let mut last = String::new();
         loop {
-            let state_json = match pool.get() {
-                Ok(conn) => get_scan_state(&conn)
-                    .unwrap_or_else(|_| json!({"status": "idle"}))
-                    .to_string(),
-                Err(_) => json!({"status": "idle"}).to_string(),
+            // pool.get() + scan-state query are blocking SQLite work: keep
+            // the 400ms poll off the async workers.
+            let state_json = {
+                let pool = Arc::clone(&pool);
+                match tokio::task::spawn_blocking(move || {
+                    pool.get()
+                        .map(|conn| {
+                            get_scan_state(&conn).unwrap_or_else(|_| json!({"status": "idle"}))
+                        })
+                        .map_err(|_| json!({"status": "idle"}))
+                })
+                .await
+                {
+                    Ok(Ok(scan)) => scan.to_string(),
+                    _ => json!({"status": "idle"}).to_string(),
+                }
             };
             if state_json != last {
                 if socket

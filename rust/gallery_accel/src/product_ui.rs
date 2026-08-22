@@ -212,7 +212,7 @@ fn folder_item_ids(conn: &Connection, artist_id: i64, folder: &str) -> Result<Ve
 /// Escape SQL LIKE wildcards so folder names (and artist paths) containing
 /// `%` or `_` match literally instead of widening the pattern to unrelated
 /// items — folder tag writes must never touch the wrong item set.
-fn escape_like(value: &str) -> String {
+pub(crate) fn escape_like(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         if matches!(c, '\\' | '%' | '_') {
@@ -470,6 +470,25 @@ pub fn merge_move_candidate_group_with_roots(
     }))
 }
 
+/// One pending move-candidate row joined with its item and duplicate counts:
+/// (id, item_artist, candidate_artist, reason, scan_candidate_id, new_path,
+/// item_hash, candidate_hash, missing, same_scan_candidate_count,
+/// same_target_count, tag_count).
+type AutoResolveMoveRow = (
+    i64,
+    i64,
+    i64,
+    String,
+    Option<i64>,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
 pub fn auto_resolve_move_candidates(conn: &Connection, limit: i64) -> Result<Value> {
     auto_resolve_move_candidates_with_roots(
         conn,
@@ -488,7 +507,7 @@ pub fn auto_resolve_move_candidates_with_roots(
     limit: i64,
 ) -> Result<Value> {
     let limit = if limit > 0 { limit.min(5000) } else { 1000 };
-    let moves: Vec<(i64, i64, i64, String, Option<i64>, String, String, String, i64, i64, i64, i64)> = conn
+    let moves: Vec<AutoResolveMoveRow> = conn
         .prepare(
             "SELECT mc.id, i.artist_id, mc.artist_id, mc.reason, mc.scan_candidate_id, mc.new_path,
                     i.content_hash, COALESCE(sc.content_hash, ''), i.missing,
@@ -1080,7 +1099,8 @@ fn start_character_import_job_with_index_changes(
         .get("candidate_limit")
         .and_then(|v| v.as_i64())
         .filter(|v| *v > 0)
-        .unwrap_or_else(import_job_candidate_limit);
+        .unwrap_or_else(import_job_candidate_limit)
+        .clamp(50, 20_000);
 
     let scope = if !tag_ids.is_empty() || !tag_names.is_empty() {
         "tag"
@@ -1193,14 +1213,15 @@ fn start_character_import_job_with_index_changes(
         }
     }
     // Prefer characters that currently have fewer auto-refs (spread growth), then by tag/id.
-    sql.push_str(&format!(
+    sql.push_str(
         " ORDER BY (
             SELECT COUNT(*) FROM character_references cr2
             JOIN characters c2 ON c2.id = cr2.character_id
             WHERE c2.name = t.name AND cr2.source_type = 'tag_single'
           ) ASC, t.name, i.id
-          LIMIT {candidate_limit}"
-    ));
+          LIMIT ?",
+    );
+    bind.push(json!(candidate_limit));
 
     let mut stmt = conn.prepare(&sql)?;
     let params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = bind

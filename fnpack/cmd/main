@@ -415,8 +415,12 @@ launch_rust_primary() {
     # supplemental groups even after usermod; force primary group via `sg render`.
     if command -v sg >/dev/null 2>&1 && getent group render >/dev/null 2>&1; then
         log "Gallery starting under sg render for OpenVINO GPU (/dev/dri)."
-        # shellcheck disable=SC2086
-        nohup sg render -c "$RUST_ACCEL_BIN --primary --host 0.0.0.0 --port $PORT --db ${DATA_DIR}/gallery.db --enable-writes --enable-media --enable-ml --static-dir ${GALLERY_STATIC_DIR}" \
+        # `sg -c` re-parses the command with an inner shell. POSIX sh (dash on
+        # fnOS) has no printf %q, so instead export the variables and let the
+        # inner shell expand quoted references itself — safe for spaces and
+        # metacharacters in DATA_DIR / GALLERY_STATIC_DIR.
+        export RUST_ACCEL_BIN PORT DATA_DIR GALLERY_STATIC_DIR
+        nohup sg render -c 'exec "$RUST_ACCEL_BIN" --primary --host 0.0.0.0 --port "$PORT" --db "$DATA_DIR/gallery.db" --enable-writes --enable-media --enable-ml --static-dir "$GALLERY_STATIC_DIR"' \
             >> "$LOG_FILE" 2>&1 &
     else
         log "Gallery starting without sg render (group/sg missing); OpenVINO may fall back to CPU."
@@ -501,6 +505,11 @@ start_app() {
     sleep 3
     if ! is_running; then
         log "Gallery process exited immediately after start. Last Gallery startup log lines:"
+        # fnOS may use startup.log as LOG_FILE, so copying only to a distinct
+        # trim log leaves the operator with an empty diagnostic section.
+        if [ -f "$LOG_FILE" ]; then
+            tail -n 80 "$LOG_FILE" 2>/dev/null || true
+        fi
         if [ -n "${TRIM_TEMP_LOGFILE:-}" ] && [ "$TRIM_TEMP_LOGFILE" != "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
             tail -n 80 "$LOG_FILE" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
         fi

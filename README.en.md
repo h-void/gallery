@@ -93,6 +93,30 @@ $env:GALLERY_MEDIA_DIR = 'D:\Pictures'
 docker compose up -d --build
 ```
 
+For a normal NAS or Windows deployment, use only the default `gallery` service; it does not require `/dev/dri` or GPU permissions. `gallery-gpu` is optional and does not affect the normal path.
+
+Intel GPU uses the optional profile in the same Compose file. Stop the default service first, then start the GPU service explicitly so both services do not claim the same port:
+
+```powershell
+docker compose stop gallery
+docker compose --profile gpu up -d --build gallery-gpu
+```
+
+Common runtime settings are listed in the `environment` block of `docker-compose.yml`. Edit the YAML directly, or override the same variable names from a project `.env` file or the host environment, for example `CHARACTER_RECOGNITION_PROVIDER=cpu` or `SCAN_INTERVAL=0`. `DATA_DIR` stays fixed at `/gallery/data`; the recycle store is `/gallery/data/recycle` and persists in `gallery-storage`.
+
+**Docker GPU note**: The `gallery-gpu` profile targets an Intel iGPU on a Linux Docker host. It maps the host `/dev/dri` device nodes into the container and adds the process to the Linux `render`/`video` groups that own those nodes. `GALLERY_RENDER_GID` and `GALLERY_VIDEO_GID` are numeric group IDs, not GPU model settings. They vary by host: run `stat -c '%n gid=%g' /dev/dri/renderD128 /dev/dri/card0` on the Linux host, then put the values in the project `.env`, for example `GALLERY_RENDER_GID=109` and `GALLERY_VIDEO_GID=44`. Windows Docker Desktop does not always expose `/dev/dri`; without that path, use the normal `gallery` service instead of this Intel profile.
+
+**Docker CUDA note**: NVIDIA hosts use the `cuda` profile in the same Compose file; no GPU index or GID needs to be entered. The host needs NVIDIA Container Toolkit (Windows Docker Desktop needs working WSL2 NVIDIA support):
+
+```powershell
+docker compose stop gallery
+docker compose --profile cuda up -d --build gallery-cuda
+```
+
+Compose exposes the NVIDIA GPU to the container. `gallery-cuda` uses a dedicated `runtime-cuda` image target that bundles the CUDA 12.x and cuDNN 9.x user-mode libraries, so the host only needs a compatible NVIDIA driver. GPU detection supports both native `/dev/nvidia*` nodes and the WSL2/Docker Desktop `/dev/dxg` plus injected-driver layout. Gallery then follows the same fnOS order, CUDA → OpenVINO → CPU, and downloads the verified ONNX Runtime CUDA runtime into `gallery-storage` at `models/ort/cuda-1.24.1`. Without an NVIDIA GPU, do not start this profile; use the default `gallery` service.
+
+**fnOS parameter note**: The current FPK does not expose a generic environment-variable editor, and Docker `.env` values do not carry over to FPK. fnOS injects the `TRIM_*` path and port variables. To change other defaults such as the provider, scan interval, or backup interval, edit `fnpack/cmd/main`, run `tools/build_rust_accel.py` and `tools/build_fnpack.py` again, install the new FPK, and restart Gallery.
+
 3. **Notes**:
    - Databases, caches, and models are persisted in the `gallery-storage` volume (`data/`, `cache/`, `models/`).
    - Media is mounted read-only (`:ro`) by default; the app only reads originals and organizes within its own index/database — it does **not physically move or rename your files**.
@@ -102,7 +126,7 @@ docker compose up -d --build
 
 ## ⚙️ Configuration
 
-The following environment variables can be customized in your environment, fnOS app configuration, or Compose file:
+The following runtime settings can be overridden in Compose (`environment`, project `.env`, or host environment). The fnOS FPK has no generic variable editor; use the rebuild flow above for fnOS:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |

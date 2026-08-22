@@ -51,10 +51,10 @@ pub(crate) struct GroupRow {
     pub(crate) blocked_candidate_count: i64,
     pub(crate) applicable_candidate_count: i64,
     pub(crate) sample_candidates: Vec<MoveRow>,
+    pub(crate) move_ids: Vec<i64>,
+    pub(crate) blocked_move_ids: Vec<i64>,
     #[serde(skip_serializing)]
     pub(crate) sample_ids: Vec<i64>,
-    #[serde(skip_serializing)]
-    pub(crate) move_ids: Vec<i64>,
 }
 
 pub(crate) fn group_source_from_row(

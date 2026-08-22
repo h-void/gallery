@@ -33,7 +33,7 @@ function applyMode(mode) {
   if (isMoves) {
     setMaintenanceView(state.maintenanceView || 'overview');
     loadMoveWorkbench().catch(e => {
-      if (!isAbortError(e)) toast('维护页面刷新失败: ' + (e.message || e), 'error');
+      if (!isAbortError(e)) toast('维护页面刷新失败：' + (e.message || e), 'error');
     });
     startMaintenanceAutoRefresh();
   } else {
@@ -50,6 +50,7 @@ function applyMode(mode) {
       });
     }).catch(e => {
       if (isCurrentRequestSeq('modeSwitchSeq', seq)) state.modeSwitchAnchor = null;
+      toast('加载媒体失败', 'error');
       logUiAction('mode_change', collectUiLogContext({
         from_mode: fromMode,
         to_mode: mode,
@@ -315,7 +316,7 @@ function bindEvents() {
 
   $('#moveRefreshBtn').addEventListener('click', () => {
     loadMoveWorkbench({preserveScroll: true}).catch(e => {
-      if (!isAbortError(e)) toast('维护页面刷新失败: ' + (e.message || e), 'error');
+      if (!isAbortError(e)) toast('维护页面刷新失败：' + (e.message || e), 'error');
     });
   });
   $('#moveAutoResolveBtn').addEventListener('click', autoResolveMoveCandidates);
@@ -330,7 +331,7 @@ function bindEvents() {
   const archiveProfileSaveBtn = $('#archiveProfileSaveBtn');
   if (archiveProfileSaveBtn) archiveProfileSaveBtn.addEventListener('click', saveArchiveSettings);
   const archivePlansRefreshBtn = $('#archivePlansRefreshBtn');
-  if (archivePlansRefreshBtn) archivePlansRefreshBtn.addEventListener('click', () => loadArchiveWorkbench());
+  if (archivePlansRefreshBtn) archivePlansRefreshBtn.addEventListener('click', () => refreshArchivePlans());
   const archivePlansPreviewBtn = $('#archivePlansPreviewBtn');
   if (archivePlansPreviewBtn) archivePlansPreviewBtn.addEventListener('click', previewArchivePlans);
   const archivePlansApplyBtn = $('#archivePlansApplyBtn');
@@ -552,7 +553,7 @@ const healthGrid = $('#healthGrid');
   document.addEventListener('visibilitychange', () => {
     if (state.mode === 'moves' && !document.hidden) {
       refreshActiveMaintenanceView({preserveScroll: true, reason: 'visible'}).catch(e => {
-        if (!isAbortError(e)) toast('维护页面刷新失败: ' + (e.message || e), 'error');
+        if (!isAbortError(e)) toast('维护页面刷新失败：' + (e.message || e), 'error');
       });
       scheduleMaintenanceAutoRefresh();
     }
@@ -573,7 +574,7 @@ const healthGrid = $('#healthGrid');
       result.style.color = r.ok ? 'var(--status-ok)' : 'var(--status-danger)';
       await loadHealthSummary();
     } catch (e) {
-      result.textContent = '备份失败: ' + (e.message || e);
+      result.textContent = '备份失败：' + (e.message || e);
       result.style.color = 'var(--status-danger)';
     } finally {
       btn.disabled = false;
@@ -820,9 +821,25 @@ function closeTopmostOverlay() {
   return false;
 }
 
+let wsRetryDelay = 1000;
+
+function scheduleWsReconnect() {
+  setTimeout(connectWS, wsRetryDelay);
+  wsRetryDelay = Math.min(wsRetryDelay * 2, 30000);
+}
+
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${proto}//${location.host}/ws/scan`);
+  let ws;
+  try {
+    ws = new WebSocket(`${proto}//${location.host}/ws/scan`);
+  } catch (e) {
+    scheduleWsReconnect();
+    return;
+  }
+  ws.onopen = () => {
+    wsRetryDelay = 1000;
+  };
   ws.onmessage = e => {
     let s = {};
     try {
@@ -864,7 +881,10 @@ function connectWS() {
       }
     }
   };
-  ws.onclose = () => setTimeout(connectWS, 3000);
+  ws.onerror = () => {
+    // onclose always follows onerror; the backoff loop lives there.
+  };
+  ws.onclose = () => scheduleWsReconnect();
 }
 
 function showProgress(s) {
@@ -1017,6 +1037,11 @@ function logModeChangeLayout(data = {}) {
 
 async function refreshCurrentView({reason = 'manual'} = {}) {
   const currentArtistId = state.currentArtist ? state.currentArtist.id : null;
+  // selectArtist bumps artistLoadSeq but not scanRefreshSeq: watch both so a
+  // user switching artists mid-refresh can never be overwritten back to the
+  // previous artist's state or URL.
+  const artistLoadSeqAtStart = Number(state.artistLoadSeq || 0);
+  const artistChanged = () => Number(state.artistLoadSeq || 0) !== artistLoadSeqAtStart;
   const hadNoArtistsBeforeRefresh = state.artists.length === 0;
   const activeFolder = state.activeFolder;
   const currentMode = state.mode;
@@ -1024,7 +1049,7 @@ async function refreshCurrentView({reason = 'manual'} = {}) {
   const gridScrollAnchor = captureGridScrollAnchor();
   const seq = nextRequestSeq('scanRefreshSeq');
   await loadArtists();
-  if (!isCurrentRequestSeq('scanRefreshSeq', seq)) return seq;
+  if (!isCurrentRequestSeq('scanRefreshSeq', seq) || artistChanged()) return seq;
   if (currentMode === 'moves' || state.mode === 'moves') {
     setMaintenanceView(maintenanceView || 'overview');
     await loadMoveWorkbench({preserveScroll: true});
@@ -1056,7 +1081,7 @@ async function refreshCurrentView({reason = 'manual'} = {}) {
       API.get(`/api/tags?artist_id=${currentArtistId}`),
       API.get(`/api/folders?artist_id=${currentArtistId}`),
     ]);
-    if (!isCurrentRequestSeq('scanRefreshSeq', seq)) return seq;
+    if (!isCurrentRequestSeq('scanRefreshSeq', seq) || artistChanged()) return seq;
     state.stats = stats;
     state.tags = tags;
     state.folders = folders;
@@ -1077,8 +1102,10 @@ async function refreshCurrentView({reason = 'manual'} = {}) {
       syncItemFilterControls();
     }
     await loadItems();
+    if (artistChanged()) return seq;
     restoreGridScrollAnchor(gridScrollAnchor);
   }
+  if (artistChanged()) return seq;
   syncBrowseUrl('replace');
   logUiAction('refresh_current_view', {reason});
   return seq;

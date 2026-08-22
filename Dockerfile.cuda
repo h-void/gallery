@@ -1,5 +1,10 @@
 # syntax=docker/dockerfile:1
 
+# CUDA build variant for CI services that always build the LAST stage
+# (e.g. Aliyun ACR source builds): identical to Dockerfile except the
+# final stage order - runtime-cuda comes last so the plain runtime image
+# is never the default product here. Keep in sync with Dockerfile;
+# tests/test_optimization_config.py enforces stage-for-stage equality.
 FROM python:3.12-slim-bookworm AS ort
 
 WORKDIR /src
@@ -109,8 +114,8 @@ CMD ["--primary", "--enable-ml", "--db", "/gallery/data/gallery.db", "--static-d
 # CUDA-flavored runtime for the compose cuda profile. The default build target
 # is the plain `runtime` stage below; docker-compose.test.yml also builds the
 # last stage and must stay GPU-free.
+FROM runtime-base AS runtime
 FROM runtime-base AS runtime-cuda
 COPY --from=cuda-libs /opt/nvidia-libs /opt/nvidia-libs
 ENV LD_LIBRARY_PATH=/opt/gallery/lib:/opt/nvidia-libs
 
-FROM runtime-base AS runtime

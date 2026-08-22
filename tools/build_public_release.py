@@ -16,6 +16,7 @@ ROOT_FILES = frozenset(
         ".gitattributes",
         ".gitignore",
         "Dockerfile",
+        "Dockerfile.cuda",
         "LICENSE",
         "README.md",
         "README.en.md",
@@ -36,6 +37,7 @@ REQUIRED_FILES = frozenset(
     (
         ".gitattributes",
         "Dockerfile",
+        "Dockerfile.cuda",
         "README.md",
         "docker-compose.yml",
         "rust/gallery_accel/Cargo.toml",

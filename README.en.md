@@ -97,7 +97,7 @@ docker compose up -d
 
 When no local image exists, Compose pulls the prebuilt `stable` image from the registry automatically — no local compilation. Add `--build` only after modifying the source; upgrade to a newly published image with `docker compose pull` followed by `docker compose up -d`.
 
-For a normal NAS or Windows deployment, use only the default `gallery` service; it does not require `/dev/dri` or GPU permissions. `gallery-gpu` is optional and does not affect the normal path.
+All three runtimes share the same `docker-compose.yml`. To pick one, edit the single line `COMPOSE_PROFILES=cpu|gpu|cuda` in the `.env` file next to it (the release ships `.env`, defaulting to `cpu`), run `docker compose down` and then `docker compose up -d` — no command-line flags needed; `--profile gpu` / `--profile cuda` remain available without editing `.env`. For a normal NAS or Windows deployment, use only the default `gallery` service; it does not require `/dev/dri` or GPU permissions. `gallery-gpu` and `gallery-cuda` are optional profiles and do not affect the normal path.
 
 **GPU support matrix**:
 
@@ -115,7 +115,7 @@ docker compose stop gallery
 docker compose --profile gpu up -d --build gallery-gpu
 ```
 
-Common runtime settings are listed in the `environment` block of `docker-compose.yml`. Edit the YAML directly, or override the same variable names from a project `.env` file or the host environment, for example `CHARACTER_RECOGNITION_PROVIDER=cpu` or `SCAN_INTERVAL=0`. `DATA_DIR` stays fixed at `/gallery/data`; the recycle store is `/gallery/data/recycle` and persists in `gallery-storage`.
+The media directory is the only value you need to fill in: set `GALLERY_MEDIA_DIR=D:\Pictures` (Windows) or `GALLERY_MEDIA_DIR=/home/user/pictures` (Linux) in the `.env` file, or edit the `./media` default directly in `docker-compose.yml`; mapped network drives and UNC paths are not supported. The mounted directory becomes the library root — every subfolder inside is recognized as one artist. Multiple libraries are one line each in `.env` (`GALLERY_MEDIA_DIR`, `GALLERY_MEDIA_DIR2`, `GALLERY_MEDIA_DIR3`, up to three): the container entrypoint auto-detects every non-empty mount as an independent library and ignores empty slots — no further configuration needed. All other runtime settings ship with working defaults; edit the values in the `environment` block of the YAML when needed. `DATA_DIR` stays fixed at `/gallery/data`; the recycle store is `/gallery/data/recycle` and persists in `gallery-storage`.
 
 **Docker GPU note**: The `gallery-gpu` profile targets an Intel iGPU on a Linux Docker host. It maps the host `/dev/dri` device nodes into the container and adds the process to the Linux `render`/`video` groups that own those nodes. `GALLERY_RENDER_GID` and `GALLERY_VIDEO_GID` are numeric group IDs, not GPU model settings. They vary by host: run `stat -c '%n gid=%g' /dev/dri/renderD128 /dev/dri/card0` on the Linux host, then put the values in the project `.env`, for example `GALLERY_RENDER_GID=109` and `GALLERY_VIDEO_GID=44`. Windows Docker Desktop (WSL2 backend) has no `/dev/dri` device, so Intel iGPUs are not usable in that environment; the `gallery-gpu` profile applies to native Linux hosts only. On a Windows machine with only an Intel iGPU, use the default `gallery` service (CPU inference).
 
@@ -132,7 +132,7 @@ Compose exposes the NVIDIA GPU to the container. `gallery-cuda` uses a dedicated
 
 3. **Notes**:
    - Databases, caches, and models are persisted in the `gallery-storage` volume (`data/`, `cache/`, `models/`).
-   - Media is mounted read-only (`:ro`) by default; the app only reads originals and organizes within its own index/database — it does **not physically move or rename your files**.
+   - Media is mounted read-only (`:ro`) by default; the app only reads originals and organizes within its own index/database — it does **not physically move or rename your files**. Read-only also disables media deletion (moving to the recycle store) and archive execution (physically moving folders): those operations fail cleanly and keep their records. Remove the trailing `:ro` on the mount line to enable them (SQLite online backups and source/target validation still run before every execution). The fnOS native deployment uses fnOS-authorized read-write paths with the full feature set.
    - Place the model at `models/character/ccip-caformer_b36-24/model_feat.onnx`; for managing media on fnOS, use the authorized-directory flow in Method 1.
 
 ---

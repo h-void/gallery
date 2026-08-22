@@ -97,7 +97,7 @@ docker compose up -d
 
 本地没有镜像时，Compose 自动从镜像仓库拉取已构建的 `stable` 镜像，无需本地编译；修改源码后才需要 `--build` 重建，升级到新发布的镜像用 `docker compose pull` 后再 `docker compose up -d`。
 
-普通 NAS 或 Windows 部署只使用默认的 `gallery` 服务；它不要求 `/dev/dri` 或 GPU 权限。`gallery-gpu` 与 `gallery-cuda` 均为可选 profile，不影响普通部署。
+三种运行时共用同一份 `docker-compose.yml`，选择方式：编辑同目录 `.env` 里的一行 `COMPOSE_PROFILES=cpu|gpu|cuda`（发行包自带 `.env`，默认 `cpu`），先 `docker compose down` 再 `docker compose up -d` 直接启动，无需命令行参数；不改 `.env` 也可用 `--profile gpu` / `--profile cuda` 启动。普通 NAS 或 Windows 部署只使用默认的 `gallery` 服务；它不要求 `/dev/dri` 或 GPU 权限。`gallery-gpu` 与 `gallery-cuda` 均为可选 profile，不影响普通部署。
 
 **GPU 支持矩阵**：
 
@@ -126,8 +126,8 @@ docker compose --profile cuda up -d --build gallery-cuda
 
 **持久化与运行参数**：
 - 数据库、缓存与模型统一持久化于 `gallery-storage` 数据卷（对应 `data/`、`cache/`、`models/`）。
-- 媒体目录默认只读（`:ro`）挂载；应用只读取原文件并在自身索引/数据库中整理，**不会物理移动或重命名你的原文件**。
-- 常用运行参数已写入 `docker-compose.yml` 的 `environment`，可直接改 yml；也可在项目根目录 `.env` 或主机环境中用同名变量覆盖，例如 `CHARACTER_RECOGNITION_PROVIDER=cpu`、`SCAN_INTERVAL=0`。`DATA_DIR` 固定为容器内 `/gallery/data`，回收站固定为 `/gallery/data/recycle`。
+- 媒体目录默认只读（`:ro`）挂载；应用只读取原文件并在自身索引/数据库中整理，**不会物理移动或重命名你的原文件**。只读同时使「删除媒体（移入回收站）」与「整理执行（物理移动文件夹）」不可用——执行会失败并保留记录，不会留下半途状态；需要这两个功能时删除挂载行尾的 `:ro`（执行前仍自动进行 SQLite 在线备份与源/目标校验）。fnOS 原生部署使用 fnOS 授权的读写路径，整理功能完整可用。
+- 媒体目录是唯一需要填写的变量：在 `.env` 写 `GALLERY_MEDIA_DIR=D:\Pictures`（Windows）或 `GALLERY_MEDIA_DIR=/home/user/pictures`（Linux），或直接改 `docker-compose.yml` 里的默认值 `./media`；映射网络盘与 UNC 路径不可用。挂载的目录即媒体库根目录，根目录下每个子文件夹识别为一个画师。多个媒体目录在 `.env` 里一行一个（`GALLERY_MEDIA_DIR`、`GALLERY_MEDIA_DIR2`、`GALLERY_MEDIA_DIR3`，最多 3 个），入口脚本自动探测非空挂载为独立库，空槽位自动忽略，无需其他配置。其余运行参数（识别后端、扫描周期、备份周期等）已写好默认值，需要调整时直接改 yml `environment` 块中的对应值。`DATA_DIR` 固定为容器内 `/gallery/data`，回收站固定为 `/gallery/data/recycle`。
 - 模型放置于 `models/character/ccip-caformer_b36-24/model_feat.onnx`；如需在 fnOS 上管理媒体，请走方案一的授权目录方式。
 
 **fnOS 参数说明**：当前 FPK 没有通用的环境变量编辑界面，Docker 的 `.env` 不能直接用于 FPK。`TRIM_*` 路径和端口变量由 fnOS 注入；要修改其他默认运行参数（例如识别后端、扫描周期、备份周期），需要修改 `fnpack/cmd/main` 的默认值，重新执行 `tools/build_rust_accel.py` 和 `tools/build_fnpack.py`，安装新的 FPK 后重启 Gallery。

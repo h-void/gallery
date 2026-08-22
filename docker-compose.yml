@@ -1,69 +1,135 @@
 name: gallery
 
+# ══════════════════════════════════════════════════════════════════════
+#  唯一需要填写的位置 / The only value you need to fill in
+# ══════════════════════════════════════════════════════════════════════
+#  媒体目录：本地磁盘任意绝对路径 / Media directory: any local absolute path
+#  示例 / examples:
+#      Windows:  GALLERY_MEDIA_DIR=D:\Pictures
+#      Linux:    GALLERY_MEDIA_DIR=/home/user/pictures
+#  填法 A / Option A: 把下方 volumes 里的 ./media 改成你的目录
+#                    edit ./media in the volumes section below
+#  填法 B / Option B: 在 .env 里取消注释并修改 / uncomment & edit in .env
+#
+#  识别模式 / Recognition mode:
+#      挂载的目录即媒体库根目录，根目录下每个子文件夹识别为一个画师
+#      the mounted directory becomes the library root; every subfolder
+#      inside is recognized as one artist
+#
+#  多个媒体目录 / Multiple media directories:
+#      .env 写一行就是一个库，两行就是两个（槽位已预置到 3 个）
+#      one line in .env per library, up to three (slots pre-wired);
+#      empty slots are ignored automatically
+#          GALLERY_MEDIA_DIR=D:\Pictures
+#          GALLERY_MEDIA_DIR2=E:\Art
+#          GALLERY_MEDIA_DIR3=F:\Collections
+#
+#  注意 / Note: 映射网络盘与 UNC 路径不可用
+#        mapped network drives and UNC paths are not supported
+# ══════════════════════════════════════════════════════════════════════
+#  切换运行时：改 .env 一行，直接启动，无需命令行参数
+#  Switch runtimes: edit one line in .env, then start — no flags needed
+# ══════════════════════════════════════════════════════════════════════
+#    1. docker compose down                 # 停止当前运行时 / stop current
+#    2. 编辑 .env 里的一行 / edit the line in .env:
+#           COMPOSE_PROFILES=cpu            # 默认 CPU（无需 GPU）/ default
+#           COMPOSE_PROFILES=gpu            # Intel 核显（仅原生 Linux）
+#           COMPOSE_PROFILES=cuda           # NVIDIA CUDA
+#    3. docker compose up -d                # 直接启动 / start directly
+#
+#  不改 .env 的等价命令行 / command-line equivalent:
+#           docker compose --profile cuda up -d gallery-cuda
+#  注意 / Note: 启动哪个服务由 .env 的 COMPOSE_PROFILES 决定；
+#        发行包自带 .env（默认 cpu），缺失该文件时 up 不会启动任何服务
+#        which services start is decided by COMPOSE_PROFILES in .env;
+#        the release ships .env (default cpu) — without it, up starts nothing
+# ══════════════════════════════════════════════════════════════════════
+
 x-gallery-base: &gallery-base
   build:
+    # 默认构建普通镜像（Dockerfile 最后一个阶段）
+    # builds the plain image (last Dockerfile stage) by default
     context: .
-    # Last Dockerfile stage; docker-compose.test.yml builds the same target
-    # and must stay GPU-free.
     target: runtime
   image: crpi-hwq9kgccbg8v0l26.cn-hangzhou.personal.cr.aliyuncs.com/hczhr/gallery:stable
   restart: unless-stopped
   ports:
-    - "${GALLERY_PORT:-8899}:8899"
+    # 改端口时直接改左侧数字 / to change the port, edit the left number
+    - "8899:8899"
   read_only: true
   tmpfs:
     - /tmp:size=512m,mode=1777
   volumes:
-    # 改成你的真实媒体目录（Windows 用 /d/Pictures 这种形式，或 C:\ 绝对路径）
+    # ↑ 唯一填空处 / the only fill-in above
+    # 只读挂载是刻意的安全设计：浏览/标签/识别只读原文件，永不修改；
+    # 需要使用「删除（移入回收站）」或「整理执行（物理移动文件夹）」时，
+    # 删除对应行尾的 :ro
+    # Read-only by design: browsing/tagging/recognition never modify source
+    # files; remove the trailing :ro to enable delete & archive execution
     - "${GALLERY_MEDIA_DIR:-./media}:/media:ro"
+    # 多个媒体目录：在 .env 多写一行即多一个库（未填的槽位挂空占位目录，自动忽略）
+    # Multiple libraries: one extra line in .env each; unset slots mount an
+    # empty placeholder and are auto-ignored by the entrypoint
+    - "${GALLERY_MEDIA_DIR2:-./media-placeholder-2}:/media2:ro"
+    - "${GALLERY_MEDIA_DIR3:-./media-placeholder-3}:/media3:ro"
     - gallery-storage:/gallery
   environment:
-    PICTURES_ROOT_LABELS: "${GALLERY_MEDIA_LABEL:-media}"
-    # Runtime tuning. Compose values are usable as-is or can be overridden
-    # from the host environment/.env without changing the image.
-    CHARACTER_RECOGNITION_ENABLED: "${CHARACTER_RECOGNITION_ENABLED:-1}"
-    CHARACTER_RECOGNITION_PROVIDER: "${CHARACTER_RECOGNITION_PROVIDER:-auto}"
-    CHARACTER_OPENVINO_DEVICE: "${CHARACTER_OPENVINO_DEVICE:-GPU}"
-    CHARACTER_ALLOW_CPU_FALLBACK: "${CHARACTER_ALLOW_CPU_FALLBACK:-1}"
-    CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK: "${CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK:-1}"
-    ONNXRUNTIME_AUTO_DOWNLOAD: "${ONNXRUNTIME_AUTO_DOWNLOAD:-1}"
-    ONNXRUNTIME_AUTO_DOWNLOAD_DIR: "${ONNXRUNTIME_AUTO_DOWNLOAD_DIR:-/gallery/models/ort}"
-    OPENVINO_RUNTIME_AUTO_DOWNLOAD: "${OPENVINO_RUNTIME_AUTO_DOWNLOAD:-1}"
-    CHARACTER_CUDA_RUNTIME_DIR: "${CHARACTER_CUDA_RUNTIME_DIR:-/gallery/models/ort/cuda-1.24.1}"
-    CHARACTER_IMPORT_IDLE_ENABLED: "${CHARACTER_IMPORT_IDLE_ENABLED:-0}"
-    SCAN_ON_START: "${SCAN_ON_START:-0}"
-    SCAN_INTERVAL: "${SCAN_INTERVAL:-21600}"
-    HASH_INTERVAL: "${HASH_INTERVAL:-30}"
-    HASH_BATCH_SIZE: "${HASH_BATCH_SIZE:-500}"
-    DB_BACKUP_INTERVAL: "${DB_BACKUP_INTERVAL:-43200}"
-    DB_BACKUP_RETENTION: "${DB_BACKUP_RETENTION:-8}"
-    DB_BACKUP_ON_START: "${DB_BACKUP_ON_START:-0}"
-    DB_BACKUP_START_DELAY: "${DB_BACKUP_START_DELAY:-120}"
+    # 高级参数：默认值可直接使用，需要调整时改这里
+    # Advanced settings: defaults work as-is; edit the values here if needed
+    # 媒体根目录与标签由入口脚本自动探测（根标签为 media、media2、media3）；
+    # 需要自定义标签时设置 / Roots & labels are auto-detected by the
+    # entrypoint (media, media2, media3); override labels here if wanted:
+    # PICTURES_ROOT_LABELS: 图库1,图库2
+    CHARACTER_RECOGNITION_ENABLED: "1"
+    CHARACTER_RECOGNITION_PROVIDER: auto
+    CHARACTER_OPENVINO_DEVICE: GPU
+    CHARACTER_ALLOW_CPU_FALLBACK: "1"
+    CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK: "1"
+    ONNXRUNTIME_AUTO_DOWNLOAD: "1"
+    ONNXRUNTIME_AUTO_DOWNLOAD_DIR: /gallery/models/ort
+    OPENVINO_RUNTIME_AUTO_DOWNLOAD: "1"
+    CHARACTER_CUDA_RUNTIME_DIR: /gallery/models/ort/cuda-1.24.1
+    CHARACTER_IMPORT_IDLE_ENABLED: "0"
+    SCAN_ON_START: "0"
+    SCAN_INTERVAL: "21600"
+    HASH_INTERVAL: "30"
+    HASH_BATCH_SIZE: "500"
+    DB_BACKUP_INTERVAL: "43200"
+    DB_BACKUP_RETENTION: "8"
+    DB_BACKUP_ON_START: "0"
+    DB_BACKUP_START_DELAY: "120"
 
 services:
   gallery:
+    # 默认服务：CPU 推理，不需要 GPU / default: CPU inference, no GPU required
+    # 由 .env 的 COMPOSE_PROFILES=cpu 激活 / activated by COMPOSE_PROFILES=cpu
     <<: *gallery-base
+    profiles: [cpu]
 
-  # Intel GPU 需要明确指定此服务，避免与默认 gallery 服务抢端口。
+  # ─────────────────────────────────────────────────────────────
+  # Intel 核显（仅原生 Linux 宿主机）/ Intel iGPU (native Linux hosts only)
+  # Windows Docker Desktop 没有 /dev/dri，此 profile 在 Windows 不可用
+  # Windows Docker Desktop has no /dev/dri; this profile is Linux-only
+  # ─────────────────────────────────────────────────────────────
+  # docker compose stop gallery
   # docker compose --profile gpu up -d --build gallery-gpu
-  # /dev/dri 的设备节点按 Linux 宿主机的 render/video 组授权。
-  # GID 是组编号，不是 GPU 编号；不同发行版可能不同。检查：
-  # stat -c '%n gid=%g' /dev/dri/renderD128 /dev/dri/card0
-  # 再用 GALLERY_RENDER_GID/GALLERY_VIDEO_GID 覆盖下面的默认值。
   gallery-gpu:
     <<: *gallery-base
     profiles: [gpu]
     devices:
       - /dev/dri:/dev/dri
     group_add:
-      # 常见 Debian 值；必须按宿主机 /dev/dri 的实际 GID 覆盖
+      # 设备所属 Linux 组的数字 GID，不是 GPU 型号
+      # numeric GIDs of the device groups, not GPU model numbers
+      # 查询 / check: stat -c '%n gid=%g' /dev/dri/renderD128 /dev/dri/card0
       - ${GALLERY_RENDER_GID:-109}
       - ${GALLERY_VIDEO_GID:-44}
 
-  # NVIDIA CUDA profile. Requires NVIDIA Container Toolkit on the host.
-  # The application keeps fnOS selection order: CUDA -> OpenVINO -> CPU.
-  # The runtime-cuda target additionally bundles the CUDA 12.x / cuDNN 9.x
-  # user-mode libraries the onnxruntime-gpu provider dlopens at session init.
+  # ─────────────────────────────────────────────────────────────
+  # NVIDIA CUDA（宿主机只需驱动，无需 CUDA Toolkit）
+  # NVIDIA CUDA (host needs the NVIDIA driver only, no CUDA Toolkit)
+  # ─────────────────────────────────────────────────────────────
+  # docker compose stop gallery
   # docker compose --profile cuda up -d --build gallery-cuda
   gallery-cuda:
     <<: *gallery-base

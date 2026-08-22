@@ -60,19 +60,18 @@ WORKDIR /opt/gallery
 COPY --from=builder /src/target/release/gallery_accel /usr/local/bin/gallery-accel
 COPY --from=ort /opt/ort/ ./lib/
 COPY app/static/ ./static/
+COPY docker-entrypoint.sh ./docker-entrypoint.sh
 COPY LICENSE ./LICENSE
 COPY fnpack/app/licenses/ONNXRUNTIME_LICENSE.txt fnpack/app/licenses/ONNXRUNTIME_THIRD_PARTY_NOTICES.txt ./licenses/
 
 RUN mkdir -p /gallery/data/logs /gallery/data/db-backups \
         /gallery/cache/video-frames /gallery/cache/transcode-cache \
         /gallery/models/character /gallery/models/artist /gallery/models/openvino-cache \
+    && chmod 755 /opt/gallery/docker-entrypoint.sh \
     && chown -R gallery:gallery /gallery /opt/gallery
 
 ENV DATA_DIR=/gallery/data \
     GALLERY_STATIC_DIR=/opt/gallery/static \
-    PICTURES_ROOT=/media \
-    PICTURES_ROOT_REAL_PATHS=/media \
-    PICTURES_ROOT_LABELS=media \
     IMAGE_PREVIEW_CACHE_DIR=/gallery/cache \
     IMAGE_PREVIEW_CACHE_MAX_BYTES=10000000000 \
     IMAGE_PREVIEW_MAX_SOURCE_PIXELS=134217728 \
@@ -108,7 +107,9 @@ VOLUME ["/gallery"]
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=20s \
     CMD curl -fsS http://127.0.0.1:8899/api/health > /dev/null || exit 1
 
-ENTRYPOINT ["/usr/bin/tini", "--", "gallery-accel"]
+# The entrypoint auto-detects non-empty /mediaN mounts as library roots
+# (PICTURES_ROOT/LABELS) before handing over to the binary.
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/gallery/docker-entrypoint.sh"]
 CMD ["--primary", "--enable-ml", "--db", "/gallery/data/gallery.db", "--static-dir", "/opt/gallery/static"]
 
 # CUDA-flavored runtime for the compose cuda profile. The default build target

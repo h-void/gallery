@@ -23,3 +23,5 @@ __pycache__/
 *.txt
 !requirements.txt
 !fnpack/app/licenses/*.txt
+.env
+media-placeholder-*

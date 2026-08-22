@@ -13,10 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 ROOT_FILES = frozenset(
     (
         ".dockerignore",
+        ".env",
         ".gitattributes",
         ".gitignore",
         "Dockerfile",
         "Dockerfile.cuda",
+        "docker-entrypoint.sh",
         "LICENSE",
         "README.md",
         "README.en.md",
@@ -35,9 +37,11 @@ TOOL_FILES = frozenset(
 )
 REQUIRED_FILES = frozenset(
     (
+        ".env",
         ".gitattributes",
         "Dockerfile",
         "Dockerfile.cuda",
+        "docker-entrypoint.sh",
         "README.md",
         "docker-compose.yml",
         "rust/gallery_accel/Cargo.toml",

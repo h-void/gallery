@@ -1,0 +1,122 @@
+# syntax=docker/dockerfile:1
+
+# CUDA build variant for CI services that always build the LAST stage
+# (e.g. Aliyun ACR source builds): identical to Dockerfile except the
+# final stage order - runtime-cuda comes last so the plain runtime image
+# is never the default product here. Keep in sync with Dockerfile;
+# tests/test_optimization_config.py enforces stage-for-stage equality.
+FROM python:3.12-slim-bookworm AS ort
+
+WORKDIR /src
+COPY tools/_fetch_ort_openvino_libs.py ./fetch_ort.py
+RUN python ./fetch_ort.py --dest /tmp/ort-full --cache /tmp/ort-wheel \
+    && mkdir -p /opt/ort \
+    && cp /tmp/ort-full/libonnxruntime.so.1.24.1 /opt/ort/ \
+    && ln -s libonnxruntime.so.1.24.1 /opt/ort/libonnxruntime.so.1 \
+    && ln -s libonnxruntime.so.1 /opt/ort/libonnxruntime.so
+
+FROM rust:1-bookworm AS builder
+
+WORKDIR /src
+COPY rust/gallery_accel/Cargo.toml rust/gallery_accel/Cargo.lock ./
+COPY rust/gallery_accel/src/ ./src/
+RUN cargo build --release --locked
+
+# CUDA 12.x / cuDNN 9.x user-mode runtime libraries for the optional
+# runtime-cuda target. The onnxruntime-gpu wheel ships only the ORT core and
+# the CUDA execution provider; the provider dlopens cudart/cublas/cudnn/etc.
+# at session init, while the driver injection (WSL2 or NVIDIA Container
+# Toolkit) supplies only libcuda.
+# Minimal set: the exact DT_NEEDED closure of
+# libonnxruntime_providers_cuda.so (cublas+cublasLt, cudnn, cudart, cufft,
+# curand). nvrtc/cusolver/cusparse/nvjitlink/nccl are neither linked nor
+# dlopened by this build and stay out to keep the image ~2GB smaller.
+FROM python:3.12-slim-bookworm AS cuda-libs
+RUN pip install --no-cache-dir --no-deps --target /wheels \
+        nvidia-cuda-runtime-cu12 \
+        nvidia-cublas-cu12 \
+        nvidia-cudnn-cu12 \
+        nvidia-cufft-cu12 \
+        nvidia-curand-cu12 \
+    && mkdir -p /opt/nvidia-libs \
+    && cp -a /wheels/nvidia/*/lib/. /opt/nvidia-libs/
+
+FROM debian:bookworm-slim AS runtime-base
+
+# Intel iGPU support: OpenVINO GPU plugin needs the Intel OpenCL ICD (non-free).
+# Default auto provider selects NVIDIA CUDA when an NVIDIA GPU is present,
+# OpenVINO GPU otherwise, and CPU as a last resort. CPU fallback is enabled
+# in Docker because hosts may lack /dev/dri (e.g. CPU-only or AMD machines).
+RUN echo "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian.org/debian bookworm non-free" \
+        > /etc/apt/sources.list.d/non-free.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl ffmpeg libgomp1 tini intel-opencl-icd \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 gallery \
+    && useradd --uid 10001 --gid gallery --create-home gallery
+
+WORKDIR /opt/gallery
+COPY --from=builder /src/target/release/gallery_accel /usr/local/bin/gallery-accel
+COPY --from=ort /opt/ort/ ./lib/
+COPY app/static/ ./static/
+COPY docker-entrypoint.sh ./docker-entrypoint.sh
+COPY LICENSE ./LICENSE
+COPY fnpack/app/licenses/ONNXRUNTIME_LICENSE.txt fnpack/app/licenses/ONNXRUNTIME_THIRD_PARTY_NOTICES.txt ./licenses/
+
+RUN mkdir -p /gallery/data/logs /gallery/data/db-backups \
+        /gallery/cache/video-frames /gallery/cache/transcode-cache \
+        /gallery/models/character /gallery/models/artist /gallery/models/openvino-cache \
+    && chmod 755 /opt/gallery/docker-entrypoint.sh \
+    && chown -R gallery:gallery /gallery /opt/gallery
+
+ENV DATA_DIR=/gallery/data \
+    GALLERY_STATIC_DIR=/opt/gallery/static \
+    IMAGE_PREVIEW_CACHE_DIR=/gallery/cache \
+    IMAGE_PREVIEW_CACHE_MAX_BYTES=10000000000 \
+    IMAGE_PREVIEW_MAX_SOURCE_PIXELS=134217728 \
+    VIDEO_FRAME_CACHE_DIR=/gallery/cache/video-frames \
+    VIDEO_FRAME_CACHE_MAX_BYTES=2000000000 \
+    VIDEO_TRANSCODE_CACHE_DIR=/gallery/cache/transcode-cache \
+    VIDEO_TRANSCODE_CACHE_MAX_BYTES=900000000 \
+    MODEL_CACHE_ROOT=/gallery/models \
+    CHARACTER_MODEL_DIR=/gallery/models/character \
+    ARTIST_MODEL_DIR=/gallery/models/artist \
+    CHARACTER_RECOGNITION_PROVIDER=auto \
+    CHARACTER_ALLOW_CPU_FALLBACK=1 \
+    CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK=1 \
+    CHARACTER_OPENVINO_CACHE_DIR=/gallery/models/openvino-cache \
+    CHARACTER_IMPORT_IDLE_ENABLED=0 \
+    ARTIST_RECOGNITION_ENABLED=0 \
+    SCAN_ON_START=0 \
+    SCAN_INTERVAL=21600 \
+    HASH_INTERVAL=30 \
+    HASH_BATCH_SIZE=500 \
+    DB_BACKUP_INTERVAL=43200 \
+    DB_BACKUP_RETENTION=8 \
+    DB_BACKUP_ON_START=0 \
+    DB_BACKUP_START_DELAY=120 \
+    LD_LIBRARY_PATH=/opt/gallery/lib \
+    ORT_DYLIB_PATH=/opt/gallery/lib/libonnxruntime.so.1
+
+USER gallery
+
+EXPOSE 8899
+VOLUME ["/gallery"]
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=20s \
+    CMD curl -fsS http://127.0.0.1:8899/api/health > /dev/null || exit 1
+
+# The entrypoint auto-detects non-empty /mediaN mounts as library roots
+# (PICTURES_ROOT/LABELS) before handing over to the binary.
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/gallery/docker-entrypoint.sh"]
+CMD ["--primary", "--enable-ml", "--db", "/gallery/data/gallery.db", "--static-dir", "/opt/gallery/static"]
+
+# CUDA-flavored runtime for the compose cuda profile. The default build target
+# is the plain `runtime` stage below; docker-compose.test.yml also builds the
+# last stage and must stay GPU-free.
+FROM runtime-base AS runtime
+FROM runtime-base AS runtime-cuda
+COPY --from=cuda-libs /opt/nvidia-libs /opt/nvidia-libs
+ENV LD_LIBRARY_PATH=/opt/gallery/lib:/opt/nvidia-libs
+

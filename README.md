@@ -95,7 +95,7 @@ Gallery 为 fnOS 提供原生应用安装包（FPK）：单一 Rust 二进制，
 | `docker-compose.cuda.yml` | **NVIDIA 显卡独立预设**。已配置 GPU 资源分配与 CUDA 镜像，填写路径直接启动。 |
 | `gallery.yml` | **极简启动清单**。仅含模式和目录两项，供本地运行 `start.cmd` / `start.sh` 使用。 |
 | `.env` | **运行参数配置**。修改端口、扫描周期、备份策略、AI 识别等高级参数，启动时自动读取。 |
-| `docker-compose.launcher.yml` | **启动器底层模板**。供启动脚本自动调用，用户无需手动编辑。 |
+| `docker-compose.launcher.yml` | **启动器底层模板**。已内置于项目目录供启动脚本调用，无需单独下载或编辑。 |
 
 #### 方式 A：NAS 图形界面部署（无需 SSH 或 Python）
 
@@ -117,7 +117,8 @@ Gallery 为 fnOS 提供原生应用安装包（FPK）：单一 Rust 二进制，
 
 需要 Docker Desktop 或 Docker Engine 与 Docker Compose，以及 Python 3.10+（仅使用标准库，无需安装任何额外 Python 包）：
 
-1. **填写配置**：打开 `gallery.yml`，填写运行模式与本地媒体目录：
+1. **获取项目**：下载仓库 ZIP 压缩包并解压（或执行 `git clone`），保留完整目录结构（启动脚本依赖的 `docker-compose.launcher.yml` 与 `tools/` 已内置其中，无需单独下载）。
+2. **填写配置**：打开 `gallery.yml`，填写运行模式与本地媒体目录：
 
    ```yaml
    模式: cpu
@@ -127,8 +128,8 @@ Gallery 为 fnOS 提供原生应用安装包（FPK）：单一 Rust 二进制，
    ```
 
    一行一个目录，数量不限。Linux 请填写 `/home/user/pictures` 这样的绝对路径。Windows 路径使用正斜杠 `/`，不支持映射网络盘和 UNC 路径。每个目录下的子文件夹识别为画师。
-2. **一键启动**：Windows 用户双击 `start.cmd`；Linux 用户在项目根目录下运行 `sh start.sh`。
-3. **启动访问**：浏览器打开 `http://localhost:8899/`（局域网其他设备使用宿主机 IP），点击「扫描全库」。模型将在后台自动下载。
+3. **一键启动**：Windows 用户双击 `start.cmd`；Linux 用户在项目根目录下运行 `sh start.sh`。
+4. **启动访问**：浏览器打开 `http://localhost:8899/`（局域网其他设备使用宿主机 IP），点击「扫描全库」。模型将在后台自动下载。
 
 | 模式 | 适用硬件与环境 |
 | :--- | :--- |

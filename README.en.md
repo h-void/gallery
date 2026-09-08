@@ -95,7 +95,7 @@ Prefer the native fnOS FPK for production. Choose either Docker workflow below:
 | `docker-compose.cuda.yml` | **NVIDIA GPU preset**. Preconfigured with GPU resource reservations; fill in your media path to launch. |
 | `gallery.yml` | **Minimal launcher configuration**. Contains only mode and directories; used by `start.cmd` / `start.sh`. |
 | `.env` | **Common parameter configuration**. Modify ports, scan/backup intervals, AI settings, etc.; read automatically on startup. |
-| `docker-compose.launcher.yml` | **Internal launcher template**. Used automatically by the startup script; manual editing is not required. |
+| `docker-compose.launcher.yml` | **Internal launcher template**. Bundled in the project directory for the startup script; manual download or editing is not required. |
 
 #### Workflow A: NAS Graphical Interface (No SSH or Python)
 
@@ -117,7 +117,8 @@ Suitable for Synology Container Manager, fnOS Docker, QNAP Container Station, UG
 
 Requires Docker Desktop or Docker Engine with Docker Compose, and Python 3.10+ (standard library only, no extra Python packages required):
 
-1. **Configure**: Open `gallery.yml` and set the running mode and media directories:
+1. **Get Project**: Download the repository ZIP and extract it (or run `git clone`), keeping the directory structure intact (the launcher template `docker-compose.launcher.yml` and `tools/` are bundled inside).
+2. **Configure**: Open `gallery.yml` and set the running mode and media directories:
 
    ```yaml
    模式: cpu
@@ -127,8 +128,8 @@ Requires Docker Desktop or Docker Engine with Docker Compose, and Python 3.10+ (
    ```
 
    `模式` specifies the mode (`cpu`, `gpu`, or `cuda`); `目录` specifies the directories. Enter one path per line. On Linux, use absolute paths such as `/home/user/pictures`. Use `/` in Windows paths. Local disks only; mapped network drives and UNC paths are not supported.
-2. **Start**: On Windows, double-click `start.cmd`. On Linux, run `sh start.sh` from the project directory.
-3. **Access**: Open `http://localhost:8899/` (use host IP for other LAN devices) and click "Scan All". Models download automatically in the background.
+3. **Start**: On Windows, double-click `start.cmd`. On Linux, run `sh start.sh` from the project directory.
+4. **Access**: Open `http://localhost:8899/` (use host IP for other LAN devices) and click "Scan All". Models download automatically in the background.
 
 | Mode | Supported Hardware & Environment |
 | :--- | :--- |

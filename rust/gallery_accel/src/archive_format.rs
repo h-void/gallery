@@ -176,6 +176,29 @@ pub(crate) fn normalize_profile(input: &Value) -> Result<Value> {
     }))
 }
 
+/// Save-time validation must agree with real rendering: render every profile
+/// once with representative plan data and validate the rendered target, so a
+/// template that can only produce invalid targets is rejected at save time
+/// instead of failing every plan at runtime.
+pub(crate) fn validate_profiles_render(settings: &Value) -> Result<()> {
+    let profiles = settings["profiles"].as_array().cloned().unwrap_or_default();
+    for profile in profiles {
+        let id = profile["id"].as_str().unwrap_or("unknown").to_string();
+        let context = RenderContext {
+            artist: "Artist".to_string(),
+            date: "2026-01-01".to_string(),
+            tags: vec!["标签".to_string()],
+            title: "标题".to_string(),
+            folder: "文件夹".to_string(),
+            index: 1,
+        };
+        render_profile(&profile, &context).with_context(|| {
+            format!("profile {id} failed a sample render; it would fail at runtime")
+        })?;
+    }
+    Ok(())
+}
+
 fn required_string(object: &Map<String, Value>, key: &str, max_len: usize) -> Result<String> {
     let value = object
         .get(key)
@@ -466,11 +489,19 @@ fn parse_year_month(raw: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(&format!("{digits}01"), "%Y%m%d").ok()
 }
 
+/// Total rendered-target length cap (artist-relative). Keeps the rendered
+/// path safely inside filesystem PATH_MAX once the artist root prefix is
+/// added, complementing the per-segment limit.
+pub(crate) const MAX_RENDERED_TARGET_CHARS: usize = 512;
+
 /// Validate a rendered target as a portable artist-relative folder path.
 pub(crate) fn validate_rendered_target(value: &str) -> Result<String> {
     let raw = value.replace('\\', "/").trim().to_string();
     if raw.is_empty() || raw.starts_with('/') || raw.starts_with("//") {
         bail!("rendered archive target must be an artist-relative folder");
+    }
+    if raw.chars().count() > MAX_RENDERED_TARGET_CHARS {
+        bail!("rendered archive target exceeds the total path length limit");
     }
     let bytes = raw.as_bytes();
     if bytes.len() >= 2 && bytes[1] == b':' {

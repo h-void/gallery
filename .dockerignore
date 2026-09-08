@@ -25,3 +25,9 @@ __pycache__/
 !fnpack/app/licenses/*.txt
 .env
 media-placeholder-*
+.gallery-launcher/
+gallery.yml
+start.cmd
+start.sh
+
+.gallery-empty/

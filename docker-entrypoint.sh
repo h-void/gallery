@@ -9,7 +9,13 @@ set -eu
 if [ -z "${PICTURES_ROOT:-}" ]; then
     roots=""
     labels=""
-    for d in /media /media2 /media3 /media4 /media5 /media6 /media7 /media8 /media9; do
+    # Discover numeric slots without a fixed upper bound (/media10, /media100...).
+    # The glob also matches /media2-backup; accept digits only after /media.
+    for d in /media /media[0-9]*; do
+        suffix=${d#/media}
+        case "$suffix" in
+            *[!0-9]*) continue ;;
+        esac
         [ -d "$d" ] || continue
         if [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
             label=${d#/}

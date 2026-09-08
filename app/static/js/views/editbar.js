@@ -1,3 +1,26 @@
+// Selection context and the batch-edit bar: tag picking/creation, character
+// suggestions, date editing, and bulk delete. The bar is shown by the edit
+// mode toggle in events.js; P4 turns selection into a modeless state.
+
+import { API } from '../api.js';
+import { state, nextRequestSeq, isCurrentRequestSeq, isActionBusy, setActionBusy } from '../store.js';
+import {
+  $, $$, escHtml, searchableTextMatches, UI_FIELD_SEPARATOR, compareNameParts, compareCharacterNames,
+} from '../utils.js';
+import { toast, logUiAction, collectUiLogContext, collectSelectionLayoutLogContext } from '../logging.js';
+import {
+  isTaggableItem, captureGridScrollAnchor, restoreGridScrollAnchor, renderGrid, syncSelectedCards,
+} from './grid.js';
+import { loadItemsPreservingDepth, isCurrentFolderScopeActive } from './sidebar.js';
+import { deleteMediaItem } from './lightbox.js';
+
+const CHARACTER_SUGGESTION_SELECTED_LIMIT = 3;
+const CHARACTER_SUGGESTION_DELAY_MS = 120;
+
+let editTagContextLoadToken = 0;
+let editTagContextInFlight = null;
+let editGlobalTagSearchToken = 0;
+
 function normalizeSelectionIds(ids) {
   const validIds = new Set((state.allItems || []).filter(isTaggableItem).map(item => Number(item.id)));
   return new Set([...ids].map(Number).filter(id => validIds.has(id)));
@@ -11,7 +34,7 @@ function selectionSetsEqual(a, b) {
   return true;
 }
 
-function applySelectionChange(ids, options = {}) {
+export function applySelectionChange(ids, options = {}) {
   const gridScrollAnchor = captureGridScrollAnchor();
   const restoreSeq = nextRequestSeq('selectionRestoreSeq');
   const nextIds = normalizeSelectionIds(ids instanceof Set ? ids : new Set(ids || []));
@@ -42,7 +65,7 @@ function applySelectionChange(ids, options = {}) {
   return changed;
 }
 
-function toggleSelect(id, options = {}) {
+export function toggleSelect(id, options = {}) {
   const nextIds = new Set(state.selectedIds);
   if (state.selectedIds.has(id)) {
     nextIds.delete(id);
@@ -65,7 +88,7 @@ function toggleSelect(id, options = {}) {
   }
 }
 
-function selectOnly(id, options = {}) {
+export function selectOnly(id, options = {}) {
   applySelectionChange([id], {
     reason: options.reason || 'click',
     event: 'item_select',
@@ -92,7 +115,7 @@ function resetEditDeleteSelectedButton(btn = $('#editDeleteSelectedBtn')) {
   btn.title = '';
 }
 
-async function deleteSelectedMediaItems() {
+export async function deleteSelectedMediaItems() {
   const btn = $('#editDeleteSelectedBtn');
   if (isActionBusy('edit-delete-selected')) return;
   const ids = [...state.selectedIds];
@@ -148,19 +171,53 @@ async function deleteSelectedMediaItems() {
   }
 }
 
-function updateEditBar() {
+// Edit mode (§4.1) is the explicit counterpart of the implicit selection
+// state: the toggle keeps the check marks on screen, turns a plain card
+// click into a selection toggle, and holds the edit bar up while nothing
+// is selected yet.
+export function setEditMode(on) {
+  const next = Boolean(on);
+  if (state.editMode === next) return;
+  state.editMode = next;
+  document.body.classList.toggle('edit-mode', next);
+  // Leaving the mode ends the session, so browsing starts clean again.
+  // The edit bar's own 取消 clears the selection without leaving the mode.
+  if (!next) applySelectionChange([], {reason: 'exit_edit_mode'});
+  syncEditModeButton();
+  updateEditBar();
+}
+
+export function syncEditModeButton() {
+  const btn = $('#editModeBtn');
+  if (!btn) return;
+  const on = Boolean(state.editMode);
+  btn.textContent = on ? '完成' : '选择';
+  btn.title = on ? '退出编辑模式' : '进入编辑模式';
+  btn.setAttribute('aria-label', btn.title);
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  btn.classList.toggle('active', on);
+}
+
+export function updateEditBar() {
   const bar = $('#editBar');
   if (!bar) return;
-  if (state.mode === 'edit') {
+  // Selection context (§4.1) is a state, not a mode: the bar floats in when
+  // anything is selected, and stays available with zero selection only while a
+  // folder scope is active so folder batch-tagging (classifyFolder) survives.
+  const selectionActive = state.selectedIds.size > 0;
+  const folderScopeActive = isCurrentFolderScopeActive();
+  const editBarActive = state.editMode || selectionActive || folderScopeActive;
+  document.body.classList.toggle('edit-bar-active', editBarActive);
+  if (editBarActive) {
     bar.classList.add('visible');
-    bar.classList.toggle('is-empty-selection', state.selectedIds.size === 0);
-    // Folder batch-tagging stays available with zero selection (classifyFolder).
-    bar.classList.toggle('has-folder-scope', isCurrentFolderScopeActive());
-    if (state.selectedIds.size > 0) {
+    bar.classList.toggle('is-empty-selection', !selectionActive);
+    bar.classList.toggle('has-folder-scope', folderScopeActive);
+    if (selectionActive) {
       $('#selectedCount').textContent = `已选 ${state.selectedIds.size} 项`;
-    } else if (isCurrentFolderScopeActive()) {
+    } else if (folderScopeActive) {
       $('#selectedCount').textContent = `当前文件夹：${state.activeFolder}`;
     } else {
+      // Edit mode holds the bar up with nothing selected yet.
       $('#selectedCount').textContent = '已选 0 项';
     }
     const selectAllBtn = $('#editSelectAllBtn');
@@ -174,7 +231,7 @@ function updateEditBar() {
     bar.classList.remove('is-empty-selection');
     bar.classList.remove('has-folder-scope');
   }
-  if (state.mode !== 'edit' || state.selectedIds.size === 0) resetEditDeleteSelectedButton();
+  if (!selectionActive) resetEditDeleteSelectedButton();
   renderEditTagPicker();
   renderCharacterTagSuggestions();
   renderEditDateControl();
@@ -194,7 +251,7 @@ function effectiveRawDateOf(item) {
   return String(item.date || '').trim();
 }
 
-function syncEditDatePrecisionInputs() {
+export function syncEditDatePrecisionInputs() {
   const precision = $('#editDatePrecision');
   const monthInput = $('#editDateMonth');
   const dayInput = $('#editDateDay');
@@ -206,11 +263,11 @@ function syncEditDatePrecisionInputs() {
   if (!useDay && !monthInput.value && dayInput.value) monthInput.value = dayInput.value.slice(0, 7);
 }
 
-function renderEditDateControl() {
+export function renderEditDateControl() {
   const picker = $('#editDatePicker');
   if (!picker) return;
-  picker.classList.toggle('visible', state.mode === 'edit');
-  if (state.mode !== 'edit') return;
+  picker.classList.toggle('visible', state.selectedIds.size > 0);
+  if (state.selectedIds.size === 0) return;
   const applyBtn = $('#editDateApplyBtn');
   const resetBtn = $('#editDateResetBtn');
   const summary = $('#editDateSummary');
@@ -241,7 +298,7 @@ function renderEditDateControl() {
   }
 }
 
-function editDateEnteredValue() {
+export function editDateEnteredValue() {
   const precision = $('#editDatePrecision');
   const monthInput = $('#editDateMonth');
   const dayInput = $('#editDateDay');
@@ -250,7 +307,7 @@ function editDateEnteredValue() {
   return String(monthInput.value || '').trim();
 }
 
-async function applyItemDateBatch(manualDate) {
+export async function applyItemDateBatch(manualDate) {
   if (isActionBusy('edit-date-batch')) return;
   const ids = [...state.selectedIds].map(Number).filter(id => id > 0);
   if (ids.length === 0) {
@@ -280,10 +337,10 @@ async function applyItemDateBatch(manualDate) {
     });
     toast(manualDate ? `已设置日期 ${manualDate}（${result.updated} 项）` : `已恢复检测日期（${result.updated} 项）`, 'success');
     renderEditDateControl();
-    await loadItems();
+    await loadItemsPreservingDepth();
     restoreGridScrollAnchor(gridScrollAnchor);
     const workbench = $('#archiveWorkbenchPanel');
-    if (workbench && workbench.open && typeof loadArchiveWorkbench === 'function') {
+    if (workbench && workbench.open) {
       loadArchiveWorkbench({keepPreview: false, autoPreview: false}).catch(() => {});
     }
     return result;
@@ -301,6 +358,10 @@ async function applyItemDateBatch(manualDate) {
     setActionBusy('edit-date-batch', '', false);
   }
 }
+
+// Late import that closes the editbar <-> organize cycle; applyItemDateBatch
+// only refreshes an open workbench after a successful date write.
+import { loadArchiveWorkbench } from './maintenance/organize.js';
 
 function tagMatchesEditQuery(tag, query) {
   const needle = (query || '').trim();
@@ -344,7 +405,7 @@ function mergeTagRecords(existingRecords, nextRecords) {
   return [...byKey.values()];
 }
 
-function selectedEditArtistIds() {
+export function selectedEditArtistIds() {
   const artistIds = new Set();
   (state.allItems || []).forEach(item => {
     if (state.selectedIds.has(item.id) && isTaggableItem(item)) {
@@ -357,13 +418,13 @@ function selectedEditArtistIds() {
   return [...artistIds].filter(Boolean).sort((a, b) => a - b);
 }
 
-function currentEditArtistId() {
+export function currentEditArtistId() {
   const ids = selectedEditArtistIds();
   if (ids.length === 1) return ids[0];
   return state.editContextArtistId || (state.currentArtist ? state.currentArtist.id : null);
 }
 
-function mergeTagsByName(tagGroups) {
+export function mergeTagsByName(tagGroups) {
   const byName = new Map();
   tagGroups.flat().forEach(tag => {
     const key = tagNameKey(tag.name);
@@ -402,7 +463,7 @@ function mergeTagsByName(tagGroups) {
   return [...byName.values()].sort((a, b) => compareNameParts(a.name || '', b.name || ''));
 }
 
-function editAvailableTags() {
+export function editAvailableTags() {
   return mergeTagsByName([
     state.tags || [],
     state.editGlobalTagResults || [],
@@ -472,7 +533,7 @@ function characterSuggestionPageKey() {
   ].join('|');
 }
 
-function resetCharacterTagSuggestions({clearCache = false} = {}) {
+export function resetCharacterTagSuggestions({clearCache = false} = {}) {
   if (state.characterSuggestionScheduleFrame != null) {
     cancelAnimationFrame(state.characterSuggestionScheduleFrame);
     state.characterSuggestionScheduleFrame = null;
@@ -504,7 +565,7 @@ function characterSuggestionSampleText() {
 
 function characterSuggestionStatusText() {
   const sampleText = characterSuggestionSampleText();
-  if (state.mode !== 'edit') return '未识别';
+  if (state.selectedIds.size === 0) return '未识别';
   if (state.characterSuggestionLoading) return sampleText ? `正在识别${UI_FIELD_SEPARATOR}${sampleText}` : '正在识别';
   if (state.characterSuggestionStatus === 'unavailable') return '角色识别不可用';
   if (state.characterSuggestionStatus === 'empty') return '无可识别媒体';
@@ -518,12 +579,12 @@ function characterSuggestionStatusText() {
 }
 
 function characterSuggestionsShouldShow() {
-  if (state.mode !== 'edit') return false;
+  if (state.selectedIds.size === 0) return false;
   if (state.characterSuggestionLoading) return true;
   return (state.characterTagSuggestions || []).length > 0;
 }
 
-function renderCharacterTagSuggestions() {
+export function renderCharacterTagSuggestions() {
   const panel = $('#characterSuggestions');
   if (!panel) return;
   const status = $('#characterSuggestionsStatus');
@@ -531,7 +592,6 @@ function renderCharacterTagSuggestions() {
   const suggestions = state.characterTagSuggestions || [];
   const show = characterSuggestionsShouldShow();
   panel.hidden = !show;
-  panel.classList.toggle('has-content', show);
   panel.setAttribute('aria-hidden', show ? 'false' : 'true');
   if (status) status.textContent = characterSuggestionStatusText();
   if (!list) return;
@@ -558,14 +618,14 @@ function renderCharacterTagSuggestions() {
   list.innerHTML = acceptAllBtn + chipsHtml;
 }
 
-function selectAllCharacterSuggestions() {
+export function selectAllCharacterSuggestions() {
   const suggestions = state.characterTagSuggestions || [];
   suggestions.forEach(suggestion => {
     if (suggestion.name) selectCharacterSuggestionTag(suggestion.name);
   });
 }
 
-function selectCharacterSuggestionTag(tagName) {
+export function selectCharacterSuggestionTag(tagName) {
   const selected = addVirtualEditTag(tagName);
   if (!selected) return;
   state.characterSuggestionSelectedNames.add(tagNameKey(tagName));
@@ -771,7 +831,7 @@ async function loadCharacterTagSuggestions() {
 }
 
 function ensureCharacterTagSuggestions(options = {}) {
-  if (state.mode !== 'edit') return;
+  if (state.selectedIds.size === 0) return;
   const pageKey = characterSuggestionPageKey();
   if (pageKey === state.characterSuggestionPageKey && (state.characterSuggestionLoading || state.characterSuggestionStatus !== 'idle')) {
     renderCharacterTagSuggestions();
@@ -780,8 +840,8 @@ function ensureCharacterTagSuggestions(options = {}) {
   loadCharacterTagSuggestions();
 }
 
-function scheduleCharacterTagSuggestions(options = {}) {
-  if (state.mode !== 'edit') return;
+export function scheduleCharacterTagSuggestions(options = {}) {
+  if (state.selectedIds.size === 0) return;
   const pageKey = characterSuggestionPageKey();
   const scheduleSeq = nextRequestSeq('characterSuggestionScheduleSeq');
   if (state.characterSuggestionScheduleFrame != null) {
@@ -797,14 +857,14 @@ function scheduleCharacterTagSuggestions(options = {}) {
     state.characterSuggestionScheduleTimer = setTimeout(() => {
       state.characterSuggestionScheduleTimer = null;
       if (!isCurrentRequestSeq('characterSuggestionScheduleSeq', scheduleSeq)) return;
-      if (state.mode !== 'edit') return;
+      if (state.selectedIds.size === 0) return;
       if (pageKey !== characterSuggestionPageKey()) return;
       ensureCharacterTagSuggestions();
     }, CHARACTER_SUGGESTION_DELAY_MS);
   });
 }
 
-async function ensureEditTagContext() {
+export async function ensureEditTagContext() {
   const artistIds = selectedEditArtistIds();
   const contextKey = artistIds.join(',');
   state.editContextArtistId = artistIds.length === 1 ? artistIds[0] : null;
@@ -900,7 +960,7 @@ function selectedItemExistingEditTagKeys() {
   return keys;
 }
 
-function renderEditTagPicker() {
+export function renderEditTagPicker() {
   const panel = $('#editTagPickerPanel');
   if (!panel) return;
   if (state.editTagContextLoading) {
@@ -961,13 +1021,28 @@ function renderEditTagPicker() {
     ? '没有匹配的全局标签，按回车创建'
     : '输入标签名搜索全局标签';
   panel.innerHTML = rows.join('') || `<div class="tag-picker-empty">${emptyText}</div>`;
-  $$('#editTagPickerPanel [data-tag-id]').forEach(btn => {
-    btn.addEventListener('click', () => toggleEditTagSelection(Number(btn.dataset.tagId), btn.dataset.tagName || ''));
-  });
-  $$('#editTagPickerPanel [data-create-tag]').forEach(btn => {
-    btn.addEventListener('click', () => createOrSelectEditTag(btn.dataset.createTag || ''));
-  });
+  bindEditTagPickerPanel(panel);
   updateEditTagPickerSummary();
+}
+
+// One delegated listener covers every picker render; the panel element itself
+// is static, only its innerHTML changes.
+function bindEditTagPickerPanel(panel) {
+  if (panel.dataset.pickerBound === '1') return;
+  panel.dataset.pickerBound = '1';
+  panel.addEventListener('click', e => {
+    const target = e.target instanceof Element ? e.target : null;
+    if (!target) return;
+    const createBtn = target.closest('[data-create-tag]');
+    if (createBtn && panel.contains(createBtn)) {
+      createOrSelectEditTag(createBtn.dataset.createTag || '');
+      return;
+    }
+    const tagBtn = target.closest('[data-tag-id]');
+    if (tagBtn && panel.contains(tagBtn)) {
+      toggleEditTagSelection(Number(tagBtn.dataset.tagId), tagBtn.dataset.tagName || '');
+    }
+  });
 }
 
 function updateEditTagPickerSummary() {
@@ -984,14 +1059,14 @@ function clearEditTagQuery() {
   if (input) input.value = '';
 }
 
-function openEditTagPicker() {
+export function openEditTagPicker() {
   $('#editTagPicker').classList.add('open');
   renderEditTagPicker();
   ensureEditTagContext();
   loadGlobalEditTagResults(state.editTagQuery);
 }
 
-function closeEditTagPicker() {
+export function closeEditTagPicker() {
   $('#editTagPicker').classList.remove('open');
   clearEditTagQuery();
   renderEditTagPicker();
@@ -1052,7 +1127,7 @@ function toggleEditTagSelection(tagId, tagName = '') {
   ensureEditTagContext();
 }
 
-function selectFirstEditTagResult() {
+export function selectFirstEditTagResult() {
   const query = (state.editTagQuery || '').trim();
   const exact = exactEditTagMatch(query);
   if (exact) {
@@ -1124,13 +1199,13 @@ async function createOrSelectEditTag(name = '') {
   }
 }
 
-async function selectOrCreateEditTagQuery() {
+export async function selectOrCreateEditTagQuery() {
   const tagName = (state.editTagQuery || $('#editTagSearch')?.value || '').trim();
   if (!tagName) return null;
   return createOrSelectEditTag(tagName);
 }
 
-function selectedEditTagIds() {
+export function selectedEditTagIds() {
   const selected = new Set([...state.selectedEditTagIds].map(numericTagId).filter(id => id != null));
   const selectedNames = selectedEditTagNameKeys();
   return editAvailableTags()
@@ -1139,7 +1214,7 @@ function selectedEditTagIds() {
     .filter(id => id != null);
 }
 
-function selectedEditTagNames(extraTagIds = []) {
+export function selectedEditTagNames(extraTagIds = []) {
   const names = [...state.selectedEditTagNames];
   const ids = new Set([...state.selectedEditTagIds, ...(extraTagIds || [])].map(id => Number(id)));
   editAvailableTags().forEach(tag => {
@@ -1153,7 +1228,7 @@ function selectedEditTagNames(extraTagIds = []) {
   return [...byKey.values()];
 }
 
-function clearSelectedEditTags() {
+export function clearSelectedEditTags() {
   state.selectedEditTagIds.clear();
   state.selectedEditTagNames.clear();
   state.characterSuggestionSelectedNames.clear();
@@ -1161,7 +1236,7 @@ function clearSelectedEditTags() {
   updateEditTagPickerSummary();
 }
 
-function characterSuggestionCoverageWarning(itemIds, tagNames) {
+export function characterSuggestionCoverageWarning(itemIds, tagNames) {
   const selectedItemIds = itemIds || [];
   const selectedSuggestionNames = state.characterSuggestionSelectedNames || new Set();
   const suggestion = (state.characterTagSuggestions || []).find(row => {
@@ -1176,7 +1251,7 @@ function characterSuggestionCoverageWarning(itemIds, tagNames) {
   return `角色建议命中 ${hitCount}/${selectedItemIds.length} 项，标签仍会应用到全部 ${selectedItemIds.length} 项；是否继续？`;
 }
 
-async function classifyItems(ids, tagIds, mode='add') {
+export async function classifyItems(ids, tagIds, mode='add') {
   if (!ids.length) return;
   if (isActionBusy('edit-classify-items')) return;
   setActionBusy('edit-classify-items', '', true);
@@ -1192,7 +1267,7 @@ async function classifyItems(ids, tagIds, mode='add') {
   try {
     let result = null;
     if (tagNames.length) {
-      result = await API.putJson('/api/items/tags-by-name', {item_ids: ids, tag_names: tagNames, mode});
+      result = await API.putJson('/api/items/tags-by-name', {item_ids: ids, tag_names: tagNames, mode}, {timeoutMs: 60000});
     } else if (artistId) {
       result = await API.put(`/api/items/tags?artist_id=${artistId}&item_ids=${ids.join(',')}&tag_ids=${tagIds.join(',')}&mode=${mode}`);
     }
@@ -1233,7 +1308,7 @@ async function classifyItems(ids, tagIds, mode='add') {
       await ensureEditTagContext();
     }
     renderEditTagPicker();
-    await loadItems();
+    await loadItemsPreservingDepth();
     const restoreResult = restoreGridScrollAnchor(gridScrollAnchor);
     logUiAction('edit_apply_layout', collectUiLogContext({
       target: 'items',
@@ -1265,7 +1340,7 @@ async function classifyItems(ids, tagIds, mode='add') {
   }
 }
 
-async function classifyFolder(folder, tagIds, mode='add') {
+export async function classifyFolder(folder, tagIds, mode='add') {
   if (!state.currentArtist || !folder) return;
   if (isActionBusy('edit-classify-folder', folder)) return;
   setActionBusy('edit-classify-folder', folder, true);
@@ -1285,7 +1360,7 @@ async function classifyFolder(folder, tagIds, mode='add') {
         folder,
         tag_names: tagNames,
         mode,
-      });
+      }, {timeoutMs: 60000});
     } else {
       result = await API.put(`/api/folders/tags?artist_id=${state.currentArtist.id}&folder=${encodeURIComponent(folder)}&tag_ids=${tagIds.join(',')}&mode=${mode}`);
     }
@@ -1316,7 +1391,7 @@ async function classifyFolder(folder, tagIds, mode='add') {
       renderEditTagPicker();
       renderSidebar();
       renderFolderTree();
-      await loadItems();
+      await loadItemsPreservingDepth();
       const restoreResult = restoreGridScrollAnchor(gridScrollAnchor);
       logUiAction('edit_apply_layout', collectUiLogContext({
         target: 'folder',
@@ -1344,7 +1419,7 @@ async function classifyFolder(folder, tagIds, mode='add') {
   }
 }
 
-async function removeSelectedTagsFromItems() {
+export async function removeSelectedTagsFromItems() {
   if (isActionBusy('edit-remove-tags')) return;
   const ids = [...state.selectedIds];
   const tagIds = selectedEditTagIds();
@@ -1397,3 +1472,7 @@ async function removeSelectedTagsFromItems() {
     setActionBusy('edit-remove-tags', '', false);
   }
 }
+
+// Cross-module imports closing the editbar cycles; all call sites are inside
+// function bodies, never at module evaluation time.
+import { renderSidebar, renderFolderTree } from './sidebar.js';

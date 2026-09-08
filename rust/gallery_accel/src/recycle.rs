@@ -35,6 +35,8 @@ const ITEM_COLUMNS: &[&str] = &[
     "missing",
     "missing_at",
     "scanned_at",
+    "width",
+    "height",
 ];
 
 /// Finalize or drop recycle rows left in the pre-commit `'moving'` state by an
@@ -64,7 +66,7 @@ pub fn reconcile_moving_recycle_entries(conn: &Connection) -> (usize, usize, usi
             // any other query failure must surface so interrupted 'moving'
             // rows are never silently skipped.
             if !error.to_string().contains("no such table") {
-                eprintln!("recycle reconciliation: failed to list 'moving' rows: {error}");
+                log_error!("recycle reconciliation: failed to list 'moving' rows: {error}");
             }
             return (0, 0, 0);
         }

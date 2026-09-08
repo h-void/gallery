@@ -51,20 +51,39 @@ fn ffmpeg_max_concurrency() -> usize {
     })
 }
 
+/// Bounded wait for a free ffmpeg slot. Queueing is intentional, but an
+/// unbounded wait would pile blocked threads onto the blocking pool when a
+/// wedged ffmpeg process never releases its slot.
+const FFMPEG_SLOT_WAIT: Duration = Duration::from_secs(60);
+/// Hard total limit for one HLS transcode (`-codec: copy` is I/O bound and
+/// even very large files finish far inside this). A wedged ffmpeg must
+/// release its slot instead of holding it for the process lifetime.
+const TRANSCODE_TOTAL_LIMIT: Duration = Duration::from_secs(2 * 60 * 60);
+
 /// Bounds concurrent ffmpeg child processes across every spawn site. Requests
 /// queue for a free slot instead of being rejected, so a burst of uncached
 /// videos cannot fan out into unbounded transcode/frame processes.
 struct FfmpegSlotGuard;
 
 impl FfmpegSlotGuard {
-    fn acquire_blocking() -> Self {
+    fn acquire_blocking() -> Result<Self> {
         let (lock, condvar) = ffmpeg_gate();
         let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + FFMPEG_SLOT_WAIT;
         while *active >= ffmpeg_max_concurrency() {
-            active = condvar.wait(active).unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                anyhow::bail!(
+                    "ffmpeg concurrency slot busy for over {FFMPEG_SLOT_WAIT:?}; request rejected"
+                );
+            }
+            let (guard, _timeout) = condvar
+                .wait_timeout(active, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            active = guard;
         }
         *active += 1;
-        FfmpegSlotGuard
+        Ok(FfmpegSlotGuard)
     }
 }
 
@@ -233,24 +252,38 @@ pub async fn serve_file_response(
     let (mime, disposition) = inline_media_headers(&full);
 
     if let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        if let Some((start, end)) = parse_bytes_range(range, len) {
-            let mut file = File::open(&full).await.map_err(internal)?;
-            use tokio::io::{AsyncSeekExt, SeekFrom};
-            file.seek(SeekFrom::Start(start)).await.map_err(internal)?;
-            let take = end - start + 1;
-            let limited = file.take(take);
-            let stream = ReaderStream::new(limited);
-            let body = Body::from_stream(stream);
-            let mut builder = Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, &mime)
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
-                .header(header::CONTENT_LENGTH, take);
-            if let Some(name) = &disposition {
-                builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
+        match parse_bytes_range(range, len) {
+            ParsedRange::Satisfiable(start, end) => {
+                let mut file = File::open(&full).await.map_err(internal)?;
+                use tokio::io::{AsyncSeekExt, SeekFrom};
+                file.seek(SeekFrom::Start(start)).await.map_err(internal)?;
+                let take = end - start + 1;
+                let limited = file.take(take);
+                let stream = ReaderStream::new(limited);
+                let body = Body::from_stream(stream);
+                let mut builder = Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, &mime)
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
+                    .header(header::CONTENT_LENGTH, take);
+                if let Some(name) = &disposition {
+                    builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
+                }
+                return builder.body(body).map_err(internal);
             }
-            return builder.body(body).map_err(internal);
+            ParsedRange::Unsatisfiable => {
+                // Malformed, multi-part, suffix-of-zero, and out-of-bounds
+                // ranges must not degrade to a 200 full-body response.
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_RANGE, format!("bytes */{len}"))
+                    .body(Body::from(
+                        json!({"error": "requested range not satisfiable"}).to_string(),
+                    ))
+                    .map_err(internal);
+            }
         }
     }
 
@@ -268,26 +301,60 @@ pub async fn serve_file_response(
     builder.body(body).map_err(internal)
 }
 
-fn parse_bytes_range(header: &str, len: u64) -> Option<(u64, u64)> {
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedRange {
+    /// Inclusive (start, end) byte range inside the body.
+    Satisfiable(u64, u64),
+    /// Malformed, unsupported (multi-part), or out-of-bounds: respond 416.
+    Unsatisfiable,
+}
+
+fn parse_bytes_range(header: &str, len: u64) -> ParsedRange {
     let header = header.trim();
-    let rest = header.strip_prefix("bytes=")?;
-    let (a, b) = rest.split_once('-')?;
-    let start: u64 = a.parse().ok()?;
-    let end: u64 = if b.is_empty() {
+    if header.is_empty() {
+        return ParsedRange::Unsatisfiable;
+    }
+    let Some(rest) = header.strip_prefix("bytes=") else {
+        return ParsedRange::Unsatisfiable;
+    };
+    // Multi-range responses are not supported.
+    if rest.contains(',') {
+        return ParsedRange::Unsatisfiable;
+    }
+    let Some((first, last)) = rest.split_once('-') else {
+        return ParsedRange::Unsatisfiable;
+    };
+    if first.is_empty() {
+        // Suffix form `bytes=-N`: the final N bytes; N=0 is unsatisfiable.
+        let Ok(suffix) = last.parse::<u64>() else {
+            return ParsedRange::Unsatisfiable;
+        };
+        if suffix == 0 || len == 0 {
+            return ParsedRange::Unsatisfiable;
+        }
+        return ParsedRange::Satisfiable(len.saturating_sub(suffix), len - 1);
+    }
+    let Ok(start) = first.parse::<u64>() else {
+        return ParsedRange::Unsatisfiable;
+    };
+    let end = if last.is_empty() {
         len.saturating_sub(1)
     } else {
-        b.parse().ok()?
+        let Ok(end) = last.parse::<u64>() else {
+            return ParsedRange::Unsatisfiable;
+        };
+        end
     };
-    if start > end || start >= len {
-        return None;
+    if start > end || len == 0 || start >= len {
+        return ParsedRange::Unsatisfiable;
     }
-    Some((start, end.min(len.saturating_sub(1))))
+    ParsedRange::Satisfiable(start, end.min(len - 1))
 }
 
 fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, Value) {
     // Details (including server paths) stay in the process log; the response
     // body is generic so absolute paths never leak to clients.
-    eprintln!("media request failed: {e}");
+    log_error!("media request failed: {e}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         json!({"error": "internal server error"}),
@@ -391,7 +458,7 @@ fn gallery_recycle_dir() -> PathBuf {
 }
 
 /// Move `src` to `dest` without overwriting, adding a UUID suffix on collision.
-pub(crate) fn move_file_no_overwrite(src: &Path, dest: &Path) -> Result<PathBuf> {
+pub(crate) fn move_file_no_overwrite(src: &Path, dest: &Path) -> Result<(PathBuf, Option<String>)> {
     let final_dest = if dest.exists() {
         let stem = dest
             .file_stem()
@@ -409,8 +476,8 @@ pub(crate) fn move_file_no_overwrite(src: &Path, dest: &Path) -> Result<PathBuf>
     } else {
         dest.to_path_buf()
     };
-    match move_file_exact_no_overwrite(src, &final_dest) {
-        Ok(()) => Ok(final_dest),
+    match move_file_exact_impl(src, &final_dest, false) {
+        Ok(warning) => Ok((final_dest, warning)),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let stem = dest
                 .file_stem()
@@ -422,8 +489,9 @@ pub(crate) fn move_file_no_overwrite(src: &Path, dest: &Path) -> Result<PathBuf>
                 .unwrap_or_default();
             let parent = dest.parent().unwrap_or_else(|| Path::new("."));
             let retry = parent.join(format!("{stem}__{}{ext}", uuid::Uuid::new_v4().simple()));
-            move_file_exact_no_overwrite(src, &retry)?;
-            Ok(retry)
+            move_file_exact_impl(src, &retry, false)
+                .map(|warning| (retry, warning))
+                .map_err(anyhow::Error::from)
         }
         Err(error) => Err(error.into()),
     }
@@ -443,7 +511,11 @@ pub(crate) fn recycle_source_is_trusted(recycled: &Path, original: &Path) -> boo
 }
 
 pub(crate) fn move_file_exact_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
-    move_file_exact_impl(src, dest, false)
+    move_file_exact_impl(src, dest, false).map(|warning| {
+        if let Some(warning) = warning {
+            log_error!("media: move completed with source cleanup warning: {warning}");
+        }
+    })
 }
 
 /// Move into an authorized path without re-resolving a potentially replaced
@@ -593,7 +665,10 @@ fn authorized_file_path(
 
 /// `force_copy` skips the hard-link attempt so tests can exercise the copy
 /// fallback deterministically on filesystems where links always succeed.
-fn move_file_exact_impl(src: &Path, dest: &Path, force_copy: bool) -> std::io::Result<()> {
+/// Move `src` to `dest` exactly once. `Ok(Some(warning))` means the move
+/// succeeded but source-side cleanup failed (best-effort retire); callers
+/// surface the warning rather than claiming complete success.
+fn move_file_exact_impl(src: &Path, dest: &Path, force_copy: bool) -> std::io::Result<Option<String>> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -609,13 +684,16 @@ fn move_file_exact_impl(src: &Path, dest: &Path, force_copy: bool) -> std::io::R
                     let _ = remove_created_file(dest, created_identity);
                     return Err(std::io::Error::other("source changed during move"));
                 }
-                if let Err(error) = retire_source_if_unchanged(src, &source_meta) {
-                    let _ = remove_created_file(dest, created_identity);
-                    return Err(error);
-                }
+                let cleanup_warning = match retire_source_if_unchanged(src, &source_meta) {
+                    Ok(warning) => warning,
+                    Err(error) => {
+                        let _ = remove_created_file(dest, created_identity);
+                        return Err(error);
+                    }
+                };
                 fsync_parent_dir_best_effort(dest);
                 fsync_parent_dir_best_effort(src);
-                return Ok(());
+                return Ok(cleanup_warning);
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(error),
             Err(_) => {}
@@ -648,13 +726,16 @@ fn move_file_exact_impl(src: &Path, dest: &Path, force_copy: bool) -> std::io::R
         let _ = remove_created_file(dest, created_identity);
         return Err(std::io::Error::other("source changed during move"));
     }
-    if let Err(error) = retire_source_if_unchanged(src, &source_meta) {
-        let _ = remove_created_file(dest, created_identity);
-        return Err(error);
-    }
+    let cleanup_warning = match retire_source_if_unchanged(src, &source_meta) {
+        Ok(warning) => warning,
+        Err(error) => {
+            let _ = remove_created_file(dest, created_identity);
+            return Err(error);
+        }
+    };
     fsync_parent_dir_best_effort(dest);
     fsync_parent_dir_best_effort(src);
-    Ok(())
+    Ok(cleanup_warning)
 }
 
 #[cfg(unix)]
@@ -711,7 +792,14 @@ fn open_source_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// cannot unlink by inode, so exchange the pathname with an operation-owned
 /// placeholder first. If another process replaced the source, the exchange is
 /// reversed before returning an error and the replacement remains in place.
-fn retire_source_if_unchanged(src: &Path, expected: &std::fs::Metadata) -> std::io::Result<()> {
+///
+/// `Ok(Some(warning))` reports a best-effort cleanup failure after the retire
+/// itself succeeded (e.g. ZFS trimacl leaving a 0-byte placeholder behind);
+/// callers must surface it instead of reporting complete success.
+fn retire_source_if_unchanged(
+    src: &Path,
+    expected: &std::fs::Metadata,
+) -> std::io::Result<Option<String>> {
     #[cfg(target_os = "linux")]
     {
         return retire_source_if_unchanged_linux(src, expected);
@@ -721,7 +809,7 @@ fn retire_source_if_unchanged(src: &Path, expected: &std::fs::Metadata) -> std::
         if !same_path_identity(src, expected) {
             return Err(std::io::Error::other("source changed during move"));
         }
-        std::fs::remove_file(src)
+        std::fs::remove_file(src).map(|()| None)
     }
 }
 
@@ -729,7 +817,7 @@ fn retire_source_if_unchanged(src: &Path, expected: &std::fs::Metadata) -> std::
 fn retire_source_if_unchanged_linux(
     src: &Path,
     expected: &std::fs::Metadata,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<String>> {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int, c_uint};
     use std::os::unix::ffi::OsStrExt;
@@ -794,9 +882,20 @@ fn retire_source_if_unchanged_linux(
 
     // The source name now refers only to our placeholder. Best-effort cleanup
     // deliberately checks identities again, preserving any concurrent rewrite.
-    let _ = remove_created_file(&placeholder, file_identity(expected));
-    let _ = remove_created_file(src, placeholder_identity);
-    Ok(())
+    // A failure leaves the retired content or a 0-byte placeholder behind:
+    // report it instead of letting the operation claim complete success.
+    let mut cleanup_warnings: Vec<String> = Vec::new();
+    if let Err(error) = remove_created_file(&placeholder, file_identity(expected)) {
+        cleanup_warnings.push(format!("retired file cleanup failed: {error}"));
+    }
+    if let Err(error) = remove_created_file(src, placeholder_identity) {
+        cleanup_warnings.push(format!("source placeholder cleanup failed: {error}"));
+    }
+    if cleanup_warnings.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(cleanup_warnings.join("; ")))
+    }
 }
 
 fn remove_created_file(path: &Path, expected: Option<(u64, u64)>) -> std::io::Result<()> {
@@ -824,7 +923,7 @@ pub(crate) fn fsync_parent_dir_best_effort(path: &Path) {
     }
 }
 
-fn move_into_recycle(full: &Path) -> Result<PathBuf> {
+fn move_into_recycle(full: &Path) -> Result<(PathBuf, Option<String>)> {
     let base = full
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -834,14 +933,14 @@ fn move_into_recycle(full: &Path) -> Result<PathBuf> {
         // Prefer nested structure under fnOS trash.
         if !rel.as_os_str().is_empty() {
             let nested = trash_root.join(&rel);
-            if let Ok(dest) = move_file_no_overwrite(full, &nested) {
-                return Ok(dest);
+            if let Ok((dest, warning)) = move_file_no_overwrite(full, &nested) {
+                return Ok((dest, warning));
             }
         }
         // Flat under trash root.
         let flat = trash_root.join(&base);
-        if let Ok(dest) = move_file_no_overwrite(full, &flat) {
-            return Ok(dest);
+        if let Ok((dest, warning)) = move_file_no_overwrite(full, &flat) {
+            return Ok((dest, warning));
         }
     }
 
@@ -851,8 +950,8 @@ fn move_into_recycle(full: &Path) -> Result<PathBuf> {
     if let Some((_, rel)) = fnos_recycle_target(full) {
         if !rel.as_os_str().is_empty() {
             let nested = recycle.join(&rel);
-            if let Ok(dest) = move_file_no_overwrite(full, &nested) {
-                return Ok(dest);
+            if let Ok((dest, warning)) = move_file_no_overwrite(full, &nested) {
+                return Ok((dest, warning));
             }
         }
     }
@@ -928,9 +1027,11 @@ pub fn delete_item_to_recycle(
     .map_err(internal)?;
     let moving_id = conn.last_insert_rowid();
 
-    // Phase 2: move the file into recycle storage (dir fsyncs inside).
-    let recycled = match move_into_recycle(&full) {
-        Ok(recycled) => recycled,
+    // Phase 2: move the file into recycle storage (dir fsyncs inside). A
+    // source-side cleanup warning must reach the result: it means the move
+    // succeeded but a placeholder may linger at the source path.
+    let (recycled, move_cleanup_warning) = match move_into_recycle(&full) {
+        Ok((recycled, warning)) => (recycled, warning),
         Err(error) => {
             let _ = conn.execute(
                 "DELETE FROM recycle_entries WHERE id=? AND status='moving'",
@@ -940,6 +1041,9 @@ pub fn delete_item_to_recycle(
         }
     };
     let recycled_s = recycled.display().to_string();
+    if let Some(warning) = &move_cleanup_warning {
+        log_error!("media: delete of {original_s} completed with cleanup warning: {warning}");
+    }
 
     // Test-only pause point between the file move and the DB commit.
     #[cfg(test)]
@@ -993,6 +1097,10 @@ pub fn delete_item_to_recycle(
                 "item_id": item_id,
                 "recycled_to": recycled_s,
                 "deleted_auto_character_refs": deleted_refs,
+                // Null when the source retired cleanly; a string means the
+                // move completed but source-side cleanup failed and a
+                // placeholder may remain at the original path.
+                "cleanup_warning": move_cleanup_warning,
             }))
         }
         Err(db_err) => match move_file_exact_no_overwrite(&recycled, &original) {
@@ -1075,7 +1183,8 @@ pub async fn video_frame_jpeg(
     }
     let _ffmpeg_slot = tokio::task::spawn_blocking(FfmpegSlotGuard::acquire_blocking)
         .await
-        .map_err(|error| internal(error.to_string()))?;
+        .map_err(|error| internal(error.to_string()))?
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, json!({"error": error.to_string()})))?;
     let mut child = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -1203,15 +1312,7 @@ fn write_video_frame_cache(cache: &Path, body: &[u8]) {
     if let Some(root) = video_frame_cache_root() {
         maybe_cleanup_video_frame_cache(&root, body.len() as u64);
     }
-    if let Some(parent) = cache.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let part = cache.with_extension("jpg.part");
-    if std::fs::write(&part, body).is_ok() {
-        let _ = std::fs::rename(&part, cache);
-    } else {
-        let _ = std::fs::remove_file(&part);
-    }
+    crate::image_preview::write_exclusive_jpeg_cache(cache, body);
 }
 
 fn maybe_cleanup_video_frame_cache(root: &Path, reserve_bytes: u64) {
@@ -1321,11 +1422,13 @@ pub fn content_hash_allowed(path: &str, roots: &MediaRoots) -> Result<Value> {
     let full = resolve_allowed_path(path, roots)?;
     let metadata = std::fs::metadata(&full)?;
     let content_hash = hash_file(&full, 1024 * 1024)?;
+    // The resolved absolute path stays server-side only; responses must not
+    // leak host paths to the client.
+    log_info!("media: content hash resolved {path} -> {}", full.display());
     Ok(json!({
         "path": path,
         "content_hash": content_hash,
         "file_size": metadata.len(),
-        "resolved_path": full.display().to_string(),
     }))
 }
 
@@ -1540,7 +1643,7 @@ pub fn start_video_transcode(path: &str, roots: &MediaRoots) -> Result<Value> {
         return Ok(json!({"ok": true, "key": key, "status": "processing", "ready": false}));
     }
     // Hold the ffmpeg slot from spawn until the waiter thread reaps the child.
-    let ffmpeg_slot = FfmpegSlotGuard::acquire_blocking();
+    let ffmpeg_slot = FfmpegSlotGuard::acquire_blocking()?;
     let spawned = std::process::Command::new("ffmpeg")
         .args([
             "-y",
@@ -1573,9 +1676,27 @@ pub fn start_video_transcode(path: &str, roots: &MediaRoots) -> Result<Value> {
     let waiter_playlist = playlist.clone();
     std::thread::spawn(move || {
         // Keep the slot until the transcode finishes, not just until this
-        // function returns.
+        // function returns. Poll so a wedged ffmpeg hits the total limit and
+        // releases the slot instead of holding it forever.
         let _slot = ffmpeg_slot;
-        let status = child.wait();
+        let deadline = std::time::Instant::now() + TRANSCODE_TOTAL_LIMIT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "ffmpeg transcode exceeded the total time limit",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                Err(error) => break Err(error),
+            }
+        };
         finish_video_transcode(status, &waiter_playlist, &waiter_marker);
     });
     // ponytail: stale markers permit a duplicate only if a broken ffmpeg process outlives one hour; add PID tracking if observed.
@@ -1671,23 +1792,35 @@ pub async fn serve_transcoded_hls_segment(
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
     {
-        if let Some((start, end)) = parse_bytes_range(range, len) {
-            use tokio::io::{AsyncSeekExt, SeekFrom};
-            let mut file = File::open(&full).await.map_err(internal)?;
-            file.seek(SeekFrom::Start(start)).await.map_err(internal)?;
-            let take = end - start + 1;
-            let mut builder = Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, &mime)
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
-                .header(header::CONTENT_LENGTH, take);
-            if let Some(name) = &disposition {
-                builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
+        match parse_bytes_range(range, len) {
+            ParsedRange::Satisfiable(start, end) => {
+                use tokio::io::{AsyncSeekExt, SeekFrom};
+                let mut file = File::open(&full).await.map_err(internal)?;
+                file.seek(SeekFrom::Start(start)).await.map_err(internal)?;
+                let take = end - start + 1;
+                let mut builder = Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, &mime)
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
+                    .header(header::CONTENT_LENGTH, take);
+                if let Some(name) = &disposition {
+                    builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
+                }
+                return builder
+                    .body(Body::from_stream(ReaderStream::new(file.take(take))))
+                    .map_err(internal);
             }
-            return builder
-                .body(Body::from_stream(ReaderStream::new(file.take(take))))
-                .map_err(internal);
+            ParsedRange::Unsatisfiable => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_RANGE, format!("bytes */{len}"))
+                    .body(Body::from(
+                        json!({"error": "requested range not satisfiable"}).to_string(),
+                    ))
+                    .map_err(internal);
+            }
         }
     }
     let file = File::open(&full).await.map_err(internal)?;
@@ -1737,8 +1870,35 @@ mod tests {
 
     #[test]
     fn parse_range_header() {
-        assert_eq!(parse_bytes_range("bytes=0-99", 1000), Some((0, 99)));
-        assert_eq!(parse_bytes_range("bytes=10-", 100), Some((10, 99)));
+        assert_eq!(
+            parse_bytes_range("bytes=0-99", 1000),
+            ParsedRange::Satisfiable(0, 99)
+        );
+        assert_eq!(
+            parse_bytes_range("bytes=10-", 100),
+            ParsedRange::Satisfiable(10, 99)
+        );
+        // Suffix ranges resolve to the final N bytes.
+        assert_eq!(
+            parse_bytes_range("bytes=-100", 1000),
+            ParsedRange::Satisfiable(900, 999)
+        );
+        // Out-of-bounds, zero-suffix, multi-part, and malformed ranges are
+        // unsatisfiable (416), never a 200 full-body fallback.
+        assert_eq!(parse_bytes_range("bytes=1000-", 1000), ParsedRange::Unsatisfiable);
+        assert_eq!(parse_bytes_range("bytes=-0", 1000), ParsedRange::Unsatisfiable);
+        assert_eq!(
+            parse_bytes_range("bytes=0-1,3-4", 1000),
+            ParsedRange::Unsatisfiable
+        );
+        assert_eq!(parse_bytes_range("chars=0-1", 1000), ParsedRange::Unsatisfiable);
+        assert_eq!(parse_bytes_range("bytes=x-y", 1000), ParsedRange::Unsatisfiable);
+        assert_eq!(parse_bytes_range("bytes=5-2", 1000), ParsedRange::Unsatisfiable);
+        // A trailing end beyond the file clamps to the last byte.
+        assert_eq!(
+            parse_bytes_range("bytes=10-9999", 100),
+            ParsedRange::Satisfiable(10, 99)
+        );
     }
 
     #[test]
@@ -1916,10 +2076,7 @@ mod tests {
         std::fs::write(&marker, b"").unwrap();
 
         finish_video_transcode(
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "wait failed",
-            )),
+            Err(std::io::Error::other("wait failed")),
             &playlist,
             &marker,
         );
@@ -1933,6 +2090,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn transcoded_playlist_rewrites_segments_to_safe_route() {
         use http_body_util::BodyExt;
 
@@ -1965,6 +2123,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn video_frame_uses_persistent_cache_before_ffmpeg() {
         let _env_guard = crate::test_support::ENV_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
@@ -2237,7 +2396,7 @@ mod tests {
         let dest = dir.path().join("dest.bin");
         std::fs::write(&src, b"new").unwrap();
         std::fs::write(&dest, b"old").unwrap();
-        let moved = move_file_no_overwrite(&src, &dest).unwrap();
+        let moved = move_file_no_overwrite(&src, &dest).unwrap().0;
         assert_ne!(moved, dest);
         assert_eq!(std::fs::read(&dest).unwrap(), b"old");
         assert_eq!(std::fs::read(&moved).unwrap(), b"new");
@@ -2356,7 +2515,7 @@ mod tests {
             }
             let _ = std::fs::remove_file(&dest);
             match move_file_exact_impl(&src, &dest, force_copy) {
-                Ok(()) => {
+                Ok(_) => {
                     // A consistent version must have been moved; the source
                     // pathname is either consumed or already re-created by the
                     // replacer with the replacement bytes.
@@ -2413,7 +2572,7 @@ mod tests {
         std::fs::create_dir_all(&dest_dir).unwrap();
         std::fs::write(&src, b"payload-xyz").unwrap();
         let dest = dest_dir.join("a.bin");
-        let moved = move_file_no_overwrite(&src, &dest).unwrap();
+        let moved = move_file_no_overwrite(&src, &dest).unwrap().0;
         assert_eq!(std::fs::read(&moved).unwrap(), b"payload-xyz");
         assert!(!src.exists());
     }

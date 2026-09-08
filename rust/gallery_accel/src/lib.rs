@@ -1,5 +1,8 @@
 use serde_json::{json, Value};
 
+#[macro_use]
+pub mod logging;
+
 mod archive_format;
 mod archive_profiles;
 mod artist_folder_move;
@@ -17,6 +20,7 @@ mod characters;
 mod content_hash;
 mod db;
 mod db_housekeeping;
+mod dimensions;
 mod duplicate_artists;
 pub mod folder_archive;
 mod folder_paths;
@@ -81,7 +85,8 @@ pub use character_references::character_references_response;
 pub use character_summary::character_summary_response;
 pub use characters::{character_response, characters_response};
 pub use content_hash::content_hash_response;
-pub use db::{env_db_path, DbConfig, DbPool, PooledConn};
+pub use db::{env_db_path, open_writable_db, DbConfig, DbPool, PooledConn};
+pub use dimensions::backfill_item_dimensions;
 pub use duplicate_artists::duplicate_artists_response;
 pub use folder_archive::{
     create_db_backup, execute_folder_renames, folder_archive_failed_plans_count,
@@ -136,8 +141,9 @@ pub use recycle::{
     recycle_entries_response, restore_recycle_entry,
 };
 pub use scan::{
-    get_scan_state, resolve_scan_scope, run_full_library_scan, run_scan, update_scan_state,
-    ScanControl,
+    get_scan_state, resolve_scan_scope, run_full_library_scan, run_full_library_scan_claimed,
+    run_scan, run_scan_claimed, update_scan_state,
+    ScanControl, ScanSlotGuard,
 };
 pub use scan_candidates_write::{
     apply_hash_unique_scan_candidate_response,

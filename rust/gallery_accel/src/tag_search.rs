@@ -31,8 +31,10 @@ fn list_tag_search(
     search: Option<&str>,
     limit: Option<usize>,
 ) -> Result<Vec<TagSearchRow>> {
-    // Type-ahead fires this per keystroke; the aggregate is tags×item_tags×
-    // items, so an absent or oversized limit must not scan unbounded rows.
+    // Type-ahead fires this per keystroke. Aggregating item_count joins
+    // item_tags x items for every tag in the library; the search path runs
+    // the pinyin match against the lightweight tag/artist names first and
+    // only aggregates counts for the matched ids.
     let limit = limit.unwrap_or(100).clamp(1, 500);
     let where_sql = if artist_id.is_some() {
         "WHERE t.artist_id=?"
@@ -48,19 +50,14 @@ fn list_tag_search(
             t.name,
             t.sort_order,
             a.name AS artist_name,
-            a.path AS artist_path,
-            COUNT(i.id) AS item_count
+            a.path AS artist_path
         FROM tags t
         JOIN artists a ON a.id = t.artist_id
-        LEFT JOIN item_tags it ON it.tag_id = t.id
-        LEFT JOIN items i ON i.id = it.item_id
-            AND i.missing=0
-            AND (i.media_type IN ('image', 'video', 'source', 'archive', 'text') OR i.is_archive=1)
         {where_sql}
-        GROUP BY t.id
+        ORDER BY t.id
         "
     ))?;
-    let mut tags = stmt
+    let mut light_rows = stmt
         .query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok(TagSearchRow {
                 id: row.get("id")?,
@@ -69,24 +66,67 @@ fn list_tag_search(
                 sort_order: row.get("sort_order")?,
                 artist_name: row.get("artist_name")?,
                 artist_path: row.get("artist_path")?,
-                item_count: row.get("item_count")?,
+                item_count: 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
 
     if let Some(query) = search.map(str::trim).filter(|q| !q.is_empty()) {
-        tags.retain(|tag| {
+        light_rows.retain(|tag| {
             crate::pinyin_search::text_matches_search(query, &[&tag.name, &tag.artist_name])
         });
+        // Cap the aggregate work: counts are computed only for the first 500
+        // matched ids (deterministic natural-name order).
+        light_rows.sort_by(|left, right| {
+            natural_compare(&left.name, &right.name)
+                .then_with(|| natural_compare(&left.artist_name, &right.artist_name))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        light_rows.truncate(MAX_SEARCH_TAG_IDS);
     }
 
-    tags.sort_by(|left, right| {
+    // Chunked aggregate: idx_item_tags_tag makes each chunk an index lookup,
+    // so no single query scans the whole join for thousands of variables.
+    let mut counts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let ids: Vec<i64> = light_rows.iter().map(|row| row.id).collect();
+    for chunk in ids.chunks(COUNT_CHUNK_IDS) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "
+            SELECT it.tag_id, COUNT(i.id)
+            FROM item_tags it
+            JOIN items i ON i.id = it.item_id
+                AND i.missing=0
+                AND (i.media_type IN ('image', 'video', 'source', 'archive', 'text') OR i.is_archive=1)
+            WHERE it.tag_id IN ({placeholders})
+            GROUP BY it.tag_id
+            "
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        while let Some((tag_id, count)) = rows.next().transpose()? {
+            counts.insert(tag_id, count);
+        }
+    }
+    for row in &mut light_rows {
+        row.item_count = counts.get(&row.id).copied().unwrap_or(0);
+    }
+
+    light_rows.sort_by(|left, right| {
         right
             .item_count
             .cmp(&left.item_count)
             .then_with(|| natural_compare(&left.name, &right.name))
             .then_with(|| natural_compare(&left.artist_name, &right.artist_name))
     });
-    tags.truncate(limit);
-    Ok(tags)
+    light_rows.truncate(limit);
+    Ok(light_rows)
 }
+
+const MAX_SEARCH_TAG_IDS: usize = 500;
+const COUNT_CHUNK_IDS: usize = 400;

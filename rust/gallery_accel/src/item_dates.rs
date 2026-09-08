@@ -29,17 +29,30 @@ pub fn canonical_of_raw(raw: &str) -> String {
 /// The immediate parent folder name of an item (the value `scan.rs` writes to
 /// `items.folder_name`, which keys `folder_rename_plans.source_folder`), or
 /// empty for items directly inside the artist root.
+///
+/// Hierarchy is decided by relative-path DEPTH, not by comparing directory
+/// names: a subdirectory may legitimately share the artist's name, and name
+/// equality would misread it as the artist root (hiding the folder from plan
+/// invalidation and letting a stale target rename a real directory).
 pub(crate) fn item_date_folder_name(artist_path: &str, file_path: &str) -> String {
     let artist = artist_path.trim_end_matches('/');
     let full = file_path.trim_end_matches('/');
     if artist.is_empty() || full.is_empty() || full == artist {
         return String::new();
     }
-    let artist_segment = artist.rsplit('/').next().unwrap_or("");
-    match full.rsplit('/').nth(1) {
-        Some(parent) if parent != artist_segment => parent.to_string(),
-        _ => String::new(),
+    let relative = match full.strip_prefix(artist) {
+        // Only a '/' boundary counts; equal paths were handled above and an
+        // empty remainder means the file sits directly in the artist root.
+        Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/'),
+        // Not under the artist root: no plan can key on it.
+        _ => return String::new(),
+    };
+    let segments: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 2 {
+        // Directly inside the artist root.
+        return String::new();
     }
+    segments[segments.len() - 2].to_string()
 }
 
 /// Apply a manual recognized-date override to a batch of items belonging to
@@ -116,7 +129,7 @@ pub fn update_item_dates_response(
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("begin item date update")?;
     let mut updated: Vec<Value> = Vec::with_capacity(rows.len());
-    let mut changed_folders: Vec<String> = Vec::new();
+    let mut changed_folders: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (item_id, detected_date, legacy_date, file_path) in rows {
         let (new_manual, new_date): (Option<String>, String) = match &parsed {
             Some(raw) => {
@@ -135,8 +148,8 @@ pub fn update_item_dates_response(
         };
         if new_date != legacy_date {
             let folder = item_date_folder_name(&artist_path, &file_path);
-            if !folder.is_empty() && !changed_folders.contains(&folder) {
-                changed_folders.push(folder);
+            if !folder.is_empty() {
+                changed_folders.insert(folder);
             }
         }
         let affected = tx
@@ -164,11 +177,9 @@ pub fn update_item_dates_response(
     // date updates: committing first would leave a crash window where
     // confirmed plans keep outdated targets and later execution renames
     // folders destructively.
-    let refreshed = crate::folder_archive::invalidate_plans_after_item_date_change(
-        &tx,
-        artist_id,
-        &changed_folders,
-    )?;
+    let folders: Vec<String> = changed_folders.into_iter().collect();
+    let refreshed =
+        crate::folder_archive::invalidate_plans_after_item_date_change(&tx, artist_id, &folders)?;
     tx.commit().context("commit item date update")?;
     Ok(json!({
         "updated": updated.len(),
@@ -250,6 +261,23 @@ mod tests {
             ""
         );
         assert_eq!(item_date_folder_name("", "/pictures/Artist/a.jpg"), "");
+    }
+
+    #[test]
+    fn folder_name_depth_survives_sibling_named_like_the_artist() {
+        // A subdirectory sharing the artist's own name must read as a nested
+        // folder, not as the artist root.
+        assert_eq!(
+            item_date_folder_name("/pictures/Artist", "/pictures/Artist/Artist/pic.jpg"),
+            "Artist",
+            "name equality must not hide a nested folder"
+        );
+        // Prefix boundary: an artist whose path is a prefix of another path
+        // segment must not produce a bogus relative path.
+        assert_eq!(
+            item_date_folder_name("/pictures/Artist", "/pictures/ArtistX/202601/x.jpg"),
+            ""
+        );
     }
 
     #[test]

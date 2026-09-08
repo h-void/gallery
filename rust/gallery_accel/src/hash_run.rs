@@ -38,6 +38,17 @@ fn stable_file_hash(path: &Path) -> Result<Option<String>> {
     Ok(Some(digest))
 }
 
+/// True only when the source is genuinely absent.
+///
+/// The hash pipeline used to read every metadata failure as "the file was
+/// deleted", so a permission error or a flapping mount mass-marked live rows
+/// missing (or dropped live scan candidates). Only `NotFound` means gone;
+/// anything else keeps the row retryable, matching the scan pipeline's
+/// fails-closed check on unreachable media roots.
+fn source_is_missing(metadata: &std::io::Result<std::fs::Metadata>) -> bool {
+    matches!(metadata, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+
 pub fn run_hash_batch(conn: &Connection, limit: i64) -> Result<Value> {
     let roots = MediaRoots {
         roots: Vec::new(),
@@ -78,7 +89,6 @@ pub fn run_hash_batch_with_roots(
         .query_map(params![limit], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
 
-    let candidate_queue_len = cand_ids.len() as i64;
     for id in cand_ids {
         let candidate_state: (String, i64, f64, Option<i64>, Option<i64>, String, String) = conn
             .query_row(
@@ -101,7 +111,13 @@ pub fn run_hash_batch_with_roots(
             conn.execute("UPDATE scan_candidates SET hash_status='error' WHERE id=? AND status IN ('pending','candidate')", params![id])?;
             continue;
         };
-        let before = std::fs::metadata(&path).ok();
+        // Only a genuinely absent source means "gone". A permission or
+        // transient I/O error must keep the row retryable: the scan pipeline
+        // fails closed on an unreachable root, and the hash pipeline must not
+        // mass-mark rows missing while a mount is flapping.
+        let before_meta = std::fs::metadata(&path);
+        let source_missing = source_is_missing(&before_meta);
+        let before = before_meta.ok();
         match stable_file_hash(&path) {
             Ok(Some(digest)) => {
                 let after = std::fs::metadata(&path).ok();
@@ -119,6 +135,27 @@ pub fn run_hash_batch_with_roots(
                     _ => false,
                 };
                 if !identity_matches {
+                    // The stored snapshot no longer matches the live file: the file
+                    // changed after the scan that recorded the candidate. Refresh the
+                    // snapshot from the live metadata so the next batch can re-hash it,
+                    // instead of leaving the row as a stuck `pending` head that blocks
+                    // every later file until a full rescan happens. A genuinely absent
+                    // source is handled by the `Ok(None) | Err(_)` branch below; here
+                    // the file is present but its identity drifted.
+                    let Some(live) = after.as_ref().or(before.as_ref()) else {
+                        continue;
+                    };
+                    let (live_size, live_mtime, live_dev, live_ino) = live_snapshot(live);
+                    conn.execute(
+                        "UPDATE scan_candidates
+                         SET file_size=?, file_mtime=?, st_dev=?, st_ino=?
+                         WHERE id=? AND status IN ('pending','candidate') AND file_path=?
+                           AND content_hash=? AND hash_status IN ('pending','error','')",
+                        params![
+                            live_size, live_mtime, live_dev, live_ino,
+                            id, candidate_state.0, candidate_state.5
+                        ],
+                    )?;
                     continue;
                 }
                 let changed = conn.execute(
@@ -153,15 +190,38 @@ pub fn run_hash_batch_with_roots(
                         }
                     }
                     Err(error) => {
-                        eprintln!("hash: resolve scan candidate {id} failed: {error:#}");
+                        log_error!("hash: resolve scan candidate {id} failed: {error:#}");
                     }
                 }
             }
             Ok(None) | Err(_) => {
-                conn.execute(
-                    "UPDATE scan_candidates SET hash_status='error' WHERE id=?",
-                    params![id],
-                )?;
+                if source_missing {
+                    // Source file is gone: this is a stale scan-candidate
+                    // reference, not a transient hash failure. Drop it so it
+                    // stops being retried forever as 'error'.
+                    // The guard must match the queue's: only a *pending*
+                    // move candidate still needs the row. Excluding every
+                    // move-candidate reference stranded rows forever, because
+                    // nothing deletes move_candidates rows, so a resolved
+                    // reference never clears and the row kept the head slot of
+                    // every batch while inverting `remaining` on maintenance.
+                    conn.execute(
+                        "DELETE FROM scan_candidates
+                         WHERE id=?
+                           AND status IN ('pending','candidate')
+                           AND NOT EXISTS (
+                               SELECT 1 FROM move_candidates mc
+                               WHERE mc.scan_candidate_id = scan_candidates.id
+                                 AND mc.status = 'pending'
+                           )",
+                        params![id],
+                    )?;
+                } else {
+                    conn.execute(
+                        "UPDATE scan_candidates SET hash_status='error' WHERE id=?",
+                        params![id],
+                    )?;
+                }
             }
         }
     }
@@ -169,7 +229,13 @@ pub fn run_hash_batch_with_roots(
     // Upgrade backlog: candidates that were hashed before the native resolver
     // existed still need the same safety pass. Keep the total candidate work
     // bounded by the caller's batch limit.
-    let history_limit = limit.saturating_sub(candidate_queue_len);
+    // The candidate queue only selects rows still needing a hash, while the
+    // history phase below only selects already-hashed rows needing resolution.
+    // They touch disjoint rows, so resolution must keep a *guaranteed* share of
+    // the tick instead of being squeezed to zero whenever the candidate backlog
+    // fills the budget (which used to starve every done candidate behind a full
+    // batch). The two phases still share the caller's batch bound.
+    let history_limit = (limit / 2).max(1);
     if history_limit > 0 {
         let ready_ids: Vec<i64> = conn
             .prepare(
@@ -194,7 +260,7 @@ pub fn run_hash_batch_with_roots(
                     }
                 }
                 Err(error) => {
-                    eprintln!("hash: resolve historical scan candidate {id} failed: {error:#}");
+                    log_error!("hash: resolve historical scan candidate {id} failed: {error:#}");
                 }
             }
         }
@@ -236,7 +302,9 @@ pub fn run_hash_batch_with_roots(
             )?;
             continue;
         };
-        let before = std::fs::metadata(&path).ok();
+        let before_meta = std::fs::metadata(&path);
+        let source_missing = source_is_missing(&before_meta);
+        let before = before_meta.ok();
         match stable_file_hash(&path) {
             Ok(Some(digest)) => {
                 let after = std::fs::metadata(&path).ok();
@@ -254,6 +322,23 @@ pub fn run_hash_batch_with_roots(
                     _ => false,
                 };
                 if !identity_matches {
+                    // Same drift handling as the scan-candidate loop: refresh the
+                    // stale snapshot in place so the row is not a perpetual `pending`
+                    // head blocking later files. A missing source is handled below.
+                    let Some(live) = after.as_ref().or(before.as_ref()) else {
+                        continue;
+                    };
+                    let (live_size, live_mtime, live_dev, live_ino) = live_snapshot(live);
+                    conn.execute(
+                        "UPDATE items
+                         SET file_size=?, file_mtime=?, st_dev=?, st_ino=?
+                         WHERE id=? AND missing=0 AND file_path=?
+                           AND content_hash=? AND hash_status IN ('pending','error','')",
+                        params![
+                            live_size, live_mtime, live_dev, live_ino,
+                            id, item_state.0, item_state.5
+                        ],
+                    )?;
                     continue;
                 }
                 let changed = conn.execute(
@@ -282,10 +367,20 @@ pub fn run_hash_batch_with_roots(
                 }
             }
             Ok(None) | Err(_) => {
-                conn.execute(
-                    "UPDATE items SET hash_status='error' WHERE id=?",
-                    params![id],
-                )?;
+                if source_missing {
+                    // File is gone: mark the item missing instead of looping on
+                    // 'error' forever. The scan/missing pipeline reconciles it.
+                    conn.execute(
+                        "UPDATE items SET missing=1, missing_at=strftime('%s','now')
+                         WHERE id=? AND missing=0",
+                        params![id],
+                    )?;
+                } else {
+                    conn.execute(
+                        "UPDATE items SET hash_status='error' WHERE id=?",
+                        params![id],
+                    )?;
+                }
             }
         }
     }
@@ -323,6 +418,7 @@ pub fn run_hash_batch_with_roots(
         "links": links,
         "housekeeping": {
             "missing_items_expired_deleted": housekeeping.missing_items_deleted,
+            "missing_items_backup": housekeeping.missing_items_backup,
             "scan_seen_expired_deleted": housekeeping.scan_seen_deleted,
             "scan_candidates_terminal_deleted": housekeeping.scan_candidates_deleted,
         },
@@ -345,9 +441,42 @@ fn file_metadata_matches(before: &std::fs::Metadata, after: &std::fs::Metadata) 
     }
 }
 
+/// Extract a fresh identity (size, mtime, dev, ino) from live metadata so a row
+/// whose stored snapshot has drifted can be refreshed in place instead of being
+/// left as a stuck `pending` head that blocks every later file.
+fn live_snapshot(meta: &std::fs::Metadata) -> (i64, f64, Option<i64>, Option<i64>) {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_secs_f64())
+        .unwrap_or(0.0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            meta.len() as i64,
+            mtime,
+            Some(meta.dev() as i64),
+            Some(meta.ino() as i64),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        (meta.len() as i64, mtime, None, None)
+    }
+}
+
 /// A hash belongs to the row snapshot only when the file still has the same
 /// observed metadata. Legacy rows with neither size nor mtime remain eligible
 /// for their first hash; every populated identity field is authoritative.
+///
+/// The mtime comparison uses only a floating-point/round-trip epsilon
+/// (`MTIME_REUSE_EPSILON`), never a 1-second or 1-millisecond grace window: a real sub-millisecond
+/// modification (e.g. an in-place equal-length rewrite bumping mtime by 0.5ms)
+/// must invalidate the cached hash rather than be reused.
+const MTIME_REUSE_EPSILON: f64 = 1e-6;
+
 fn file_matches_snapshot(
     metadata: &std::fs::Metadata,
     file_size: i64,
@@ -361,7 +490,7 @@ fn file_matches_snapshot(
                 .modified()
                 .ok()
                 .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                .is_none_or(|value| (value.as_secs_f64() - file_mtime).abs() >= 1.0))
+                .is_none_or(|value| (value.as_secs_f64() - file_mtime).abs() >= MTIME_REUSE_EPSILON))
     {
         return false;
     }
@@ -431,7 +560,8 @@ mod tests {
           date TEXT DEFAULT '', auto_role TEXT DEFAULT '', tags TEXT DEFAULT '[]',
           missing INTEGER DEFAULT 0, missing_at REAL, scanned_at REAL,
           content_hash TEXT DEFAULT '', hash_status TEXT DEFAULT 'pending', hash_updated_at REAL,
-          media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0, st_dev INTEGER, st_ino INTEGER
+          media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0, st_dev INTEGER, st_ino INTEGER,
+          width INTEGER DEFAULT 0, height INTEGER DEFAULT 0
         );
         CREATE TABLE scan_candidates (
           id INTEGER PRIMARY KEY, scan_id TEXT DEFAULT '', status TEXT, hash_status TEXT,
@@ -451,6 +581,8 @@ mod tests {
           reason TEXT DEFAULT '', status TEXT, resolved_at REAL
         );
         CREATE TABLE item_tags (item_id INTEGER NOT NULL, tag_id INTEGER NOT NULL);
+        CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL);
+        INSERT INTO artists (id, name, path) VALUES (1, 'artist', '/pictures/artist');
         "
     }
 
@@ -652,6 +784,208 @@ mod tests {
         assert_eq!(std::fs::read(&secret).unwrap(), b"secret-bytes");
     }
 
+    /// R5 regression: a scan candidate whose source file was deleted but whose
+    /// path is still authorized must be dropped (not retried forever as
+    /// `error`), and a missing item file must be flagged `missing=1` instead of
+    /// left in a perpetual `error` state.
+    #[test]
+    fn missing_file_scan_candidate_is_dropped_and_item_marked_missing() {
+        let dir = tempdir().unwrap();
+        let media = dir.path().join("pictures");
+        std::fs::create_dir_all(&media).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(race_schema()).unwrap();
+        let gone = media.join("gone.bin");
+        let gone_s = gone.to_string_lossy().to_string();
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, hash_status)
+             VALUES (1, 1, ?, 'gone.bin', 'pending')",
+            params![gone_s],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_candidates (id, status, hash_status, file_path, file_name)
+             VALUES (1, 'pending', 'pending', ?, 'gone.bin')",
+            params![gone_s],
+        )
+        .unwrap();
+        let roots = MediaRoots {
+            roots: vec![media.to_string_lossy().replace('\\', "/")],
+            labels: vec!["p1".into()],
+            real_paths: vec![media.to_string_lossy().replace('\\', "/")],
+        };
+
+        let out = run_hash_batch_with_roots(&conn, &roots, 10).unwrap();
+        assert_eq!(out["ok"], true);
+
+        // The stale candidate row is gone, not stuck in 'error'.
+        let cand_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_candidates WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cand_count, 0);
+
+        // The item is flagged missing rather than left in 'error'.
+        let (missing, hash_status): (i64, String) = conn
+            .query_row(
+                "SELECT missing, hash_status FROM items WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(missing, 1);
+        assert_eq!(hash_status, "pending");
+    }
+
+    fn single_media_root(media: &Path) -> MediaRoots {
+        let root = media.to_string_lossy().replace('\\', "/");
+        MediaRoots {
+            roots: vec![root.clone()],
+            labels: vec!["p1".into()],
+            real_paths: vec![root],
+        }
+    }
+
+    /// The DELETE guard must match the queue guard. A *resolved* move-candidate
+    /// reference used to block the delete, and nothing deletes
+    /// `move_candidates` rows, so the candidate was re-picked at the head of
+    /// every batch forever and inflated the maintenance `remaining` count.
+    #[test]
+    fn resolved_move_reference_does_not_strand_a_missing_candidate() {
+        let dir = tempdir().unwrap();
+        let media = dir.path().join("pictures");
+        std::fs::create_dir_all(&media).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(race_schema()).unwrap();
+        let gone = media.join("gone.bin").to_string_lossy().to_string();
+        conn.execute(
+            "INSERT INTO scan_candidates (id, status, hash_status, file_path, file_name)
+             VALUES (1, 'pending', 'pending', ?, 'gone.bin')",
+            params![gone],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO move_candidates (id, scan_candidate_id, status)
+             VALUES (1, 1, 'resolved')",
+            [],
+        )
+        .unwrap();
+
+        let out = run_hash_batch_with_roots(&conn, &single_media_root(&media), 10).unwrap();
+        assert_eq!(out["ok"], true);
+
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scan_candidates WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "a finished move must not strand its scan candidate"
+        );
+    }
+
+    /// A *pending* move still owns the row, so the delete guard skips it and the
+    /// queue never offers it in the first place.
+    #[test]
+    fn pending_move_reference_keeps_the_scan_candidate_row() {
+        let dir = tempdir().unwrap();
+        let media = dir.path().join("pictures");
+        std::fs::create_dir_all(&media).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(race_schema()).unwrap();
+        let gone = media.join("gone.bin").to_string_lossy().to_string();
+        conn.execute(
+            "INSERT INTO scan_candidates (id, status, hash_status, file_path, file_name)
+             VALUES (1, 'pending', 'pending', ?, 'gone.bin')",
+            params![gone],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO move_candidates (id, scan_candidate_id, status)
+             VALUES (1, 1, 'pending')",
+            [],
+        )
+        .unwrap();
+
+        let out = run_hash_batch_with_roots(&conn, &single_media_root(&media), 10).unwrap();
+        assert_eq!(out["ok"], true);
+
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scan_candidates WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 1, "a pending move still owns the row");
+    }
+
+    /// Pins the rule the pipeline relies on: a failed `metadata` call only means
+    /// "gone" when the OS said NotFound. Permission errors and transient I/O
+    /// failures must keep the row retryable.
+    #[test]
+    fn source_is_missing_only_trusts_not_found() {
+        let file = tempdir().unwrap().path().join("probe.bin");
+        let present = std::fs::metadata(&file);
+        assert!(
+            matches!(present, Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "a missing probe file must report NotFound"
+        );
+
+        let denied = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "probe",
+        ));
+        assert!(
+            !source_is_missing(&denied),
+            "a permission error is not a deleted file"
+        );
+        let flapping = Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "probe",
+        ));
+        assert!(!source_is_missing(&flapping), "a mount flap is not a deletion");
+
+        let stale = std::fs::File::create(tempdir().unwrap().path().join("live.bin")).unwrap();
+        let live = stale.metadata();
+        assert!(!source_is_missing(&live), "a readable file is not missing");
+    }
+
+    /// End-to-end companion: an existing source that cannot be hashed keeps the
+    /// item retryable instead of being flagged missing.
+    #[test]
+    fn unhashable_source_is_retried_instead_of_marked_missing() {
+        let dir = tempdir().unwrap();
+        let media = dir.path().join("pictures");
+        // Exists, so `metadata` succeeds, but `stable_file_hash` returns
+        // Ok(None): the same shape as an EACCES or a flapping mount.
+        let not_a_file = media.join("replaced-by-directory");
+        std::fs::create_dir_all(&not_a_file).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(race_schema()).unwrap();
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, hash_status)
+             VALUES (1, 1, ?, 'replaced-by-directory', 'pending')",
+            params![not_a_file.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        let out = run_hash_batch_with_roots(&conn, &single_media_root(&media), 10).unwrap();
+        assert_eq!(out["ok"], true);
+
+        let (missing, hash_status): (i64, String) = conn
+            .query_row(
+                "SELECT missing, hash_status FROM items WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(missing, 0, "an existing source is not missing");
+        assert_eq!(hash_status, "error", "an unreadable source stays retryable");
+    }
+
     #[test]
     fn hashes_pending_item() {
         let dir = tempdir().unwrap();
@@ -666,7 +1000,8 @@ mod tests {
               date TEXT DEFAULT '', auto_role TEXT DEFAULT '', tags TEXT DEFAULT '[]',
               missing INTEGER DEFAULT 0, missing_at REAL, scanned_at REAL,
               content_hash TEXT DEFAULT '', hash_status TEXT DEFAULT 'pending', hash_updated_at REAL,
-              media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0, st_dev INTEGER, st_ino INTEGER
+              media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0, st_dev INTEGER, st_ino INTEGER,
+              width INTEGER DEFAULT 0, height INTEGER DEFAULT 0
             );
             CREATE TABLE scan_candidates (
               id INTEGER PRIMARY KEY, scan_id TEXT DEFAULT '', status TEXT, hash_status TEXT,
@@ -732,7 +1067,8 @@ mod tests {
               auto_role TEXT DEFAULT '', tags TEXT DEFAULT '[]',
               missing INTEGER DEFAULT 0, missing_at REAL, scanned_at REAL,
               content_hash TEXT DEFAULT '', hash_status TEXT DEFAULT 'pending', hash_updated_at REAL,
-              media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0, st_dev INTEGER, st_ino INTEGER
+              media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0, st_dev INTEGER, st_ino INTEGER,
+              width INTEGER DEFAULT 0, height INTEGER DEFAULT 0
             );
             CREATE TABLE scan_candidates (
               id INTEGER PRIMARY KEY, scan_id TEXT DEFAULT '', status TEXT, hash_status TEXT,
@@ -800,7 +1136,8 @@ mod tests {
               auto_role TEXT DEFAULT '', tags TEXT DEFAULT '[]',
               missing INTEGER DEFAULT 0, missing_at REAL, scanned_at REAL,
               content_hash TEXT DEFAULT '', hash_status TEXT DEFAULT 'pending', hash_updated_at REAL,
-              media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0, st_dev INTEGER, st_ino INTEGER
+              media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0, st_dev INTEGER, st_ino INTEGER,
+              width INTEGER DEFAULT 0, height INTEGER DEFAULT 0
             );
             CREATE TABLE scan_candidates (
               id INTEGER PRIMARY KEY, scan_id TEXT DEFAULT '', status TEXT, hash_status TEXT,
@@ -844,5 +1181,180 @@ mod tests {
         assert_eq!(response["summary"]["links"], 1);
         assert_eq!(response["summary"]["documents"], 1);
         assert_eq!(response["links"][0]["provider_name"], "夸克网盘");
+    }
+
+    /// L3 cross-check: `file_matches_snapshot` must reject a sub-second mtime
+    /// change (no 1-second grace window). The cached hash is only valid when the
+    /// live file mtime still matches the stored value within float epsilon.
+    #[test]
+    fn file_matches_snapshot_rejects_subsecond_mtime_change() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("snap.bin");
+        std::fs::write(&file, b"snapshot-content").unwrap();
+        let meta0 = std::fs::metadata(&file).unwrap();
+        let m0 = meta0
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Unchanged snapshot matches.
+        assert!(
+            file_matches_snapshot(&meta0, meta0.len() as i64, m0, None, None),
+            "unchanged metadata must match the snapshot"
+        );
+
+        // Bump mtime by 500ms. The live metadata must no longer match the stored mtime.
+        let new_mtime = m0 + 0.5;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(new_mtime))
+            .unwrap();
+        let meta1 = std::fs::metadata(&file).unwrap();
+        let live = meta1
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(
+            (live - m0).abs() >= 0.4,
+            "test setup: stored mtime should advance by ~0.5s, got delta {}",
+            live - m0
+        );
+        assert!(
+            !file_matches_snapshot(&meta1, meta1.len() as i64, m0, None, None),
+            "a 500ms mtime change must invalidate the cached snapshot"
+        );
+    }
+
+    /// L5: already-hashed scan candidates needing resolution must keep making
+    /// progress even when the candidate-hashing queue is full of error rows that
+    /// would otherwise consume the entire tick budget.
+    #[test]
+    fn history_phase_resolves_done_candidates_when_candidate_queue_full() {
+        let dir = tempdir().unwrap();
+        let media = dir.path().join("pictures");
+        std::fs::create_dir_all(&media).unwrap();
+        let file = media.join("real.bin");
+        std::fs::write(&file, b"real-content-bytes").unwrap();
+        let (size, mtime) = file_state(&file);
+        let digest = crate::content_hash::hash_file(&file, 1024 * 1024).unwrap();
+        let real_path = file.to_string_lossy().to_string();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(race_schema()).unwrap();
+
+        // A present item already lives at the file path, so the done candidate
+        // resolves via resolve_existing (action "existing") and is marked resolved.
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, file_size, file_mtime, hash_status, missing)
+             VALUES (1, 1, ?, 'real.bin', ?, ?, 'done', 0)",
+            params![real_path, size, mtime],
+        )
+        .unwrap();
+
+        // Error candidate: a directory path keeps it 'error' and consumes the
+        // candidate-queue slot every tick. Without a reserved resolution budget
+        // the done candidate behind it would never be processed.
+        let sub = media.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let dir_path = sub.to_string_lossy().to_string();
+        conn.execute(
+            "INSERT INTO scan_candidates (id, status, hash_status, file_path, file_name)
+             VALUES (1, 'pending', 'error', ?, 'subdir')",
+            params![dir_path],
+        )
+        .unwrap();
+
+        // Done candidate awaiting resolution.
+        conn.execute(
+            "INSERT INTO scan_candidates (id, status, hash_status, file_path, file_name, file_size, file_mtime, content_hash)
+             VALUES (2, 'pending', 'done', ?, 'real.bin', ?, ?, ?)",
+            params![real_path, size, mtime, digest],
+        )
+        .unwrap();
+
+        // limit=1: the error candidate fills the candidate queue; before the fix
+        // the history phase received 0 budget and the done candidate was never
+        // resolved.
+        let out = run_hash_batch_with_roots(&conn, &single_media_root(&media), 1).unwrap();
+
+        let status: String = conn
+            .query_row("SELECT status FROM scan_candidates WHERE id=2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            status, "resolved",
+            "history phase must resolve the done candidate even when the candidate queue is full: {out}"
+        );
+    }
+
+    /// L5: a scan candidate whose stored snapshot drifted (file changed after the
+    /// scan) must be refreshed in place rather than blocking every later file;
+    /// both the stale head and the file behind it make progress within a few ticks.
+    #[test]
+    fn stale_pending_candidate_refreshes_snapshot_and_unblocks_later_files() {
+        let dir = tempdir().unwrap();
+        let media = dir.path().join("pictures");
+        std::fs::create_dir_all(&media).unwrap();
+        let stale = media.join("stale.bin");
+        let normal = media.join("normal.bin");
+        std::fs::write(&stale, b"stale-v1").unwrap();
+        std::fs::write(&normal, b"normal-v1").unwrap();
+        let roots = single_media_root(&media);
+
+        // Record the stale candidate with a STALE snapshot, then rewrite the file
+        // so the stored size/mtime no longer matches the live file.
+        let (stale_size, stale_mtime) = file_state(&stale);
+        std::fs::write(&stale, b"stale-version-two-longer").unwrap();
+        let (normal_size, normal_mtime) = file_state(&normal);
+        let stale_path = stale.to_string_lossy().to_string();
+        let normal_path = normal.to_string_lossy().to_string();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(race_schema()).unwrap();
+        // Present items at both paths so each candidate resolves via the safe
+        // "existing" path after its snapshot is refreshed and it is re-hashed.
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, hash_status, missing)
+             VALUES (1, 1, ?, 'stale.bin', 'done', 0), (2, 1, ?, 'normal.bin', 'done', 0)",
+            params![stale_path, normal_path],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_candidates (id, status, hash_status, file_path, file_name, file_size, file_mtime)
+             VALUES (1, 'pending', 'pending', ?, 'stale.bin', ?, ?)",
+            params![stale_path, stale_size, stale_mtime],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_candidates (id, status, hash_status, file_path, file_name, file_size, file_mtime)
+             VALUES (2, 'pending', 'pending', ?, 'normal.bin', ?, ?)",
+            params![normal_path, normal_size, normal_mtime],
+        )
+        .unwrap();
+
+        // limit=1: with the stale candidate at the head, the old code blocked the
+        // normal file forever; the refresh keeps both progressing across ticks.
+        for _ in 0..3 {
+            run_hash_batch_with_roots(&conn, &roots, 1).unwrap();
+        }
+
+        let stale_status: String = conn
+            .query_row("SELECT hash_status FROM scan_candidates WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        let normal_status: String = conn
+            .query_row("SELECT hash_status FROM scan_candidates WHERE id=2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            stale_status, "done",
+            "stale candidate should be re-hashed after its snapshot is refreshed"
+        );
+        assert_eq!(
+            normal_status, "done",
+            "the normal candidate must make progress behind a stale head"
+        );
     }
 }

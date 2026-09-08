@@ -34,6 +34,9 @@ pub(crate) struct ItemDetailRow {
     pub(crate) favorite: bool,
     pub(crate) artist_name: String,
     pub(crate) artist_path: String,
+    /// Intrinsic pixel size; 0 means "unknown" and the grid falls back to 4:3.
+    pub(crate) width: i64,
+    pub(crate) height: i64,
 }
 
 pub fn item_detail_response(conn: &Connection, item_id: i64) -> Result<Value> {
@@ -66,6 +69,8 @@ pub(crate) fn get_item_detail(conn: &Connection, item_id: i64) -> Result<Option<
             i.missing,
             i.missing_at,
             i.scanned_at,
+            i.width,
+            i.height,
             EXISTS(SELECT 1 FROM item_favorites f WHERE f.item_id=i.id) AS favorite,
             a.name AS artist_name,
             a.path AS artist_path
@@ -114,6 +119,8 @@ pub(crate) fn get_item_detail(conn: &Connection, item_id: i64) -> Result<Option<
             favorite: row.get("favorite")?,
             artist_name: row.get("artist_name")?,
             artist_path: row.get("artist_path")?,
+            width: row.get("width").unwrap_or(0),
+            height: row.get("height").unwrap_or(0),
         }
     };
     Ok(Some(item))

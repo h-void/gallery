@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use gallery_accel::upstream::Upstream;
-use gallery_accel::{env_db_path, spawn_configured_workers};
+use gallery_accel::{env_db_path, log_error, log_info, spawn_configured_workers};
 
 mod route_params;
 mod routes;
@@ -12,10 +12,14 @@ mod routes;
 struct Args {
     #[arg(long)]
     db: Option<PathBuf>,
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
-    #[arg(long, default_value_t = 18899)]
-    port: u16,
+    /// Bind address. Defaults to 127.0.0.1, or 0.0.0.0 in primary mode. An
+    /// explicit value is always honoured, so a test can stay loopback-only.
+    #[arg(long)]
+    host: Option<String>,
+    /// Bind port. Defaults to 18899, or 8899 in primary mode. An explicit
+    /// value is always honoured.
+    #[arg(long)]
+    port: Option<u16>,
     #[arg(long, default_value_t = 16)]
     pool_size: usize,
     /// Open the database read-only (default). Implied off when writes are enabled.
@@ -47,20 +51,32 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
     if args.primary {
-        if args.host == "127.0.0.1" {
-            args.host = "0.0.0.0".to_string();
-        }
-        if args.port == 18899 {
-            args.port = std::env::var("TRIM_SERVICE_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .or_else(|| std::env::var("PORT").ok().and_then(|v| v.parse().ok()))
-                .unwrap_or(8899);
-        }
+        // Capability defaults only: an explicit --host/--port is never
+        // rewritten, otherwise a primary-mode smoke test could not restrict
+        // itself to loopback.
         args.enable_writes = true;
         args.enable_media = true;
         args.read_only = false;
     }
+
+    let host = args.host.clone().unwrap_or_else(|| {
+        if args.primary {
+            "0.0.0.0".to_string()
+        } else {
+            "127.0.0.1".to_string()
+        }
+    });
+    let port = args.port.unwrap_or_else(|| {
+        if args.primary {
+            std::env::var("TRIM_SERVICE_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or_else(|| std::env::var("PORT").ok().and_then(|v| v.parse().ok()))
+                .unwrap_or(8899)
+        } else {
+            18899
+        }
+    });
 
     let db_path = args.db.unwrap_or_else(env_db_path);
     let read_only = args.read_only && !args.enable_writes;
@@ -87,6 +103,17 @@ async fn main() -> anyhow::Result<()> {
     // Finish or discard deletes interrupted by crash/power loss before any
     // request can observe the half-state ('moving' recycle rows).
     if !read_only {
+        let cleaned_spools = gallery_accel::scan::cleanup_stale_presence_spools(
+            gallery_accel::scan::PRESENCE_SPOOL_MAX_AGE,
+        );
+        if cleaned_spools > 0 {
+            log_info!("cleaned {cleaned_spools} stale presence spool files on startup");
+        }
+        // Deliberately a dedicated short-lived connection, not the pool:
+        // this must run before the listener binds and before AppState (and
+        // its DbPool) exist. Keep journal_mode/busy_timeout aligned with
+        // configure_connection so pool connections never meet a
+        // differently-configured peer on the same WAL file.
         match rusqlite::Connection::open(&db_path) {
             Ok(conn) => {
                 let _ = conn.execute_batch("PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL;");
@@ -95,22 +122,22 @@ async fn main() -> anyhow::Result<()> {
                         let (finalized, dropped, missing) =
                             gallery_accel::reconcile_moving_recycle_entries(&conn);
                         if finalized + dropped + missing > 0 {
-                            eprintln!(
+                            log_info!(
                                 "recycle reconciliation: finalized={finalized} dropped={dropped} marked_missing={missing}"
                             );
                         }
                     }
-                    Err(error) => eprintln!("recycle schema check failed: {error}"),
+                    Err(error) => log_error!("recycle schema check failed: {error}"),
                 }
                 let move_reconciliation = gallery_accel::reconcile_pending_artist_move(&conn);
                 if move_reconciliation["reconciled"] == serde_json::json!(true) {
-                    eprintln!(
+                    log_info!(
                         "artist move reconciliation: {}",
                         move_reconciliation["outcome"].as_str().unwrap_or("unknown")
                     );
                 }
             }
-            Err(error) => eprintln!("recycle reconciliation open failed: {error}"),
+            Err(error) => log_error!("recycle reconciliation open failed: {error}"),
         }
     }
 
@@ -142,9 +169,9 @@ async fn main() -> anyhow::Result<()> {
         app = routes::with_static_ui(app, static_dir);
     }
 
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
+    let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    eprintln!(
+    log_info!(
         "gallery_accel listening on http://{} primary={} writes={}",
         addr, args.primary, args.enable_writes
     );

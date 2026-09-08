@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use crate::content_hash::hash_file;
+use crate::dimensions::media_dimensions;
 use crate::media_roots::{authorized_media_path, MediaRoots};
 
 #[derive(Clone)]
@@ -54,69 +55,6 @@ struct ItemMissing {
     st_ino: Option<i64>,
     missing: i64,
     content_hash: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn candidate_with(path: &str, artist: &str, date: &str) -> MoveTargetCandidate {
-        MoveTargetCandidate {
-            id: 1,
-            artist_id: 1,
-            artist_path: artist.to_string(),
-            file_path: path.to_string(),
-            file_name: String::new(),
-            file_size: 0,
-            file_mtime: 0.0,
-            folder_name: String::new(),
-            date: date.to_string(),
-            is_archive: 0,
-            media_type: String::new(),
-            content_hash: String::new(),
-            hash_status: String::new(),
-            st_dev: None,
-            st_ino: None,
-        }
-    }
-
-    #[test]
-    fn candidate_detected_raw_preserves_folder_precision() {
-        let c = candidate_with(
-            "/pictures/artist/2026/202607 works/pic.jpg",
-            "/pictures/artist",
-            "2026-07-01",
-        );
-        assert_eq!(candidate_detected_raw(&c), "2026-07");
-
-        let c = candidate_with(
-            "/pictures/artist/2026-05-01_title/pic.jpg",
-            "/pictures/artist",
-            "2026-05-01",
-        );
-        assert_eq!(candidate_detected_raw(&c), "2026-05-01");
-
-        let c = candidate_with(
-            "/pictures/artist/202508/01_1536_title/pic.jpg",
-            "/pictures/artist",
-            "2025-08-01",
-        );
-        assert_eq!(candidate_detected_raw(&c), "2025-08-01");
-
-        let c = candidate_with(
-            "/pictures/artist/plain/pic.jpg",
-            "/pictures/artist",
-            "2026-08-15",
-        );
-        assert_eq!(
-            candidate_detected_raw(&c),
-            "2026-08-15",
-            "unparseable folder falls back to the candidate canonical date"
-        );
-
-        let c = candidate_with("/pictures/artist/pic.jpg", "/pictures/artist", "");
-        assert_eq!(candidate_detected_raw(&c), "");
-    }
 }
 
 const ALLOWED_MOVE_REASONS: &[&str] = &["inode", "category_rename"];
@@ -212,6 +150,29 @@ fn candidate_stat_is_current(roots: Option<&MediaRoots>, candidate: &MoveTargetC
         }
         _ => true,
     }
+}
+
+/// In-transaction content verification for durable `hash_status='done'` writes.
+///
+/// `candidate_stat_is_current` cannot detect an in-place rewrite that preserves
+/// size, mtime, and dev/inode, so a digest computed earlier could be committed
+/// for bytes that are no longer on disk. Re-reading the file and comparing with
+/// the candidate hash immediately before the durable write closes that window;
+/// a mismatch fails the transaction as `candidate_stale`, which rolls back and
+/// requeues the candidate for a fresh hash.
+fn candidate_content_is_current(
+    roots: Option<&MediaRoots>,
+    candidate: &MoveTargetCandidate,
+) -> bool {
+    let path = match roots {
+        Some(roots) => authorized_media_path(roots, &candidate.file_path),
+        None => Ok(Path::new(&candidate.file_path).to_path_buf()),
+    };
+    let Ok(path) = path else {
+        return false;
+    };
+    !candidate.content_hash.is_empty()
+        && hash_file(&path, 1024 * 1024).is_ok_and(|digest| digest == candidate.content_hash)
 }
 
 fn supersede_candidate(
@@ -350,6 +311,23 @@ fn inferred_media_type(file_name: &str, media_type: &str) -> String {
     .to_string()
 }
 
+/// Probe dimensions before promoting a scan candidate; failures leave zero so
+/// the maintenance backfill can retry without blocking item creation.
+fn candidate_dimensions(
+    roots: Option<&MediaRoots>,
+    candidate: &MoveTargetCandidate,
+    media_type: &str,
+) -> (i64, i64) {
+    let path = match roots {
+        Some(roots) => authorized_media_path(roots, &candidate.file_path).ok(),
+        None => Some(Path::new(&candidate.file_path).to_path_buf()),
+    };
+    path.and_then(|path| media_dimensions(&path, media_type).ok())
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .map(|(width, height)| (i64::from(width), i64::from(height)))
+        .unwrap_or_default()
+}
+
 /// Return scan candidates that still need a user decision.
 ///
 /// This is deliberately read-only; promotion continues through the existing
@@ -452,7 +430,7 @@ fn resolve_existing_scan_candidate_response_inner(
     };
     if !candidate_file_is_current(roots, &candidate)? {
         supersede_candidate(conn, roots, &candidate)?;
-        return Ok(json!({"action": "no_match"}));
+        return Ok(json!({"action": "no_match", "reason": "candidate_stale"}));
     }
 
     conn.execute_batch("BEGIN IMMEDIATE")
@@ -500,6 +478,18 @@ fn resolve_existing_scan_candidate_response_inner(
         {
             return Ok(None);
         }
+        // The path is already in the library, so every pending move candidate
+        // hanging off this scan candidate can never execute again: the
+        // executor re-reads the scan candidate with status IN
+        // ('pending','candidate') and would return no_match forever. Close
+        // them in the same transaction instead of leaving dead rows in the
+        // 待判断 list (A2).
+        conn.execute(
+            "UPDATE move_candidates SET status='superseded', resolved_at=strftime('%s','now')
+             WHERE scan_candidate_id=?1 AND status='pending'",
+            params![candidate_id],
+        )
+        .context("close resolved same-path move candidates")?;
         Ok(Some(item_id))
     })();
 
@@ -515,7 +505,11 @@ fn resolve_existing_scan_candidate_response_inner(
         Err(error) if error.to_string() == "candidate_stale" => {
             rollback(conn);
             supersede_candidate(conn, roots, &candidate)?;
-            Ok(json!({"action": "no_match"}))
+            Ok(json!({
+                "action": "no_match",
+                "reason": "candidate_stale",
+                "scan_candidate_id": candidate.id
+            }))
         }
         Err(error) => {
             rollback(conn);
@@ -626,6 +620,9 @@ fn apply_hash_unique_scan_candidate_response_inner(
         if !candidate_row_is_unchanged(conn, &candidate)?
             || !candidate_stat_is_current(roots, &candidate)
         {
+            bail!("candidate_stale");
+        }
+        if !candidate_content_is_current(roots, &candidate) {
             bail!("candidate_stale");
         }
         let old_path = conn
@@ -759,7 +756,7 @@ fn apply_hash_unique_scan_candidate_response_inner(
 /// (or a unique-constraint error occurs) so Python can fall back to the more
 /// complex `_mark_existing_item_for_candidate` path.
 pub fn create_new_item_response(conn: &Connection, candidate_id: i64) -> Result<Value> {
-    create_new_item_response_inner(conn, None, candidate_id)
+    create_new_item_response_inner(conn, None, candidate_id, &[])
 }
 
 pub fn create_new_item_response_with_roots(
@@ -767,13 +764,26 @@ pub fn create_new_item_response_with_roots(
     roots: &MediaRoots,
     candidate_id: i64,
 ) -> Result<Value> {
-    create_new_item_response_inner(conn, Some(roots), candidate_id)
+    create_new_item_response_inner(conn, Some(roots), candidate_id, &[])
+}
+
+/// Create the new file's own item row and copy the given source items' tags
+/// onto it inside the same transaction, so a tag inheritance can never land
+/// half-applied next to a committed record.
+pub fn create_new_item_response_with_tags(
+    conn: &Connection,
+    roots: &MediaRoots,
+    candidate_id: i64,
+    inherit_tag_item_ids: &[i64],
+) -> Result<Value> {
+    create_new_item_response_inner(conn, Some(roots), candidate_id, inherit_tag_item_ids)
 }
 
 fn create_new_item_response_inner(
     conn: &Connection,
     roots: Option<&MediaRoots>,
     candidate_id: i64,
+    inherit_tag_item_ids: &[i64],
 ) -> Result<Value> {
     let Some(candidate) = move_target_candidate(conn, candidate_id)? else {
         return Ok(json!({"action": "no_match"}));
@@ -783,12 +793,20 @@ fn create_new_item_response_inner(
         return Ok(json!({"action": "no_match"}));
     }
 
+    // Do media I/O before BEGIN IMMEDIATE; a probe must not hold the SQLite
+    // write lock while reading a JPEG header or invoking ffprobe.
+    let media_type = inferred_media_type(&candidate.file_name, &candidate.media_type);
+    let (width, height) = candidate_dimensions(roots, &candidate, &media_type);
+
     conn.execute_batch("BEGIN IMMEDIATE")
         .context("begin scan-candidate create-new-item")?;
     let result = (|| -> Result<Option<i64>> {
         if !candidate_row_is_unchanged(conn, &candidate)?
             || !candidate_stat_is_current(roots, &candidate)
         {
+            bail!("candidate_stale");
+        }
+        if candidate.hash_status == "done" && !candidate_content_is_current(roots, &candidate) {
             bail!("candidate_stale");
         }
         let occupied = conn
@@ -803,7 +821,6 @@ fn create_new_item_response_inner(
             return Ok(None);
         }
 
-        let media_type = inferred_media_type(&candidate.file_name, &candidate.media_type);
         let detected_raw = candidate_detected_raw(&candidate);
         let inserted = conn.execute(
             "
@@ -811,10 +828,10 @@ fn create_new_item_response_inner(
                 (artist_id, file_path, file_name, file_size, file_mtime,
                  folder_name, date, detected_date, auto_role, tags, is_archive, media_type,
                  content_hash, hash_status, hash_updated_at, st_dev, st_ino,
-                 missing, missing_at, scanned_at)
+                 missing, missing_at, scanned_at, width, height)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', '[]', ?9, ?10, ?11, ?12,
                     CASE WHEN ?12 = 'done' THEN strftime('%s','now') ELSE NULL END,
-                    ?13, ?14, 0, NULL, strftime('%s','now'))
+                    ?13, ?14, 0, NULL, strftime('%s','now'), ?15, ?16)
             ",
             params![
                 candidate.artist_id,
@@ -831,6 +848,8 @@ fn create_new_item_response_inner(
                 &candidate.hash_status,
                 candidate.st_dev,
                 candidate.st_ino,
+                width,
+                height,
             ],
         );
         let inserted = match inserted {
@@ -842,6 +861,11 @@ fn create_new_item_response_inner(
             return Ok(None);
         }
         let item_id = conn.last_insert_rowid();
+
+        if !inherit_tag_item_ids.is_empty() {
+            move_item_tags_to_item(conn, inherit_tag_item_ids, item_id, candidate.artist_id)
+                .context("inherit source tags into new scan-candidate item")?;
+        }
 
         conn.execute(
             "
@@ -1121,6 +1145,29 @@ fn create_scan_move_candidate(
                 candidate.st_ino,
             ],
         )?;
+    } else {
+        // Reuse the still-pending row for this (new path, old record, reason)
+        // pair instead of stacking duplicates, but refresh its evidence so it
+        // tracks the current scan version (A3): the scanner abandons resolved
+        // scan-candidate rows and inserts a fresh one for the same path, so a
+        // row kept from the previous round would otherwise stay linked to a
+        // terminal scan candidate and display a stale hash.
+        conn.execute(
+            "UPDATE move_candidates
+             SET scan_candidate_id=?1, old_path=?2, content_hash=?3, st_dev=?4, st_ino=?5
+             WHERE status='pending' AND new_path=?6
+               AND COALESCE(item_id,0)=COALESCE(?7,0) AND reason=?8",
+            params![
+                candidate.id,
+                old_path,
+                &candidate.content_hash,
+                candidate.st_dev,
+                candidate.st_ino,
+                &candidate.file_path,
+                item_id,
+                reason,
+            ],
+        )?;
     }
     conn.execute(
         "UPDATE scan_candidates SET status='candidate', resolved_at=NULL WHERE id=?1",
@@ -1297,6 +1344,9 @@ fn apply_scan_candidate_move_response_inner(
         if !candidate_row_is_unchanged(conn, &candidate)?
             || !candidate_stat_is_current(roots, &candidate)
         {
+            bail!("candidate_stale");
+        }
+        if candidate.hash_status == "done" && !candidate_content_is_current(roots, &candidate) {
             bail!("candidate_stale");
         }
         let item = conn
@@ -1555,7 +1605,7 @@ fn apply_move_candidate_response_inner_with_roots(
         }
         if !candidate_file_is_current(roots, &candidate)? {
             supersede_candidate(conn, roots, &candidate)?;
-            return Ok(json!({"action": "no_match"}));
+            return Ok(json!({"action": "no_match", "reason": "candidate_stale"}));
         }
         candidate
     } else {
@@ -1698,9 +1748,46 @@ fn apply_move_candidate_response_inner_with_roots(
                 {
                     return Ok(None);
                 }
-                group_tag_item_ids = group_rows.into_iter().map(|row| row.0).collect();
-                group_tag_item_ids.sort_unstable();
-                group_tag_item_ids.dedup();
+                // Identity gate. Several pending rows for the same
+                // (old record, target) pair are repeated evidence for one
+                // identity; several *distinct* old records are competing
+                // identities. Taking the lowest id would silently adopt one
+                // record's path, tags and history on the user's behalf, so the
+                // whole cluster stays pending until a human or stronger
+                // evidence picks one.
+                let mut distinct_sources: Vec<i64> = group_rows.iter().map(|row| row.0).collect();
+                distinct_sources.sort_unstable();
+                distinct_sources.dedup();
+                if distinct_sources.len() != 1 || distinct_sources[0] != move_row.item_id {
+                    return Ok(None);
+                }
+                // Reverse competition: the selected old record must not also
+                // be waiting on a different target, and no live copy may
+                // already hold this content at another path.
+                let other_targets: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM move_candidates
+                         WHERE status='pending' AND item_id=?1
+                           AND COALESCE(scan_candidate_id,0) <> COALESCE(?2,0)",
+                        params![move_row.item_id, scan_candidate_id],
+                        |row| row.get(0),
+                    )
+                    .context("count competing targets for move source")?;
+                let active_copies: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM items
+                         WHERE missing=0 AND id<>?1 AND content_hash<>'' AND content_hash=?2",
+                        params![move_row.item_id, &item.content_hash],
+                        |row| row.get(0),
+                    )
+                    .context("count active copies of move source")?;
+                if other_targets > 0 || active_copies > 0 {
+                    return Ok(None);
+                }
+                // Only the selected record's own tags migrate. Competing
+                // candidates are unverified hypotheses, not proven copies, so
+                // their tags, paths and dates are left exactly as they are.
+                group_tag_item_ids = vec![move_row.item_id];
             }
             None if item.artist_id != move_row.artist_id => {
                 // Cross-artist changes are deliberately group-only.
@@ -1767,6 +1854,11 @@ fn apply_move_candidate_response_inner_with_roots(
         {
             bail!("candidate_stale");
         }
+        // The update below persists content_hash with hash_status='done' when
+        // the candidate carries a digest; re-verify the bytes first.
+        if !content_hash.is_empty() && !candidate_content_is_current(roots, &candidate) {
+            bail!("candidate_stale");
+        }
         let file_name = path_file_name(&move_row.new_path).to_string();
         let media = inferred_media_type(&file_name, &media_type);
         let hash_status = if content_hash.is_empty() {
@@ -1776,8 +1868,9 @@ fn apply_move_candidate_response_inner_with_roots(
         };
         let detected_raw = candidate_detected_raw(&candidate);
 
-        conn.execute(
-            "
+        let updated = conn
+            .execute(
+                "
             UPDATE items
             SET artist_id = COALESCE(?1, artist_id),
                 file_path = ?2,
@@ -1799,25 +1892,31 @@ fn apply_move_candidate_response_inner_with_roots(
                 scanned_at = strftime('%s','now')
             WHERE id = ?15
             ",
-            params![
-                group_artists.map(|(_, target_artist_id)| target_artist_id),
-                &move_row.new_path,
-                &file_name,
-                file_size,
-                file_mtime,
-                &folder_name,
-                &detected_raw,
-                &date,
-                is_archive,
-                &media,
-                &content_hash,
-                hash_status,
-                candidate.st_dev,
-                candidate.st_ino,
-                move_row.item_id,
-            ],
-        )
-        .context("update confirmed move item")?;
+                params![
+                    group_artists.map(|(_, target_artist_id)| target_artist_id),
+                    &move_row.new_path,
+                    &file_name,
+                    file_size,
+                    file_mtime,
+                    &folder_name,
+                    &detected_raw,
+                    &date,
+                    is_archive,
+                    &media,
+                    &content_hash,
+                    hash_status,
+                    candidate.st_dev,
+                    candidate.st_ino,
+                    move_row.item_id,
+                ],
+            )
+            .context("update confirmed move item")?;
+        if updated != 1 {
+            // The disk-side target was validated, but the durable item row did
+            // not update exactly once. Roll the whole apply back instead of
+            // reporting success with zero rows written.
+            anyhow::bail!("target item row did not update exactly once");
+        }
         conn.execute(
             "
             INSERT INTO move_history
@@ -1874,7 +1973,11 @@ fn apply_move_candidate_response_inner_with_roots(
         Err(error) if error.to_string() == "candidate_stale" => {
             rollback(conn);
             supersede_candidate(conn, roots, &candidate)?;
-            Ok(json!({"action": "no_match"}))
+            Ok(json!({
+                "action": "no_match",
+                "reason": "candidate_stale",
+                "scan_candidate_id": candidate.id
+            }))
         }
         Err(error) => {
             rollback(conn);
@@ -1883,6 +1986,13 @@ fn apply_move_candidate_response_inner_with_roots(
     }
 }
 
+/// Move the selected source item's tags onto the target item (reused by
+/// target-artist tag name). The target itself moved across artists, so its
+/// old artist-owned tag rows are replaced by the target-artist rows.
+///
+/// Callers pass exactly the selected old record: competing candidates are
+/// unverified hypotheses rather than proven copies, so their tags, paths,
+/// dates and favourites are never merged into the survivor.
 fn move_item_tags_to_item(
     conn: &Connection,
     source_item_ids: &[i64],
@@ -1938,9 +2048,12 @@ fn move_item_tags_to_item(
         };
         target_tag_ids.push(tag_id);
     }
-    for item_id in source_item_ids {
-        conn.execute("DELETE FROM item_tags WHERE item_id=?1", params![item_id])?;
-    }
+    // Tags belong to an artist: the moved item must not keep its previous
+    // artist's tag rows. Sibling sources are untouched.
+    conn.execute(
+        "DELETE FROM item_tags WHERE item_id=?1",
+        params![target_item_id],
+    )?;
     for tag_id in target_tag_ids {
         conn.execute(
             "INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
@@ -2011,3 +2124,287 @@ pub fn mark_move_candidate_new_response(
     }
     Ok(created)
 }
+
+/// Resolve a cross-artist cluster where several missing old records all claim
+/// the same new file. Rewriting one of them would silently pick an identity
+/// and hand the new file that record's history, so the new file gets its own
+/// record instead and inherits the union of every source's tags. Sources that
+/// disagree on tags (or that also wait on another target) are not blocked:
+/// this path rewrites nothing, all sources share the candidate's content
+/// hash, and an extra tag on the new record is reversible by editing it,
+/// while leaving the cluster pending would demand a human decision for every
+/// such cluster.
+pub fn resolve_ambiguous_cluster_as_new_response(
+    conn: &Connection,
+    roots: &MediaRoots,
+    move_candidate_id: i64,
+) -> Result<Value> {
+    let scan_candidate_id: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT scan_candidate_id FROM move_candidates
+             WHERE id = ?1 AND status = 'pending' AND reason = 'manual_needed'",
+            params![move_candidate_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .context("fetch move candidate for ambiguous cluster")?;
+    let Some(scan_candidate_id) = scan_candidate_id.flatten().filter(|id| *id > 0) else {
+        return Ok(json!({"action": "no_match"}));
+    };
+    let candidate = conn
+        .query_row(
+            "SELECT artist_id, file_path, status, content_hash
+             FROM scan_candidates WHERE id = ?1",
+            params![scan_candidate_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .context("fetch ambiguous-cluster scan candidate")?;
+    let Some((candidate_artist_id, candidate_path, candidate_status, candidate_hash)) = candidate
+    else {
+        return Ok(json!({"action": "no_match"}));
+    };
+    if !matches!(candidate_status.as_str(), "pending" | "candidate") || candidate_hash.is_empty() {
+        return Ok(json!({"action": "no_match"}));
+    }
+    let rows: Vec<(i64, i64, i64, String, String, i64, String)> = conn
+        .prepare(
+            "SELECT mc.item_id, mc.artist_id, i.artist_id, mc.reason, mc.new_path,
+                    i.missing, i.content_hash
+             FROM move_candidates mc
+             JOIN items i ON i.id = mc.item_id
+             WHERE mc.status = 'pending' AND mc.scan_candidate_id = ?1
+             ORDER BY mc.id",
+        )?
+        .query_map(params![scan_candidate_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if rows.len() < 2 {
+        return Ok(json!({"action": "no_match"}));
+    }
+    let old_artist_id = rows[0].2;
+    if old_artist_id == candidate_artist_id
+        || rows.iter().any(
+            |(item_id, row_candidate_artist, row_item_artist, reason, new_path, missing, hash)| {
+                *item_id <= 0
+                    || *row_candidate_artist != candidate_artist_id
+                    || *row_item_artist != old_artist_id
+                    || reason != "manual_needed"
+                    || new_path != &candidate_path
+                    || *missing != 1
+                    || hash != &candidate_hash
+            },
+        )
+    {
+        return Ok(json!({"action": "no_match"}));
+    }
+    let mut sources: Vec<i64> = rows.iter().map(|row| row.0).collect();
+    sources.sort_unstable();
+    sources.dedup();
+    if sources.len() < 2 {
+        // Repeated rows for one old record are duplicate evidence for a single
+        // identity, not a dispute; the normal group apply owns that case.
+        return Ok(json!({"action": "no_match"}));
+    }
+    let active_copies: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM items
+             WHERE missing = 0 AND content_hash <> '' AND content_hash = ?1",
+            params![&candidate_hash],
+            |row| row.get(0),
+        )
+        .context("count live copies for ambiguous cluster")?;
+    if active_copies > 0 {
+        return Ok(json!({"action": "no_match"}));
+    }
+    // Sources that also wait on a *different* new file are deliberately not
+    // blocked here: every pending target of a source shares its content hash,
+    // so the tags follow the content and every same-content copy may carry
+    // them. Unlike the single-record identity gate above (which rewrites an
+    // old record and must stay strict), this path only creates a new record
+    // and copies tags, so a wrong extra tag is reversible by editing the new
+    // record, while blocking would leave the cluster for a human.
+    create_new_item_response_with_tags(conn, roots, scan_candidate_id, &sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate_with(path: &str, artist: &str, date: &str) -> MoveTargetCandidate {
+        MoveTargetCandidate {
+            id: 1,
+            artist_id: 1,
+            artist_path: artist.to_string(),
+            file_path: path.to_string(),
+            file_name: String::new(),
+            file_size: 0,
+            file_mtime: 0.0,
+            folder_name: String::new(),
+            date: date.to_string(),
+            is_archive: 0,
+            media_type: String::new(),
+            content_hash: String::new(),
+            hash_status: String::new(),
+            st_dev: None,
+            st_ino: None,
+        }
+    }
+
+    #[test]
+    fn candidate_detected_raw_preserves_folder_precision() {
+        let c = candidate_with(
+            "/pictures/artist/2026/202607 works/pic.jpg",
+            "/pictures/artist",
+            "2026-07-01",
+        );
+        assert_eq!(candidate_detected_raw(&c), "2026-07");
+
+        let c = candidate_with(
+            "/pictures/artist/2026-05-01_title/pic.jpg",
+            "/pictures/artist",
+            "2026-05-01",
+        );
+        assert_eq!(candidate_detected_raw(&c), "2026-05-01");
+
+        let c = candidate_with(
+            "/pictures/artist/202508/01_1536_title/pic.jpg",
+            "/pictures/artist",
+            "2025-08-01",
+        );
+        assert_eq!(candidate_detected_raw(&c), "2025-08-01");
+
+        let c = candidate_with(
+            "/pictures/artist/plain/pic.jpg",
+            "/pictures/artist",
+            "2026-08-15",
+        );
+        assert_eq!(
+            candidate_detected_raw(&c),
+            "2026-08-15",
+            "unparseable folder falls back to the candidate canonical date"
+        );
+
+        let c = candidate_with("/pictures/artist/pic.jpg", "/pictures/artist", "");
+        assert_eq!(candidate_detected_raw(&c), "");
+    }
+
+    #[test]
+    fn candidate_content_check_detects_same_stat_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jpg");
+        std::fs::write(&path, b"AAAAAAAAAAAAAAAA").unwrap();
+        let old_digest = hash_file(&path, 1024 * 1024).unwrap();
+        let mut candidate = candidate_with(&path.to_string_lossy(), "/pictures/artist", "");
+        candidate.hash_status = "done".into();
+        candidate.content_hash = old_digest;
+        assert!(candidate_content_is_current(None, &candidate));
+
+        // Same-size in-place replacement inside the same wall-clock second
+        // keeps size/mtime/inode identical while the bytes differ, so the
+        // stat-only check passes; the content check must catch it.
+        std::fs::write(&path, b"BBBBBBBBBBBBBBBB").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 16);
+        assert!(
+            !candidate_content_is_current(None, &candidate),
+            "a digest must not be committed for replaced bytes"
+        );
+    }
+
+    #[test]
+    fn create_new_item_fails_closed_when_content_no_longer_matches() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE items (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               artist_id INTEGER, file_path TEXT UNIQUE, file_name TEXT,
+               file_size INTEGER DEFAULT 0, file_mtime REAL DEFAULT 0,
+               folder_name TEXT DEFAULT '', date TEXT DEFAULT '',
+               detected_date TEXT DEFAULT '', auto_role TEXT DEFAULT '',
+               tags TEXT DEFAULT '[]', is_archive INTEGER DEFAULT 0,
+               media_type TEXT DEFAULT 'image', content_hash TEXT DEFAULT '',
+               hash_status TEXT DEFAULT 'pending', hash_updated_at REAL,
+               st_dev INTEGER, st_ino INTEGER, missing INTEGER DEFAULT 0,
+               missing_at REAL, scanned_at INTEGER,
+               width INTEGER DEFAULT 0, height INTEGER DEFAULT 0
+             );
+             CREATE TABLE scan_candidates (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id TEXT DEFAULT '',
+               artist_id INTEGER, file_path TEXT, file_name TEXT,
+               file_size INTEGER DEFAULT 0, file_mtime REAL DEFAULT 0,
+               folder_name TEXT DEFAULT '', date TEXT DEFAULT '',
+               is_archive INTEGER DEFAULT 0, media_type TEXT DEFAULT 'image',
+               content_hash TEXT DEFAULT '', hash_status TEXT DEFAULT 'pending',
+               status TEXT DEFAULT 'pending', resolved_at REAL,
+               st_dev INTEGER, st_ino INTEGER
+             );
+             CREATE TABLE move_candidates (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, scan_candidate_id INTEGER,
+               item_id INTEGER, artist_id INTEGER, old_path TEXT, new_path TEXT,
+               reason TEXT, content_hash TEXT, st_dev INTEGER, st_ino INTEGER,
+               status TEXT DEFAULT 'pending', resolved_at REAL
+             );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO artists (id, path) VALUES (1, '/pictures/artist')", [])
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jpg");
+        std::fs::write(&path, b"AAAAAAAAAAAAAAAA").unwrap();
+        let stale_digest = hash_file(&path, 1024 * 1024).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let file_mtime = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        conn.execute(
+            "INSERT INTO scan_candidates
+             (scan_id, artist_id, file_path, file_name, file_size, file_mtime,
+              folder_name, date, is_archive, media_type, content_hash, hash_status, status)
+             VALUES ('s1', 1, ?, 'a.jpg', 16, ?, '', '', 0, 'image', ?, 'done', 'pending')",
+            rusqlite::params![path.to_string_lossy(), file_mtime, stale_digest],
+        )
+        .unwrap();
+        let candidate_id: i64 = conn.last_insert_rowid();
+        // Replace the bytes after the candidate row was recorded; the hash no
+        // longer describes the file, so the promotion must not commit it.
+        std::fs::write(&path, b"BBBBBBBBBBBBBBBB").unwrap();
+
+        let result = create_new_item_response(&conn, candidate_id).unwrap();
+        assert_eq!(result["action"], "no_match", "{result}");
+        let items: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(items, 0, "no item may be created from replaced content");
+        let (status, hash_status, content_hash): (String, String, String) = conn
+            .query_row(
+                "SELECT status, hash_status, content_hash FROM scan_candidates WHERE id=?",
+                [candidate_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "superseded");
+        assert_eq!(hash_status, "pending", "stale hash must be requeued, not stored");
+        assert_eq!(content_hash, "");
+    }
+}
+

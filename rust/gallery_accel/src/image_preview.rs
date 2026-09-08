@@ -124,15 +124,62 @@ fn write_preview_cache(cache_path: &Path, body: &[u8]) {
     if let Some(root) = preview_cache_root() {
         maybe_cleanup_preview_cache(&root, body.len() as u64);
     }
-    if let Some(parent) = cache_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    write_exclusive_jpeg_cache(cache_path, body);
+}
+
+/// Sequence number for unique `.part` temp names: two concurrent writers of
+/// the same cache key must never share one temp file, or an interleaved write
+/// publishes a corrupt JPEG the content-addressed cache would serve forever.
+static PART_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Minimal structural JPEG check (SOI ... EOI) before publishing a cached
+/// image.
+fn looks_like_jpeg(body: &[u8]) -> bool {
+    body.len() >= 4 && body.starts_with(&[0xFF, 0xD8]) && body.ends_with(&[0xFF, 0xD9])
+}
+
+/// Exclusively write `body` to `cache_path` through a per-writer temp file and
+/// publish it with an atomic rename. Temp files are cleaned up on any failure;
+/// the destination is only ever a structurally valid JPEG.
+pub(crate) fn write_exclusive_jpeg_cache(cache_path: &Path, body: &[u8]) -> bool {
+    let Some(parent) = cache_path.parent() else {
+        return false;
+    };
+    let _ = std::fs::create_dir_all(parent);
+    let file_name = cache_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if file_name.is_empty() {
+        return false;
     }
-    let part = cache_path.with_extension("jpg.part");
-    if std::fs::write(&part, body).is_ok() {
-        let _ = std::fs::rename(&part, cache_path);
-    } else {
+    let part = parent.join(format!(
+        "{file_name}.part-{}-{}",
+        std::process::id(),
+        PART_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let published =
+        std::fs::write(&part, body).is_ok() && looks_like_jpeg(body) && {
+            #[cfg(windows)]
+            {
+                // A concurrent reader holding the destination open makes
+                // rename fail on Windows; drop the stale destination once.
+                if std::fs::rename(&part, cache_path).is_err() {
+                    let _ = std::fs::remove_file(cache_path);
+                    std::fs::rename(&part, cache_path).is_ok()
+                } else {
+                    true
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                std::fs::rename(&part, cache_path).is_ok()
+            }
+        };
+    if !published {
         let _ = std::fs::remove_file(&part);
     }
+    published
 }
 
 /// Clamp the requested preview edge to the allowed range, mirroring
@@ -387,84 +434,6 @@ pub fn image_preview_response(path: &str, max_edge: u32) -> Result<Value> {
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use image::GenericImageView;
-
-    #[test]
-    fn preview_renders_valid_jpeg_within_bounds() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("in.png");
-        let img = DynamicImage::new_rgba8(800, 600);
-        img.save(&src).unwrap();
-
-        let bytes = image_preview_bytes(src.to_str().unwrap(), 256).unwrap();
-        assert!(bytes.len() > 0);
-        let decoded = image::load_from_memory(&bytes).unwrap();
-        let (w, h) = decoded.dimensions();
-        assert!(w <= 256 && h <= 256);
-        assert_eq!(w, 256);
-    }
-
-    #[test]
-    fn clamp_max_edge_respects_limits() {
-        assert_eq!(clamp_max_edge(None), 512);
-        assert_eq!(clamp_max_edge(Some(10)), 64);
-        assert_eq!(clamp_max_edge(Some(9999)), 2048);
-        assert_eq!(clamp_max_edge(Some(200)), 200);
-    }
-
-    #[test]
-    fn truncated_jpeg_exif_app1_is_ignored_without_panicking() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("truncated.jpg");
-        std::fs::write(&src, [0xff, 0xd8, 0xff, 0xe1, 0x00, 0x08, b'E', b'x']).unwrap();
-
-        assert_eq!(read_jpeg_exif_orientation(&src), None);
-    }
-
-    #[test]
-    fn source_pixel_limit_defaults_to_pillow_warning_threshold() {
-        std::env::remove_var("IMAGE_PREVIEW_MAX_SOURCE_PIXELS");
-        assert_eq!(max_source_pixels(), 89_478_485);
-    }
-
-    #[test]
-    fn preview_cache_key_matches_python_layout() {
-        // Payload format must match Python json.dumps(sort_keys=True).
-        let path_json = serde_json::to_string("/a/b.jpg").unwrap();
-        let payload = format!(
-            "{{\"format\": \"jpeg\", \"max_edge\": 512, \"mtime_ns\": 123, \"path\": {}, \"quality\": 72, \"size\": 456, \"version\": 1}}",
-            path_json
-        );
-        let mut hasher = Sha256::new();
-        hasher.update(payload.as_bytes());
-        let key = format!("{:x}", hasher.finalize());
-        assert_eq!(
-            key,
-            "84e369b64b5217f0186b24c1d0e7b6cf2a272b46efe68796f90f19658d27ed81"
-        );
-    }
-
-    #[test]
-    fn preview_cache_cleanup_evicts_oldest_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache_dir = dir.path().join("aa").join("bb");
-        std::fs::create_dir_all(&cache_dir).unwrap();
-        let old = cache_dir.join("old.jpg");
-        let new = cache_dir.join("new.jpg");
-        std::fs::write(&old, b"12345678").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&new, b"abcdefgh").unwrap();
-
-        let removed = cleanup_preview_cache(dir.path(), 12, 0).unwrap();
-        assert_eq!(removed, 1);
-        assert!(!old.exists());
-        assert!(new.exists());
-    }
-}
-
 fn maybe_cleanup_preview_cache(root: &Path, reserve_bytes: u64) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -542,4 +511,82 @@ fn cleanup_preview_cache(
         }
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::GenericImageView;
+
+    #[test]
+    fn preview_renders_valid_jpeg_within_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.png");
+        let img = DynamicImage::new_rgba8(800, 600);
+        img.save(&src).unwrap();
+
+        let bytes = image_preview_bytes(src.to_str().unwrap(), 256).unwrap();
+        assert!(!bytes.is_empty());
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        let (w, h) = decoded.dimensions();
+        assert!(w <= 256 && h <= 256);
+        assert_eq!(w, 256);
+    }
+
+    #[test]
+    fn clamp_max_edge_respects_limits() {
+        assert_eq!(clamp_max_edge(None), 512);
+        assert_eq!(clamp_max_edge(Some(10)), 64);
+        assert_eq!(clamp_max_edge(Some(9999)), 2048);
+        assert_eq!(clamp_max_edge(Some(200)), 200);
+    }
+
+    #[test]
+    fn truncated_jpeg_exif_app1_is_ignored_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("truncated.jpg");
+        std::fs::write(&src, [0xff, 0xd8, 0xff, 0xe1, 0x00, 0x08, b'E', b'x']).unwrap();
+
+        assert_eq!(read_jpeg_exif_orientation(&src), None);
+    }
+
+    #[test]
+    fn source_pixel_limit_defaults_to_pillow_warning_threshold() {
+        std::env::remove_var("IMAGE_PREVIEW_MAX_SOURCE_PIXELS");
+        assert_eq!(max_source_pixels(), 89_478_485);
+    }
+
+    #[test]
+    fn preview_cache_key_matches_python_layout() {
+        // Payload format must match Python json.dumps(sort_keys=True).
+        let path_json = serde_json::to_string("/a/b.jpg").unwrap();
+        let payload = format!(
+            "{{\"format\": \"jpeg\", \"max_edge\": 512, \"mtime_ns\": 123, \"path\": {}, \"quality\": 72, \"size\": 456, \"version\": 1}}",
+            path_json
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(payload.as_bytes());
+        let key = format!("{:x}", hasher.finalize());
+        assert_eq!(
+            key,
+            "84e369b64b5217f0186b24c1d0e7b6cf2a272b46efe68796f90f19658d27ed81"
+        );
+    }
+
+    #[test]
+    fn preview_cache_cleanup_evicts_oldest_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("aa").join("bb");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let old = cache_dir.join("old.jpg");
+        let new = cache_dir.join("new.jpg");
+        std::fs::write(&old, b"12345678").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&new, b"abcdefgh").unwrap();
+
+        let removed = cleanup_preview_cache(dir.path(), 12, 0).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!old.exists());
+        assert!(new.exists());
+    }
 }

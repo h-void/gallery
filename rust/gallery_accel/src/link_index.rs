@@ -36,6 +36,9 @@ struct SourceItem {
 
 #[derive(Clone, Debug)]
 struct ExistingDocument {
+    file_path: String,
+    file_name: String,
+    folder_name: String,
     file_size: i64,
     file_mtime: f64,
     parse_status: String,
@@ -166,6 +169,7 @@ pub fn reindex_scanned_artist_links(
     roots: &MediaRoots,
     artist_ids: &[i64],
 ) -> Result<Value> {
+    ensure_link_schema(conn)?;
     let ids: BTreeSet<i64> = artist_ids.iter().copied().filter(|id| *id > 0).collect();
     let mut indexed_documents = 0i64;
     let mut skipped_documents = 0i64;
@@ -174,7 +178,7 @@ pub fn reindex_scanned_artist_links(
     let mut artist_errors = Vec::new();
 
     for artist_id in ids {
-        match reindex_artist_links(conn, roots, artist_id) {
+        match reindex_artist_links_inner(conn, roots, artist_id) {
             Ok(result) => {
                 indexed_documents += result["indexed_documents"].as_i64().unwrap_or(0);
                 skipped_documents += result["skipped_documents"].as_i64().unwrap_or(0);
@@ -205,8 +209,15 @@ pub fn reindex_artist_links(
     artist_id: i64,
 ) -> Result<Value> {
     ensure_link_schema(conn)?;
+    reindex_artist_links_inner(conn, roots, artist_id)
+}
+
+fn reindex_artist_links_inner(
+    conn: &Connection,
+    roots: &MediaRoots,
+    artist_id: i64,
+) -> Result<Value> {
     let items = list_source_items(conn, artist_id)?;
-    let active_item_ids: BTreeSet<i64> = items.iter().map(|item| item.id).collect();
     let mut indexed_documents = 0i64;
     let mut skipped_documents = 0i64;
     let mut links = 0i64;
@@ -247,18 +258,21 @@ pub fn reindex_artist_links(
             .map(|duration| duration.as_secs_f64())
             .unwrap_or(0.0);
         let existing = existing_document(conn, item.id)?;
-        if existing
-            .as_ref()
-            .map(|document| {
-                document.file_size == item.file_size
-                    && document.file_mtime == item.file_mtime
-                    && document.parse_status == "ready"
-            })
-            .unwrap_or(false)
-        {
-            update_document_metadata(conn, &item)?;
-            skipped_documents += 1;
-            continue;
+        if let Some(ref document) = existing {
+            let mtime_matches = (document.file_mtime - item.file_mtime).abs() <= 0.0001;
+            if document.file_size == item.file_size
+                && mtime_matches
+                && document.parse_status == "ready"
+            {
+                let metadata_changed = document.file_path != item.file_path
+                    || document.file_name != item.file_name
+                    || document.folder_name != item.folder_name;
+                if metadata_changed {
+                    update_document_metadata(conn, &item)?;
+                }
+                skipped_documents += 1;
+                continue;
+            }
         }
         let bytes = match read_source_file(&real_path) {
             Ok(bytes) => bytes,
@@ -283,7 +297,7 @@ pub fn reindex_artist_links(
         links += extracted.len() as i64;
     }
 
-    prune_stale_documents(conn, artist_id, &active_item_ids)?;
+    prune_stale_documents(conn, artist_id)?;
     Ok(json!({
         "ok": true,
         "artist_id": artist_id,
@@ -367,8 +381,9 @@ pub fn artist_links_response(conn: &Connection, artist_id: i64) -> Result<Value>
 
     let mut cloud_drives = 0usize;
     let mut links = Vec::with_capacity(groups.len());
+    let domain_rules = load_domain_rules(conn)?;
     for (url, group) in groups {
-        let classification = classify_host(conn, &group.host)?;
+        let classification = classify_host_with_rules(&group.host, &domain_rules);
         if classification.category == "cloud_drive" {
             cloud_drives += 1;
         }
@@ -471,13 +486,16 @@ fn list_source_items(conn: &Connection, artist_id: i64) -> Result<Vec<SourceItem
 
 fn existing_document(conn: &Connection, item_id: i64) -> Result<Option<ExistingDocument>> {
     conn.query_row(
-        "SELECT file_size, file_mtime, parse_status FROM artist_link_documents WHERE item_id=?",
+        "SELECT file_path, file_name, folder_name, file_size, file_mtime, parse_status FROM artist_link_documents WHERE item_id=?",
         params![item_id],
         |row| {
             Ok(ExistingDocument {
-                file_size: row.get(0)?,
-                file_mtime: row.get(1)?,
-                parse_status: row.get(2)?,
+                file_path: row.get(0)?,
+                file_name: row.get(1)?,
+                folder_name: row.get(2)?,
+                file_size: row.get(3)?,
+                file_mtime: row.get(4)?,
+                parse_status: row.get(5)?,
             })
         },
     )
@@ -597,26 +615,18 @@ fn replace_document_links(
     Ok(())
 }
 
-fn prune_stale_documents(
-    conn: &Connection,
-    artist_id: i64,
-    active_item_ids: &BTreeSet<i64>,
-) -> Result<()> {
-    let mut stmt =
-        conn.prepare("SELECT id, item_id FROM artist_link_documents WHERE artist_id=?")?;
-    let rows = stmt
-        .query_map(params![artist_id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (document_id, item_id) in rows {
-        if !active_item_ids.contains(&item_id) {
-            conn.execute(
-                "DELETE FROM artist_link_documents WHERE id=?",
-                params![document_id],
-            )?;
-        }
-    }
+/// Drop link documents whose item row is permanently gone (deleted outright,
+/// or replaced by a different item row). Documents survive a temporary
+/// `missing=1` mark so a mount blip cannot CASCADE-clear the artist's whole
+/// link index; the file is re-parsed only when its metadata changed after it
+/// returns.
+fn prune_stale_documents(conn: &Connection, artist_id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM artist_link_documents
+         WHERE artist_id=?
+           AND NOT EXISTS (SELECT 1 FROM items WHERE items.id=artist_link_documents.item_id)",
+        params![artist_id],
+    )?;
     Ok(())
 }
 
@@ -722,9 +732,33 @@ fn html_declared_encoding(bytes: &[u8]) -> Option<&'static Encoding> {
         .and_then(|capture| Encoding::for_label(capture.as_str().as_bytes()))
 }
 
+/// Line numbers for one document text, computed in a single pass. Per-link
+/// rescans from byte 0 are quadratic on large source lists.
+struct LineIndex {
+    newlines: Vec<usize>,
+}
+
+impl LineIndex {
+    fn new(text: &str) -> Self {
+        Self {
+            newlines: text
+                .bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte == b'\n')
+                .map(|(index, _)| index)
+                .collect(),
+        }
+    }
+
+    fn line_at(&self, byte_index: usize) -> i64 {
+        self.newlines.partition_point(|&position| position < byte_index) as i64 + 1
+    }
+}
+
 fn extract_text_links(text: &str) -> Vec<ExtractedLink> {
     static URL: OnceLock<Regex> = OnceLock::new();
     let pattern = URL.get_or_init(|| Regex::new(r#"(?i)\bhttps?://[^\s<>\"'`]+"#).unwrap());
+    let lines = LineIndex::new(text);
     let mut links = Vec::new();
     for matched in pattern.find_iter(text) {
         let raw = trim_url_punctuation(matched.as_str());
@@ -735,7 +769,7 @@ fn extract_text_links(text: &str) -> Vec<ExtractedLink> {
         if let Some(link) = normalize_link(
             raw,
             String::new(),
-            line_number_at(text, matched.start()),
+            lines.line_at(matched.start()),
             context,
         ) {
             links.push(link);
@@ -745,6 +779,7 @@ fn extract_text_links(text: &str) -> Vec<ExtractedLink> {
 }
 
 fn extract_html_links(text: &str) -> Vec<ExtractedLink> {
+    let lines = LineIndex::new(text);
     let mut links = Vec::new();
     let mut cursor = 0usize;
     while let Some(relative) = find_ascii_case_insensitive(&text[cursor..], "<a") {
@@ -781,7 +816,7 @@ fn extract_html_links(text: &str) -> Vec<ExtractedLink> {
                 tag_end + 1
             };
             let context = compact_text(&context_at(text, start, context_end), MAX_CONTEXT_CHARS);
-            if let Some(link) = normalize_link(&href, label, line_number_at(text, start), context) {
+            if let Some(link) = normalize_link(&href, label, lines.line_at(start), context) {
                 links.push(link);
             }
         }
@@ -895,14 +930,6 @@ fn trim_url_punctuation(value: &str) -> &str {
         trimmed = &trimmed[..trimmed.len() - last.len_utf8()];
     }
     trimmed
-}
-
-fn line_number_at(text: &str, byte_index: usize) -> i64 {
-    text[..byte_index]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count() as i64
-        + 1
 }
 
 fn context_at(text: &str, start: usize, end: usize) -> String {
@@ -1124,30 +1151,38 @@ fn decode_html_entities(value: &str) -> String {
     output
 }
 
-fn classify_host(conn: &Connection, host: &str) -> Result<LinkClassification> {
-    let rule = conn
-        .query_row(
-            "SELECT category, provider_name FROM artist_link_domain_rules
-             WHERE ? = domain OR ? LIKE '%.' || domain
-             ORDER BY length(domain) DESC LIMIT 1",
-            params![host, host],
-            |row| {
-                Ok(LinkClassification {
-                    category: row.get(0)?,
-                    provider_name: row.get(1)?,
-                })
-            },
-        )
-        .optional()?;
-    if let Some(rule) = rule {
-        return Ok(LinkClassification {
-            category: rule.category,
-            provider_name: if rule.provider_name.is_empty() {
+/// Load custom domain rules once per response instead of one query per URL.
+fn load_domain_rules(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn
+        .prepare("SELECT domain, category, provider_name FROM artist_link_domain_rules")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn classify_host_with_rules(host: &str, rules: &[(String, String, String)]) -> LinkClassification {
+    // Longest matching domain wins, mirroring the previous
+    // `ORDER BY length(domain) DESC LIMIT 1` SQL.
+    let matched = rules
+        .iter()
+        .filter(|(domain, _, _)| host == domain || host.ends_with(&format!(".{domain}")))
+        .max_by_key(|(domain, _, _)| domain.len());
+    if let Some((_, category, provider_name)) = matched {
+        return LinkClassification {
+            category: category.clone(),
+            provider_name: if provider_name.is_empty() {
                 host.to_string()
             } else {
-                rule.provider_name
+                provider_name.clone()
             },
-        });
+        };
     }
 
     const CLOUD_DRIVES: &[(&str, &str)] = &[
@@ -1184,16 +1219,16 @@ fn classify_host(conn: &Connection, host: &str) -> Result<LinkClassification> {
     ];
     for (domain, provider_name) in CLOUD_DRIVES {
         if host == *domain || host.ends_with(&format!(".{domain}")) {
-            return Ok(LinkClassification {
+            return LinkClassification {
                 category: "cloud_drive".to_string(),
                 provider_name: (*provider_name).to_string(),
-            });
+            };
         }
     }
-    Ok(LinkClassification {
+    LinkClassification {
         category: "other".to_string(),
         provider_name: host.to_string(),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1295,6 +1330,183 @@ mod tests {
     }
 
     #[test]
+    fn reindex_unchanged_documents_skips_metadata_updates() {
+        let dir = tempdir().unwrap();
+        let text_path = dir.path().join("links.txt");
+        fs::write(&text_path, "https://pan.quark.cn/s/demo").unwrap();
+        let conn = fixture_conn();
+        let metadata = fs::metadata(&text_path).unwrap();
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, file_size, file_mtime, folder_name, missing, media_type)
+             VALUES (1, 1, ?, 'links.txt', ?, 1.0, '', 0, 'text')",
+            params![text_path.to_string_lossy(), metadata.len() as i64],
+        )
+        .unwrap();
+        let roots = MediaRoots::identical(vec![dir.path().to_string_lossy().to_string()], vec!["library".into()]);
+        let first = reindex_artist_links(&conn, &roots, 1).unwrap();
+        assert_eq!(first["indexed_documents"], 1);
+
+        // Attach a trigger to detect any UPDATE on artist_link_documents
+        conn.execute(
+            "CREATE TRIGGER assert_no_update_on_clean_docs BEFORE UPDATE ON artist_link_documents
+             BEGIN
+                 SELECT RAISE(FAIL, 'redundant update on clean document');
+             END;",
+            [],
+        )
+        .unwrap();
+
+        // Second reindex on unchanged files: should not trigger the UPDATE
+        let second = reindex_artist_links(&conn, &roots, 1).unwrap();
+        assert_eq!(second["indexed_documents"], 0);
+        assert_eq!(second["skipped_documents"], 1);
+    }
+
+    #[test]
+    fn mtime_change_reindexes_same_length_link_document() {
+        let dir = tempdir().unwrap();
+        let text_path = dir.path().join("links.txt");
+        fs::write(&text_path, "https://example.com/aaaa").unwrap();
+        let conn = fixture_conn();
+        let roots = MediaRoots::identical(vec![dir.path().to_string_lossy().to_string()], vec!["library".into()]);
+
+        // Fix initial mtime
+        let base_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let f = std::fs::OpenOptions::new().write(true).open(&text_path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(base_time)).unwrap();
+        drop(f);
+        let meta = fs::metadata(&text_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, file_size, file_mtime, folder_name, missing, media_type)
+             VALUES (1, 1, ?, 'links.txt', ?, ?, '', 0, 'text')",
+            params![
+                text_path.to_string_lossy(),
+                meta.len() as i64,
+                meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64(),
+            ],
+        ).unwrap();
+
+        let res1 = reindex_artist_links(&conn, &roots, 1).unwrap();
+        assert_eq!(res1["indexed_documents"], 1);
+        let links1 = artist_links_response(&conn, 1).unwrap();
+        assert_eq!(links1["links"][0]["url"], "https://example.com/aaaa");
+
+        // Scenario 1: Same length + 500ms
+        let time_plus_500ms = base_time + std::time::Duration::from_millis(500);
+        fs::write(&text_path, "https://example.com/bbbb").unwrap(); // same byte length (24 bytes)
+        let f = std::fs::OpenOptions::new().write(true).open(&text_path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(time_plus_500ms)).unwrap();
+        drop(f);
+
+        let res2 = reindex_artist_links(&conn, &roots, 1).unwrap();
+        assert_eq!(res2["indexed_documents"], 1, "must reindex when mtime advanced by 500ms");
+        let links2 = artist_links_response(&conn, 1).unwrap();
+        assert_eq!(links2["links"][0]["url"], "https://example.com/bbbb");
+
+        // Scenario 2: Same length + 1000ms
+        let time_plus_1500ms = time_plus_500ms + std::time::Duration::from_millis(1000);
+        fs::write(&text_path, "https://example.com/cccc").unwrap(); // same length
+        let f = std::fs::OpenOptions::new().write(true).open(&text_path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(time_plus_1500ms)).unwrap();
+        drop(f);
+
+        let res3 = reindex_artist_links(&conn, &roots, 1).unwrap();
+        assert_eq!(res3["indexed_documents"], 1, "must reindex when mtime advanced by 1s");
+        let links3 = artist_links_response(&conn, 1).unwrap();
+        assert_eq!(links3["links"][0]["url"], "https://example.com/cccc");
+
+        // Scenario 3 & 4: Completely unchanged (no edits)
+        conn.execute(
+            "CREATE TRIGGER assert_no_update_on_clean_docs_g1 BEFORE UPDATE ON artist_link_documents
+             BEGIN
+                 SELECT RAISE(FAIL, 'redundant update on clean document');
+             END;",
+            [],
+        ).unwrap();
+
+        let res4 = reindex_artist_links(&conn, &roots, 1).unwrap();
+        assert_eq!(res4["indexed_documents"], 0);
+        assert_eq!(res4["skipped_documents"], 1);
+
+        // Third read returns current link
+        let links4 = artist_links_response(&conn, 1).unwrap();
+        assert_eq!(links4["links"][0]["url"], "https://example.com/cccc");
+
+        // Scenario 5: Path changed in items table but content and mtime unchanged -> updates metadata only
+        conn.execute("DROP TRIGGER assert_no_update_on_clean_docs_g1", []).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE test_doc_upd_counter (cnt INTEGER);
+             INSERT INTO test_doc_upd_counter VALUES (0);
+             CREATE TRIGGER count_doc_updates AFTER UPDATE ON artist_link_documents
+             BEGIN
+                 UPDATE test_doc_upd_counter SET cnt = cnt + 1;
+             END;"
+        ).unwrap();
+
+        conn.execute("UPDATE items SET folder_name='new_folder' WHERE id=1", []).unwrap();
+        let res5 = reindex_artist_links(&conn, &roots, 1).unwrap();
+        assert_eq!(res5["indexed_documents"], 0, "must not re-read or reindex document");
+        assert_eq!(res5["skipped_documents"], 1);
+        let upd_cnt: i64 = conn.query_row("SELECT cnt FROM test_doc_upd_counter", [], |r| r.get(0)).unwrap();
+        assert_eq!(upd_cnt, 1, "metadata update must be executed once for folder rename");
+
+        let doc_folder: String = conn.query_row("SELECT folder_name FROM artist_link_documents WHERE item_id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(doc_folder, "new_folder");
+    }
+
+    #[test]
+    fn temporarily_missing_documents_keep_their_links() {
+        let dir = tempdir().unwrap();
+        let text_path = dir.path().join("links.txt");
+        fs::write(&text_path, "https://pan.quark.cn/s/demo 访问码: Q123").unwrap();
+        let conn = fixture_conn();
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, file_size, file_mtime, folder_name, missing, media_type)
+             VALUES (1, 1, ?, 'links.txt', 100, 1, '', 0, 'text')",
+            params![text_path.to_string_lossy()],
+        )
+        .unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let roots = MediaRoots::identical(vec![root], vec!["library".into()]);
+
+        reindex_artist_links(&conn, &roots, 1).unwrap();
+        let links_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM artist_link_occurrences", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(links_before, 1);
+
+        // Mount blip: the item is soft-marked missing, then a reindex runs.
+        // The document and its occurrences must survive.
+        conn.execute("UPDATE items SET missing=1 WHERE id=1", []).unwrap();
+        let result = reindex_artist_links(&conn, &roots, 1).unwrap();
+        let links_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM artist_link_occurrences", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(result["indexed_documents"], 0);
+        assert_eq!(
+            links_after, links_before,
+            "temporary missing must not prune the link index"
+        );
+
+        // Permanent deletion of the item row prunes the document.
+        conn.execute("DELETE FROM items WHERE id=1", []).unwrap();
+        reindex_artist_links(&conn, &roots, 1).unwrap();
+        let docs_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artist_link_documents WHERE artist_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(docs_after, 0, "documents of deleted items must be pruned");
+    }
+
+    #[test]
     fn rejects_source_documents_outside_authorized_roots() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("library");
@@ -1339,6 +1551,7 @@ mod tests {
         assert_eq!(links[0].normalized_url, "https://example.test/a?x=1&y=2");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_link_occurrence(
         conn: &Connection,
         item_id: i64,

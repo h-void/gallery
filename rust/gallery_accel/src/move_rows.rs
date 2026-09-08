@@ -17,6 +17,11 @@ pub(crate) struct MoveRow {
     new_path: String,
     reason: String,
     content_hash: String,
+    /// The linked item's own content hash, so the UI can state whether both
+    /// sides actually agree instead of claiming "matched" from one side.
+    item_hash: String,
+    /// True only when both hashes are present and equal (P3 wording gate).
+    hash_match: bool,
     st_dev: Option<i64>,
     st_ino: Option<i64>,
     status: String,
@@ -82,6 +87,40 @@ fn batch_artist_lookup(
     Ok(map)
 }
 
+/// Batched `id -> integer column` lookup, mirroring `batch_artist_lookup`.
+/// Used for evidence the row needs to judge an action but must not expose as
+/// a new serialized field.
+fn batch_i64_lookup(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ids: &[i64],
+) -> Result<HashMap<i64, Option<i64>>> {
+    let mut map: HashMap<i64, Option<i64>> = HashMap::new();
+    let unique: BTreeSet<i64> = ids.iter().copied().collect();
+    let unique: Vec<i64> = unique.into_iter().collect();
+    for chunk in unique.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, {column} FROM {table} WHERE id IN ({placeholders})"
+        ))?;
+        let found: Vec<(i64, i64)> = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, value) in found {
+            map.insert(id, Some(value));
+        }
+    }
+    for id in unique {
+        map.entry(id).or_insert(None);
+    }
+    Ok(map)
+}
+
 fn attach_move_context_batch(
     conn: &Connection,
     roots: &MediaRoots,
@@ -94,6 +133,8 @@ fn attach_move_context_batch(
         .collect();
     let artist_by_item = batch_artist_lookup(conn, "items", &item_ids)?;
     let artist_by_scan_candidate = batch_artist_lookup(conn, "scan_candidates", &candidate_ids)?;
+    let hash_by_item = batch_text_lookup(conn, "items", "content_hash", &item_ids)?;
+    let missing_by_item = batch_i64_lookup(conn, "items", "missing", &item_ids)?;
     let store = ArtistContextStore::load(
         conn,
         rows.iter().flat_map(|row| {
@@ -116,10 +157,44 @@ fn attach_move_context_batch(
                 row,
                 &artist_by_item,
                 &artist_by_scan_candidate,
+                &hash_by_item,
+                &missing_by_item,
                 &store,
             )
         })
         .collect()
+}
+
+/// Batched `id -> text column` lookup, mirroring `batch_artist_lookup`.
+fn batch_text_lookup(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ids: &[i64],
+) -> Result<HashMap<i64, Option<String>>> {
+    let mut map: HashMap<i64, Option<String>> = HashMap::new();
+    let unique: BTreeSet<i64> = ids.iter().copied().collect();
+    let unique: Vec<i64> = unique.into_iter().collect();
+    for chunk in unique.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, {column} FROM {table} WHERE id IN ({placeholders})"
+        ))?;
+        let found: Vec<(i64, Option<String>)> = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, value) in found {
+            map.insert(id, value);
+        }
+    }
+    for id in unique {
+        map.entry(id).or_insert(None);
+    }
+    Ok(map)
 }
 
 fn assemble_move_row(
@@ -127,6 +202,8 @@ fn assemble_move_row(
     row: BasicMoveRow,
     artist_by_item: &HashMap<i64, Option<i64>>,
     artist_by_scan_candidate: &HashMap<i64, Option<i64>>,
+    hash_by_item: &HashMap<i64, Option<String>>,
+    missing_by_item: &HashMap<i64, Option<i64>>,
     store: &ArtistContextStore,
 ) -> Result<MoveRow> {
     let item_artist_id = row
@@ -138,6 +215,15 @@ fn assemble_move_row(
         .and_then(|id| artist_by_scan_candidate.get(&id).copied())
         .flatten()
         .or(Some(row.artist_id));
+    let item_hash = row
+        .item_id
+        .and_then(|id| hash_by_item.get(&id).cloned())
+        .flatten()
+        .unwrap_or_default();
+    let item_missing = row
+        .item_id
+        .and_then(|id| missing_by_item.get(&id).copied())
+        .flatten();
     let item_artist = store.get(item_artist_id);
     let candidate_artist = store.get(candidate_artist_id);
     Ok(build_move_row(
@@ -147,6 +233,8 @@ fn assemble_move_row(
         candidate_artist,
         item_artist_id,
         candidate_artist_id,
+        item_hash,
+        item_missing,
     ))
 }
 
@@ -157,6 +245,8 @@ fn build_move_row(
     candidate_artist: Option<&ArtistContext>,
     item_artist_id: Option<i64>,
     candidate_artist_id: Option<i64>,
+    item_hash: String,
+    item_missing: Option<i64>,
 ) -> MoveRow {
     let item_artist_name = item_artist
         .map(|artist| artist.name.clone())
@@ -170,6 +260,7 @@ fn build_move_row(
     let candidate_artist_path = candidate_artist
         .map(|artist| artist.path.clone())
         .unwrap_or_default();
+    let is_pending = row.status == "pending";
     let is_cross_artist = match (item_artist, candidate_artist) {
         (Some(item), Some(candidate)) => item.id != candidate.id,
         _ => false,
@@ -185,7 +276,11 @@ fn build_move_row(
         old_path: row.old_path.clone(),
         new_path: row.new_path.clone(),
         reason: row.reason,
-        content_hash: row.content_hash,
+        content_hash: row.content_hash.clone(),
+        item_hash: item_hash.clone(),
+        hash_match: !item_hash.is_empty()
+            && !row.content_hash.is_empty()
+            && item_hash == row.content_hash,
         st_dev: row.st_dev,
         st_ino: row.st_ino,
         status: row.status,
@@ -219,7 +314,16 @@ fn build_move_row(
         },
         is_cross_artist,
         same_artist_name,
-        can_confirm: row.item_id.is_some() && !is_cross_artist,
+        // Confirming repairs one old record's path, so the row must still be
+        // actionable: pending, linked to an existing record that is actually
+        // missing, and with both sides resolving to the same artist. An
+        // unknown artist is not evidence that the move is same-artist.
+        can_confirm: is_pending
+            && row.item_id.is_some()
+            && item_missing == Some(1)
+            && item_artist_id.is_some()
+            && candidate_artist_id.is_some()
+            && item_artist_id == candidate_artist_id,
     }
 }
 

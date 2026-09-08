@@ -1,0 +1,328 @@
+/* Layout skeleton: header, scan progress, sidebar, toolbar, grid frame.
+   Studio Folio: paper bands separated by crease rules; the folio's brand
+   binding line sits at the very top of the viewport (body::after in base.css).
+   Each adjacent region pair gets exactly one crease boundary so navigation,
+   tools, status and content read as distinct sheets. */
+
+/* ---- Header: 56px paper band, one crease rule underneath.
+   The h1 carries the studio seal mark (same motif as the favicon) in
+   vermilion over a display serif wordmark. */
+header{
+  display:flex;align-items:center;gap:12px;padding:10px 16px;
+  background:var(--bg-chrome);
+  border-bottom:1px solid var(--border-subtle);
+  z-index:100;flex-shrink:0;min-height:56px;
+}
+header h1{
+  display:inline-flex;align-items:center;gap:8px;
+  font-family:var(--font-display);
+  font-size:var(--fs-title);white-space:nowrap;font-weight:600;
+  color:var(--text-1);letter-spacing:.02em;
+}
+header h1::before{
+  content:'';width:16px;height:16px;flex:0 0 16px;
+  background-color:var(--vermilion);
+  -webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='24' cy='22' r='9' fill='%23000'/%3E%3Cpath d='M8 52l18-24 12 14 7-9 12 19z' fill='%23000'/%3E%3C/svg%3E") center/contain no-repeat;
+  mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='24' cy='22' r='9' fill='%23000'/%3E%3Cpath d='M8 52l18-24 12 14 7-9 12 19z' fill='%23000'/%3E%3C/svg%3E") center/contain no-repeat;
+}
+header button,header input{
+  box-sizing:border-box;
+  background:var(--bg-raised);color:var(--text-1);border:1px solid var(--border-subtle);
+  height:var(--control-height);min-height:var(--control-height);
+  border-radius:var(--radius);padding:0 var(--control-padding-x);
+  font-size:var(--header-control-font-size);line-height:1.2;cursor:pointer;
+}
+header button{display:inline-flex;align-items:center;justify-content:center;white-space:nowrap}
+header button:hover:not(:disabled){background:var(--bg-overlay);border-color:var(--vermilion)}
+header input:hover{border-color:var(--border-subtle)}
+header input{flex:1;max-width:240px;background:var(--bg-overlay);border-color:transparent}
+header input:focus{outline:none;border-color:transparent;box-shadow:var(--focus-ring)}
+.artist-picker{position:relative;flex:0 0 220px;min-width:180px;transition:flex-basis .16s ease}
+.artist-picker.open,.artist-picker:focus-within{flex-basis:320px}
+body.library-needs-artist .artist-picker input,
+body.library-empty-artists .artist-picker input{
+  border:1px solid var(--vermilion);
+}
+.artist-picker input{width:100%;max-width:none;cursor:text}
+header #scanBtn,header .scan-folder-btn,header #stopScanBtn{
+  height:var(--control-height);min-height:var(--control-height);
+  padding:0 var(--control-padding-x);font-size:var(--header-control-font-size);
+}
+@media(min-width:769px){
+  #scanBtn{margin-left:4px}
+}
+.search-control{
+  position:relative;display:flex;align-items:center;gap:4px;
+  flex:1 1 330px;max-width:430px;min-width:240px;
+}
+.search-control input{flex:1 1 auto;width:100%;max-width:none;min-width:0;cursor:text}
+.search-clear-btn{flex:0 0 auto}
+.search-options-btn{
+  flex:0 0 auto;min-width:58px;white-space:nowrap;
+}
+.search-control input,.search-control .search-options-btn{
+  font-family:inherit;font-size:var(--header-control-font-size);line-height:1.2;
+}
+.search-options-btn.active{background:var(--accent-soft);border-color:transparent;color:var(--vermilion-deep)}
+/* One crease rule splits the search group from the scan/maintenance actions.
+   It hangs off the search group so it survives #scanBtn hiding. */
+@media(min-width:1001px){
+  .search-control::after{
+    content:'';position:absolute;right:-6px;top:50%;transform:translateY(-50%);
+    width:1px;height:20px;background:var(--border-subtle);
+  }
+}
+
+/* Tablet: two-row header so 800px does not clip search/scan (phone drawer stays ≤768). */
+@media(min-width:769px) and (max-width:1000px){
+  header{
+    flex-wrap:wrap;align-items:center;row-gap:8px;column-gap:10px;
+    padding:8px 12px;min-height:0;
+  }
+  header h1{flex:0 0 auto}
+  .artist-picker{
+    flex:1 1 160px;min-width:140px;max-width:none;
+  }
+  .artist-picker.open,.artist-picker:focus-within{flex-basis:min(260px,42vw)}
+  .search-control{
+    flex:1 1 calc(100% - 200px);max-width:none;min-width:180px;
+  }
+  header #scanBtn,header .scan-folder-btn,header #stopScanBtn{
+    flex:0 0 auto;margin-left:0;
+  }
+}
+
+/* ---- Scan progress: full-width 3px bar, one status line, no box ---- */
+.scan-progress{
+  display:none;grid-template-columns:auto minmax(160px,1fr) minmax(160px,34vw);
+  align-items:center;gap:12px;padding:0 16px 8px;
+  background:var(--bg-chrome);
+  flex-shrink:0;font-size:var(--fs-small);
+}
+.scan-progress.visible{display:grid;animation:scan-fade-in var(--motion) ease-out}
+.scan-progress.hiding{opacity:0;transition:opacity var(--motion)}
+@keyframes scan-fade-in{from{opacity:0}to{opacity:1}}
+.scan-progress-meta{display:flex;align-items:center;gap:8px;white-space:nowrap;color:var(--text-2)}
+.scan-progress-meta span:first-child{color:var(--text-2);font-weight:600}
+.scan-progress-meta span:last-child{color:var(--text-3);font-variant-numeric:tabular-nums}
+.scan-progress-track{height:3px;background:rgba(31,26,20,.18);overflow:hidden}
+.scan-progress-track .fill{
+  height:100%;background:var(--accent);
+  will-change:width;
+  transition:width .3s;
+}
+.scan-progress-path{color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+
+/* ---- Sidebar: paper band; zones split by crease rules, no boxes ---- */
+main{display:flex;flex:1;overflow:hidden}
+.filter-backdrop{display:none}
+.filter-backdrop[hidden]{display:none}
+.sidebar{
+  width:var(--sidebar-width,260px);min-width:180px;max-width:min(520px,45vw);
+  background:var(--bg-chrome);
+  display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;
+}
+.sidebar-mobile-head{display:none}
+.sidebar-mobile-columns{display:none}
+.item-filter-section{
+  flex:0 0 auto;
+}
+.sidebar-section-body{display:flex;flex:1;flex-direction:column;min-height:0}
+.sidebar-section-body[hidden]{display:none !important}
+.sidebar-section.is-collapsed{flex:0 0 auto!important}
+.sidebar-section.is-collapsed>.sidebar-section-body{display:none}
+.item-filter-section .sidebar-header,.tag-section .sidebar-header,.folder-section .sidebar-header,.duplicate-section .sidebar-header{
+  height:var(--sidebar-row-height);min-height:var(--sidebar-row-height);
+  border-bottom:0;
+}
+/* R4: a stable crease rule between sidebar function groups. The rule belongs to
+   the group itself, not to the drag handle, so it survives collapsing either
+   list and never doubles the handle's own hover line. */
+.duplicate-section,
+.item-filter-section + .tag-section,
+.folder-section{
+  border-top:1px solid var(--border-subtle);
+}
+.item-filter-section .sidebar-section-body{padding-bottom:10px}
+.item-filter-reset{border:0;background:transparent;color:var(--text-3);font:inherit;font-size:var(--fs-small);cursor:pointer}
+.item-filter-reset:hover:not(:disabled),.item-filter-reset:focus-visible{color:var(--vermilion-deep);outline:none}
+.item-filter-reset:disabled{opacity:.6;cursor:not-allowed}
+.item-filter-field{display:grid;gap:5px;padding:0 12px;color:var(--text-3);font-size:var(--fs-small)}
+.item-filter-field select,.item-filter-field input{
+  width:100%;height:var(--control-height-sm);min-width:0;padding:0 8px;
+  border:1px solid transparent;border-radius:var(--radius);background:var(--bg-overlay);color:var(--text-1);
+  font:inherit;
+}
+.item-filter-field select:focus-visible,.item-filter-field input:focus-visible{outline:none;box-shadow:var(--focus-ring);border-color:transparent}
+.item-filter-dates{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:2px}
+.item-filter-dates .item-filter-field:first-child{padding-right:0}
+.item-filter-dates .item-filter-field:last-child{padding-left:0}
+.item-filter-date-actions{display:flex;justify-content:flex-end;padding:0 12px;margin-top:6px}
+.item-filter-sort-field{margin-top:8px}
+.item-date-reset-btn{
+  flex:0 0 auto;height:var(--control-height-sm);padding:0 10px;
+  border:1px solid var(--border-subtle);border-radius:var(--radius);background:var(--bg-raised);
+  color:var(--text-2);font:inherit;font-size:var(--fs-small);cursor:pointer;white-space:nowrap;
+  display:inline-flex;align-items:center;justify-content:center;
+}
+.item-date-reset-btn:hover:not(:disabled),.item-date-reset-btn:focus-visible{
+  color:var(--vermilion-deep);border-color:var(--vermilion);outline:none;
+}
+.item-date-reset-btn:disabled{
+  opacity:.45;cursor:not-allowed;border-color:var(--border-subtle);
+}
+.sidebar-empty-hint{
+  display:none;padding:16px 14px;color:var(--text-3);font-size:var(--fs-small);line-height:1.55;text-align:left;
+}
+body.library-needs-artist:not(.mode-moves) .tag-section,
+body.library-needs-artist:not(.mode-moves) .folder-section{
+  display:none;
+}
+body.library-needs-artist:not(.mode-moves) .sidebar-tag-divider{display:none}
+body.library-needs-artist:not(.mode-moves) .sidebar-empty-hint{
+  display:block;
+}
+body.mode-moves .sidebar,
+body.mode-moves .sidebar-resizer{
+  display:none !important;
+}
+body.mode-moves .content{
+  width:100%;
+}
+.sidebar-resizer{
+  flex:0 0 4px;width:4px;cursor:col-resize;background:var(--bg-chrome);
+  position:relative;touch-action:none;
+}
+.sidebar-resizer::after{
+  content:'';position:absolute;top:0;bottom:0;left:1px;width:1px;
+  background:var(--border-subtle);transition:background var(--motion);
+}
+.sidebar-resizer:hover::after,.sidebar-resizer:focus::after,body.sidebar-resizing .sidebar-resizer::after{
+  background:var(--vermilion);
+}
+body.sidebar-resizing{cursor:col-resize;user-select:none}
+.sidebar-tag-divider{
+  flex:0 0 4px;width:100%;position:relative;cursor:row-resize;touch-action:none;
+  background:var(--bg-chrome);
+}
+.sidebar-tag-divider::after{
+  content:'';position:absolute;left:0;right:0;top:1px;height:2px;
+  background:transparent;transition:background var(--motion);
+}
+.sidebar-tag-divider:hover::after,.sidebar-tag-divider:focus::after,body.sidebar-tag-resizing .sidebar-tag-divider::after{
+  background:var(--vermilion);
+}
+.sidebar-tag-divider[hidden]{display:none}
+body.sidebar-tag-resizing{cursor:row-resize;user-select:none}
+.sidebar-section{display:flex;flex-direction:column;min-height:0}
+.tag-section{flex:var(--sidebar-tag-ratio,46) 1 0}
+.folder-section{flex:calc(100 - var(--sidebar-tag-ratio,46)) 1 0}
+.tag-section.is-collapsed,.folder-section.is-collapsed{flex:0 0 auto!important}
+.sidebar.sidebar-tags-collapsed .folder-section:not(.is-collapsed){flex:1 1 0}
+.sidebar.sidebar-folders-collapsed .tag-section:not(.is-collapsed){flex:0 1 auto}
+.sidebar.sidebar-tags-collapsed .sidebar-tag-divider,
+.sidebar.sidebar-folders-collapsed .sidebar-tag-divider{display:none}
+/* Section headers read as plain operation-area titles: body system font,
+   15px/600, no tracking (§V1/V2) — the serif stays with the brand wordmark. */
+.sidebar-header{
+  padding:12px;font-size:var(--fs-section);font-weight:600;color:var(--text-2);
+  font-family:inherit;letter-spacing:0;
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+}
+.sidebar-section-toggle{
+  flex:1;min-width:0;display:flex;align-items:center;gap:8px;padding:0;
+  border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;
+}
+.sidebar-section-toggle:hover{color:var(--text-1)}
+/* Focus draws a full vermilion ring around the header row: an inset underline
+   inside a 10px-radius full-width toggle reads as a stray dash, not focus. */
+.sidebar-section-toggle:focus-visible{outline:2px solid var(--vermilion);outline-offset:2px;border-radius:var(--radius)}
+.sidebar-section-chevron{
+  flex:0 0 8px;width:8px;height:8px;margin-left:auto;
+  border-right:1px solid currentColor;border-bottom:1px solid currentColor;
+  transform:rotate(45deg) translateY(-2px);transition:transform var(--motion);
+}
+/* Independent chevron toggle: same fixed hit area and final-row position in
+   every section header, so chevron right edges align at desktop and mobile. */
+.sidebar-chevron-toggle{
+  flex:0 0 auto;width:26px;height:26px;display:flex;align-items:center;justify-content:center;
+  padding:0;margin-left:2px;border:0;background:transparent;cursor:pointer;
+  border-radius:var(--radius);
+  color:var(--text-3);transition:color var(--motion);
+}
+.sidebar-chevron-toggle:hover,.sidebar-chevron-toggle:focus-visible{color:var(--text-1)}
+.sidebar-chevron-toggle:focus-visible{outline:2px solid var(--vermilion);outline-offset:2px}
+.sidebar-chevron-toggle .sidebar-section-chevron{margin-left:0}
+.sidebar-chevron-toggle[aria-expanded="false"] .sidebar-section-chevron{transform:rotate(-45deg) translateY(2px)}
+.tag-sort,.media-filter-select{
+  height:var(--control-height-sm);min-width:0;padding:0 8px;
+  border:1px solid transparent;border-radius:var(--radius);background:var(--bg-overlay);color:var(--text-1);
+  font:inherit;font-size:var(--fs-small);
+}
+.tag-sort{flex:0 0 76px;width:76px}
+.tag-sort:focus-visible,.media-filter-select:focus-visible{outline:none;box-shadow:var(--focus-ring);border-color:transparent}
+.sidebar-list{flex:1;overflow-y:auto;padding:4px 0}
+.sidebar-list-empty{padding:12px;color:var(--text-3);font-size:var(--fs-small)}
+.folder-tree{flex:1;overflow-y:auto;padding:0 0 4px}
+
+/* ---- Content frame and toolbar: tools band above the artwork ---- */
+.content{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+.toolbar{
+  display:flex;align-items:center;gap:8px;padding:10px 14px;
+  background:var(--bg-chrome);
+  border-bottom:1px solid var(--border-subtle);
+  flex-wrap:wrap;flex-shrink:0;
+  min-height:calc(var(--control-height) + 20px);
+}
+.edit-mode-btn{display:inline-flex}
+.mobile-filter-btn,.mobile-header-toggle{display:none}
+/* §V3: compact tool strips never shift vertically on hover — a row of
+   controls must not float. */
+header .btn:hover:not(:disabled),
+.toolbar .btn:hover:not(:disabled),
+.maintenance-section-actions .btn:hover:not(:disabled),
+.edit-bar .btn:hover:not(:disabled){transform:none}
+.media-filter-select{height:var(--control-height);min-width:128px;max-width:190px;font-size:var(--toolbar-control-font-size)}
+.mobile-filter-btn{
+    height:var(--control-height);min-height:var(--control-height);padding:0 var(--control-padding-x);
+    font-size:var(--toolbar-control-font-size);line-height:1.2;align-items:center;justify-content:center;
+  }
+.duplicate-files-toggle{display:inline-flex}
+.mobile-header-toggle{
+    height:var(--control-height);min-height:var(--control-height);
+    padding:0 var(--control-padding-x);font-size:var(--header-control-font-size);line-height:1.2;
+  }
+.view-toggle{
+  padding:2px;background:var(--bg-overlay);
+}
+.view-toggle button{
+  height:var(--control-height);min-height:var(--control-height);padding:0 var(--control-padding-x);
+  font-size:var(--toolbar-control-font-size);line-height:1.2;font-weight:600;
+  border-radius:var(--radius);border-color:transparent;background:transparent;
+  display:inline-flex;align-items:center;justify-content:center;box-shadow:none;
+}
+.mobile-column-toggle{display:none;gap:2px;align-items:center;padding:2px;border-radius:var(--radius)}
+.artist-links-launcher{
+  display:flex;align-items:center;gap:6px;min-width:0;
+}
+/* §V3: semantic toolbar groups separate by ~14px (8px flex gap + 6px group
+   margin) while spacing inside a group stays 6-8px. Desktop only; mobile
+   keeps the tight 6px gap. */
+@media(min-width:769px){
+  .toolbar #duplicateFilesToggle,.toolbar #desktopViewToggle,.toolbar .artist-links-launcher{margin-left:6px}
+}
+
+/* ---- Grid frame: the artwork zone. The paper fiber, the soft warm light and
+   the corner vignette live on this scroller's background; with the default
+   attachment they stay fixed to the frame while thumbnails scroll over them,
+   and every card surface is opaque so texture never touches media. */
+.grid-container{
+  flex:1;overflow-y:auto;padding:14px;position:relative;
+  background:var(--bg-canvas);
+  background-image:var(--texture-grain),var(--paper-glow),var(--paper-vignette);
+}
+.grid{
+  display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(var(--grid-min-col),1fr));
+  align-content:start;
+}
+.grid.compact{grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:6px}

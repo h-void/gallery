@@ -67,6 +67,23 @@ static ACTIVE_DEVICE: OnceLock<String> = OnceLock::new();
 /// endpoints can report `preparing` instead of blocking behind the builder.
 static SESSION_BUILDING: AtomicBool = AtomicBool::new(false);
 
+/// RAII: always clear `SESSION_BUILDING` on scope exit, including panics, so
+/// a failed build can never leave every later recognition request spinning
+/// forever while `/api/ml-runtime/status` reports `preparing`.
+struct SessionBuildingGuard;
+
+impl Drop for SessionBuildingGuard {
+    fn drop(&mut self) {
+        SESSION_BUILDING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Upper bound for waiting on another thread's session build. Legitimate
+/// builds (model/CUDA download rounds) finish well inside this; a builder
+/// that exceeds it is stuck, and waiting callers must observe a
+/// "session not initialized" failure instead of spinning forever.
+const SESSION_BUILD_WAIT: Duration = Duration::from_secs(15 * 60);
+
 fn env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
         .map(|v| {
@@ -172,14 +189,14 @@ fn start_session_idle_unloader() {
                 std::thread::sleep(check_interval);
                 let mut slot = session_slot().lock().unwrap_or_else(|e| e.into_inner());
                 if slot.unload_if_idle(Instant::now(), timeout) {
-                    eprintln!(
+                    log_info!(
                         "gallery-accel: unloaded character model after {} idle seconds",
                         timeout.as_secs()
                     );
                 }
             })
         {
-            eprintln!("gallery-accel: failed to start character model idle unloader: {error}");
+            log_error!("gallery-accel: failed to start character model idle unloader: {error}");
         }
     });
 }
@@ -344,7 +361,7 @@ fn ensure_ort_loaded() -> Result<(OrtCoreType, Option<String>)> {
     }
     ORT_CORE.store(CORE_CPU, Ordering::SeqCst);
     if last_err.is_some() {
-        eprintln!(
+        log_error!(
             "gallery-accel: init_from candidates failed ({:?}); using ort::init()",
             last_err
         );
@@ -593,14 +610,24 @@ fn load_session() -> Result<&'static Mutex<CcipSessionSlot>> {
     // recognition reads, and the idle unloader for the whole wait.
     if SESSION_BUILDING.swap(true, Ordering::SeqCst) {
         // Another thread is already building; fall through once it finishes
-        // and its result is visible in the slot.
+        // and its result is visible in the slot. Wait with a deadline: a
+        // stuck builder must never keep callers spinning for the process
+        // lifetime.
+        let deadline = Instant::now() + SESSION_BUILD_WAIT;
         while SESSION_BUILDING.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                log_error!(
+                    "gallery-accel: character session build exceeded {SESSION_BUILD_WAIT:?}; giving up waiting"
+                );
+                break;
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
         start_session_idle_unloader();
         return Ok(slot);
     }
-    let loaded = (|| -> Result<CcipSession> {
+    let _building_guard = SessionBuildingGuard;
+    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<CcipSession> {
         // Give the background preparation round a chance to conclude
         // before deciding the provider (never blocks a running service).
         let path = character_model_path();
@@ -632,7 +659,7 @@ fn load_session() -> Result<&'static Mutex<CcipSessionSlot>> {
                         &mut fallback_reason,
                         format!("CUDAExecutionProvider failed: {e}"),
                     );
-                    eprintln!("gallery-accel: CUDA EP failed ({e}); falling back to CPU EP");
+                    log_error!("gallery-accel: CUDA EP failed ({e}); falling back to CPU EP");
                 }
                 Err(e) => return Err(e),
             }
@@ -653,7 +680,7 @@ fn load_session() -> Result<&'static Mutex<CcipSessionSlot>> {
                             &mut fallback_reason,
                             format!("OpenVINOExecutionProvider failed: {e}"),
                         );
-                        eprintln!(
+                        log_error!(
                             "gallery-accel: OpenVINO GPU failed ({e}); falling back to CPU EP"
                         );
                     }
@@ -664,9 +691,21 @@ fn load_session() -> Result<&'static Mutex<CcipSessionSlot>> {
         let mut session = build_cpu_session(&path)?;
         session.fallback_reason = fallback_reason;
         Ok(session)
-    })()
-    .map_err(|e| e.to_string());
-    SESSION_BUILDING.store(false, Ordering::SeqCst);
+    }))
+    .map(|built| built.map_err(|e| e.to_string()))
+    .unwrap_or_else(|panic| {
+        // A panicking builder becomes an observable failed-session state
+        // instead of a permanently stuck `preparing` flag (the Drop guard
+        // already released the flag).
+        let message = if let Some(s) = panic.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = panic.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        Err(format!("character session build panicked: {message}"))
+    });
     if let Ok(ref sess) = loaded {
         let _ = ACTIVE_PROVIDER.set(sess.provider.clone());
         let _ = ACTIVE_DEVICE.set(sess.active_device.clone());
@@ -690,7 +729,7 @@ pub fn clear_failed_session_cache() {
     if matches!(guard.session, Some(Err(_))) {
         guard.session = None;
         guard.last_used = None;
-        eprintln!("gallery-accel: cleared cached failed character session");
+        log_info!("gallery-accel: cleared cached failed character session");
     }
 }
 
@@ -1018,7 +1057,13 @@ fn extract_video_frame_jpeg(path: &Path, t: f64) -> Result<Vec<u8>> {
             }
             Ok(buf)
         }
-        Ok((_, Err(error))) => Err(anyhow!("read ffmpeg output: {error}")),
+        Ok((_, Err(error))) => {
+            // The reader failed; stop ffmpeg now so no orphan process or pipe
+            // buffer lingers behind this request.
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(anyhow!("read ffmpeg output: {error}"))
+        }
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();

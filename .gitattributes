@@ -3,3 +3,6 @@
 
 # Preserve upstream dependency notices, including intentional trailing whitespace.
 fnpack/app/licenses/** -whitespace
+
+start.sh text eol=lf
+start.cmd text eol=crlf

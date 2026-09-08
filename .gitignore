@@ -32,3 +32,10 @@ fnnas-docs/
 rust/**/target/
 media/
 media-placeholder-*/
+.gallery-launcher/
+
+# Local tool configs and damaged-git forensic backup (never tracked)
+/.commandcode/
+/.git-damaged-*/
+
+.gallery-empty/

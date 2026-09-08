@@ -160,6 +160,10 @@ impl std::ops::Deref for PooledConn {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
+        // Invariant: `conn` is only taken by `Drop`, so it is always `Some`
+        // while a pooled connection is borrowable. If this ever fires, the
+        // pool was borrowed after drop; a loud panic beats handing back a
+        // missing connection.
         self.conn.as_ref().expect("pooled connection missing")
     }
 }
@@ -167,6 +171,18 @@ impl std::ops::Deref for PooledConn {
 impl Drop for PooledConn {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
+            // A connection returned mid-transaction would leak its locks and
+            // uncommitted state into the next borrower (a failed COMMIT on a
+            // call site leaves the transaction open). Roll any open
+            // transaction back before re-pooling; if even the rollback fails,
+            // discard the connection entirely.
+            if !conn.is_autocommit() && conn.execute_batch("ROLLBACK").is_err() {
+                if let Ok(mut state) = self.pool.conns.lock() {
+                    state.live = state.live.saturating_sub(1);
+                }
+                self.pool.available.notify_one();
+                return;
+            }
             if let Ok(mut state) = self.pool.conns.lock() {
                 // Do not grow the idle list beyond configured size; a surplus
                 // connection is closed instead (and stops counting as live).
@@ -211,7 +227,7 @@ fn open_readonly_db(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn open_writable_db(path: &Path) -> Result<Connection> {
+pub fn open_writable_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create data dir {}", parent.display()))?;
@@ -276,7 +292,9 @@ fn ensure_product_schema(conn: &Connection, create_indexes: bool) -> Result<()> 
             st_ino INTEGER,
             missing INTEGER NOT NULL DEFAULT 0,
             missing_at REAL,
-            scanned_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            scanned_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            width INTEGER NOT NULL DEFAULT 0,
+            height INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -430,6 +448,7 @@ fn ensure_product_schema(conn: &Connection, create_indexes: bool) -> Result<()> 
     .context("initialize product schema")?;
     ensure_character_reference_columns(conn)?;
     ensure_item_date_columns(conn)?;
+    ensure_item_dimension_columns(conn)?;
     // Folder-archive schema (including its repair UPDATE) belongs to writable
     // startup so list endpoints never perform DDL/DML on read paths.
     crate::folder_archive::ensure_folder_schema(conn)?;
@@ -540,6 +559,31 @@ fn ensure_item_date_columns(conn: &Connection) -> Result<()> {
         }
     }
     backfill_item_detected_dates(conn)?;
+    Ok(())
+}
+
+/// Adds the intrinsic pixel-size columns used by the justified grid.
+///
+/// Legacy databases predate these columns, and the item page/detail queries
+/// select them unconditionally, so they must exist before any read path runs.
+/// `0` means "unknown": the grid falls back to a 4:3 aspect until the
+/// dimension backfill fills the row in.
+fn ensure_item_dimension_columns(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(items)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (name, definition) in [
+        ("width", "INTEGER NOT NULL DEFAULT 0"),
+        ("height", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            conn.execute(
+                &format!("ALTER TABLE items ADD COLUMN {name} {definition}"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -709,13 +753,15 @@ fn has_virtual_paths(conn: &Connection, roots: &MediaRoots) -> Result<bool> {
         if exists == 0 {
             continue;
         }
-        for root in &roots.roots {
+        for (root_index, root) in roots.roots.iter().enumerate() {
             let root_n = root.replace('\\', "/").trim_end_matches('/').to_string();
             if root_n.is_empty() {
                 continue;
             }
-            // Skip when virtual root already equals real root (no alias).
-            let idx = roots.roots.iter().position(|r| r == root).unwrap_or(0);
+            // Skip when virtual root already equals real root (no alias). Use the
+            // enumeration index: position() misaligns duplicate virtual roots
+            // that map to different real paths.
+            let idx = root_index;
             if roots
                 .real_root_at(idx)
                 .map(|r| r.replace('\\', "/").trim_end_matches('/') == root_n.as_str())
@@ -1492,6 +1538,7 @@ fn merge_item_into(
     }
     for table in ["move_candidates", "move_history"] {
         if table_exists(conn, table)? && column_exists(conn, table, "item_id")? {
+            let table = sql_ident(table);
             conn.execute(
                 &format!("UPDATE {table} SET item_id=? WHERE item_id=?"),
                 rusqlite::params![keep_id, source_id],
@@ -1808,8 +1855,15 @@ pub fn normalize_configured_media_paths(conn: &Connection, roots: &MediaRoots) -
             .with_context(|| format!("begin media path migration: {phase}"))?;
         match work() {
             Ok(value) => {
-                conn.execute_batch("COMMIT")
-                    .with_context(|| format!("commit media path migration: {phase}"))?;
+                if let Err(error) = conn.execute_batch("COMMIT") {
+                    // A failed COMMIT leaves the transaction open on this
+                    // connection: roll it back here (the pool guards its
+                    // connections at return as a second layer) instead of
+                    // letting the dirty connection escape.
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(error)
+                        .with_context(|| format!("commit media path migration: {phase}"));
+                }
                 Ok(value)
             }
             Err(error) => {
@@ -1949,6 +2003,7 @@ pub fn normalize_configured_media_paths(conn: &Connection, roots: &MediaRoots) -
                         if !table_exists(conn, table)? {
                             continue;
                         }
+                        let table = sql_ident(table);
                         conn.execute(
                             &format!("UPDATE {table} SET artist_id=? WHERE artist_id=?"),
                             rusqlite::params![target_id, artist_id],
@@ -2021,6 +2076,7 @@ pub fn normalize_configured_media_paths(conn: &Connection, roots: &MediaRoots) -
         if exists == 0 {
             continue;
         }
+        let (table, column) = (sql_ident(table), sql_ident(column));
         migration_tx(conn, &format!("rewrite {table}.{column}"), || {
             for (root_n, real_n) in &pairs {
                 // Exact-prefix match, not LIKE: `_` is a wildcard and LIKE is
@@ -2152,12 +2208,12 @@ pub fn normalize_configured_media_paths(conn: &Connection, roots: &MediaRoots) -
             }
             Ok(())
         })?;
-        eprintln!("media path migration: {table}.{column} phase committed");
+        log_info!("media path migration: {table}.{column} phase committed");
     }
 
     set_migration_signature(conn, &signature)?;
     if merged_link_documents > 0 {
-        eprintln!(
+        log_info!(
             "media path migration: dropped {merged_link_documents} stale virtual-path link document(s)"
         );
     }
@@ -2204,6 +2260,19 @@ fn configure_connection(conn: &Connection, read_only: bool) -> Result<()> {
     Ok(())
 }
 
+/// SQL identifiers interpolated into statement text must come from internal
+/// constants only — never from user input. Fail loudly if that invariant is
+/// ever violated instead of letting a future refactor become an injection.
+fn sql_ident(name: &str) -> &str {
+    let valid = !name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    assert!(valid, "SQL identifier must be an internal constant: {name:?}");
+    name
+}
+
 fn sqlite_immutable_uri(path: &Path) -> String {
     let path = path.to_string_lossy().replace('\\', "/");
     let mut encoded = String::with_capacity(path.len());
@@ -2221,6 +2290,16 @@ fn sqlite_immutable_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_ident_rejects_non_internal_identifiers() {
+        assert_eq!(sql_ident("move_candidates"), "move_candidates");
+        assert_eq!(sql_ident("_legacy"), "_legacy");
+        for bad in ["", "Move", "move;drop", "move-table", "1table", "t able"] {
+            let rejected = std::panic::catch_unwind(|| sql_ident(bad)).is_err();
+            assert!(rejected, "sql_ident must reject {bad:?}");
+        }
+    }
 
     #[test]
     fn schema_initialization_does_not_run_media_path_migration() {
@@ -3285,6 +3364,7 @@ mod tests {
             "the kept item's recognition result survives"
         );
         for table in ["move_candidates", "move_history"] {
+            let table = sql_ident(table);
             let item_id: i64 = conn
                 .query_row(&format!("SELECT item_id FROM {table}"), [], |r| r.get(0))
                 .unwrap();
@@ -4012,6 +4092,7 @@ mod tests {
             ],
             "detached NULL-item references survive; the newest winner copies created_at"
         );
+        #[allow(clippy::type_complexity)]
         let suggestions: Vec<(i64, i64, Option<i64>, String, Option<i64>)> = conn
             .prepare(
                 "SELECT id, item_id, artist_id, status, matched_ref_id

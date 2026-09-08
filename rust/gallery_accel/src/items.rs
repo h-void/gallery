@@ -203,7 +203,7 @@ fn items_page_query_response_inner(
                 i.folder_name, i.date, i.detected_date, i.manual_date, i.auto_role,
                 i.manual_role, i.is_archive, i.media_type,
                 i.content_hash, i.hash_status, i.hash_updated_at, i.st_dev, i.st_ino, i.missing,
-                i.missing_at, i.scanned_at,
+                i.missing_at, i.scanned_at, i.width, i.height,
                 EXISTS(SELECT 1 FROM item_favorites f WHERE f.item_id=i.id) AS favorite,
                 a.name AS artist_name, a.path AS artist_path
          FROM items i JOIN artists a ON a.id=i.artist_id
@@ -468,7 +468,9 @@ fn item_page_where(
         let condition = match cursor.sort.as_str() {
             "date_asc" => "(i.date > ? OR (i.date = ? AND (i.file_name COLLATE NATURAL_NOCASE > ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id > ?))))",
             "name" => "(i.file_name COLLATE NATURAL_NOCASE > ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id > ?))",
+            "name_desc" => "(i.file_name COLLATE NATURAL_NOCASE < ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id < ?))",
             "size" => "(i.file_size < ? OR (i.file_size = ? AND i.id < ?))",
+            "size_asc" => "(i.file_size > ? OR (i.file_size = ? AND i.id > ?))",
             "scanned_desc" => "(i.scanned_at < ? OR (i.scanned_at = ? AND i.id < ?))",
             _ => "(i.date < ? OR (i.date = ? AND (i.file_name COLLATE NATURAL_NOCASE > ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id > ?))))",
         };
@@ -486,7 +488,17 @@ fn item_page_where(
                 params.push(SqlValue::Text(cursor.file_name.clone()));
                 params.push(SqlValue::Integer(cursor.id));
             }
+            "name_desc" => {
+                params.push(SqlValue::Text(cursor.file_name.clone()));
+                params.push(SqlValue::Text(cursor.file_name.clone()));
+                params.push(SqlValue::Integer(cursor.id));
+            }
             "size" => {
+                params.push(SqlValue::Integer(cursor.file_size));
+                params.push(SqlValue::Integer(cursor.file_size));
+                params.push(SqlValue::Integer(cursor.id));
+            }
+            "size_asc" => {
                 params.push(SqlValue::Integer(cursor.file_size));
                 params.push(SqlValue::Integer(cursor.file_size));
                 params.push(SqlValue::Integer(cursor.id));
@@ -531,7 +543,9 @@ fn item_order_sql(sort: Option<&str>, group_duplicates: bool) -> &'static str {
                 "i.content_hash ASC, i.date ASC, i.file_name COLLATE NATURAL_NOCASE ASC, i.id ASC"
             }
             "name" => "i.content_hash ASC, i.file_name COLLATE NATURAL_NOCASE ASC, i.id ASC",
+            "name_desc" => "i.content_hash ASC, i.file_name COLLATE NATURAL_NOCASE DESC, i.id DESC",
             "size" => "i.content_hash ASC, i.file_size DESC, i.id DESC",
+            "size_asc" => "i.content_hash ASC, i.file_size ASC, i.id ASC",
             "scanned_desc" => "i.content_hash ASC, i.scanned_at DESC, i.id DESC",
             _ => {
                 "i.content_hash ASC, i.date DESC, i.file_name COLLATE NATURAL_NOCASE ASC, i.id ASC"
@@ -541,7 +555,9 @@ fn item_order_sql(sort: Option<&str>, group_duplicates: bool) -> &'static str {
     match sort.unwrap_or("date_desc") {
         "date_asc" => "i.date ASC, i.file_name COLLATE NATURAL_NOCASE ASC, i.id ASC",
         "name" => "i.file_name COLLATE NATURAL_NOCASE ASC, i.id ASC",
+        "name_desc" => "i.file_name COLLATE NATURAL_NOCASE DESC, i.id DESC",
         "size" => "i.file_size DESC, i.id DESC",
+        "size_asc" => "i.file_size ASC, i.id ASC",
         "scanned_desc" => "i.scanned_at DESC, i.id DESC",
         _ => "i.date DESC, i.file_name COLLATE NATURAL_NOCASE ASC, i.id ASC",
     }
@@ -572,7 +588,9 @@ fn normalized_sort(sort: Option<&str>) -> &'static str {
     match sort.unwrap_or("date_desc") {
         "date_asc" => "date_asc",
         "name" => "name",
+        "name_desc" => "name_desc",
         "size" => "size",
+        "size_asc" => "size_asc",
         "scanned_desc" => "scanned_desc",
         _ => "date_desc",
     }
@@ -623,6 +641,8 @@ fn item_detail_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemDetailRow> {
         favorite: row.get("favorite")?,
         artist_name: row.get("artist_name")?,
         artist_path: row.get("artist_path")?,
+        width: row.get("width").unwrap_or(0),
+        height: row.get("height").unwrap_or(0),
     })
 }
 
@@ -745,6 +765,8 @@ mod tests {
             favorite: false,
             artist_name: String::new(),
             artist_path: String::new(),
+            width: 0,
+            height: 0,
         }
     }
 
@@ -789,7 +811,8 @@ mod tests {
                 is_archive INTEGER DEFAULT 0, media_type TEXT DEFAULT 'image',
                 content_hash TEXT DEFAULT '', hash_status TEXT DEFAULT 'pending',
                 hash_updated_at REAL, st_dev INTEGER, st_ino INTEGER, missing INTEGER DEFAULT 0,
-                missing_at REAL, scanned_at INTEGER DEFAULT 0
+                missing_at REAL, scanned_at INTEGER DEFAULT 0,
+                width INTEGER DEFAULT 0, height INTEGER DEFAULT 0
              );
              CREATE TABLE item_favorites (item_id INTEGER PRIMARY KEY);
              CREATE TABLE item_tags (item_id INTEGER, tag_id INTEGER);
@@ -849,6 +872,9 @@ mod tests {
 
         let name_asc = page(Some("name"), None, None);
         assert_eq!(page_file_names(&name_asc), ["a.jpg", "b.jpg"]);
+
+        let name_desc = page(Some("name_desc"), None, None);
+        assert_eq!(page_file_names(&name_desc), ["b.jpg", "a.jpg"]);
 
         let ranged = page(Some("date_desc"), Some("2020-01-01"), Some("2020-12-31"));
         assert_eq!(page_file_names(&ranged), ["a.jpg"]);

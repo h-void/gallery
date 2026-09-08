@@ -1,0 +1,45 @@
+# ==============================================================================
+# Gallery - Intel 核显预设配置（Linux / NAS 核显直通专用）
+#
+# 【使用说明】
+# 1. 写入路径：在下方 volumes 中将 /volume1/photo 替换为你的实际媒体目录绝对路径。
+# 2. 其它参数修改（端口、扫描周期、备份策略、AI 识别等）：全部在 .env 中修改。
+# ==============================================================================
+
+name: gallery
+
+services:
+  gallery:
+    image: crpi-hwq9kgccbg8v0l26.cn-hangzhou.personal.cr.aliyuncs.com/hczhr/gallery:stable
+    restart: unless-stopped
+    ports:
+      - "${GALLERY_PORT:-8899}:8899"
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    volumes:
+      # ── 1. 媒体路径（冒号左侧替换为实际路径；只读挂载 :ro 保护原文件安全）──
+      - "${GALLERY_MEDIA_DIR:-/volume1/photo}:/media:ro"
+      # 多目录挂载示例：
+      # - "${GALLERY_MEDIA_DIR2:-/volume2/art}:/media2:ro"
+      # - "${GALLERY_MEDIA_DIR3:-/volume3/extra}:/media3:ro"
+      - gallery-storage:/gallery
+    environment:
+      CHARACTER_RECOGNITION_PROVIDER: "${CHARACTER_RECOGNITION_PROVIDER:-openvino}"
+      CHARACTER_RECOGNITION_ENABLED: "${CHARACTER_RECOGNITION_ENABLED:-1}"
+      CHARACTER_ALLOW_CPU_FALLBACK: "${CHARACTER_ALLOW_CPU_FALLBACK:-1}"
+      ONNXRUNTIME_AUTO_DOWNLOAD: "${ONNXRUNTIME_AUTO_DOWNLOAD:-1}"
+      CHARACTER_MODEL_IDLE_TIMEOUT_SECONDS: "${CHARACTER_MODEL_IDLE_TIMEOUT_SECONDS:-600}"
+      SCAN_INTERVAL: "${SCAN_INTERVAL:-21600}"
+      HASH_INTERVAL: "${HASH_INTERVAL:-30}"
+      DB_BACKUP_INTERVAL: "${DB_BACKUP_INTERVAL:-43200}"
+      DB_BACKUP_RETENTION: "${DB_BACKUP_RETENTION:-8}"
+    devices:
+      - /dev/dri:/dev/dri
+    # 无权限时可在 .env 填入 NAS 的 render、video 组 ID
+    group_add:
+      - ${GALLERY_RENDER_GID:-109}
+      - ${GALLERY_VIDEO_GID:-44}
+
+volumes:
+  gallery-storage:

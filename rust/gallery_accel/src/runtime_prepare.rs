@@ -1052,7 +1052,7 @@ fn spawn_worker(source: String, db_path: Option<PathBuf>) -> Result<()> {
                 worker_loop(source);
             }));
             if result.is_err() {
-                eprintln!("gallery-accel: runtime preparation worker panicked; marking failed");
+                log_error!("gallery-accel: runtime preparation worker panicked; marking failed");
                 mark_worker_start_failed("runtime preparation worker panicked");
             }
         })
@@ -1093,7 +1093,7 @@ fn sweep_stale_staging(dir: &Path) {
             std::fs::remove_file(&path)
         };
         if let Err(error) = result {
-            eprintln!(
+            log_error!(
                 "runtime prep: failed to remove stale staging {}: {error}",
                 path.display()
             );

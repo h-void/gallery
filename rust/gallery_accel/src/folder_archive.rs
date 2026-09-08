@@ -402,7 +402,7 @@ fn open_relative_dir(
 
 #[cfg(test)]
 std::thread_local! {
-    static FORCE_RENAME_PARENT_PERMISSION_DENIED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static FORCE_RENAME_PARENT_PERMISSION_DENIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(target_os = "linux")]
@@ -2444,10 +2444,10 @@ pub fn list_folder_renames(
     if refresh {
         if let Some(aid) = artist_id {
             if let Err(error) = auto_discover_artist_folder_plans(conn, aid) {
-                eprintln!("folder rename auto-discover failed for artist {aid}: {error:#}");
+                log_error!("folder rename auto-discover failed for artist {aid}: {error:#}");
             }
             if let Err(error) = recompute_artist_plan_targets(conn, roots, aid) {
-                eprintln!("folder rename target recompute failed for artist {aid}: {error:#}");
+                log_error!("folder rename target recompute failed for artist {aid}: {error:#}");
             }
         }
     }
@@ -3283,6 +3283,32 @@ pub fn undo_folder_rename_plan(
         bail!("outside_artist");
     }
 
+    let target_db = target_path.to_string_lossy().replace('\\', "/");
+    let source_db = source_path.to_string_lossy().replace('\\', "/");
+    let target_logical = folder_db_path(&artist_path, &target);
+    let source_logical = folder_db_path(&artist_path, &source);
+    // Precheck: the executed plan must still own items under the executed
+    // target prefix. Reverting with zero matching rows would move the folder
+    // on disk while no database row follows it back.
+    let expected_items: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM items
+         WHERE artist_id=? AND (
+           file_path=? OR instr(file_path, ?)=1 OR
+           file_path=? OR instr(file_path, ?)=1
+         )",
+        params![
+            artist_id,
+            &target_db,
+            format!("{target_db}/"),
+            &target_logical,
+            format!("{target_logical}/"),
+        ],
+        |row| row.get(0),
+    )?;
+    if expected_items == 0 {
+        bail!("no_items_under_target");
+    }
+
     let backup = create_db_backup(conn)?;
     rename_artist_dir_no_overwrite(&artist_root, roots, &target, &source).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -3292,10 +3318,6 @@ pub fn undo_folder_rename_plan(
         }
     })?;
 
-    let target_db = target_path.to_string_lossy().replace('\\', "/");
-    let source_db = source_path.to_string_lossy().replace('\\', "/");
-    let target_logical = folder_db_path(&artist_path, &target);
-    let source_logical = folder_db_path(&artist_path, &source);
     let db_result = (|| -> Result<i64> {
         let tx = conn.unchecked_transaction()?;
         let updated_items = update_folder_item_paths(
@@ -3306,6 +3328,12 @@ pub fn undo_folder_rename_plan(
             &source_logical,
             &source_db,
         )?;
+        // The folder was already renamed back on disk; committing zero rows
+        // would leave the revert unrecorded. Roll the disk move back through
+        // the shared failure path below.
+        if updated_items == 0 {
+            bail!("path rewrite matched no items for a non-empty plan");
+        }
         let mut log = serde_json::from_str::<Value>(&execution_log)
             .ok()
             .and_then(|value| value.as_array().cloned())
@@ -3648,8 +3676,22 @@ fn run_folder_rename_all(
 }
 
 pub fn create_db_backup(conn: &Connection) -> Result<String> {
+    create_db_backup_in(conn, Path::new(""))
+}
+
+/// Lifecycle housekeeping backups live in their own `housekeeping/` subtree so
+/// routine missing-item cleanup can never prune the pre-archive backup an undo
+/// depends on.
+pub fn create_housekeeping_db_backup(conn: &Connection) -> Result<String> {
+    create_db_backup_in(conn, Path::new("housekeeping"))
+}
+
+fn create_db_backup_in(conn: &Connection, subdir: &Path) -> Result<String> {
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into());
-    let root = PathBuf::from(data_dir).join("db-backups");
+    let mut root = PathBuf::from(data_dir).join("db-backups");
+    if !subdir.as_os_str().is_empty() {
+        root.push(subdir);
+    }
     std::fs::create_dir_all(&root)?;
     let label = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let mut index = 0usize;
@@ -4833,6 +4875,51 @@ mod tests {
         assert_eq!(plan.0, "reverted");
         assert!(plan.1.is_none());
         assert!(plan.2.contains("folder_rename_undo"));
+    }
+
+    #[test]
+    fn undo_refuses_target_prefix_without_items_before_touching_disk() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        // The original source directory no longer exists on disk.
+        let target = artist.join("renamed");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("a.jpg"), b"x").unwrap();
+        let conn = create_archive_db(&dir.path().join("gallery.db"), &artist, true);
+        // The executed plan no longer owns any item under the target prefix
+        // (the item was deleted after execution).
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name)
+             VALUES (1, 1, '/elsewhere/a.jpg', 'a.jpg')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folder_rename_plans
+             (artist_id, source_folder, target_folder, status, executed_at, execution_log)
+             VALUES (1, 'original', 'renamed', 'executed', 1, '[]')",
+            [],
+        )
+        .unwrap();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+
+        let error = undo_folder_rename_plan(&conn, &test_roots(dir.path()), 1).unwrap_err();
+
+        assert!(
+            error.to_string().contains("no_items_under_target"),
+            "{error}"
+        );
+        // The disk and the database are untouched.
+        assert!(target.join("a.jpg").is_file());
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM folder_rename_plans WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "executed");
     }
 
     #[test]

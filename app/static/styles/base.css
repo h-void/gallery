@@ -1,0 +1,135 @@
+/* Base layer: reset, scrollbars, shared control shapes, focus underline.
+   Studio Folio: rice-paper canvas, vermilion actions, ink text. Hover lifts
+   controls 1px after a short delay (so a fast sweep never reads as "clickable"
+   too early) and focus is always a 2px vermilion underline, never a halo. */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+[hidden]{display:none!important}
+html,body{height:100%;overflow:hidden}
+body{
+  font:var(--fs-body)/1.5 "Microsoft YaHei","微软雅黑","PingFang SC","Noto Sans CJK SC","WenQuanYi Micro Hei",system-ui,sans-serif;
+  background-color:var(--bg-canvas);
+  color:var(--text-1);display:flex;flex-direction:column;letter-spacing:0;
+}
+/* Brand anchor: the folio's 2px double binding rule across the very top.
+   Paper texture itself lives only on the .grid-container background layer. */
+body::after{
+  content:'';position:fixed;top:0;left:0;right:0;height:2px;z-index:200;pointer-events:none;
+  background:var(--paper-binding);
+}
+::selection{background:var(--accent-selection)}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border-strong);border:2px solid transparent;background-clip:content-box;border-radius:var(--radius-pill)}
+::-webkit-scrollbar-thumb:hover{background-color:var(--vermilion)}
+*{scrollbar-color:var(--border-strong) transparent;scrollbar-width:thin}
+
+/* Buttons: primary = vermilion seal fill; default/ghost = paper with a crease
+   rule; danger = wine. Hover lifts 1px, starting 80ms after intent so a quick
+   sweep never looks clickable; no box-shadow stacking. */
+button{background:none;border:0;color:inherit;font:inherit;padding:0;cursor:pointer}
+a{color:var(--vermilion-deep);text-decoration:none}
+a:hover{color:var(--indigo);text-decoration:underline;text-underline-offset:3px}
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;box-sizing:border-box;
+  height:var(--control-height);min-height:var(--control-height);max-width:100%;
+  padding:0 var(--control-padding-x);
+  border:1px solid var(--border-subtle);border-radius:var(--radius);background:var(--bg-raised);
+  color:var(--text-1);font:inherit;font-size:var(--toolbar-control-font-size);line-height:1.2;
+  cursor:pointer;white-space:nowrap;text-decoration:none;vertical-align:middle;
+  transition:background var(--motion),border-color var(--motion),color var(--motion),opacity var(--motion),transform 160ms ease-out;
+}
+.btn:hover:not(:disabled){
+  border-color:var(--border-strong);background:var(--bg-overlay);color:var(--text-1);
+  transform:translateY(-1px);transition:background var(--motion),border-color var(--motion),color var(--motion),opacity var(--motion),transform 160ms ease-out 80ms;
+}
+.btn:active:not(:disabled){transform:translateY(0);transition-duration:50ms}
+.btn:focus-visible{outline:none;box-shadow:var(--focus-ring)}
+/* Disabled controls carry no WCAG 1.4.3 floor, but the label still has to be
+   readable: the element stays at 60% (border and fill fade with it, so it reads
+   as inactive) while the ink steps to --text-1, which composites to 4.2:1.
+   --text-3 at 55% composited to 2.24:1 and was unreadable. */
+.btn:disabled{opacity:.6;cursor:not-allowed;background:var(--bg-raised);color:var(--text-1);box-shadow:none;transform:none}
+.btn.active{background:var(--accent-soft);color:var(--vermilion-deep)}
+.btn-primary{background:var(--accent-solid);border-color:var(--accent-solid);color:#fff}
+.btn-primary:hover:not(:disabled){background:var(--accent-deep);border-color:var(--accent-deep);color:#fff}
+.btn-danger{background:var(--danger-solid);border-color:var(--danger-solid);color:#fff}
+.btn-danger:hover:not(:disabled){background:var(--danger-deep);border-color:var(--danger-deep);color:#fff}
+.btn-soft-primary,.btn-ops{background:var(--accent-soft);border-color:transparent;color:var(--vermilion-deep)}
+.btn-soft-primary:hover:not(:disabled),.btn-ops:hover:not(:disabled){background:var(--accent-solid);border-color:var(--accent-solid);color:#fff}
+.btn-ghost{background:var(--bg-raised);color:var(--text-1)}
+/* Chrome-band ghosts rest as paper chips (Studio Folio keeps filled tools on
+   the band); hover adds the vermilion rule and one crease step. .active keeps
+   its vermilion-soft fill (search scope, view segments). */
+header .btn-ghost:not(:disabled):not(.active),
+.toolbar .btn-ghost:not(:disabled):not(.active){background:var(--bg-raised);border-color:var(--border-subtle)}
+header .btn-ghost:hover:not(:disabled):not(.active),
+.toolbar .btn-ghost:hover:not(:disabled):not(.active){background:var(--bg-overlay);border-color:var(--vermilion)}
+.btn-icon{
+  width:var(--control-height);min-width:var(--control-height);height:var(--control-height);
+  min-height:var(--control-height);padding:0;aspect-ratio:1;border-radius:var(--radius-pill);
+}
+.btn-sm{
+  height:var(--control-height-sm);min-height:var(--control-height-sm);
+  padding:0 10px;font-size:var(--fs-small);
+}
+.btn-sm.btn-icon{width:var(--control-height-sm);min-width:var(--control-height-sm)}
+.btn-glyph{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;line-height:1}
+.btn-glyph svg{display:block;width:1em;height:1em;stroke:currentColor}
+
+/* Segment groups: one activation language app-wide — vermilion-soft fill. */
+.btn-segment{
+  border-radius:var(--radius);background:transparent;border-color:transparent;color:var(--text-2);
+  box-shadow:none;
+}
+.btn-segment:hover:not(:disabled){background:var(--bg-raised);border-color:transparent;color:var(--text-1)}
+.btn-segment.active{
+  position:relative;z-index:1;
+  background:var(--accent-soft);border-color:transparent;color:var(--vermilion-deep);
+  box-shadow:none;
+}
+.segment-group,
+.view-toggle,
+.maintenance-view-tabs{
+  display:inline-flex;align-items:center;gap:2px;padding:2px;
+  border-radius:var(--radius);
+  background:var(--bg-overlay);
+  box-sizing:border-box;min-height:calc(var(--control-height) + 4px);
+}
+.segment-group > .btn,
+.view-toggle > .btn,
+.maintenance-view-tabs > .btn{
+  height:var(--control-height);min-height:var(--control-height);
+  padding:0 var(--control-padding-x);box-sizing:border-box;
+}
+
+/* Inputs and selects: borderless paper wells; focus draws the vermilion
+   underline instead of ringing the box. */
+input,select,textarea,button{font-family:inherit}
+input[type="text"],input[type="search"],input[type="url"],input[type="month"],input[type="date"],select{
+  background:var(--bg-overlay);color:var(--text-1);border:1px solid transparent;border-radius:var(--radius);
+}
+input:hover:not(:disabled):not([type="checkbox"]){border-color:var(--border-subtle)}
+input:focus-visible,select:focus-visible{outline:none;border-color:transparent;box-shadow:var(--focus-ring)}
+input::placeholder{color:var(--text-3)}
+/* Disabled selects read like disabled buttons instead of falling back to the
+   browser default rendering. */
+select:disabled{opacity:.45;cursor:not-allowed;color:var(--text-2)}
+
+/* Status dots: 6px semantic circles used by cards and text strips. */
+.status-dot{
+  display:inline-block;width:6px;height:6px;border-radius:50%;flex:0 0 6px;
+  background:var(--text-3);vertical-align:middle;
+}
+.status-dot.ok{background:var(--ok)}
+.status-dot.info{background:var(--status-info)}
+.status-dot.warn{background:var(--warn)}
+.status-dot.danger{background:var(--danger)}
+
+.empty{display:flex;align-items:center;justify-content:center;height:200px;color:var(--text-2);font-size:var(--fs-body)}
+.spinner{width:20px;height:20px;border:2px solid var(--border-subtle);border-top-color:var(--vermilion);border-radius:50%;animation:spin .6s linear infinite;display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
+  html{scroll-behavior:auto !important}
+}

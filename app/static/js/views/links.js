@@ -1,3 +1,13 @@
+// Artist link dialogs: scanned cloud-drive/text links and profile links.
+
+import { API } from '../api.js';
+import { state, isCurrentRequestSeq, isActionBusy, setActionBusy } from '../store.js';
+import {
+  $, $$, escHtml, searchableTextMatches, UI_FIELD_SEPARATOR, copyText, folderTreeHasPath,
+} from '../utils.js';
+import { toast } from '../logging.js';
+import { selectFolder } from './sidebar.js';
+
 const artistLinksDialogOpeners = new WeakMap();
 let artistLinksDialogChromeBound = false;
 let artistLinksDialogArtistId = null;
@@ -8,7 +18,7 @@ function artistLinksDialogElement(dialog) {
   return dialog;
 }
 
-function openArtistLinksDialog(dialogId, opener) {
+export function openArtistLinksDialog(dialogId, opener) {
   const dialog = artistLinksDialogElement(dialogId);
   if (!dialog || typeof dialog.showModal !== 'function') return;
   $$('.artist-links-dialog[open]').forEach(other => {
@@ -19,7 +29,7 @@ function openArtistLinksDialog(dialogId, opener) {
   dialog.showModal();
 }
 
-function closeArtistLinksDialog(dialog) {
+export function closeArtistLinksDialog(dialog) {
   const element = artistLinksDialogElement(dialog);
   if (element && element.open) element.close();
 }
@@ -55,7 +65,7 @@ function bindArtistLinksDialogChrome() {
   });
 }
 
-function resetArtistLinks() {
+export function resetArtistLinks() {
   state.artistLinks = null;
   state.artistLinksLoading = false;
   state.artistLinksCategory = 'all';
@@ -74,7 +84,7 @@ function isCurrentArtistLinkRequest(artistId, artistSeq) {
     && isCurrentRequestSeq('artistLoadSeq', artistSeq);
 }
 
-async function loadArtistLinks(artistId = state.currentArtist?.id, artistSeq = null) {
+export async function loadArtistLinks(artistId = state.currentArtist?.id, artistSeq = null) {
   if (!artistId || !state.currentArtist || Number(state.currentArtist.id) !== Number(artistId)) return;
   state.artistLinksLoading = true;
   renderArtistLinks();
@@ -212,7 +222,19 @@ function artistLinkMarkup(link) {
   `;
 }
 
-function renderArtistLinks() {
+// Presentation-only state sync: the toolbar hairline in front of the link
+// entries is drawn by CSS when at least one entry is visible. Mirror the two
+// `hidden` flags onto the launcher so every early return stays in step.
+export function syncArtistLinksLauncher() {
+  const launcher = $('.artist-links-launcher');
+  if (!launcher) return;
+  const profile = $('#artistProfileLinksOpenBtn');
+  const links = $('#artistLinksOpenBtn');
+  const visible = Boolean((profile && !profile.hidden) || (links && !links.hidden));
+  launcher.classList.toggle('has-visible-entry', visible);
+}
+
+export function renderArtistLinks() {
   const opener = $('#artistLinksOpenBtn');
   const dialog = $('#artistLinksDialog');
   const summary = $('#artistLinksSummary');
@@ -223,6 +245,7 @@ function renderArtistLinks() {
     opener.hidden = true;
     closeArtistLinksDialog(dialog);
     artistLinksDialogArtistId = null;
+    syncArtistLinksLauncher();
     return;
   }
   const data = state.artistLinks || {links: [], documents: [], summary: {}};
@@ -236,9 +259,11 @@ function renderArtistLinks() {
     && (Number(counts.cloud_drives || 0) > 0 || Number(counts.links || 0) > 0 || links.length > 0);
   if (!hasContent) {
     opener.hidden = true;
+    syncArtistLinksLauncher();
     return;
   }
   opener.hidden = false;
+  syncArtistLinksLauncher();
   const reindex = $('#artistLinksReindexBtn');
   const reindexBusy = isActionBusy('artist-links-reindex', state.currentArtist.id);
   if (reindex) {
@@ -307,7 +332,7 @@ function renderArtistLinks() {
   });
 }
 
-function bindArtistLinks() {
+export function bindArtistLinks() {
   bindArtistLinksDialogChrome();
   const openBtn = $('#artistLinksOpenBtn');
   const dialog = $('#artistLinksDialog');
@@ -370,7 +395,7 @@ function bindArtistLinks() {
   }
 }
 
-function resetArtistProfileLinks() {
+export function resetArtistProfileLinks() {
   state.artistProfileLinks = null;
   state.artistProfileLinksLoading = false;
   const kind = $('#artistProfileLinkKind');
@@ -383,7 +408,7 @@ function resetArtistProfileLinks() {
   renderArtistProfileLinks();
 }
 
-async function loadArtistProfileLinks(artistId = state.currentArtist?.id, artistSeq = null) {
+export async function loadArtistProfileLinks(artistId = state.currentArtist?.id, artistSeq = null) {
   if (!artistId || !state.currentArtist || Number(state.currentArtist.id) !== Number(artistId)) return;
   state.artistProfileLinksLoading = true;
   renderArtistProfileLinks();
@@ -464,7 +489,7 @@ function bindArtistProfileLinkDeletes() {
   });
 }
 
-function renderArtistProfileLinks() {
+export function renderArtistProfileLinks() {
   const opener = $('#artistProfileLinksOpenBtn');
   const dialog = $('#artistProfileLinksDialog');
   const summary = $('#artistProfileLinksSummary');
@@ -475,9 +500,11 @@ function renderArtistProfileLinks() {
     opener.hidden = true;
     closeArtistLinksDialog(dialog);
     artistProfileLinksDialogArtistId = null;
+    syncArtistLinksLauncher();
     return;
   }
   opener.hidden = false;
+  syncArtistLinksLauncher();
   const submit = $('#artistProfileLinksForm button[type="submit"]');
   const addBusy = isActionBusy('artist-profile-link-add', state.currentArtist.id);
   if (submit) {
@@ -504,9 +531,8 @@ function renderArtistProfileLinks() {
     return;
   }
   const totalLinks = Math.max(links.length, Number(counts.social || 0) + Number(counts.subscription || 0));
-  // With no links yet the entry doubles as the explicit add path.
+  // Entry title stays fixed at the dialog name; the link count lives in the summary row.
   const entryTitle = opener.querySelector('.artist-links-entry-title');
-  if (entryTitle) entryTitle.textContent = totalLinks ? '社交与订阅' : '添加主页或订阅';
   summary.hidden = !totalLinks;
   if (totalLinks) summary.textContent = `${counts.social || 0} 个社交主页 \u00b7 ${counts.subscription || 0} 个赞助订阅`;
   status.textContent = links.length ? '' : '尚未添加任何主页或订阅链接';
@@ -518,7 +544,7 @@ function renderArtistProfileLinks() {
   bindArtistProfileLinkDeletes();
 }
 
-function bindArtistProfileLinks() {
+export function bindArtistProfileLinks() {
   bindArtistLinksDialogChrome();
   const openBtn = $('#artistProfileLinksOpenBtn');
   const dialog = $('#artistProfileLinksDialog');

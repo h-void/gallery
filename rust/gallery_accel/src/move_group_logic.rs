@@ -6,7 +6,6 @@ use serde::Serialize;
 
 use crate::media_roots::MediaRoots;
 use crate::move_rows::MoveRow;
-use crate::path_display::display_path;
 
 #[derive(Clone, Debug)]
 pub(crate) struct GroupSourceRow {
@@ -22,14 +21,6 @@ pub(crate) struct GroupSourceRow {
     pub(crate) scan_candidate_status: Option<String>,
     pub(crate) scan_candidate_path: Option<String>,
     pub(crate) item_artist_id: Option<i64>,
-    pub(crate) item_artist_name: String,
-    pub(crate) item_artist_path: String,
-    pub(crate) candidate_artist_name: String,
-    pub(crate) candidate_artist_path: String,
-    pub(crate) display_item_artist_path: String,
-    pub(crate) display_candidate_artist_path: String,
-    pub(crate) is_cross_artist: bool,
-    pub(crate) same_artist_name: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -59,24 +50,10 @@ pub(crate) struct GroupRow {
 
 pub(crate) fn group_source_from_row(
     row: &Row<'_>,
-    roots: &MediaRoots,
+    _roots: &MediaRoots,
 ) -> rusqlite::Result<GroupSourceRow> {
     let item_artist_id: Option<i64> = row.get("item_artist_id")?;
     let candidate_artist_id: i64 = row.get("candidate_artist_id")?;
-    let item_artist_name: Option<String> = row.get("item_artist_name")?;
-    let candidate_artist_name: Option<String> = row.get("candidate_artist_name")?;
-    let item_artist_path: Option<String> = row.get("item_artist_path")?;
-    let candidate_artist_path: Option<String> = row.get("candidate_artist_path")?;
-    let item_artist_name = item_artist_name.unwrap_or_default();
-    let candidate_artist_name = candidate_artist_name.unwrap_or_default();
-    let item_artist_path = item_artist_path.unwrap_or_default();
-    let candidate_artist_path = candidate_artist_path.unwrap_or_default();
-    let is_cross_artist = item_artist_id
-        .map(|id| id != candidate_artist_id)
-        .unwrap_or(false);
-    let same_artist_name = !item_artist_name.is_empty()
-        && !candidate_artist_name.is_empty()
-        && item_artist_name.to_lowercase() == candidate_artist_name.to_lowercase();
     Ok(GroupSourceRow {
         id: row.get("id")?,
         item_id: row.get("item_id")?,
@@ -90,22 +67,6 @@ pub(crate) fn group_source_from_row(
         scan_candidate_status: row.get("scan_candidate_status")?,
         scan_candidate_path: row.get("scan_candidate_path")?,
         item_artist_id,
-        item_artist_name,
-        item_artist_path: item_artist_path.clone(),
-        candidate_artist_name,
-        candidate_artist_path: candidate_artist_path.clone(),
-        display_item_artist_path: if item_artist_path.is_empty() {
-            String::new()
-        } else {
-            display_path(&item_artist_path, roots)
-        },
-        display_candidate_artist_path: if candidate_artist_path.is_empty() {
-            String::new()
-        } else {
-            display_path(&candidate_artist_path, roots)
-        },
-        is_cross_artist,
-        same_artist_name,
     })
 }
 
@@ -207,14 +168,6 @@ mod tests {
                 scan_candidate_status: Some("pending".to_string()),
                 scan_candidate_path: Some("/new/a.jpg".to_string()),
                 item_artist_id: Some(1),
-                item_artist_name: "A".to_string(),
-                item_artist_path: "/old/A".to_string(),
-                candidate_artist_name: "A".to_string(),
-                candidate_artist_path: "/new/A".to_string(),
-                display_item_artist_path: "/old/A".to_string(),
-                display_candidate_artist_path: "/new/A".to_string(),
-                is_cross_artist: true,
-                same_artist_name: true,
             },
             GroupSourceRow {
                 id: 2,
@@ -229,14 +182,6 @@ mod tests {
                 scan_candidate_status: Some("pending".to_string()),
                 scan_candidate_path: Some("/new/a.jpg".to_string()),
                 item_artist_id: Some(1),
-                item_artist_name: "A".to_string(),
-                item_artist_path: "/old/A".to_string(),
-                candidate_artist_name: "A".to_string(),
-                candidate_artist_path: "/new/A".to_string(),
-                display_item_artist_path: "/old/A".to_string(),
-                display_candidate_artist_path: "/new/A".to_string(),
-                is_cross_artist: true,
-                same_artist_name: true,
             },
         ];
         assert_eq!(duplicate_target_move_ids(&rows), HashSet::from([1, 2]));

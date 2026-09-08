@@ -101,8 +101,38 @@ impl MediaRoots {
             }
         }
 
-        // No mapping configured: return cleaned path as-is (legacy single-root / test layouts).
+        // No mapping configured: return the cleaned path as-is (legacy
+        // single-root / test layouts). Accepted risk: with empty roots a host
+        // path can pass through here, but authorized_media_path only allows
+        // it while roots are empty, and resolve_allowed_path still
+        // canonicalizes and re-checks against authorized roots before any
+        // filesystem access.
         Ok(PathBuf::from(cleaned_trim))
+    }
+
+    /// Index of the authorized root whose real path contains `path`, if any.
+    /// Virtual aliases and already-real paths both resolve through `map_to_real`.
+    pub fn root_index_for_path(&self, path: &str) -> Option<usize> {
+        let mapped = self.map_to_real(path).ok()?;
+        let mapped = normalize_slashes(&mapped.to_string_lossy())
+            .trim_end_matches('/')
+            .to_string();
+        if mapped.is_empty() {
+            return None;
+        }
+        for i in 0..self.roots.len() {
+            if let Some(real) = self.real_root_at(i) {
+                let real_n = normalize_slashes(real)
+                    .trim_end_matches(['/', '\\'])
+                    .to_string();
+                if !real_n.is_empty()
+                    && (mapped == real_n || mapped.starts_with(&(real_n.clone() + "/")))
+                {
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
     /// Normalize a DB path: rewrite virtual roots to real roots; leave other paths unchanged.

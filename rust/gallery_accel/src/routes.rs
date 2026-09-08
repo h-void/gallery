@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::route_params::{
     ArtistReferenceScoreRequest, CandidateQuery, CharacterSummaryQuery, CharactersQuery,
@@ -23,6 +23,7 @@ use gallery_accel::{
     artist_detail_response, artist_links_response, artist_profile_links_response,
     artist_recognition_status, artist_reference_scores_response, artist_references_response,
     artist_stats_response, artists_response, auto_resolve_move_candidates_with_roots,
+    backfill_item_dimensions,
     cancel_character_import_job, character_model_signature, character_recognition_status,
     character_references_response, character_response, character_summary_response,
     characters_response, cluster_scores_response, confirm_all_artist_plans,
@@ -37,13 +38,14 @@ use gallery_accel::{
     items_page_cursor_query_response, items_page_query_response, list_folder_renames,
     list_media_root_directories, mark_move_candidate_new_response,
     merge_move_candidate_group_with_roots, move_candidate_groups_response,
-    move_candidates_response, move_history_response, operation_history_response,
+    move_candidates_response, move_history_response, open_writable_db, operation_history_response,
     operation_log_response, preview_artist_folder_move, preview_folder_rename_template,
     preview_jpeg_allowed, propagate_hash_tags_response, rebuild_character_index, recheck_plan,
     recognize_character_native_topk_with_roots, reconfirm_plan, recycle_entries_response,
     reindex_artist_links, resolve_existing_scan_candidate_response_with_roots, resolve_scan_scope,
-    restore_recycle_entry, run_folder_rename_all_now, run_full_library_scan,
-    run_hash_batch_with_roots, run_scan, scan_candidates_response, serve_file_response, serve_text,
+    restore_recycle_entry, run_folder_rename_all_now, run_full_library_scan_claimed,
+    run_hash_batch_with_roots, run_scan_claimed, scan_candidates_response, serve_file_response,
+    serve_text,
     serve_transcoded_hls, serve_transcoded_hls_segment, serve_video_compatible, serve_video_hls,
     set_folder_rename_auto, set_folder_rename_format_settings, set_item_favorite_response,
     start_character_import_job_with_roots, start_video_transcode, suggest_artists_native,
@@ -52,9 +54,11 @@ use gallery_accel::{
     update_item_dates_response, update_item_tags_by_name_response, update_item_tags_response,
     update_tag, video_frame_jpeg, video_transcode_status, DbConfig, DbPool, MediaRoots,
     ScanControl, WorkerStatus, MAX_CLUSTER_SCORE_VECTORS,
+    log_error,
+    log_warn,
 };
 use serde_json::{json, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Clone, Copy)]
@@ -86,10 +90,24 @@ pub struct AppState {
     upstream: Option<Upstream>,
     primary: bool,
     scan: Arc<ScanControl>,
+    dimension_backfill: Arc<Mutex<DimensionBackfillStatus>>,
     workers: WorkerStatus,
     data_dir: PathBuf,
     ui_log_max_bytes: u64,
     ui_log_backups: usize,
+}
+
+#[derive(Clone, Default)]
+struct DimensionBackfillStatus {
+    running: bool,
+    processed: u64,
+    updated: u64,
+    failed: u64,
+    remaining: u64,
+    next_after_id: i64,
+    cursor_done: bool,
+    complete: bool,
+    error: Option<String>,
 }
 
 struct OperationGuard {
@@ -128,6 +146,7 @@ impl AppState {
             upstream,
             primary,
             scan: Arc::new(ScanControl::new()),
+            dimension_backfill: Arc::new(Mutex::new(DimensionBackfillStatus::default())),
             workers: WorkerStatus::default(),
             data_dir,
             ui_log_max_bytes: env_positive_u64("UI_LOG_MAX_BYTES", UI_LOG_MAX_BYTES),
@@ -214,6 +233,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/artists/{artist_id}/stats", get(api_artist_stats))
         .route("/api/items", get(api_items_page))
+        .route(
+            "/api/items/dimensions/backfill",
+            post(api_backfill_item_dimensions),
+        )
+        .route(
+            "/api/items/dimensions/backfill/status",
+            get(api_backfill_item_dimensions_status),
+        )
         .route("/api/items/tags", put(api_update_item_tags))
         .route("/api/items/tags-by-name", put(api_update_item_tags_by_name))
         .route("/api/items/date", put(api_update_item_dates))
@@ -629,6 +656,11 @@ async fn api_health(State(state): State<AppState>) -> Json<Value> {
             body
         })
     };
+    // A poisoned worker-status mutex means a background loop panicked; the
+    // loop recovered, but health must stay degraded until restart.
+    if state.workers.recovered_from_poison() {
+        mark_degraded(&mut body, "worker_status_mutex_poisoned");
+    }
     // Native fields are complete in product mode. An optional upstream may only fill gaps.
     if let Some(upstream) = state.upstream.as_ref() {
         // Gap-filling must never stall /api/health itself: a dead upstream answers
@@ -1497,6 +1529,149 @@ async fn api_items_page(
     })
 }
 
+async fn api_backfill_item_dimensions(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "write mode not enabled"})),
+        ));
+    }
+    let status = Arc::clone(&state.dimension_backfill);
+    {
+        let mut current = status.lock().map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("dimension backfill state unavailable: {error}")})),
+            )
+        })?;
+        if current.running {
+            return Ok(Json(dimension_backfill_value(&current)));
+        }
+        *current = DimensionBackfillStatus {
+            running: true,
+            ..DimensionBackfillStatus::default()
+        };
+    }
+
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    let control = Arc::clone(&state.scan);
+    let task_status = Arc::clone(&status);
+    tokio::spawn(async move {
+        let mut after_id = 0_i64;
+        loop {
+            while !control.try_start() {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let batch_pool = Arc::clone(&pool);
+            let batch_roots = roots.clone();
+            let batch_control = Arc::clone(&control);
+            let batch = tokio::task::spawn_blocking(move || {
+                let _operation_guard = OperationGuard {
+                    control: batch_control,
+                };
+                let conn = batch_pool.get()?;
+                backfill_item_dimensions(&conn, &batch_roots, after_id, 32)
+            })
+            .await;
+
+            let value = match batch {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => {
+                    if let Ok(mut current) = task_status.lock() {
+                        current.running = false;
+                        current.complete = false;
+                        current.error = Some(error.to_string());
+                    }
+                    break;
+                }
+                Err(error) => {
+                    if let Ok(mut current) = task_status.lock() {
+                        current.running = false;
+                        current.complete = false;
+                        current.error = Some(error.to_string());
+                    }
+                    break;
+                }
+            };
+
+            let processed = value.get("processed").and_then(Value::as_u64).unwrap_or(0);
+            let updated = value.get("updated").and_then(Value::as_u64).unwrap_or(0);
+            let failed = value.get("failed").and_then(Value::as_u64).unwrap_or(0);
+            let remaining = value.get("remaining").and_then(Value::as_u64).unwrap_or(0);
+            let next_after_id = value
+                .get("next_after_id")
+                .and_then(Value::as_i64)
+                .unwrap_or(after_id);
+            let cursor_done = value
+                .get("cursor_done")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            if let Ok(mut current) = task_status.lock() {
+                current.processed += processed;
+                current.updated += updated;
+                current.failed += failed;
+                current.remaining = remaining;
+                current.next_after_id = next_after_id;
+                current.cursor_done = cursor_done;
+            }
+            if cursor_done {
+                if let Ok(mut current) = task_status.lock() {
+                    current.running = false;
+                    current.complete = remaining == 0;
+                }
+                break;
+            }
+            if next_after_id <= after_id {
+                if let Ok(mut current) = task_status.lock() {
+                    current.running = false;
+                    current.complete = false;
+                    current.error = Some("dimension backfill cursor did not advance".to_string());
+                }
+                break;
+            }
+            after_id = next_after_id;
+        }
+    });
+
+    let current = status.lock().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("dimension backfill state unavailable: {error}")})),
+        )
+    })?;
+    Ok(Json(dimension_backfill_value(&current)))
+}
+
+async fn api_backfill_item_dimensions_status(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let current = state.dimension_backfill.lock().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("dimension backfill state unavailable: {error}")})),
+        )
+    })?;
+    Ok(Json(dimension_backfill_value(&current)))
+}
+
+fn dimension_backfill_value(status: &DimensionBackfillStatus) -> Value {
+    json!({
+        "running": status.running,
+        "processed": status.processed,
+        "updated": status.updated,
+        "failed": status.failed,
+        "remaining": status.remaining,
+        "next_after_id": status.next_after_id,
+        "cursor_done": status.cursor_done,
+        "complete": status.complete,
+        "error": status.error,
+    })
+}
+
 async fn api_tags(
     State(state): State<AppState>,
     Query(query): Query<TagsQuery>,
@@ -1955,16 +2130,24 @@ async fn api_character_summary(
     State(state): State<AppState>,
     Query(query): Query<CharacterSummaryQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    character_summary_response(
-        &conn,
-        query.artist_id,
-        query.model_repo_id.as_deref().unwrap_or(""),
-        query.model_variant.as_deref().unwrap_or(""),
-        query.model_file.as_deref().unwrap_or(""),
-    )
-    .map(Json)
-    .map_err(to_http_error)
+    // The tag rollup amplifies through item_tags x items; keep it off the
+    // async workers.
+    let pool = Arc::clone(&state.pool);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        character_summary_response(
+            &conn,
+            query.artist_id,
+            query.model_repo_id.as_deref().unwrap_or(""),
+            query.model_variant.as_deref().unwrap_or(""),
+            query.model_file.as_deref().unwrap_or(""),
+        )
+        .map(Json)
+        .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?;
+    result
 }
 
 async fn api_character_references(
@@ -1982,17 +2165,24 @@ async fn api_artist_reference_scores(
     State(state): State<AppState>,
     Json(payload): Json<ArtistReferenceScoreRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    artist_reference_scores_response(
-        &conn,
-        &payload.dino_embedding,
-        &payload.wd14_embedding,
-        payload.dino_weight.unwrap_or(0.65),
-        payload.wd14_weight.unwrap_or(0.35),
-        payload.limit,
-    )
-    .map(Json)
-    .map_err(to_http_error)
+    // Full-table embedding scan + dot products: run on the blocking pool.
+    let pool = Arc::clone(&state.pool);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        artist_reference_scores_response(
+            &conn,
+            &payload.dino_embedding,
+            &payload.wd14_embedding,
+            payload.dino_weight.unwrap_or(0.65),
+            payload.wd14_weight.unwrap_or(0.35),
+            payload.limit,
+        )
+        .map(Json)
+        .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?;
+    result
 }
 
 #[derive(serde::Deserialize)]
@@ -2009,7 +2199,10 @@ async fn api_cluster_scores(
             Json(json!({"error": format!("too many vectors (max {MAX_CLUSTER_SCORE_VECTORS})")})),
         ));
     }
-    cluster_scores_response(&payload.vectors)
+    // The O(n^2 x dim) matrix must not occupy a Tokio worker.
+    tokio::task::spawn_blocking(move || cluster_scores_response(&payload.vectors))
+        .await
+        .map_err(|error| to_similarity_http_error(anyhow::Error::new(error)))?
         .map(Json)
         .map_err(to_similarity_http_error)
 }
@@ -2017,25 +2210,41 @@ async fn api_cluster_scores(
 async fn api_scan_start(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if !state.scan.try_start() {
-        return Ok(Json(json!({"ok": false, "message": "Already scanning"})));
-    }
+    let guard = match state.scan.try_claim() {
+        Some(g) => g,
+        None => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "a scan or file operation is already running"})),
+            ));
+        }
+    };
     let db_path = state.db_path.clone();
     let roots = state.roots.clone();
     let control = Arc::clone(&state.scan);
     tokio::task::spawn_blocking(move || {
+        let _guard = guard;
         // Dedicated connection avoids borrowing the request pool during long walks.
-        let conn = match rusqlite::Connection::open(&db_path) {
+        let conn = match open_writable_db(&db_path) {
             Ok(c) => c,
             Err(err) => {
-                control.set_running(false);
-                eprintln!("scan open db failed: {err}");
+                log_error!("scan open db failed: {err}");
                 return;
             }
         };
-        let _ = conn.execute_batch("PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL;");
-        if let Err(err) = run_full_library_scan(&conn, &roots, &control) {
-            eprintln!("scan failed: {err}");
+        match run_full_library_scan_claimed(&conn, &roots, &control) {
+            Ok(outcome) => {
+                let phase = outcome.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+                if phase == "partial" || phase == "failed" {
+                    log_warn!(
+                        "scan finished with {phase}: {}",
+                        outcome.get("errors").unwrap_or(&json!([]))
+                    );
+                }
+            }
+            Err(err) => {
+                log_error!("scan failed: {err}");
+            }
         }
     });
     Ok(Json(json!({"ok": true})))
@@ -2077,26 +2286,42 @@ async fn api_scan_folder(
             (code, Json(json!({"error": msg, "ok": false})))
         })?;
     }
-    if !state.scan.try_start() {
-        return Ok(Json(json!({"ok": false, "message": "Already scanning"})));
-    }
+    let guard = match state.scan.try_claim() {
+        Some(g) => g,
+        None => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "a scan or file operation is already running"})),
+            ));
+        }
+    };
     let db_path = state.db_path.clone();
     let roots = state.roots.clone();
     let control = Arc::clone(&state.scan);
     let folder = q.folder.clone();
     let artist_id = q.artist_id;
     tokio::task::spawn_blocking(move || {
-        let conn = match rusqlite::Connection::open(&db_path) {
+        let _guard = guard;
+        let conn = match open_writable_db(&db_path) {
             Ok(c) => c,
             Err(err) => {
-                control.set_running(false);
-                eprintln!("scan open db failed: {err}");
+                log_error!("scan open db failed: {err}");
                 return;
             }
         };
-        let _ = conn.execute_batch("PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL;");
-        if let Err(err) = run_scan(&conn, &roots, &control, Some(artist_id), folder.as_deref()) {
-            eprintln!("scan failed: {err}");
+        match run_scan_claimed(&conn, &roots, &control, Some(artist_id), folder.as_deref()) {
+            Ok(outcome) => {
+                let phase = outcome.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+                if phase == "partial" || phase == "failed" {
+                    log_warn!(
+                        "scan folder finished with {phase}: {}",
+                        outcome.get("errors").unwrap_or(&json!([]))
+                    );
+                }
+            }
+            Err(err) => {
+                log_error!("scan failed: {err}");
+            }
         }
     });
     Ok(Json(json!({"ok": true})))
@@ -2128,12 +2353,13 @@ async fn api_hash_run(
             Json(json!({"error": "another file operation is running"})),
         ));
     }
-    let _operation_guard = OperationGuard {
-        control: Arc::clone(&state.scan),
-    };
     let pool = Arc::clone(&state.pool);
     let roots = state.roots.clone();
+    let control = Arc::clone(&state.scan);
     let result = tokio::task::spawn_blocking(move || {
+        // The operation lock lives inside the blocking task: a client
+        // disconnect drops only the response, never the mutex early.
+        let _operation_guard = OperationGuard { control };
         let conn = pool.get()?;
         run_hash_batch_with_roots(&conn, &roots, 32)
     })
@@ -2172,9 +2398,19 @@ async fn api_file_delete(
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let path = q.get("path").cloned().unwrap_or_default();
+    // A recycle delete moves real files; share the operation slot with scans,
+    // moves, and archive executions instead of racing them.
+    if !state.scan.try_start() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "another file operation is running"})),
+        ));
+    }
     let roots = state.roots.clone();
     let pool = Arc::clone(&state.pool);
+    let control = Arc::clone(&state.scan);
     tokio::task::spawn_blocking(move || {
+        let _operation_guard = OperationGuard { control };
         let conn = pool.get().map_err(to_http_error)?;
         delete_to_recycle(&path, &roots, &conn)
             .map(Json)
@@ -2231,9 +2467,19 @@ async fn api_recycle_restore(
             Json(json!({"error": "write capability is disabled"})),
         ));
     }
+    // A restore writes real files back into the library; share the operation
+    // slot with scans, moves, and archive executions.
+    if !state.scan.try_start() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "another file operation is running"})),
+        ));
+    }
     let pool = Arc::clone(&state.pool);
     let roots = state.roots.clone();
+    let control = Arc::clone(&state.scan);
     tokio::task::spawn_blocking(move || {
+        let _operation_guard = OperationGuard { control };
         let conn = pool.get().map_err(to_http_error)?;
         restore_recycle_entry(&conn, &roots, entry_id)
             .map(Json)
@@ -2825,11 +3071,7 @@ async fn api_ui_log(State(state): State<AppState>, Json(body): Json<Value>) -> J
     } else {
         payload
     };
-    let line = format!(
-        "{} {}\n",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-        payload
-    );
+    let line = format!("{} {}\n", gallery_accel::logging::log_timestamp(), payload);
     Json(json!({
         "ok": append_ui_log(
             &log_path(&state.data_dir, "ui-actions.log"),
@@ -2863,11 +3105,19 @@ async fn api_logs_tail(
         .clamp(1, LOG_TAIL_MAX_BYTES);
     let path = log_path(&state.data_dir, name);
     let exists = path.is_file();
+    let updated_at = path
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
     let (lines, truncated) =
         read_bounded_log_tail(&path, line_limit, max_bytes).unwrap_or_default();
     Json(json!({
         "source": source,
         "exists": exists,
+        "updated_at": updated_at,
         "lines": lines,
         "truncated": truncated,
         "max_bytes": max_bytes
@@ -3194,7 +3444,7 @@ fn blocking_http_error(error: tokio::task::JoinError) -> (StatusCode, Json<Value
 fn to_http_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {
     // Details (including server paths from the anyhow chain) stay in the
     // process log; the response body is generic so paths never leak to clients.
-    eprintln!("request failed: {error:#}");
+    log_error!("request failed: {error:#}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({"error": "internal server error"})),
@@ -3215,6 +3465,7 @@ fn to_similarity_http_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {
     let message = error.to_string();
     if message == "vectors must be non-empty"
         || message == "all vectors must have the same dimension"
+        || message == "vectors must contain only finite values"
     {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": message})));
     }
@@ -3464,6 +3715,9 @@ async fn proxy_request(
 }
 
 #[cfg(test)]
+// Env serialization (ENV_LOCK) is intentionally held across awaits: the
+// async tests set process-global env vars before driving the router.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
@@ -3489,6 +3743,82 @@ mod tests {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(body.as_ref(), expected.as_bytes(), "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn dimension_backfill_runs_in_background_and_reports_completion() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pictures = dir.path().join("pictures").join("Artist");
+        std::fs::create_dir_all(&pictures).unwrap();
+        let image_path = pictures.join("wide.png");
+        image::RgbImage::new(640, 360).save(&image_path).unwrap();
+        let _root = crate::test_support::EnvVar::set("PICTURES_ROOT", dir.path().join("pictures"));
+        let state = AppState::new(
+            dir.path().join("gallery.db"),
+            DbConfig {
+                read_only: false,
+                pool_size: 1,
+            },
+            Capabilities {
+                read_only: false,
+                writes: true,
+                media: true,
+                ml: true,
+            },
+        )
+        .unwrap();
+        state
+            .pool
+            .get()
+            .unwrap()
+            .execute(
+                "INSERT INTO artists (id, name, path) VALUES (1, 'Artist', ?1)",
+                [dir.path().join("pictures").join("Artist").to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        state
+            .pool
+            .get()
+            .unwrap()
+            .execute(
+                "INSERT INTO items (artist_id, file_path, file_name, media_type) VALUES (1, ?1, 'wide.png', 'image')",
+                [image_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let app = router(state);
+        let (status, started) = json_response(
+            &app,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/items/dimensions/backfill")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(started.get("running").is_some());
+
+        let mut finished = Value::Null;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let (status, body) = json_response(
+                &app,
+                Request::builder()
+                    .uri("/api/items/dimensions/backfill/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            if body["running"] == json!(false) {
+                finished = body;
+                break;
+            }
+        }
+        assert_eq!(finished["complete"], json!(true));
+        assert_eq!(finished["updated"], json!(1));
+        assert_eq!(finished["remaining"], json!(0));
     }
 
     #[test]
@@ -4246,6 +4576,52 @@ mod tests {
         assert!(path.is_file());
         assert!(std::path::PathBuf::from(format!("{}.1", path.display())).is_file());
         assert!(std::path::PathBuf::from(format!("{}.2", path.display())).is_file());
+    }
+
+    /// `product_ui::log_line_timestamp_millis` only parses 23-character stamps
+    /// carrying a `,mmm` / `.mmm` fraction. A bare `%H:%M:%S` stamp makes every
+    /// Rust-era line undateable, so fresh `frontend_error` rows inherit an old
+    /// timestamp and the health error window filters them out.
+    #[tokio::test]
+    async fn ui_log_lines_carry_a_parseable_timestamp() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path());
+
+        let state = AppState::new(
+            dir.path().join("gallery.db"),
+            DbConfig {
+                read_only: false,
+                pool_size: 1,
+            },
+            Capabilities {
+                read_only: false,
+                writes: true,
+                media: true,
+                ml: true,
+            },
+        )
+        .unwrap();
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/ui-log")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"event":"frontend_error"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content =
+            std::fs::read_to_string(dir.path().join("logs").join("ui-actions.log")).unwrap();
+        let stamp = content.get(..23).expect("line starts with a 23-char timestamp");
+        assert!(
+            chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S,%3f").is_ok(),
+            "ui-actions.log must use the shared log format: {stamp:?}"
+        );
     }
 
     #[tokio::test]

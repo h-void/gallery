@@ -23,6 +23,12 @@ ROOT_FILES = frozenset(
         "README.md",
         "README.en.md",
         "docker-compose.yml",
+        "docker-compose.gpu.yml",
+        "docker-compose.cuda.yml",
+        "docker-compose.launcher.yml",
+        "gallery.yml",
+        "start.cmd",
+        "start.sh",
     )
 )
 TOOL_FILES = frozenset(
@@ -33,6 +39,7 @@ TOOL_FILES = frozenset(
         "tools/build_release.py",
         "tools/build_rust_accel.py",
         "tools/build_public_release.py",
+        "tools/start_gallery.py",
     )
 )
 REQUIRED_FILES = frozenset(
@@ -44,6 +51,13 @@ REQUIRED_FILES = frozenset(
         "docker-entrypoint.sh",
         "README.md",
         "docker-compose.yml",
+        "docker-compose.gpu.yml",
+        "docker-compose.cuda.yml",
+        "docker-compose.launcher.yml",
+        "gallery.yml",
+        "start.cmd",
+        "start.sh",
+        "tools/start_gallery.py",
         "rust/gallery_accel/Cargo.toml",
         "rust/gallery_accel/Cargo.lock",
         "app/static/index.html",
@@ -93,6 +107,17 @@ def strip_test_mod_declarations(relative: str, text: str) -> str:
         kept.append(line)
         pending_cfg = False
     return "".join(kept)
+
+
+def sanitize_public_env(text: str) -> str:
+    """Keep the release profile while dropping local active overrides."""
+    return "".join(
+        line
+        for line in text.splitlines(keepends=True)
+        if "=" not in line
+        or line.lstrip().startswith("#")
+        or line.strip().startswith("COMPOSE_PROFILES=")
+    )
 
 
 def is_public_file(path: str | Path) -> bool:
@@ -153,7 +178,20 @@ def stage_public_release(output: Path, tracked_files: Iterable[str | Path] | Non
             raise FileNotFoundError(f"tracked public file is missing: {source}")
         destination = output.joinpath(*relative.split("/"))
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if relative in _TEST_MOD_FILES:
+        if relative == ".env":
+            destination.write_text(
+                sanitize_public_env(source.read_text(encoding="utf-8")),
+                encoding="utf-8",
+                newline="",
+            )
+        elif relative == "gallery.yml":
+            # Never publish user-entered local media paths or the selected mode.
+            destination.write_text(
+                "# cpu：CPU；gpu：Intel 核显；cuda：NVIDIA\n模式: cpu\n\n"
+                "# 一行一个目录，Windows 路径使用 /\n目录:\n  - D:/Pictures\n",
+                encoding="utf-8",
+            )
+        elif relative in _TEST_MOD_FILES:
             # Strip the declarations of the removed test modules so the
             # public tree compiles (and `cargo test` passes) out of the box.
             text = source.read_text(encoding="utf-8")

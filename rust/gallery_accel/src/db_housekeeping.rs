@@ -1,6 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+
+use crate::folder_archive::create_housekeeping_db_backup;
 
 const TERMINAL_SCAN_CANDIDATE_STATUSES: &str = "'resolved','new','superseded'";
 
@@ -9,12 +11,19 @@ pub struct HousekeepingResult {
     pub missing_items_deleted: usize,
     pub scan_seen_deleted: usize,
     pub scan_candidates_deleted: usize,
+    /// Online backup taken before this batch permanently deleted expired
+    /// missing items. `None` when the batch deleted no missing items.
+    pub missing_items_backup: Option<String>,
 }
 
 pub fn cleanup_scan_seen(conn: &Connection, scan_id: &str) -> Result<usize> {
-    Ok(conn.execute("DELETE FROM scan_seen WHERE scan_id=?", params![scan_id])?)
+    crate::scan::delete_scan_seen_chunked(conn, Some(scan_id), None)
 }
 
+/// Missing items expiring out of the 90-day window are permanently deleted
+/// (cascading their tags and favorites). Every batch that would delete at
+/// least one such row first takes a SQLite online backup; a failed backup
+/// aborts the whole housekeeping batch without deleting anything.
 pub fn run_housekeeping_batch(
     conn: &Connection,
     missing_item_cutoff: f64,
@@ -22,7 +31,44 @@ pub fn run_housekeeping_batch(
     scan_candidate_cutoff: f64,
     batch_size: i64,
 ) -> Result<HousekeepingResult> {
+    run_housekeeping_batch_with_backup(
+        conn,
+        missing_item_cutoff,
+        scan_seen_cutoff,
+        scan_candidate_cutoff,
+        batch_size,
+        &create_housekeeping_db_backup,
+    )
+}
+
+pub fn run_housekeeping_batch_with_backup(
+    conn: &Connection,
+    missing_item_cutoff: f64,
+    scan_seen_cutoff: f64,
+    scan_candidate_cutoff: f64,
+    batch_size: i64,
+    backup: &dyn Fn(&Connection) -> Result<String>,
+) -> Result<HousekeepingResult> {
     let batch_size = batch_size.clamp(1, 50_000);
+    let pending_missing_items: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM items i
+         WHERE i.missing=1
+           AND i.missing_at IS NOT NULL
+           AND i.missing_at <= ?
+           AND NOT EXISTS (
+               SELECT 1 FROM move_candidates mc
+               WHERE mc.item_id=i.id AND mc.status='pending'
+           )",
+        params![missing_item_cutoff],
+        |row| row.get(0),
+    )?;
+    let mut missing_items_backup = None;
+    if pending_missing_items > 0 {
+        missing_items_backup = Some(
+            backup(conn)
+                .context("backup before expired missing-item deletion failed; batch skipped")?,
+        );
+    }
     let tx = conn.unchecked_transaction()?;
     let missing_items_deleted = tx.execute(
         "DELETE FROM items
@@ -75,6 +121,7 @@ pub fn run_housekeeping_batch(
         missing_items_deleted,
         scan_seen_deleted,
         scan_candidates_deleted,
+        missing_items_backup,
     })
 }
 
@@ -211,10 +258,28 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_housekeeping_batch(&conn, 500.0, 500.0, 500.0, 100).unwrap();
+        let backup_calls = std::cell::Cell::new(0usize);
+        let backup = |_: &Connection| -> Result<String> {
+            backup_calls.set(backup_calls.get() + 1);
+            Ok("/tmp/backup".into())
+        };
+        let result = run_housekeeping_batch_with_backup(
+            &conn,
+            500.0,
+            500.0,
+            500.0,
+            100,
+            &backup,
+        )
+        .unwrap();
         assert_eq!(result.missing_items_deleted, 1);
         assert_eq!(result.scan_seen_deleted, 2);
         assert_eq!(result.scan_candidates_deleted, 1);
+        assert_eq!(backup_calls.get(), 1, "deleting missing items must back up first");
+        assert_eq!(
+            result.missing_items_backup.as_deref(),
+            Some("/tmp/backup")
+        );
 
         let remaining_items: Vec<i64> = conn
             .prepare("SELECT id FROM items ORDER BY id")
@@ -252,5 +317,70 @@ mod tests {
             remaining_candidates,
             vec!["active-old", "new-old", "old-active", "terminal-recent"]
         );
+    }
+
+    #[test]
+    fn zero_expired_missing_items_takes_no_backup() {
+        let conn = fixture();
+        conn.execute(
+            "INSERT INTO items (id,missing,missing_at) VALUES (1,0,100.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_seen (scan_id, artist_id, file_path, created_at)
+             VALUES ('old', 1, '/a.jpg', 100)",
+            [],
+        )
+        .unwrap();
+        let backup_calls = std::cell::Cell::new(0usize);
+        let backup = |_: &Connection| -> Result<String> {
+            backup_calls.set(backup_calls.get() + 1);
+            Ok("/tmp/backup".into())
+        };
+
+        let result =
+            run_housekeeping_batch_with_backup(&conn, 500.0, 500.0, 500.0, 100, &backup).unwrap();
+
+        assert_eq!(result.missing_items_deleted, 0);
+        assert_eq!(result.scan_seen_deleted, 1);
+        assert_eq!(backup_calls.get(), 0, "no deletion, no backup");
+        assert_eq!(result.missing_items_backup, None);
+    }
+
+    #[test]
+    fn failed_backup_aborts_the_whole_housekeeping_batch() {
+        let conn = fixture();
+        conn.execute(
+            "INSERT INTO items (id,missing,missing_at) VALUES (1,1,100.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_seen (scan_id, artist_id, file_path, created_at)
+             VALUES ('old', 1, '/a.jpg', 100)",
+            [],
+        )
+        .unwrap();
+        let backup = |_: &Connection| -> Result<String> {
+            Err(anyhow::anyhow!("disk full"))
+        };
+
+        let error =
+            run_housekeeping_batch_with_backup(&conn, 500.0, 500.0, 500.0, 100, &backup)
+                .unwrap_err();
+
+        assert!(
+            error.to_string().contains("backup"),
+            "unexpected error: {error}"
+        );
+        let items: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        let seen: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(items, 1, "failed backup must keep the missing item");
+        assert_eq!(seen, 1, "failed backup must skip the whole batch");
     }
 }

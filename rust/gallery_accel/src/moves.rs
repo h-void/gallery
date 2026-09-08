@@ -71,7 +71,7 @@ fn list_move_candidates(
             FROM move_candidates mc
             LEFT JOIN items i ON i.id = mc.item_id
             WHERE {where_sql}
-            ORDER BY mc.created_at, mc.id
+            ORDER BY mc.created_at DESC, mc.id DESC
             LIMIT ? OFFSET ?
             "
         ),
@@ -88,7 +88,7 @@ fn count_waiting_hash_candidates(conn: &Connection) -> Result<i64> {
             SELECT 's' || id AS key
             FROM scan_candidates
             WHERE status IN ('pending', 'candidate')
-              AND hash_status != 'done'
+              AND COALESCE(hash_status, '') != 'done'
             UNION
             SELECT
                 CASE

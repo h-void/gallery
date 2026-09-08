@@ -14,7 +14,7 @@ use crate::media_roots::MediaRoots;
 use crate::operations::operation_history_response;
 use crate::scan_candidates_write::{
     apply_move_candidate_group_item_response_with_roots, apply_move_candidate_response_with_roots,
-    mark_move_candidate_new_response,
+    mark_move_candidate_new_response, resolve_ambiguous_cluster_as_new_response,
 };
 use crate::tags_write::{update_item_tags_by_name_response, update_item_tags_response};
 
@@ -104,18 +104,53 @@ fn is_error_log_line(line: &str) -> bool {
         || lower.contains("frontend_rejection")
 }
 
+/// Parse a persisted log stamp into epoch millis.
+///
+/// Every writer (`logging::log_timestamp`, the Python-era logger, the fnOS
+/// launcher) serializes LOCAL wall-clock time without an offset, so the text
+/// must be interpreted in the configured local timezone. Interpreting it as
+/// UTC shifted every line by the host offset and mis-dated the
+/// `/api/operation-log` and health recent-errors windows.
 fn log_line_timestamp_millis(line: &str) -> Option<i64> {
+    use chrono::TimeZone;
     let timestamp = line.get(line.find("20")?..)?.get(..23)?;
     ["%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%d %H:%M:%S.%f"]
         .iter()
         .find_map(|format| chrono::NaiveDateTime::parse_from_str(timestamp, format).ok())
-        .map(|value| value.and_utc().timestamp_millis())
+        .and_then(|value| {
+            chrono::Local
+                .from_local_datetime(&value)
+                .earliest()
+                .map(|local| local.timestamp_millis())
+        })
+}
+
+/// Health-panel errors are only "recent" inside this window. Log files left
+/// behind by the pre-Rust stack are never rewritten, so without a window their
+/// historical errors resurface in `/api/health` forever.
+/// **0 disables the window** and keeps every error.
+const LOG_ERROR_WINDOW_HOURS_DEFAULT: i64 = 168;
+
+fn log_error_window_millis() -> i64 {
+    let hours = env_i64(
+        "GALLERY_LOG_ERROR_WINDOW_HOURS",
+        LOG_ERROR_WINDOW_HOURS_DEFAULT,
+    );
+    if hours <= 0 {
+        return i64::MAX;
+    }
+    hours.saturating_mul(3_600_000)
+}
+
+fn now_millis() -> i64 {
+    (now() * 1000.0) as i64
 }
 
 pub fn recent_log_errors(log_dir: &Path, limit: usize) -> Vec<Value> {
     if limit == 0 {
         return Vec::new();
     }
+    let cutoff = now_millis().saturating_sub(log_error_window_millis());
     let mut out = Vec::new();
     let mut sequence = 0usize;
     for name in ["gallery.log", "startup.log", "ui-actions.log"] {
@@ -137,6 +172,9 @@ pub fn recent_log_errors(log_dir: &Path, limit: usize) -> Vec<Value> {
                 timestamp = value;
             }
             if !is_error_log_line(&line) {
+                continue;
+            }
+            if timestamp < cutoff {
                 continue;
             }
             out.push((
@@ -184,23 +222,24 @@ fn folder_item_ids(conn: &Connection, artist_id: i64, folder: &str) -> Result<Ve
         }
         return Ok(ids);
     }
+    // Byte-exact prefix comparison instead of LIKE: SQLite's built-in LIKE is
+    // ASCII case-insensitive and would conflate distinct `Foo`/`foo` folders
+    // (case-sensitive media filesystems keep both), so a tag write for one
+    // would silently rewrite the sibling's metadata. substr()+`=` with an
+    // explicit BINARY collation matches the requested folder's exact bytes and
+    // needs no wildcard escaping.
     let prefix = {
         let base = artist_path
             .replace('\\', "/")
             .trim_end_matches('/')
             .to_string();
-        escape_like(&format!("{base}/{folder}/"))
+        format!("{base}/{folder}/")
     };
     sql.push_str(
-        " AND (replace(file_path,'\\\\','/') LIKE ? ESCAPE '\\' \
-           OR replace(file_path,'\\\\','/') LIKE ? ESCAPE '\\')",
+        " AND substr(replace(file_path,'\\\\','/'), 1, length(?)) = ? COLLATE BINARY",
     );
-    // Also match files directly under folder without trailing slash edge cases.
-    let like_prefix = format!("{prefix}%");
-    let exact_folder_prefix = prefix.trim_end_matches('/').to_string();
-    let like_exact = format!("{exact_folder_prefix}/%");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![artist_id, like_prefix, like_exact], |r| {
+    let rows = stmt.query_map(params![artist_id, prefix, prefix], |r| {
         r.get::<_, i64>(0)
     })?;
     for row in rows {
@@ -432,6 +471,7 @@ pub fn merge_move_candidate_group_with_roots(
     let mut applied = Vec::new();
     let mut skipped = Vec::new();
     let mut handled_scan_candidates = HashSet::new();
+    let mut stale = 0i64;
     for (id, scan_candidate_id, _new_path) in moves {
         if let Some(scan_candidate_id) = scan_candidate_id {
             if !handled_scan_candidates.insert(scan_candidate_id) {
@@ -449,12 +489,24 @@ pub fn merge_move_candidate_group_with_roots(
                 applied.push(json!({"id": id, "item_id": v.get("item_id")}));
             }
             Ok(v) => {
+                let reason = v
+                    .get("reason")
+                    .cloned()
+                    .unwrap_or(json!(v.get("action").cloned().unwrap_or(json!("not_moved"))));
+                if reason == json!("candidate_stale") {
+                    stale += 1;
+                }
                 skipped.push(json!({
                     "id": id,
-                    "reason": v.get("reason").cloned().unwrap_or(json!(v.get("action").cloned().unwrap_or(json!("not_moved"))))
+                    "reason": reason
                 }));
             }
-            Err(e) => skipped.push(json!({"id": id, "reason": e.to_string()})),
+            Err(e) => {
+                if e.to_string() == "candidate_stale" {
+                    stale += 1;
+                }
+                skipped.push(json!({"id": id, "reason": e.to_string()}));
+            }
         }
     }
     Ok(json!({
@@ -462,7 +514,7 @@ pub fn merge_move_candidate_group_with_roots(
         "item_artist_id": old_artist_id,
         "candidate_artist_id": new_artist_id,
         "applied": applied.len(),
-        "stale": 0,
+        "stale": stale,
         "skipped": skipped.len(),
         "resolved_existing": 0,
         "applied_candidates": applied,
@@ -473,7 +525,7 @@ pub fn merge_move_candidate_group_with_roots(
 /// One pending move-candidate row joined with its item and duplicate counts:
 /// (id, item_artist, candidate_artist, reason, scan_candidate_id, new_path,
 /// item_hash, candidate_hash, missing, same_scan_candidate_count,
-/// same_target_count, tag_count).
+/// same_target_count, tag_count, active_hash_duplicates).
 type AutoResolveMoveRow = (
     i64,
     i64,
@@ -487,7 +539,17 @@ type AutoResolveMoveRow = (
     i64,
     i64,
     i64,
+    i64,
 );
+
+/// Reasons the resolver itself proves unique before it writes a row:
+/// identical inode (`inode`) or a category-only rename (`category_rename`).
+/// Every other reason in `move_candidates` exists because the resolver could
+/// not decide (multiple missing old records, an active copy, an occupied
+/// target, multiple inode or category matches), so automatic processing must
+/// not confirm them: applying the first row would silently pick an identity
+/// and inherit that record's tags.
+const AUTO_APPLY_MOVE_REASONS: &[&str] = &["inode", "category_rename"];
 
 pub fn auto_resolve_move_candidates(conn: &Connection, limit: i64) -> Result<Value> {
     auto_resolve_move_candidates_with_roots(
@@ -509,18 +571,48 @@ pub fn auto_resolve_move_candidates_with_roots(
     let limit = if limit > 0 { limit.min(5000) } else { 1000 };
     let moves: Vec<AutoResolveMoveRow> = conn
         .prepare(
-            "SELECT mc.id, i.artist_id, mc.artist_id, mc.reason, mc.scan_candidate_id, mc.new_path,
-                    i.content_hash, COALESCE(sc.content_hash, ''), i.missing,
-                    (SELECT COUNT(*) FROM move_candidates sibling
-                     WHERE sibling.status='pending' AND sibling.scan_candidate_id=mc.scan_candidate_id),
-                    (SELECT COUNT(*) FROM move_candidates sibling
-                     WHERE sibling.status='pending' AND sibling.new_path=mc.new_path),
-                    (SELECT COUNT(*) FROM item_tags it WHERE it.item_id=i.id)
-             FROM move_candidates mc
-             JOIN items i ON i.id=mc.item_id
-             LEFT JOIN scan_candidates sc ON sc.id=mc.scan_candidate_id
-             WHERE mc.status='pending'
-             ORDER BY mc.id LIMIT ?",
+            // An auto-eligible row is one the loop below will actually apply
+            // (cross-artist proven, ambiguous cluster, mark-as-new, or an
+            // auto-apply reason). This must mirror the proof in the loop exactly;
+            // if the proof changes, update both. Ordering auto-eligible rows
+            // first means a backlog of manual-only (`left_for_manual`) rows can
+            // never permanently starve background-appliable moves behind them.
+            "SELECT *,
+                (CASE
+                   WHEN item_artist_id <> candidate_artist_id AND reason = 'manual_needed' AND i_missing = 1
+                        AND item_hash <> '' AND item_hash = candidate_hash
+                        AND active_hash_duplicates = 0 AND group_count >= 2 THEN 1
+                   WHEN item_artist_id <> candidate_artist_id AND reason = 'manual_needed' AND i_missing = 1
+                        AND item_hash <> '' AND item_hash = candidate_hash
+                        AND active_hash_duplicates = 0 AND group_count = 1 AND target_count = 1 THEN 1
+                   WHEN reason = 'manual_needed' AND i_missing = 0 AND tag_count = 0
+                        AND group_count = 1 AND target_count = 1
+                        AND item_hash <> '' AND item_hash = candidate_hash THEN 1
+                   WHEN reason IN ('inode', 'category_rename')
+                        AND group_count = 1 AND target_count = 1 AND i_missing = 1
+                        AND active_hash_duplicates = 0
+                        AND (item_hash = '' OR candidate_hash = '' OR item_hash = candidate_hash) THEN 1
+                   ELSE 0
+                 END) AS auto_eligible
+             FROM (
+               SELECT mc.id AS id, i.artist_id AS item_artist_id, mc.artist_id AS candidate_artist_id,
+                      mc.reason AS reason, mc.scan_candidate_id AS scan_candidate_id, mc.new_path AS new_path,
+                      i.content_hash AS item_hash, COALESCE(sc.content_hash, '') AS candidate_hash,
+                      i.missing AS i_missing,
+                      (SELECT COUNT(*) FROM move_candidates sibling
+                       WHERE sibling.status='pending' AND sibling.scan_candidate_id=mc.scan_candidate_id) AS group_count,
+                      (SELECT COUNT(*) FROM move_candidates sibling
+                       WHERE sibling.status='pending' AND sibling.new_path=mc.new_path) AS target_count,
+                      (SELECT COUNT(*) FROM item_tags it WHERE it.item_id=i.id) AS tag_count,
+                      (SELECT COUNT(*) FROM items dup
+                        WHERE dup.missing=0 AND dup.id<>i.id
+                          AND dup.content_hash<>'' AND dup.content_hash=i.content_hash) AS active_hash_duplicates
+                 FROM move_candidates mc
+                 JOIN items i ON i.id=mc.item_id
+                 LEFT JOIN scan_candidates sc ON sc.id=mc.scan_candidate_id
+                 WHERE mc.status='pending'
+             ) AS pending
+             ORDER BY auto_eligible DESC, id LIMIT ?",
         )?
         .query_map(params![limit], |row| {
             Ok((
@@ -536,12 +628,16 @@ pub fn auto_resolve_move_candidates_with_roots(
                 row.get(9)?,
                 row.get(10)?,
                 row.get(11)?,
+                row.get(12)?,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut applied = 0i64;
     let mut added_as_new = 0i64;
     let mut skipped = 0i64;
+    let mut left_for_manual = 0i64;
+    let mut resolved_existing = 0i64;
+    let mut stale = 0i64;
     let mut handled_scan_candidates = HashSet::new();
     for (
         id,
@@ -556,9 +652,66 @@ pub fn auto_resolve_move_candidates_with_roots(
         group_count,
         target_count,
         tag_count,
+        active_hash_duplicates,
     ) in moves
     {
-        let result = if item_artist_id != candidate_artist_id && reason == "manual_needed" {
+        // Re-prove the match is unambiguous before applying it automatically:
+        // one pending candidate for the scan candidate, one for the new path,
+        // a missing old record, no live copy sharing the hash, and hash
+        // agreement whenever both sides know it.
+        let hash_agrees = item_hash.is_empty() || candidate_hash.is_empty() || item_hash == candidate_hash;
+        let auto_appliable = AUTO_APPLY_MOVE_REASONS.contains(&reason.as_str())
+            && group_count == 1
+            && target_count == 1
+            && missing == 1
+            && active_hash_duplicates == 0
+            && hash_agrees;
+        // Cross-artist automatic handling needs the same proof as the shared
+        // write: a completed hash on both sides that actually agrees, a still
+        // missing source, no live copy of the content and no competing edge.
+        // Without it the background worker would merge the first row of an
+        // ambiguous cluster and inherit that record's tags.
+        let cross_artist_proven = item_artist_id != candidate_artist_id
+            && reason == "manual_needed"
+            && missing == 1
+            && !item_hash.is_empty()
+            && item_hash == candidate_hash
+            && group_count == 1
+            && target_count == 1
+            && active_hash_duplicates == 0;
+        // An ambiguous cross-artist cluster (several missing old records all
+        // claim the same new file) must not be rewritten onto one old record,
+        // because that would silently adopt that record's dates and history.
+        // Give the new file its own record and inherit the union of the
+        // cluster's tags; sources that disagree on tags (or that also wait on
+        // another target) are not blocked, because this path rewrites nothing
+        // and every pending target of a source shares its content hash.
+        let ambiguous_cluster = item_artist_id != candidate_artist_id
+            && reason == "manual_needed"
+            && group_count >= 2
+            && missing == 1
+            && !item_hash.is_empty()
+            && item_hash == candidate_hash
+            && active_hash_duplicates == 0;
+        if ambiguous_cluster {
+            if let Some(scan_candidate_id) = scan_candidate_id {
+                if !handled_scan_candidates.insert(scan_candidate_id) {
+                    continue;
+                }
+            }
+            match resolve_ambiguous_cluster_as_new_response(conn, roots, id) {
+                Ok(v)
+                    if v.get("action").and_then(|a| a.as_str()) == Some("new") =>
+                {
+                    added_as_new += 1;
+                }
+                _ => {
+                    left_for_manual += 1;
+                }
+            }
+            continue;
+        }
+        let result = if cross_artist_proven {
             if let Some(scan_candidate_id) = scan_candidate_id {
                 if !handled_scan_candidates.insert(scan_candidate_id) {
                     continue;
@@ -580,12 +733,27 @@ pub fn auto_resolve_move_candidates_with_roots(
             && item_hash == candidate_hash
         {
             mark_move_candidate_new_response(conn, id)
-        } else {
+        } else if auto_appliable {
             apply_move_candidate_response_with_roots(conn, roots, id)
+        } else {
+            // Ambiguous or blocked: keep it pending for the 待判断 list instead
+            // of picking one old record on the user's behalf.
+            left_for_manual += 1;
+            continue;
         };
         match result {
             Ok(v) if v.get("action").and_then(|a| a.as_str()) == Some("moved") => applied += 1,
             Ok(v) if v.get("action").and_then(|a| a.as_str()) == Some("new") => added_as_new += 1,
+            Ok(v) if v.get("action").and_then(|a| a.as_str()) == Some("existing") => {
+                resolved_existing += 1
+            }
+            Ok(v)
+                if v.get("action").and_then(|a| a.as_str()) == Some("no_match")
+                    && v.get("reason").and_then(|r| r.as_str()) == Some("candidate_stale") =>
+            {
+                stale += 1
+            }
+            Err(e) if e.to_string() == "candidate_stale" => stale += 1,
             _ => skipped += 1,
         }
     }
@@ -598,11 +766,12 @@ pub fn auto_resolve_move_candidates_with_roots(
         .unwrap_or(0);
     Ok(json!({
         "action": "auto_processed",
-        "resolved_existing": 0,
+        "resolved_existing": resolved_existing,
         "applied": applied,
         "added_as_new": added_as_new,
-        "stale": 0,
+        "stale": stale,
         "skipped": skipped,
+        "left_for_manual": left_for_manual,
         "remaining": remaining,
     }))
 }
@@ -941,7 +1110,7 @@ static FAKE_EMBEDDING_FOR_TESTS: std::sync::atomic::AtomicBool =
 
 #[cfg(test)]
 thread_local! {
-    static REBUILD_INDEX_CALLS_FOR_TESTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static REBUILD_INDEX_CALLS_FOR_TESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Serializes import tests that toggle fake embedding (avoids parallel env races).
@@ -1633,11 +1802,11 @@ pub fn spawn_character_import_idle_worker(pool: std::sync::Arc<crate::db::DbPool
                             }
                         }
                         Err(e) => {
-                            eprintln!("character idle import error: {e}");
+                            log_error!("character idle import error: {e}");
                             no_progress = 0;
                         }
                     },
-                    Err(e) => eprintln!("character idle import pool: {e}"),
+                    Err(e) => log_error!("character idle import pool: {e}"),
                 }
                 std::thread::sleep(std::time::Duration::from_secs(sleep_s));
             }
@@ -1690,6 +1859,65 @@ mod tests {
     }
 
     #[test]
+    fn folder_item_ids_matches_folder_case_exactly() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE items (
+               id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT,
+               media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0,
+               missing INTEGER DEFAULT 0
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, path) VALUES (1, '/root')",
+            [],
+        )
+        .unwrap();
+        for (id, path) in [
+            (1, "/root/Foo/a.jpg"),
+            (2, "/root/foo/b.jpg"),
+            (3, "/root/foox/c.jpg"),
+        ] {
+            conn.execute(
+                "INSERT INTO items (id, artist_id, file_path) VALUES (?, 1, ?)",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+        }
+        // SQLite's LIKE is ASCII case-insensitive, so a `Foo` tag write used to
+        // also rewrite every file under the distinct `foo` folder.
+        let ids = folder_item_ids(&conn, 1, "Foo").unwrap();
+        assert_eq!(ids, vec![1], "case-only sibling folders must stay distinct");
+        let ids = folder_item_ids(&conn, 1, "foo").unwrap();
+        assert_eq!(ids, vec![2], "case-only sibling folders must stay distinct");
+        let ids = folder_item_ids(&conn, 1, "Foox").unwrap();
+        assert!(ids.is_empty(), "no prefix bleeding into longer names");
+    }
+
+    #[test]
+    fn log_line_timestamp_parses_local_wall_clock_not_utc() {
+        use chrono::TimeZone;
+        let naive = chrono::NaiveDateTime::parse_from_str(
+            "2026-07-01 12:00:00,000",
+            "%Y-%m-%d %H:%M:%S,%3f",
+        )
+        .unwrap();
+        let expected_local = chrono::Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .expect("wall-clock time resolves in the local timezone")
+            .timestamp_millis();
+        let parsed = log_line_timestamp_millis("2026-07-01 12:00:00,000 [ERROR] boom")
+            .expect("log stamp must parse");
+        assert_eq!(
+            parsed, expected_local,
+            "log stamps are local wall-clock; UTC interpretation shifts by the host offset"
+        );
+    }
+
+    #[test]
     fn operation_log_includes_errors_array() {
         let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
@@ -1725,7 +1953,7 @@ mod tests {
         };
         let log = operation_log_response(&conn, &roots, Some(10), Some(10)).unwrap();
         assert!(log.get("errors").is_some());
-        assert!(log["errors"].as_array().unwrap().len() >= 1);
+        assert!(!log["errors"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1840,8 +2068,20 @@ mod tests {
         assert!(artist.join("2026-01-05 测试").exists());
     }
 
+    /// Builds a log line whose timestamp sits `offset_hours` away from now so
+    /// the entry stays inside the "recent" window whenever the suite runs.
+    fn log_line_at(offset_hours: i64, fractional: &str, text: &str) -> String {
+        let millis = super::now_millis() + offset_hours * 3_600_000;
+        let stamp = chrono::DateTime::from_timestamp_millis(millis)
+            .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+        format!("{}{} {}\n", stamp, fractional, text)
+    }
+
     #[test]
     fn recent_log_errors_uses_exact_markers_and_a_bounded_tail() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _window = crate::test_support::EnvVar::set("GALLERY_LOG_ERROR_WINDOW_HOURS", "168");
         let dir = tempdir().unwrap();
         let logs = dir.path().join("logs");
         std::fs::create_dir_all(&logs).unwrap();
@@ -1868,47 +2108,115 @@ mod tests {
 
     #[test]
     fn recent_log_errors_sorts_newest_across_log_files() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _window = crate::test_support::EnvVar::set("GALLERY_LOG_ERROR_WINDOW_HOURS", "168");
         let dir = tempdir().unwrap();
         let logs = dir.path().join("logs");
         std::fs::create_dir_all(&logs).unwrap();
         std::fs::write(
             logs.join("gallery.log"),
-            "2026-08-17 06:50:00,000 [ERROR] oldest\n",
+            log_line_at(-2, ",000", "[ERROR] oldest"),
         )
         .unwrap();
         std::fs::write(
             logs.join("startup.log"),
-            "2026-08-18 00:50:00,000 [ERROR] newest\n",
+            log_line_at(-1, ",000", "[ERROR] newest"),
         )
         .unwrap();
 
         let errors = recent_log_errors(&logs, 10);
 
-        assert_eq!(errors[0]["line"], "2026-08-18 00:50:00,000 [ERROR] newest");
-        assert_eq!(errors[1]["line"], "2026-08-17 06:50:00,000 [ERROR] oldest");
+        assert_eq!(errors.len(), 2, "both entries are inside the window");
+        assert!(errors[0]["line"]
+            .as_str()
+            .unwrap()
+            .ends_with("[ERROR] newest"));
+        assert!(errors[1]["line"]
+            .as_str()
+            .unwrap()
+            .ends_with("[ERROR] oldest"));
     }
 
     #[test]
     fn recent_log_errors_orders_colored_dotted_timestamps_and_tracebacks() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _window = crate::test_support::EnvVar::set("GALLERY_LOG_ERROR_WINDOW_HOURS", "168");
         let dir = tempdir().unwrap();
         let logs = dir.path().join("logs");
         std::fs::create_dir_all(&logs).unwrap();
         std::fs::write(
             logs.join("gallery.log"),
-            "2021-01-01 00:00:00,000 [ERROR] newest\n",
+            log_line_at(-1, ",000", "[ERROR] newest"),
         )
         .unwrap();
         std::fs::write(
             logs.join("startup.log"),
-            "\x1b[1;31m2020-01-01 00:00:00.031040940 [ERROR] older\nTraceback (most recent call last):\n",
+            format!(
+                "\x1b[1;31m{}Traceback (most recent call last):\n",
+                log_line_at(-2, ".031040940", "[ERROR] older")
+            ),
         )
         .unwrap();
 
         let errors = recent_log_errors(&logs, 10);
 
-        assert_eq!(errors[0]["line"], "2021-01-01 00:00:00,000 [ERROR] newest");
+        assert_eq!(errors.len(), 3, "all entries are inside the window");
+        assert!(errors[0]["line"]
+            .as_str()
+            .unwrap()
+            .ends_with("[ERROR] newest"));
         assert_eq!(errors[1]["line"], "Traceback (most recent call last):");
         assert!(errors[2]["line"].as_str().unwrap().contains("older"));
+    }
+
+    #[test]
+    fn recent_log_errors_drops_entries_older_than_the_window() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _window = crate::test_support::EnvVar::set("GALLERY_LOG_ERROR_WINDOW_HOURS", "168");
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        // Stale file left behind by the pre-Rust stack: must stop polluting health.
+        std::fs::write(
+            logs.join("gallery.log"),
+            log_line_at(-24 * 30, ",000", "[ERROR] fossil"),
+        )
+        .unwrap();
+        std::fs::write(
+            logs.join("startup.log"),
+            log_line_at(-1, ",000", "[ERROR] current"),
+        )
+        .unwrap();
+
+        let errors = recent_log_errors(&logs, 10);
+
+        assert_eq!(errors.len(), 1, "only the fresh entry survives");
+        assert!(errors[0]["line"]
+            .as_str()
+            .unwrap()
+            .ends_with("[ERROR] current"));
+    }
+
+    #[test]
+    fn recent_log_errors_window_can_be_disabled() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _window = crate::test_support::EnvVar::set("GALLERY_LOG_ERROR_WINDOW_HOURS", "0");
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("gallery.log"),
+            log_line_at(-24 * 30, ",000", "[ERROR] fossil"),
+        )
+        .unwrap();
+
+        let errors = recent_log_errors(&logs, 10);
+
+        assert_eq!(errors.len(), 1, "window=0 keeps every error");
+        assert!(errors[0]["line"]
+            .as_str()
+            .unwrap()
+            .ends_with("[ERROR] fossil"));
     }
 
     fn fixture_conn() -> (tempfile::TempDir, Connection) {

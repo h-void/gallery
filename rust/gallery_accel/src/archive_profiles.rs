@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::archive_format::{self, RenderContext};
@@ -73,6 +73,9 @@ pub fn set_folder_rename_format_settings(
     artist_id: Option<i64>,
 ) -> Result<Value> {
     let normalized = archive_format::normalize_settings(value)?;
+    // Save-time validation renders every profile once so a template that
+    // would fail every real render is rejected here, not at runtime.
+    archive_format::validate_profiles_render(&normalized)?;
     conn.execute(
         "INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,strftime('%s','now'))
          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
@@ -136,6 +139,14 @@ pub fn preview_folder_rename_template(
          WHERE p.artist_id=? AND p.id IN (SELECT value FROM json_each(?)) ORDER BY p.id"
     };
     let mut stmt = conn.prepare(sql)?;
+    // Batch tag-name lookup: the preview loop would otherwise issue one
+    // query per tag id per plan (N+1 across the whole preview batch).
+    let tag_names: HashMap<i64, String> = conn
+        .prepare("SELECT id, name FROM tags")?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
     let mut rows = if selected.is_empty() {
         stmt.query(params![artist_id])?
     } else {
@@ -159,12 +170,7 @@ pub fn preview_folder_rename_template(
             .and_then(|raw| serde_json::from_str::<Vec<i64>>(&raw).ok())
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|id| {
-                conn.query_row("SELECT name FROM tags WHERE id=?", [id], |r| r.get(0))
-                    .optional()
-                    .ok()
-                    .flatten()
-            })
+            .filter_map(|id| tag_names.get(&id).cloned())
             .filter(|name: &String| !name.is_empty())
             .collect();
         let plan_status: String = row.get(6)?;
@@ -183,7 +189,7 @@ pub fn preview_folder_rename_template(
                 }
             }
         }
-        let rendered = archive_format::render_profile(
+        let rendered = match archive_format::render_profile(
             &profile,
             &RenderContext {
                 artist,
@@ -193,7 +199,25 @@ pub fn preview_folder_rename_template(
                 folder: folder.clone(),
                 index,
             },
-        )?;
+        ) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                // One plan that cannot render must not fail the whole preview
+                // batch: report it per plan and keep previewing the rest.
+                conflicts.push(json!({
+                    "plan_id": id,
+                    "code": "render_failed",
+                    "detail": json!({
+                        "code": "render_failed",
+                        "source_folder": folder,
+                        "error": error.to_string(),
+                    }),
+                }));
+                previews.push(json!({"id": id, "source_folder": folder, "target_folder": "", "tokens": {}, "format_source": source, "status": plan_status, "will_apply": false, "conflicts": [{"code": "render_failed"}], "can_apply": false}));
+                index += 1;
+                continue;
+            }
+        };
         let requested_target = rendered.target_folder.clone();
         let source_key = folder.to_ascii_lowercase();
         let mut target = requested_target.clone();

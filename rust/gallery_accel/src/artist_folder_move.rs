@@ -150,9 +150,14 @@ fn target_parent_stays_under_root(target: &Path, root: &Path) -> bool {
 
 fn indexed_conflicts(conn: &Connection, target: &str, artist_id: i64) -> Result<Vec<Value>> {
     let mut conflicts = Vec::new();
+    // Byte-exact comparisons: COLLATE NOCASE reports case-only distinct paths
+    // (`/root/Foo` vs `/root/foo`) as conflicts on case-sensitive media
+    // filesystems, and a raw `LIKE target || '/%'` treats `%`/`_` in valid
+    // directory names as wildcards. `=`/`substr` with an explicit BINARY
+    // collation match canonical path bytes and need no escaping.
     let artist_conflict = conn
         .query_row(
-            "SELECT id, path FROM artists WHERE id != ? AND path = ? COLLATE NOCASE LIMIT 1",
+            "SELECT id, path FROM artists WHERE id != ? AND path COLLATE BINARY = ? LIMIT 1",
             params![artist_id, target],
             |row| Ok(json!({"artist_id": row.get::<_, i64>(0)?, "path": row.get::<_, String>(1)?})),
         )
@@ -161,9 +166,13 @@ fn indexed_conflicts(conn: &Connection, target: &str, artist_id: i64) -> Result<
         conflicts.push(conflict);
     }
     let mut stmt = conn.prepare(
-        "SELECT id, artist_id, file_path FROM items WHERE artist_id != ? AND (file_path = ? COLLATE NOCASE OR file_path LIKE ? || '/%') LIMIT 20",
+        "SELECT id, artist_id, file_path FROM items
+         WHERE artist_id != ?
+           AND (file_path COLLATE BINARY = ?
+                OR substr(file_path, 1, length(?) + 1) = ? || '/')
+         LIMIT 20",
     )?;
-    let rows = stmt.query_map(params![artist_id, target, target], |row| {
+    let rows = stmt.query_map(params![artist_id, target, target, target], |row| {
         Ok(json!({"item_id": row.get::<_, i64>(0)?, "artist_id": row.get::<_, i64>(1)?, "path": row.get::<_, String>(2)?}))
     })?;
     for row in rows {
@@ -473,19 +482,36 @@ fn update_recycle_entries_for_move(
         let Some(new_original) = remap_path(&original_path, source, target) else {
             continue;
         };
-        let mut new_snapshot_raw = snapshot_raw.clone();
-        let mut snapshot: Value = serde_json::from_str(&snapshot_raw).unwrap_or(Value::Null);
-        if let Some(object) = snapshot.as_object_mut() {
-            if let Some(file_path) = object.get("file_path").and_then(Value::as_str) {
-                if let Some(next) = remap_path(file_path, source, target) {
-                    object.insert("file_path".into(), Value::String(next));
-                    if let Ok(encoded) = serde_json::to_string(&snapshot) {
-                        new_snapshot_raw = encoded;
-                    }
-                }
+        // `original_path` and the snapshot `file_path` must remap together:
+        // updating only one leaves the entry pointing at two different
+        // generations of the tree and permanently unrestorable. Any failure
+        // skips the whole entry (it keeps its consistent pre-move paths) and
+        // is reported instead of silently half-applied.
+        let outcome = (|| -> Result<String> {
+            let snapshot: Value = serde_json::from_str(&snapshot_raw)
+                .map_err(|error| anyhow!("parse item_snapshot: {error}"))?;
+            let object = snapshot
+                .as_object()
+                .ok_or_else(|| anyhow!("item_snapshot is not an object"))?;
+            let file_path = object
+                .get("file_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("item_snapshot has no file_path"))?;
+            let new_file_path = remap_path(file_path, source, target)
+                .ok_or_else(|| anyhow!("snapshot file_path does not remap under source prefix"))?;
+            let mut encoded = snapshot;
+            encoded["file_path"] = Value::String(new_file_path);
+            serde_json::to_string(&encoded)
+                .map_err(|error| anyhow!("encode item_snapshot: {error}"))
+        })();
+        let encoded = match outcome {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                log_error!("artist move: recycle entry {id} left unremapped: {error}");
+                continue;
             }
-        }
-        conn.execute(update, params![new_original, new_snapshot_raw, id])?;
+        };
+        conn.execute(update, params![new_original, encoded, id])?;
         changed += 1;
     }
     Ok(changed)
@@ -816,17 +842,17 @@ pub fn reconcile_pending_artist_move(conn: &Connection) -> Value {
     let parsed: Value = match serde_json::from_str(&raw) {
         Ok(value) => value,
         Err(error) => {
-            eprintln!("artist move intent unreadable, keeping for inspection: {error}");
+            log_error!("artist move intent unreadable, keeping for inspection: {error}");
             return json!({"reconciled": true, "outcome": "unreadable_intent"});
         }
     };
     let Some(artist_id) = parsed["artist_id"].as_i64() else {
-        eprintln!("artist move intent missing artist_id, keeping for inspection");
+        log_error!("artist move intent missing artist_id, keeping for inspection");
         return json!({"reconciled": true, "outcome": "unreadable_intent"});
     };
     let (Some(source), Some(target)) = (parsed["source"].as_str(), parsed["target"].as_str())
     else {
-        eprintln!("artist move intent missing paths, keeping for inspection");
+        log_error!("artist move intent missing paths, keeping for inspection");
         return json!({"reconciled": true, "outcome": "unreadable_intent"});
     };
     let source_dir = PathBuf::from(source);
@@ -835,13 +861,13 @@ pub fn reconcile_pending_artist_move(conn: &Connection) -> Value {
         match apply_artist_move_db_updates(conn, artist_id, source, target) {
             Ok(updated) => {
                 clear_pending_move_intent();
-                eprintln!(
+                log_info!(
                     "artist move rolled forward for artist {artist_id}: {updated} db rows updated"
                 );
                 "rolled_forward"
             }
             Err(error) => {
-                eprintln!(
+                log_error!(
                     "artist move roll-forward failed for artist {artist_id}: {error:#}; intent kept"
                 );
                 "roll_forward_failed"
@@ -849,10 +875,10 @@ pub fn reconcile_pending_artist_move(conn: &Connection) -> Value {
         }
     } else if source_dir.is_dir() && !target_dir.is_dir() {
         clear_pending_move_intent();
-        eprintln!("artist move intent dropped: filesystem was never moved");
+        log_info!("artist move intent dropped: filesystem was never moved");
         "rolled_back"
     } else {
-        eprintln!(
+        log_error!(
             "artist move intent needs manual reconciliation: source={source} target={target}"
         );
         "needs_manual_reconciliation"
@@ -989,6 +1015,60 @@ pub fn execute_artist_folder_move(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn recycle_entry_remaps_original_and_snapshot_together() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE recycle_entries (
+                id INTEGER PRIMARY KEY, artist_id INTEGER, original_path TEXT,
+                item_snapshot TEXT, status TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO recycle_entries (id, artist_id, original_path, item_snapshot, status)
+             VALUES (1, 1, '/old/Artist/pic.jpg', ?, 'recycled')",
+            [r#"{"file_path": "/old/Artist/pic.jpg", "file_name": "pic.jpg"}"#],
+        )
+        .unwrap();
+        // Snapshot file_path outside the moved prefix: the pair must stay
+        // untouched instead of half-updating.
+        conn.execute(
+            "INSERT INTO recycle_entries (id, artist_id, original_path, item_snapshot, status)
+             VALUES (2, 1, '/old/Artist/gone.jpg', ?, 'recycled')",
+            [r#"{"file_path": "/elsewhere/pic.jpg"}"#],
+        )
+        .unwrap();
+        // Malformed snapshot: same rule.
+        conn.execute(
+            "INSERT INTO recycle_entries (id, artist_id, original_path, item_snapshot, status)
+             VALUES (3, 1, '/old/Artist/bad.jpg', 'not-json', 'recycled')",
+            [],
+        )
+        .unwrap();
+
+        let changed = update_recycle_entries_for_move(&conn, 1, "/old/Artist", "/new/Artist")
+            .expect("remap must not fail the move");
+
+        assert_eq!(changed, 1, "only the fully remappable entry updates");
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT original_path, item_snapshot FROM recycle_entries ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(rows[0].0.starts_with("/new/Artist"), "{}", rows[0].0);
+        assert!(rows[0].1.contains("/new/Artist/pic.jpg"), "{}", rows[0].1);
+        assert_eq!(rows[1].0, "/old/Artist/gone.jpg", "unremappable pair keeps original");
+        assert_eq!(
+            rows[1].1, r#"{"file_path": "/elsewhere/pic.jpg"}"#,
+            "unremappable pair keeps snapshot"
+        );
+        assert_eq!(rows[2].0, "/old/Artist/bad.jpg");
+        assert_eq!(rows[2].1, "not-json");
+    }
 
     #[test]
     fn retained_directory_records_are_persisted_and_pruned() {
@@ -1506,5 +1586,65 @@ mod tests {
         assert_eq!(artist_path, path_text(&target));
         assert_eq!(item_path, path_text(&target.join("work").join("image.jpg")));
         assert!(Path::new(result["backup"].as_str().unwrap()).is_file());
+    }
+
+    fn conflict_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists(id INTEGER PRIMARY KEY,name TEXT,path TEXT,missing INTEGER DEFAULT 0,missing_at REAL);
+             CREATE TABLE items(id INTEGER PRIMARY KEY,artist_id INTEGER,file_path TEXT,file_size INTEGER,missing INTEGER DEFAULT 0);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn indexed_conflicts_match_path_bytes_not_case() {
+        let conn = conflict_fixture();
+        conn.execute_batch(
+            "INSERT INTO artists(id,name,path) VALUES(1,'Source','/root/Somewhere');
+             INSERT INTO artists(id,name,path) VALUES(2,'Lower','/root/foo');
+             INSERT INTO artists(id,name,path) VALUES(3,'Exact','/root/Foo');
+             INSERT INTO items(id,artist_id,file_path,missing) VALUES(1,2,'/root/foo/a.jpg',0);
+             INSERT INTO items(id,artist_id,file_path,missing) VALUES(2,3,'/root/Foo/b.jpg',0);",
+        )
+        .unwrap();
+        let conflicts = indexed_conflicts(&conn, "/root/Foo", 1).unwrap();
+        let ids: Vec<i64> = conflicts
+            .iter()
+            .filter_map(|value| value["artist_id"].as_i64())
+            .collect();
+        // The case-only sibling `/root/foo` must not block the move; the exact
+        // `/root/Foo` artist and its items must.
+        assert!(ids.contains(&3), "exact path conflict is reported: {conflicts:?}");
+        assert!(!ids.contains(&2), "case-only sibling must not be a conflict: {conflicts:?}");
+        let paths: Vec<String> = conflicts
+            .iter()
+            .filter_map(|value| value["path"].as_str().map(str::to_owned))
+            .collect();
+        assert!(paths.contains(&"/root/Foo/b.jpg".to_string()));
+        assert!(!paths.contains(&"/root/foo/a.jpg".to_string()));
+    }
+
+    #[test]
+    fn indexed_conflicts_treat_wildcards_in_target_literally() {
+        let conn = conflict_fixture();
+        conn.execute_batch(
+            "INSERT INTO artists(id,name,path) VALUES(1,'Source','/root/Somewhere');
+             INSERT INTO artists(id,name,path) VALUES(2,'Sibling','/root/100Xfoo');
+             INSERT INTO artists(id,name,path) VALUES(3,'Exact','/root/100%foo');
+             INSERT INTO items(id,artist_id,file_path,missing) VALUES(1,2,'/root/100Xfoo/deep/y.jpg',0);
+             INSERT INTO items(id,artist_id,file_path,missing) VALUES(2,3,'/root/100%foo/real/z.jpg',0);",
+        )
+        .unwrap();
+        let conflicts = indexed_conflicts(&conn, "/root/100%foo", 1).unwrap();
+        let paths: Vec<String> = conflicts
+            .iter()
+            .filter_map(|value| value["path"].as_str().map(str::to_owned))
+            .collect();
+        // `%` in the destination is a literal character: the LIKE-free prefix
+        // test must not report items under the unrelated `100Xfoo` directory.
+        assert!(paths.contains(&"/root/100%foo/real/z.jpg".to_string()), "{paths:?}");
+        assert!(!paths.contains(&"/root/100Xfoo/deep/y.jpg".to_string()), "{paths:?}");
     }
 }

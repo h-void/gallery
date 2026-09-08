@@ -1,0 +1,6 @@
+# cpu：CPU；gpu：Intel 核显；cuda：NVIDIA
+模式: cpu
+
+# 一行一个目录，Windows 路径使用 /
+目录:
+  - D:/Pictures

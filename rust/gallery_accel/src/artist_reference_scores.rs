@@ -37,6 +37,18 @@ pub fn artist_reference_scores_response(
     wd14_weight: f64,
     limit: Option<i64>,
 ) -> Result<Value> {
+    if query_dino.is_empty() || query_wd14.is_empty() {
+        return Err(anyhow!("query embeddings must be non-empty"));
+    }
+    // NaN/Inf queries would silently poison every dot product downstream.
+    if query_dino.iter().any(|value| !value.is_finite())
+        || query_wd14.iter().any(|value| !value.is_finite())
+    {
+        return Err(anyhow!("query embeddings must contain only finite values"));
+    }
+    if !dino_weight.is_finite() || !wd14_weight.is_finite() {
+        return Err(anyhow!("weights must be finite"));
+    }
     let mut best_by_artist: HashMap<i64, ArtistReferenceScore> = HashMap::new();
     let mut stmt = conn.prepare(
         "

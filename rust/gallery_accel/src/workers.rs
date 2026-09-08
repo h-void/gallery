@@ -1,30 +1,55 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::{
-    create_db_backup, run_full_library_scan, run_hash_batch_with_roots, DbPool, MediaRoots,
+    create_db_backup, run_full_library_scan_claimed, run_hash_batch_with_roots, DbPool,
+    MediaRoots,
     ScanControl,
 };
 
 #[derive(Clone, Default)]
 pub struct WorkerStatus {
     inner: Arc<Mutex<BTreeMap<String, Value>>>,
+    /// Set once when the status mutex is found poisoned. A poisoned lock must
+    /// never kill the background loops: recover and keep recording, but keep
+    /// health degraded until restart.
+    poisoned: Arc<AtomicBool>,
 }
 
 impl WorkerStatus {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<String, Value>> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                if !self.poisoned.swap(true, Ordering::SeqCst) {
+                    log_error!(
+                        "workers: status mutex was poisoned; recovered, health stays degraded"
+                    );
+                }
+                poisoned.into_inner()
+            }
+        }
+    }
+
     pub fn record(&self, name: &str, running: bool, last: Value, next_at: Option<f64>) {
-        self.inner.lock().unwrap().insert(
+        self.lock().insert(
             name.to_string(),
             json!({"running": running, "last": last, "next_at": next_at}),
         );
     }
 
     pub fn snapshot(&self) -> Value {
-        json!(self.inner.lock().unwrap().clone())
+        json!(self.lock().clone())
+    }
+
+    /// True when a panic poisoned the status mutex and the worker recovered.
+    pub fn recovered_from_poison(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
     }
 }
 
@@ -48,7 +73,7 @@ fn interval_env(name: &str) -> Option<Duration> {
                 Ok(_) => None,
                 Err(_) => {
                     if !trimmed.is_empty() {
-                        eprintln!(
+                        log_error!(
                             "workers: ignoring invalid {name}={value:?}; expected seconds, loop disabled"
                         );
                     }
@@ -75,13 +100,6 @@ fn run_backup(pool: &Arc<DbPool>) -> Result<Value> {
     let conn = pool.get()?;
     let backup = create_db_backup(&conn)?;
     Ok(json!({"ok": true, "backup": backup}))
-}
-
-struct ScanSlotGuard(Arc<ScanControl>);
-impl Drop for ScanSlotGuard {
-    fn drop(&mut self) {
-        self.0.set_running(false);
-    }
 }
 
 pub fn spawn_configured_workers(
@@ -150,22 +168,23 @@ fn spawn_scan_loop(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            let next_at = now() + interval.as_secs_f64();
-            let result = if !scan.try_start() {
-                Ok(json!({"ok": true, "skipped": "scan_active"}))
-            } else {
-                let pool = pool.clone();
-                let roots = roots.clone();
-                let scan = scan.clone();
-                tokio::task::spawn_blocking(move || -> Result<Value> {
-                    let _slot = ScanSlotGuard(scan.clone());
-                    let conn = pool.get()?;
-                    run_full_library_scan(&conn, &roots, &scan)
-                })
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
+            let result = match scan.try_claim() {
+                None => Ok(json!({"ok": true, "skipped": "scan_active"})),
+                Some(guard) => {
+                    let pool = pool.clone();
+                    let roots = roots.clone();
+                    let scan = scan.clone();
+                    tokio::task::spawn_blocking(move || -> Result<Value> {
+                        let _slot = guard;
+                        let conn = pool.get()?;
+                        run_full_library_scan_claimed(&conn, &roots, &scan)
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
+                }
             };
+            let next_at = now() + interval.as_secs_f64();
             status.record(
                 "scan",
                 true,
@@ -193,24 +212,26 @@ fn spawn_hash_loop(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            let next_at = now() + interval.as_secs_f64();
-            let result = if !scan.try_start() {
-                // Claim the operation slot: hashing while a scan or folder move
-                // rewrites paths reads stale files. Skip this tick instead.
-                Ok(json!({"ok": true, "skipped": "scan_active"}))
-            } else {
-                let pool = pool.clone();
-                let roots = roots.clone();
-                let scan = scan.clone();
-                tokio::task::spawn_blocking(move || -> Result<Value> {
-                    let _slot = ScanSlotGuard(scan);
-                    let conn = pool.get()?;
-                    run_hash_batch_with_roots(&conn, &roots, batch_size)
-                })
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
+            let result = match scan.try_claim() {
+                None => {
+                    // Claim the operation slot: hashing while a scan or folder move
+                    // rewrites paths reads stale files. Skip this tick instead.
+                    Ok(json!({"ok": true, "skipped": "scan_active"}))
+                }
+                Some(guard) => {
+                    let pool = pool.clone();
+                    let roots = roots.clone();
+                    tokio::task::spawn_blocking(move || -> Result<Value> {
+                        let _slot = guard;
+                        let conn = pool.get()?;
+                        run_hash_batch_with_roots(&conn, &roots, batch_size)
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
+                }
             };
+            let next_at = now() + interval.as_secs_f64();
             status.record(
                 "hash",
                 true,
@@ -260,12 +281,12 @@ fn spawn_backup_loop(
         };
         loop {
             tokio::time::sleep(interval).await;
-            let next_at = now() + interval.as_secs_f64();
             let pool = pool.clone();
             let result = tokio::task::spawn_blocking(move || run_backup(&pool))
                 .await
                 .map_err(anyhow::Error::from)
                 .and_then(|result| result);
+            let next_at = now() + interval.as_secs_f64();
             status.record(
                 "backup",
                 true,
@@ -409,5 +430,61 @@ mod tests {
         assert_eq!(prune_backup_root(&root, 1).unwrap(), 1);
         assert!(!root.join("20240101").exists());
         assert!(root.join("20240102").exists());
+    }
+
+    #[test]
+    fn poisoned_status_mutex_recovers_and_reports_degraded() {
+        let status = WorkerStatus::default();
+        // Poison the mutex: a thread panics while holding the lock.
+        let poacher = {
+            let inner = std::sync::Arc::clone(&status.inner);
+            std::thread::spawn(move || {
+                let _guard = inner.lock().unwrap();
+                panic!("poison the status mutex");
+            })
+        };
+        let _ = poacher.join();
+        // record/snapshot must survive the poisoned lock and keep serving.
+        status.record("scan", true, json!({"status": "waiting"}), None);
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot["scan"]["last"]["status"], "waiting");
+        assert!(
+            status.recovered_from_poison(),
+            "poison recovery must surface as degraded"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_worker_next_at_computed_after_task_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            DbPool::with_config(
+                dir.path().join("gallery.db"),
+                crate::DbConfig {
+                    read_only: false,
+                    pool_size: 1,
+                },
+            )
+            .unwrap(),
+        );
+        let status = WorkerStatus::default();
+        let scan = Arc::new(ScanControl::new());
+        let roots = MediaRoots {
+            roots: Vec::new(),
+            labels: Vec::new(),
+            real_paths: Vec::new(),
+        };
+        let interval = Duration::from_millis(50);
+        let start_time = now();
+        spawn_scan_loop(pool, roots, scan, status.clone(), interval);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot["scan"]["running"], true);
+        let next_at = snapshot["scan"]["next_at"].as_f64().expect("next_at must be present");
+        assert!(
+            next_at >= start_time + 0.08,
+            "next_at ({next_at}) must reflect post-run time, start_time={start_time}"
+        );
     }
 }

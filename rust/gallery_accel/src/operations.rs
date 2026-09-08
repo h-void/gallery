@@ -32,7 +32,29 @@ pub fn operation_history_response(
             .unwrap_or(Ordering::Equal)
             .then_with(|| history_entry_id(right).cmp(&history_entry_id(left)))
     });
-    let total = history.len() as i64;
+    // `total` is the true history size, not the number of fetched rows: every
+    // move_history row counts once, and every executed/reverted folder-rename
+    // plan counts once per execution-log entry (min one).
+    let total: i64 = conn.query_row(
+        "
+        SELECT
+            (SELECT COUNT(*) FROM move_history)
+            + COALESCE(
+                (
+                    SELECT SUM(MAX(1, json_array_length(
+                        CASE WHEN json_valid(COALESCE(execution_log, ''))
+                             THEN COALESCE(execution_log, '[]')
+                             ELSE '[]' END
+                    )))
+                    FROM folder_rename_plans
+                    WHERE executed_at IS NOT NULL OR COALESCE(execution_log, '') != '[]'
+                ),
+                0
+            )
+        ",
+        [],
+        |row| row.get(0),
+    )?;
     history.truncate(limit as usize);
     Ok(json!({
         "history": history,

@@ -1,0 +1,145 @@
+/* Design tokens — "Studio Folio" (工作室样册): warm rice paper + vermilion.
+   The app reads as a hand-bound illustration folio in a working studio:
+   rice-paper surfaces, vermilion binding accents, ink text. The artwork zone
+   carries a paper-fiber grain and a soft corner vignette that always sit
+   behind opaque surfaces, never over media.
+   Every legacy token name from the dark themes is preserved as an alias
+   mapped onto this palette so JS reads and old overrides keep working. */
+:root{
+  /* Paper surfaces: canvas < raised < overlay. */
+  /* --paper-canvas: the rice-paper sheet the whole folio is mounted on. */
+  --paper-canvas:#F4ECDD;
+  /* --paper-raised: a card blank laid on the sheet. */
+  --paper-raised:#EDE3D0;
+  /* --paper-overlay: the slip-sheet under popups and dialogs. */
+  --paper-overlay:#E5D9C2;
+  /* --paper-crease: the fold line / hairline rule between paper regions. */
+  --paper-crease:#D9C9AC;
+  /* Aliases: chrome bands share the canvas paper; zones split by crease lines. */
+  --bg-chrome:#F1E7D6;
+  --bg-canvas:#F4ECDD;
+  --bg-raised:#EDE3D0;
+  --bg-overlay:#E5D9C2;
+  /* Ink text: 3 steps, hierarchy by size/weight/tone instead of borders. */
+  /* --ink-1: fresh ink for body copy; --ink-3 faded ink for captions.
+     All three steps keep >= 4.5:1 on the darkest paper (--paper-overlay). */
+  --ink-1:#1F1A14;--ink-2:#5A4F40;--ink-3:#6A5944;
+  --text-1:#1F1A14;--text-2:#5A4F40;--text-3:#6A5944;
+  /* Vermilion: the studio seal color — only actions and selected states. */
+  --vermilion:#C04B3A;
+  --vermilion-deep:#9A3B2E;
+  --vermilion-soft:rgba(192,75,58,.12);
+  --vermilion-line:rgba(192,75,58,.45);
+  --accent:#C04B3A;--accent-solid:#C04B3A;--accent-deep:#9A3B2E;--accent-soft:rgba(192,75,58,.12);
+  --accent-line:rgba(192,75,58,.45);--accent-faint:rgba(192,75,58,.08);
+  --accent-selection:rgba(192,75,58,.28);
+  /* Secondary hues: indigo for links' hover, ochre for favorites/warnings,
+     moss for success, rose-stone for neutral caution, wine for destructive. */
+  --indigo:#2F4A6B;
+  --ochre:#C58C2C;
+  /* --ochre-deep: ochre darkened for warning TEXT on paper (ochre itself
+     stays on dots/stars, where no 4.5:1 text contrast is required). */
+  --ochre-deep:#7A5212;
+  --moss:#4F7355;
+  --rose-stone:#B47A7A;
+  /* --danger #9a2a2a is the only danger fill safe under white text (7.6:1);
+     #7e2020 is the pressed step. */
+  --danger:#9A2A2A;--danger-solid:#9A2A2A;--danger-deep:#7E2020;
+  --ok:#4F7355;--warn:#C58C2C;
+  --status-ok:#4f7355;--status-info:#2F4A6B;--status-warn:#C58C2C;--status-danger:#9a2a2a;
+  --unclassified:#C58C2C;
+  /* Rules: crease at rest, deeper crease on hover — paper never uses white. */
+  --border-subtle:#D9C9AC;--border-strong:#C2AE8C;
+  /* Type scale */
+  --fs-display:24px;--fs-title:18px;--fs-section:15px;--fs-body:14px;--fs-small:13px;--fs-micro:11px;
+  /* Display serif for folio titles (local stacks only, no webfonts). */
+  --font-display:"Cormorant Garamond","EB Garamond","Source Serif Pro","Songti SC","SimSun",serif;
+  --font-mono:ui-monospace,"Cascadia Code",Consolas,"SF Mono",Menlo,monospace;
+  /* Micro-label language: tracked caps like a folio's printed captions. */
+  --label-tracking:.14em;
+  --shadow-label:0 1px 2px rgba(31,26,20,.25);
+  /* Radius tiers unchanged: 4px thumbnails, 10px controls, 16px dialogs. */
+  --radius-sm:4px;--radius:10px;--radius-lg:16px;--radius-pill:999px;
+  /* Pop shadow: warm gray-brown, reserved for dialogs/dropdowns/lightbox. */
+  --shadow-pop:0 8px 24px rgba(84,62,38,.22);
+  --shadow-card-lift:0 2px 6px rgba(84,62,38,.18);
+  /* Focus is a 2px vermilion underline (inset bottom edge), not a halo ring. */
+  --focus-ring:inset 0 -2px 0 var(--vermilion);
+  /* Motion: opacity/transform/background 150ms ease-out. */
+  --motion:150ms ease-out;
+  --motion-slow:240ms ease-out;
+  /* Paper texture layers (decorative, always behind opaque surfaces):
+     fine paper fiber, a faint warm light from above, a soft corner vignette. */
+  --texture-grain:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.36 0 0 0 0 0.28 0 0 0 0 0.18 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23g)'/%3E%3C/svg%3E");
+  --paper-glow:radial-gradient(1100px 420px at 50% -80px,rgba(255,248,235,.55),transparent 65%);
+  --paper-vignette:radial-gradient(140% 90% at 50% 0%,transparent 60%,rgba(122,96,60,.12));
+  /* Legacy texture aliases mapped onto the paper layers. */
+  --texture-scanline:var(--texture-grain);
+  --glow-enlarger:var(--paper-glow);
+  --glow-vignette:var(--paper-vignette);
+  /* The top binding band: 2px double rule (vermilion over crease). */
+  --paper-binding:linear-gradient(180deg,var(--vermilion) 0 1px,var(--paper-crease) 1px 2px);
+  /* Layout constants */
+  --sidebar-width:260px;--sidebar-tag-ratio:46;--mobile-grid-columns:2;--grid-min-col:156px;
+  --control-height:34px;
+  --control-height-sm:30px;
+  --sidebar-row-height:calc(var(--control-height-sm) + 20px);
+  --control-padding-x:12px;
+  --header-control-font-size:var(--fs-small);--toolbar-control-font-size:var(--fs-small);
+  color-scheme:light;
+}
+
+/* Studio Folio Dark (乌木夜色): warm dark lacquer paper, ivory text, vibrant vermilion seal.
+   Maintains the handcrafted illustration folio aesthetic with zero eye strain in dark environments.
+   WCAG AA compliant: text contrast >= 4.5:1 across all surfaces. */
+[data-theme="dark"]{
+  --paper-canvas:#1A1612;
+  --paper-raised:#241F1A;
+  --paper-overlay:#2D2620;
+  --paper-crease:#3A3128;
+  --bg-chrome:#1F1A15;
+  --bg-canvas:#1A1612;
+  --bg-raised:#241F1A;
+  --bg-overlay:#2D2620;
+  --ink-1:#EDE3D0;
+  --ink-2:#B3A28C;
+  --ink-3:#9E8E7A;
+  --text-1:#EDE3D0;
+  --text-2:#B3A28C;
+  --text-3:#9E8E7A;
+  --vermilion:#D95D4A;
+  --vermilion-deep:#E06C5B;
+  --vermilion-soft:rgba(217,93,74,.18);
+  --vermilion-line:rgba(217,93,74,.45);
+  --accent:#D95D4A;
+  --accent-solid:#C04B3A;
+  --accent-deep:#9E3729;
+  --accent-soft:rgba(217,93,74,.18);
+  --accent-line:rgba(217,93,74,.45);
+  --accent-faint:rgba(217,93,74,.08);
+  --accent-selection:rgba(217,93,74,.32);
+  --indigo:#6A8BB3;
+  --ochre:#D49B38;
+  --ochre-deep:#E2B258;
+  --moss:#6A9A72;
+  --rose-stone:#C48E8E;
+  --danger:#B84242;
+  --danger-solid:#B84242;
+  --danger-deep:#9E3232;
+  --ok:#6A9A72;
+  --warn:#D49B38;
+  --status-ok:#6A9A72;
+  --status-info:#6A8BB3;
+  --status-warn:#D49B38;
+  --status-danger:#B84242;
+  --unclassified:#D49B38;
+  --border-subtle:#3A3128;
+  --border-strong:#52463A;
+  --shadow-label:0 1px 2px rgba(0,0,0,.5);
+  --shadow-pop:0 8px 24px rgba(0,0,0,.45);
+  --shadow-card-lift:0 2px 8px rgba(0,0,0,.45);
+  --paper-glow:radial-gradient(1100px 420px at 50% -80px,rgba(255,230,190,.04),transparent 65%);
+  --paper-vignette:radial-gradient(140% 90% at 50% 0%,transparent 60%,rgba(0,0,0,.35));
+  --paper-binding:linear-gradient(180deg,var(--vermilion) 0 1px,var(--paper-crease) 1px 2px);
+  color-scheme:dark;
+}

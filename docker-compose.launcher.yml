@@ -1,0 +1,61 @@
+# 脚本内部配置；用户填写 gallery.yml。
+name: gallery
+
+x-gallery-base: &gallery-base
+  build:
+    context: .
+    target: runtime
+  image: crpi-hwq9kgccbg8v0l26.cn-hangzhou.personal.cr.aliyuncs.com/hczhr/gallery:stable
+  restart: unless-stopped
+  ports:
+    - "${GALLERY_PORT:-8899}:8899"
+  read_only: true
+  tmpfs:
+    - /tmp:size=512m,mode=1777
+  volumes:
+    - "${GALLERY_MEDIA_DIR:-./media}:/media:ro"
+    - "${GALLERY_MEDIA_DIR2:-./media-placeholder-2}:/media2:ro"
+    - "${GALLERY_MEDIA_DIR3:-./media-placeholder-3}:/media3:ro"
+    - gallery-storage:/gallery
+  environment:
+    CHARACTER_RECOGNITION_ENABLED: "${CHARACTER_RECOGNITION_ENABLED:-1}"
+    CHARACTER_RECOGNITION_PROVIDER: "${CHARACTER_RECOGNITION_PROVIDER:-auto}"
+    CHARACTER_ALLOW_CPU_FALLBACK: "${CHARACTER_ALLOW_CPU_FALLBACK:-1}"
+    ONNXRUNTIME_AUTO_DOWNLOAD: "${ONNXRUNTIME_AUTO_DOWNLOAD:-1}"
+    CHARACTER_MODEL_IDLE_TIMEOUT_SECONDS: "${CHARACTER_MODEL_IDLE_TIMEOUT_SECONDS:-600}"
+    SCAN_INTERVAL: "${SCAN_INTERVAL:-21600}"
+    HASH_INTERVAL: "${HASH_INTERVAL:-30}"
+    DB_BACKUP_INTERVAL: "${DB_BACKUP_INTERVAL:-43200}"
+    DB_BACKUP_RETENTION: "${DB_BACKUP_RETENTION:-8}"
+
+services:
+  gallery:
+    <<: *gallery-base
+    profiles: [cpu]
+
+  gallery-gpu:
+    <<: *gallery-base
+    profiles: [gpu]
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - ${GALLERY_RENDER_GID:-109}
+      - ${GALLERY_VIDEO_GID:-44}
+
+  gallery-cuda:
+    <<: *gallery-base
+    profiles: [cuda]
+    build:
+      context: .
+      target: runtime-cuda
+    image: crpi-hwq9kgccbg8v0l26.cn-hangzhou.personal.cr.aliyuncs.com/hczhr/gallery:stable-cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  gallery-storage:

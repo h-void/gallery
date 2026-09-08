@@ -21,14 +21,23 @@ pub fn similarity_matrix(vectors: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
             "too many vectors for similarity matrix (max {MAX_CLUSTER_SCORE_VECTORS})"
         ));
     }
+    for vector in vectors {
+        if vector.len() != dim {
+            return Err(anyhow!("all vectors must have the same dimension"));
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(anyhow!("vectors must contain only finite values"));
+        }
+    }
     let mut scores = vec![vec![0.0f32; n]; n];
     for i in 0..n {
         let vi = &vectors[i];
-        if vi.len() != dim {
-            return Err(anyhow!("all vectors must have the same dimension"));
-        }
-        for j in 0..n {
-            scores[i][j] = dot(vi, &vectors[j]);
+        // The matrix is symmetric: compute each pair once and mirror it.
+        scores[i][i] = dot(vi, vi);
+        for j in (i + 1)..n {
+            let value = dot(vi, &vectors[j]);
+            scores[i][j] = value;
+            scores[j][i] = value;
         }
     }
     Ok(scores)

@@ -1,24 +1,85 @@
-function applyMode(mode) {
-  // Mobile has no edit mode: pointer-heavy batch editing stays desktop-only.
-  if (mode === 'edit' && typeof isMobileViewport === 'function' && isMobileViewport()) mode = 'browse';
+// Global event wiring and mode switching. All dynamic-list interactions go
+// through container-level delegation (grid cards, tag picker, move lists);
+// static controls keep direct listeners.
+
+import { API } from './api.js';
+import { state, nextRequestSeq, isCurrentRequestSeq } from './store.js';
+import { $, $$, debounce } from './utils.js';
+import { toast, logUiAction, collectUiLogContext } from './logging.js';
+import {
+  restoreBrowseUrl, syncBrowseUrl, browseUrlParams, saveItemSort, saveItemDates,
+  getSavedTagSort, saveTagSort, loadArtists, closeArtistDropdown,
+} from './router.js';
+import {
+  syncFilterDrawer, openFilterDrawer, closeFilterDrawer, closeFilterDrawerIfMobile,
+  closeMobileHeaderTools, closeMobileHeaderToolsIfMobile, toggleMobileHeaderTools,
+  syncMobileHeaderTools, syncSearchOptionsControl, openSearchOptions, closeSearchOptions,
+  toggleSearchOptions, setSearchScope, setSearchTarget, bindSidebarResize,
+  bindSidebarTagResize, bindSidebarSectionToggles, bindMobileColumnToggle, setSidebarWidth,
+  setCardRatio, syncItemFilterControls, selectBrowseRole, renderSidebar, renderFolderTree,
+  renderToolbar, loadItems, loadItemsPreservingDepth, updateDuplicateFilesButton,
+  updateScanFolderButton, isDuplicateFilesScopeActive, scrollToItemsTop,
+  onViewportLayoutChange, renderLibraryEmptyState, isMobileViewport, syncClearSearch,
+} from './views/sidebar.js';
+import { renderGrid, bindGridEvents, captureGridScrollAnchor, restoreGridScrollAnchor, isTaggableItem, scheduleJustifiedRelayout } from './views/grid.js';
+import {
+  closeLightbox, moveLightbox, onLightboxWheel, startLightboxPan, moveLightboxPan,
+  stopLightboxPan, onLightboxDelete, bindLightboxVideoDiagnostics,
+} from './views/lightbox.js';
+import {
+  updateEditBar, applySelectionChange, ensureEditTagContext, selectOrCreateEditTagQuery,
+  selectedEditTagIds, selectedEditTagNames, characterSuggestionCoverageWarning,
+  applyItemDateBatch, editDateEnteredValue, syncEditDatePrecisionInputs,
+  deleteSelectedMediaItems, removeSelectedTagsFromItems, selectAllCharacterSuggestions,
+  selectCharacterSuggestionTag, closeEditTagPicker, renderEditTagPicker,
+  setEditMode, syncEditModeButton,
+} from './views/editbar.js';
+import { bindArtistLinks, bindArtistProfileLinks, renderArtistLinks, renderArtistProfileLinks, closeArtistLinksDialog } from './views/links.js';
+import {
+  loadMoveWorkbench, refreshActiveMaintenanceView, startMaintenanceAutoRefresh,
+  stopMaintenanceAutoRefresh, scheduleMaintenanceAutoRefresh, setMaintenanceView, syncMaintenanceTabsEdge, handleMaintenanceJump,
+} from './views/maintenance/index.js';
+import {
+  runFolderRenameAllNow, saveMlDownloadSource, retryMlRuntime,
+  loadHealthSummary, setFolderRenameAutoEnabled, startFullScan, backfillItemDimensions, openErrorArtistsDialog, closeErrorArtistsDialog,
+  loadErrorArtistsPage, jumpToErrorArtist,
+} from './views/maintenance/overview.js';
+import { autoResolveMoveCandidates } from './views/maintenance/paths.js';
+import {
+  saveArchiveSettings, refreshArchivePlans, previewArchivePlans, applyArchiveTemplate, syncArchiveRuleDirtyState,
+  scheduleArchiveDraftPreview, switchOrganizeArtist, stepOrganizeArtist,
+  toggleAllArchivePlansConfirmation, executeArchivePlans, invalidateArtistFolderMovePreview,
+  previewArtistFolderMove, executeArtistFolderMove, openArtistFolderMoveDirectoryDialog,
+  closeArtistFolderMoveDirectoryDialog, chooseArtistFolderMoveDirectory, loadArtistFolderMoveDirectories,
+} from './views/maintenance/organize.js';
+import {
+  rebuildCharacterIndex, importCharacterLibraryReferences, cancelCharacterImportJob,
+  deleteCharacter, deleteCharacterReference, loadCharacterLibrary, renderCharacterLibrary,
+  setCharacterLibraryMobileView, gotoCharacterLibraryPanel, openCharacterReferences,
+  applyCharacterLibraryMobileView,
+} from './views/maintenance/characters.js';
+import { loadRecycleBin, restoreRecycleEntry, setOperationHistoryFilter } from './views/maintenance/records.js';
+import { toggleTheme, setThemeMode } from './views/theme.js';
+
+const DUPLICATES_VIEW_ACTIVE_REFRESH_MS = 10000;
+const DUPLICATES_VIEW_IDLE_REFRESH_MS = 60000;
+
+export function applyMode(mode) {
   const fromMode = state.mode;
-  $$('.mode-tabs button').forEach(b => {
-    const active = b.dataset.mode === mode;
-    b.classList.toggle('active', active);
-    b.setAttribute('aria-pressed', String(active));
-  });
-  const seq = nextRequestSeq('modeSwitchSeq');
-  const capturedAnchor = captureGridScrollAnchor();
-  const gridScrollAnchor = state.modeSwitchAnchor || capturedAnchor;
-  state.modeSwitchAnchor = gridScrollAnchor;
+  const isMoves = mode === 'moves';
+  const maintenanceBtn = $('#maintenanceBtn');
+  if (maintenanceBtn) {
+    maintenanceBtn.classList.toggle('active', isMoves);
+    maintenanceBtn.setAttribute('aria-pressed', String(isMoves));
+    maintenanceBtn.textContent = isMoves ? '浏览' : '维护';
+    maintenanceBtn.title = isMoves ? '浏览' : '维护';
+  }
   state.mode = mode;
   state.selectedIds.clear();
   closeFilterDrawer();
   closeMobileHeaderToolsIfMobile();
   updateEditBar();
-  const isMoves = mode === 'moves';
   document.body.classList.toggle('mode-moves', isMoves);
-  document.body.classList.toggle('mode-edit', mode === 'edit');
   document.body.classList.toggle('mode-browse', mode === 'browse' || !mode);
   $('#movePanel').classList.toggle('visible', isMoves);
   if (isMoves) requestAnimationFrame(syncMaintenanceTabsEdge);
@@ -28,8 +89,8 @@ function applyMode(mode) {
   $('#searchOptionsBtn').disabled = isMoves;
   if (isMoves) closeSearchOptions();
   updateDuplicateFilesButton();
-  if (typeof renderArtistLinks === 'function') renderArtistLinks();
-  if (typeof renderArtistProfileLinks === 'function') renderArtistProfileLinks();
+  renderArtistLinks();
+  renderArtistProfileLinks();
   renderLibraryEmptyState();
   if (isMoves) {
     setMaintenanceView(state.maintenanceView || 'overview');
@@ -40,54 +101,35 @@ function applyMode(mode) {
   } else {
     stopMaintenanceAutoRefresh();
     renderSidebar();
-    loadItems().then(() => {
-      const restoreResult = restoreGridScrollAnchor(gridScrollAnchor, {seq});
-      if (isCurrentRequestSeq('modeSwitchSeq', seq)) state.modeSwitchAnchor = null;
-      logModeChangeLayout({
-        from_mode: fromMode,
-        to_mode: mode,
-        seq,
-        restore: restoreResult,
-      });
+    loadItemsPreservingDepth().then(() => {
+      logModeChangeLayout({from_mode: fromMode, to_mode: mode});
     }).catch(e => {
-      if (isCurrentRequestSeq('modeSwitchSeq', seq)) state.modeSwitchAnchor = null;
       toast('加载媒体失败', 'error');
       logUiAction('mode_change', collectUiLogContext({
         from_mode: fromMode,
         to_mode: mode,
-        seq,
         error: e.message || String(e),
       }));
     });
   }
 }
 
-function syncMaintenanceTabsEdge() {
-  const maintenanceTabs = $('.maintenance-view-tabs');
-  if (!maintenanceTabs || maintenanceTabs.clientWidth === 0) return;
-  const atEnd = maintenanceTabs.scrollLeft + maintenanceTabs.clientWidth
-    >= maintenanceTabs.scrollWidth - 2;
-  if (atEnd) maintenanceTabs.dataset.scrolledEnd = '';
-  else delete maintenanceTabs.dataset.scrolledEnd;
+// One clear path for the typed query: Escape, the clear button, and any
+// future caller share the same reset so scope, selection and URL state stay
+// consistent. It only clears the search — filters, dates, tags and sort stay.
+function clearBrowseSearch(input) {
+  if (input) input.value = '';
+  state.search = '';
+  logUiAction('search_change', {search: '', scope: state.searchScope, target: state.searchTarget});
+  state.selectedIds.clear();
+  updateEditBar();
+  scrollToItemsTop();
+  syncBrowseUrl('push');
+  loadItems();
 }
 
-function syncItemFilterControls() {
-  const sortEl = $('#itemSort');
-  if (sortEl) sortEl.value = state.itemSort;
-  const dateFrom = $('#itemDateFrom');
-  if (dateFrom) {
-    dateFrom.value = state.itemDateFrom;
-    dateFrom.max = state.itemDateTo;
-  }
-  const dateTo = $('#itemDateTo');
-  if (dateTo) {
-    dateTo.value = state.itemDateTo;
-    dateTo.min = state.itemDateFrom;
-  }
-  const dateReset = $('#itemDateReset');
-  if (dateReset) {
-    dateReset.disabled = !state.itemDateFrom && !state.itemDateTo;
-  }
+function isAbortError(error) {
+  return Boolean(error && (error.name === 'AbortError' || error.code === 20));
 }
 
 function applyItemFilterControls() {
@@ -115,10 +157,179 @@ function applyItemFilterControls() {
   loadItems();
 }
 
-function bindEvents() {
+function logModeChangeLayout(data = {}) {
+  const restore = data.restore || {};
+  logUiAction('mode_change', collectUiLogContext({
+    from_mode: data.from_mode || '',
+    to_mode: data.to_mode || state.mode,
+    seq: data.seq ?? null,
+    first_visible_id: restore.first_visible_id ?? null,
+    before_top: restore.before_top == null ? null : Math.round(restore.before_top),
+    after_top: restore.after_top == null ? null : Math.round(restore.after_top),
+    top_delta: restore.top_delta == null ? null : Math.round(restore.top_delta),
+    grid_scroll_top: restore.grid_scroll_top ?? ($('#gridContainer') ? Math.round($('#gridContainer').scrollTop) : 0),
+    edit_bar_height: restore.edit_bar_height ?? ($('#editBar') ? Math.round($('#editBar').getBoundingClientRect().height) : 0),
+    restored: Boolean(restore.restored),
+    stale: Boolean(restore.stale),
+    scroll_source: restore.scroll_source || '',
+  }));
+}
+
+export async function refreshCurrentView({reason = 'manual'} = {}) {
+  const currentArtistId = state.currentArtist ? state.currentArtist.id : null;
+  // selectArtist bumps artistLoadSeq but not scanRefreshSeq: watch both so a
+  // user switching artists mid-refresh can never be overwritten back to the
+  // previous artist's state or URL.
+  const artistLoadSeqAtStart = Number(state.artistLoadSeq || 0);
+  const artistChanged = () => Number(state.artistLoadSeq || 0) !== artistLoadSeqAtStart;
+  const hadNoArtistsBeforeRefresh = state.artists.length === 0;
+  const activeFolder = state.activeFolder;
+  const currentMode = state.mode;
+  const maintenanceView = state.maintenanceView;
+  const gridScrollAnchor = captureGridScrollAnchor();
+  const seq = nextRequestSeq('scanRefreshSeq');
+  await loadArtists();
+  if (!isCurrentRequestSeq('scanRefreshSeq', seq) || artistChanged()) return seq;
+  if (currentMode === 'moves' || state.mode === 'moves') {
+    setMaintenanceView(maintenanceView || 'overview');
+    await loadMoveWorkbench({preserveScroll: true});
+    logUiAction('refresh_current_view', {reason, mode: 'moves'});
+    return seq;
+  }
+  const shouldAutoSelectFirstScannedArtist =
+    reason === 'scan_complete' &&
+    state.browseUrlRestored &&
+    !currentArtistId &&
+    hadNoArtistsBeforeRefresh &&
+    state.artists.length > 0;
+  if (shouldAutoSelectFirstScannedArtist) {
+    await selectArtist(state.artists[0].id, {history: 'replace'});
+    logUiAction('refresh_current_view', {reason, auto_selected_artist: true});
+    return seq;
+  }
+  if (currentArtistId) {
+    state.currentArtist = state.artists.find(a => a.id === currentArtistId) || null;
+    if (!state.currentArtist) {
+      clearUI();
+      syncBrowseUrl('replace');
+      logUiAction('refresh_current_view', {reason, artist_missing: true});
+      return seq;
+    }
+    state.activeFolder = activeFolder;
+    const [stats, tags, folders] = await Promise.all([
+      API.get(`/api/artists/${currentArtistId}/stats`),
+      API.get(`/api/tags?artist_id=${currentArtistId}`),
+      API.get(`/api/folders?artist_id=${currentArtistId}`),
+    ]);
+    if (!isCurrentRequestSeq('scanRefreshSeq', seq) || artistChanged()) return seq;
+    state.stats = stats;
+    state.tags = tags;
+    state.folders = folders;
+    renderSidebar();
+    renderFolderTree();
+    renderEditTagPicker();
+    renderToolbar();
+    // After a finished scan, make newly scanned files visible on the first
+    // implicit browse page: without an explicit sort or date range, switch the
+    // implicit date_desc order to scanned_desc and mark it explicit so the
+    // 全部 badge reflects the actual order. Explicit sorts and any scoped
+    // browse state (folder, tag/role, search, duplicates) remain untouched.
+    if (reason === 'scan_complete' && !state.itemSortExplicit && state.itemSort === 'date_desc' &&
+        !state.itemDateFrom && !state.itemDateTo &&
+        !state.activeFolder && !state.activeRole && !state.search && !state.duplicatesOnly) {
+      state.itemSort = 'scanned_desc';
+      state.itemSortExplicit = true;
+      syncItemFilterControls();
+    }
+    await loadItemsPreservingDepth();
+    if (artistChanged()) return seq;
+    restoreGridScrollAnchor(gridScrollAnchor);
+  }
+  if (artistChanged()) return seq;
+  syncBrowseUrl('replace');
+  logUiAction('refresh_current_view', {reason});
+  return seq;
+}
+
+// Late imports closing the events <-> router cycle.
+import { selectArtist } from './router.js';
+import { clearUI } from './views/sidebar.js';
+
+// The all/duplicates views change as scan candidates finish hashing. Poll
+// /api/hash/status while the user is looking at either view and silently
+// reload it when progress moves; refreshCurrentView keeps scroll anchored.
+let duplicatesViewRefreshTimer = null;
+
+export function duplicatesViewRefreshEligible() {
+  if (state.mode !== 'browse') return false;
+  if (document.hidden) return false;
+  const lightbox = $('#lightbox');
+  if (lightbox && lightbox.style && lightbox.style.display && lightbox.style.display !== 'none') return false;
+  return isDuplicateFilesScopeActive();
+}
+
+export function hashProgressFingerprint(status) {
+  const items = status.items || {};
+  const candidates = status.scan_candidates || {};
+  return [
+    items.pending, items.processing, items.done, items.error,
+    candidates.pending, candidates.processing, candidates.done, candidates.error,
+  ].join('/');
+}
+
+function hashCheckHasWork(status) {
+  const items = status.items || {};
+  const candidates = status.scan_candidates || {};
+  return Boolean(
+    Number(items.remaining || 0) + Number(candidates.remaining || 0) > 0
+    || (status.worker && status.worker.thread_alive)
+  );
+}
+
+export function scheduleDuplicatesViewRefresh(delay) {
+  if (duplicatesViewRefreshTimer) clearTimeout(duplicatesViewRefreshTimer);
+  const fallback = duplicatesViewRefreshEligible()
+    ? DUPLICATES_VIEW_ACTIVE_REFRESH_MS
+    : DUPLICATES_VIEW_IDLE_REFRESH_MS;
+  duplicatesViewRefreshTimer = setTimeout(refreshDuplicatesViewAutomatically, delay != null ? delay : fallback);
+}
+
+export async function refreshDuplicatesViewAutomatically() {
+  if (!duplicatesViewRefreshEligible() || state.duplicatesRefreshInFlight
+      || state.loadingItems || state.loadingMoreItems) {
+    scheduleDuplicatesViewRefresh();
+    return;
+  }
+  state.duplicatesRefreshInFlight = true;
+  let delay = DUPLICATES_VIEW_IDLE_REFRESH_MS;
+  try {
+    const status = await API.get('/api/hash/status');
+    if (!duplicatesViewRefreshEligible()) return;
+    delay = hashCheckHasWork(status) ? DUPLICATES_VIEW_ACTIVE_REFRESH_MS : DUPLICATES_VIEW_IDLE_REFRESH_MS;
+    const fingerprint = hashProgressFingerprint(status);
+    if (state.duplicatesRefreshFingerprint !== null && fingerprint !== state.duplicatesRefreshFingerprint) {
+      await refreshCurrentView({reason: 'duplicates_hash_progress'});
+    }
+    state.duplicatesRefreshFingerprint = fingerprint;
+    state.duplicatesRefreshFailures = 0;
+  } catch (e) {
+    state.duplicatesRefreshFailures += 1;
+    if (state.duplicatesRefreshFailures === 3) {
+      toast('重复文件自动刷新失败，稍后会继续尝试', 'error');
+    }
+    logUiAction('duplicates_refresh_failed', collectUiLogContext({error: e.message || String(e)}));
+  } finally {
+    state.duplicatesRefreshInFlight = false;
+    scheduleDuplicatesViewRefresh(delay);
+  }
+}
+
+export function bindEvents() {
   $('#mobileHeaderToggle').addEventListener('click', toggleMobileHeaderTools);
   syncMobileHeaderTools();
   syncSearchOptionsControl();
+  $('#editModeBtn').addEventListener('click', () => setEditMode(!state.editMode));
+  syncEditModeButton();
   $('#mobileFilterBtn').addEventListener('click', openFilterDrawer);
   $('#filterBackdrop').addEventListener('click', closeFilterDrawer);
   $('#filterDrawerClose').addEventListener('click', closeFilterDrawer);
@@ -126,6 +337,24 @@ function bindEvents() {
   bindSidebarTagResize();
   bindSidebarSectionToggles();
   bindMobileColumnToggle();
+  const cardRatioEl = $('#cardRatioSelect');
+  if (cardRatioEl) {
+    cardRatioEl.addEventListener('change', () => {
+      setCardRatio(cardRatioEl.value, true);
+    });
+  }
+  const themeToggleEl = $('#themeToggleBtn');
+  if (themeToggleEl) {
+    themeToggleEl.addEventListener('click', () => {
+      toggleTheme();
+    });
+  }
+  const themeModeEl = $('#themeModeSelect');
+  if (themeModeEl) {
+    themeModeEl.addEventListener('change', () => {
+      setThemeMode(themeModeEl.value, true);
+    });
+  }
   syncItemFilterControls();
   $('#mediaFilter').addEventListener('change', e => selectBrowseRole(e.target.value));
   const tagSortEl = $('#tagSort');
@@ -164,18 +393,14 @@ function bindEvents() {
   }
   window.addEventListener('popstate', restoreBrowseUrl);
   bindLightboxVideoDiagnostics();
+  // Seed the viewport layout tracker once at boot: a resize that crosses the
+  // 768px breakpoint must re-render the browse grid into the other engine,
+  // which requires knowing the viewport the page was rendered in.
+  onViewportLayoutChange();
   window.addEventListener('resize', () => {
     setSidebarWidth(state.sidebarWidth, false);
-    if (state.mode === 'edit' && typeof isMobileViewport === 'function' && isMobileViewport()) {
-      const browseTab = $('.mode-tabs button[data-mode="browse"]');
-      if (browseTab) browseTab.click();
-    }
-    if (typeof onViewportLayoutChange === 'function') {
-      onViewportLayoutChange();
-    } else if (!isMobileViewport()) {
-      closeFilterDrawer();
-      closeMobileHeaderTools();
-    }
+    scheduleJustifiedRelayout();
+    onViewportLayoutChange();
   });
   $('#artistSearch').addEventListener('focus', e => {
     e.target.select();
@@ -185,13 +410,17 @@ function bindEvents() {
     renderArtistDropdown(e.target.value);
   });
   $('#artistSearch').addEventListener('keydown', e => {
-    if (e.key === 'Enter') {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      moveArtistDropdownActive(e.key === 'ArrowDown' ? 1 : -1);
+    } else if (e.key === 'Enter') {
       e.preventDefault();
       selectFirstArtistResult();
     } else if (e.key === 'Escape') {
       closeArtistDropdown();
     }
   });
+  $('#searchInput').addEventListener('input', syncClearSearch);
   $('#searchInput').addEventListener('input', debounce(e => {
     state.search = e.target.value;
     logUiAction('search_change', {search: state.search, scope: state.searchScope, target: state.searchTarget});
@@ -205,25 +434,29 @@ function bindEvents() {
     if (e.key === 'Escape') {
       if (e.target.value) {
         e.preventDefault();
-        e.target.value = '';
-        state.search = '';
-        logUiAction('search_change', {search: '', scope: state.searchScope, target: state.searchTarget});
-        state.selectedIds.clear();
-        updateEditBar();
-        scrollToItemsTop();
-        syncBrowseUrl('push');
-        loadItems();
+        clearBrowseSearch(e.target);
       } else {
         e.target.blur();
       }
     }
   });
+  const clearSearchBtn = $('#clearSearchBtn');
+  if (clearSearchBtn) {
+    clearSearchBtn.addEventListener('click', () => {
+      const input = $('#searchInput');
+      clearBrowseSearch(input);
+      if (input && typeof input.focus === 'function') input.focus();
+    });
+  }
   $('#searchOptionsBtn').addEventListener('click', e => {
     e.stopPropagation();
     toggleSearchOptions();
   });
-  $$('#searchOptionsMenu [data-search-scope]').forEach(btn => {
-    btn.addEventListener('click', e => {
+  const searchOptionsMenu = $('#searchOptionsMenu');
+  if (searchOptionsMenu) {
+    searchOptionsMenu.addEventListener('click', e => {
+      const btn = e.target instanceof Element ? e.target.closest('[data-search-scope]') : null;
+      if (!btn || !searchOptionsMenu.contains(btn)) return;
       e.stopPropagation();
       setSearchScope(btn.dataset.searchScope);
       logUiAction('search_change', {search: state.search, scope: state.searchScope, target: state.searchTarget});
@@ -233,7 +466,7 @@ function bindEvents() {
       syncBrowseUrl('push');
       loadItems();
     });
-  });
+  }
   $('#tagsOnlyToggle').addEventListener('change', e => {
     setSearchTarget(e.target.checked ? 'tags' : 'all');
     logUiAction('search_change', {search: state.search, scope: state.searchScope, target: state.searchTarget});
@@ -243,8 +476,11 @@ function bindEvents() {
     syncBrowseUrl('push');
     loadItems();
   });
-  $$('#duplicateFilesToggle [data-duplicates]').forEach(btn => {
-    btn.addEventListener('click', () => {
+  const duplicateFilesToggle = $('#duplicateFilesToggle');
+  if (duplicateFilesToggle) {
+    duplicateFilesToggle.addEventListener('click', e => {
+      const btn = e.target instanceof Element ? e.target.closest('[data-duplicates]') : null;
+      if (!btn || !duplicateFilesToggle.contains(btn)) return;
       const duplicatesOnly = btn.dataset.duplicates === 'duplicates';
       if (state.duplicatesOnly === duplicatesOnly) return;
       state.duplicatesOnly = duplicatesOnly;
@@ -255,7 +491,7 @@ function bindEvents() {
       syncBrowseUrl('push');
       loadItems();
     });
-  });
+  }
   const gridContainer = $('#gridContainer');
   if (gridContainer) gridContainer.addEventListener('scroll', maybeLoadMoreOnScroll, {passive: true});
   window.addEventListener('scroll', maybeLoadMoreOnScroll, {passive: true});
@@ -271,23 +507,34 @@ function bindEvents() {
       if (r.ok) toast(isFolderScan ? '文件夹扫描已启动' : '画师扫描已启动', 'success');
       else toast(r.message || '扫描已在运行', 'error');
     } catch (e) {
-      toast(isFolderScan ? '启动文件夹扫描失败' : '启动画师扫描失败', 'error');
+      // 409: another scan or file operation owns the slot.
+      if (e && e.status === 409) {
+        toast('扫描已在运行', 'error');
+      } else {
+        toast(isFolderScan ? '启动文件夹扫描失败' : '启动画师扫描失败', 'error');
+      }
     } finally {
       setActionBusy('scan-context', '', false);
     }
   });
 
-  $$('.mode-tabs button').forEach(btn => {
-    btn.addEventListener('click', () => {
-      $$('.mode-tabs button').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      $$('.mode-tabs button').forEach(b => b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'));
-      applyMode(btn.dataset.mode);
+  const maintenanceBtn = $('#maintenanceBtn');
+  if (maintenanceBtn) {
+    maintenanceBtn.addEventListener('click', () => {
+      const nextMode = state.mode === 'moves' ? 'browse' : 'moves';
+      // Edit mode belongs to the browse grid; the maintenance panel has
+      // nothing to select, so leaving for it ends the session instead of
+      // stranding the check marks behind it.
+      if (nextMode === 'moves') setEditMode(false);
+      applyMode(nextMode);
     });
-  });
+  }
 
-  $$('#desktopViewToggle button').forEach(btn => {
-    btn.addEventListener('click', () => {
+  const desktopViewToggle = $('#desktopViewToggle');
+  if (desktopViewToggle) {
+    desktopViewToggle.addEventListener('click', e => {
+      const btn = e.target instanceof Element ? e.target.closest('button[data-view]') : null;
+      if (!btn || !desktopViewToggle.contains(btn)) return;
       $$('#desktopViewToggle button').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       $$('#desktopViewToggle button').forEach(b => b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'));
@@ -295,7 +542,7 @@ function bindEvents() {
       syncBrowseUrl('push');
       renderGrid();
     });
-  });
+  }
 
   $('#scanBtn').addEventListener('click', startFullScan);
   $('#emptyScanBtn').addEventListener('click', startFullScan);
@@ -338,8 +585,28 @@ function bindEvents() {
       setFolderRenameAutoEnabled(e.target.checked);
     });
   }
+  const organizeArtistSelect = $('#organizeArtistSelect');
+  if (organizeArtistSelect) organizeArtistSelect.addEventListener('change', e => switchOrganizeArtist(e.target.value));
+  const organizeArtistPrevBtn = $('#organizeArtistPrevBtn');
+  if (organizeArtistPrevBtn) organizeArtistPrevBtn.addEventListener('click', () => stepOrganizeArtist('prev'));
+  const organizeArtistNextBtn = $('#organizeArtistNextBtn');
+  if (organizeArtistNextBtn) organizeArtistNextBtn.addEventListener('click', () => stepOrganizeArtist('next'));
   const archiveProfileSaveBtn = $('#archiveProfileSaveBtn');
   if (archiveProfileSaveBtn) archiveProfileSaveBtn.addEventListener('click', saveArchiveSettings);
+  const archiveTemplateInput = $('#archiveTemplateInput');
+  if (archiveTemplateInput) {
+    archiveTemplateInput.addEventListener('input', () => {
+      syncArchiveRuleDirtyState();
+      scheduleArchiveDraftPreview();
+    });
+  }
+  const archiveCollisionSelect = $('#archiveCollisionSelect');
+  if (archiveCollisionSelect) {
+    archiveCollisionSelect.addEventListener('change', () => {
+      syncArchiveRuleDirtyState();
+      scheduleArchiveDraftPreview();
+    });
+  }
   const archivePlansRefreshBtn = $('#archivePlansRefreshBtn');
   if (archivePlansRefreshBtn) archivePlansRefreshBtn.addEventListener('click', () => refreshArchivePlans());
   const archivePlansPreviewBtn = $('#archivePlansPreviewBtn');
@@ -358,6 +625,8 @@ function bindEvents() {
       input.value = input.value.slice(0, start) + value + input.value.slice(end);
       input.focus();
       input.setSelectionRange(start + value.length, start + value.length);
+      syncArchiveRuleDirtyState();
+      scheduleArchiveDraftPreview();
     });
   });
   const archivePlansDryRunBtn = $('#archivePlansDryRunBtn');
@@ -375,12 +644,25 @@ function bindEvents() {
   });
   const recycleRefreshBtn = $('#recycleRefreshBtn');
   if (recycleRefreshBtn) recycleRefreshBtn.addEventListener('click', () => loadRecycleBin());
+  const operationHistoryPanel = $('#operationHistoryPanel');
+  if (operationHistoryPanel) {
+    operationHistoryPanel.addEventListener('click', e => {
+      const btn = e.target instanceof Element ? e.target.closest('[data-operation-filter]') : null;
+      if (btn && operationHistoryPanel.contains(btn)) {
+        setOperationHistoryFilter(btn.dataset.operationFilter || 'all');
+      }
+    });
+  }
   const artistFolderMoveForm = $('#artistFolderMoveForm');
   if (artistFolderMoveForm) artistFolderMoveForm.addEventListener('submit', e => { e.preventDefault(); previewArtistFolderMove(); });
   const artistFolderMovePreviewBtn = $('#artistFolderMovePreviewBtn');
   if (artistFolderMovePreviewBtn) artistFolderMovePreviewBtn.addEventListener('click', previewArtistFolderMove);
   const artistFolderMoveRoot = $('#artistFolderMoveRoot');
-  if (artistFolderMoveRoot) artistFolderMoveRoot.addEventListener('change', invalidateArtistFolderMovePreview);
+  if (artistFolderMoveRoot) artistFolderMoveRoot.addEventListener('change', () => {
+    // 父目录相对于所选根目录：换根目录即清空旧父目录与预览（P6）。
+    state.artistFolderMoveParentPath = '';
+    invalidateArtistFolderMovePreview();
+  });
   const artistFolderMoveDestination = $('#artistFolderMoveDestination');
   if (artistFolderMoveDestination) artistFolderMoveDestination.addEventListener('input', invalidateArtistFolderMovePreview);
   const artistFolderMoveBrowseBtn = $('#artistFolderMoveBrowseBtn');
@@ -477,12 +759,52 @@ function bindEvents() {
         deleteCharacter(Number(deleteBtn.dataset.characterDelete));
         return;
       }
-      const btn = target ? target.closest('[data-character-select]') : null;
+      const searchBtn = target ? target.closest('[data-character-search]') : null;
+      if (searchBtn && characterList.contains(searchBtn)) {
+        const query = searchBtn.dataset.characterSearch;
+        if (query) {
+          applyMode('browse');
+          const searchInput = $('#searchInput');
+          if (searchInput) searchInput.value = query;
+          state.searchQuery = query;
+          syncClearSearch();
+          loadItems({reset: true});
+        }
+        return;
+      }
+      const shell = target ? target.closest('.character-card-shell') : null;
+      const btn = target ? (target.closest('[data-character-select]') || shell?.querySelector('[data-character-select]')) : null;
       if (!btn || !characterList.contains(btn)) return;
       const characterId = Number(btn.dataset.characterSelect);
       if (!characterId) return;
       state.characterLibrarySelectedCharacterId = characterId;
+      openCharacterReferences();
       loadCharacterLibrary({characterId});
+    });
+  }
+  // Empty-state shortcut: no character yet, so offer the import zone directly
+  // instead of leaving the user in a dead list.
+  if (characterList) {
+    characterList.addEventListener('click', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      const gotoBtn = target ? target.closest('[data-character-library-goto]') : null;
+      if (!gotoBtn || !characterList.contains(gotoBtn)) return;
+      gotoCharacterLibraryPanel(gotoBtn.dataset.characterLibraryGoto);
+    });
+  }
+  const characterLibraryViews = $('#characterLibraryViews');
+  if (characterLibraryViews) {
+    characterLibraryViews.addEventListener('click', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      const btn = target ? target.closest('[data-character-library-view]') : null;
+      if (!btn || !characterLibraryViews.contains(btn)) return;
+      setCharacterLibraryMobileView(btn.dataset.characterLibraryView);
+    });
+  }
+  const characterLibraryBackBtn = $('#characterLibraryBackBtn');
+  if (characterLibraryBackBtn) {
+    characterLibraryBackBtn.addEventListener('click', () => {
+      setCharacterLibraryMobileView('characters');
     });
   }
   const characterReferenceList = $('#characterReferenceList');
@@ -500,6 +822,9 @@ function bindEvents() {
     // hints at off-screen views on mobile.
     maintenanceTabs.addEventListener('scroll', syncMaintenanceTabsEdge, {passive: true});
     window.addEventListener('resize', syncMaintenanceTabsEdge);
+    // Crossing the mobile breakpoint must repaint the character-library view
+    // switch: desktop shows all three zones again.
+    window.addEventListener('resize', applyCharacterLibraryMobileView);
     syncMaintenanceTabsEdge();
     maintenanceTabs.addEventListener('click', e => {
       const target = e.target instanceof Element ? e.target : null;
@@ -520,7 +845,7 @@ function bindEvents() {
       handleMaintenanceJump(card.dataset.maintenanceJump);
     });
   }
-const healthGrid = $('#healthGrid');
+  const healthGrid = $('#healthGrid');
   if (healthGrid) healthGrid.addEventListener('click', e => {
     const target = e.target instanceof Element ? e.target.closest('[data-error-artists-open]') : null;
     if (target && healthGrid.contains(target)) openErrorArtistsDialog();
@@ -566,6 +891,23 @@ const healthGrid = $('#healthGrid');
     jumpToErrorArtist({artist_id: target.dataset.errorArtistId, latest_plan_id: target.dataset.errorLatestPlanId});
   });
 
+  const maintenanceGuideDialogEl = $('#maintenanceGuideDialog');
+  if (maintenanceGuideDialogEl) {
+    $('#maintenanceGuideOpenBtn')?.addEventListener('click', () => {
+      if (typeof maintenanceGuideDialogEl.showModal === 'function') maintenanceGuideDialogEl.showModal();
+    });
+    $('#maintenanceGuideCloseBtn')?.addEventListener('click', () => {
+      if (maintenanceGuideDialogEl.open) maintenanceGuideDialogEl.close();
+    });
+    maintenanceGuideDialogEl.addEventListener('cancel', e => {
+      e.preventDefault();
+      if (maintenanceGuideDialogEl.open) maintenanceGuideDialogEl.close();
+    });
+    maintenanceGuideDialogEl.addEventListener('click', e => {
+      if (e.target === maintenanceGuideDialogEl && maintenanceGuideDialogEl.open) maintenanceGuideDialogEl.close();
+    });
+  }
+
   document.addEventListener('visibilitychange', () => {
     if (state.mode === 'moves' && !document.hidden) {
       refreshActiveMaintenanceView({preserveScroll: true, reason: 'visible'}).catch(e => {
@@ -598,6 +940,8 @@ const healthGrid = $('#healthGrid');
       setActionBusy('backup-manual', '', false);
     }
   });
+
+  $('#dimensionBackfillBtn').addEventListener('click', backfillItemDimensions);
 
   $('#editApplyBtn').addEventListener('click', async () => {
     await ensureEditTagContext();
@@ -702,8 +1046,17 @@ const healthGrid = $('#healthGrid');
     applySelectionChange([], {reason: 'cancel_selection'});
   });
 
+  // The tag picker's panel handler rewrites its innerHTML while handling a
+  // selection, which detaches the clicked option before this bubble-phase
+  // check runs — contains(detachedNode) is false, so every selection used to
+  // read as an outside click and slammed the picker shut. Capture the
+  // containment verdict first: capture runs before the panel handler.
+  let clickInsideEditTagPicker = false;
   document.addEventListener('click', e => {
-    if (!$('#editTagPicker').contains(e.target)) {
+    clickInsideEditTagPicker = $('#editTagPicker').contains(e.target);
+  }, true);
+  document.addEventListener('click', e => {
+    if (!clickInsideEditTagPicker && !$('#editTagPicker').contains(e.target)) {
       closeEditTagPicker();
     }
     const artistPicker = $('#artistPicker');
@@ -723,6 +1076,15 @@ const healthGrid = $('#healthGrid');
     if (e.key === 'Control' || e.key === 'Meta') state.selectionModifierDown = true;
     if (e.key === 'Escape' && closeTopmostOverlay()) {
       e.preventDefault();
+      if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+    }
+    if ((e.key === 't' || e.key === 'T') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      const activeEl = document.activeElement;
+      const tag = activeEl ? activeEl.tagName : '';
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable) {
+        e.preventDefault();
+        toggleTheme();
+      }
     }
     // Focus trap for open filter drawer / lightbox dialogs.
     if (e.key === 'Tab') {
@@ -791,8 +1153,8 @@ const healthGrid = $('#healthGrid');
     e.stopPropagation();
     moveLightbox(1);
   });
-  if (typeof bindArtistLinks === 'function') bindArtistLinks();
-  if (typeof bindArtistProfileLinks === 'function') bindArtistProfileLinks();
+  bindArtistLinks();
+  bindArtistProfileLinks();
 }
 
 function closeTopmostOverlay() {
@@ -825,435 +1187,23 @@ function closeTopmostOverlay() {
     closeMobileHeaderTools();
     return true;
   }
+  if (state.editMode) {
+    setEditMode(false);
+    return true;
+  }
   return false;
 }
 
-let wsRetryDelay = 1000;
-
-function scheduleWsReconnect() {
-  setTimeout(connectWS, wsRetryDelay);
-  wsRetryDelay = Math.min(wsRetryDelay * 2, 30000);
-}
-
-function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  let ws;
-  try {
-    ws = new WebSocket(`${proto}//${location.host}/ws/scan`);
-  } catch (e) {
-    scheduleWsReconnect();
-    return;
-  }
-  ws.onopen = () => {
-    wsRetryDelay = 1000;
-  };
-  ws.onmessage = e => {
-    let s = {};
-    try {
-      s = JSON.parse(e.data);
-    } catch (err) {
-      return;
-    }
-    if (!s || typeof s !== 'object') return;
-    // First message after page load is the server's current-state snapshot.
-    // A terminal snapshot means the scan finished before this page loaded:
-    // loadItems() already fetched the result, so refreshing (and toasting
-    // 扫描完成) here would only race restoreBrowseUrl and clobber deep links.
-    const isInitialScanSnapshot = !state.lastScanState;
-    const wasScanning = state.lastScanState && state.lastScanState.status === 'scanning';
-    state.lastScanState = s;
-    state.scanRunning = s.status === 'scanning';
-    // Refresh the current view once per finished scan run. The run key
-    // (scan_id) also catches scans that were already running when the page
-    // loaded, which the old wasScanning heuristic missed.
-    const gate = shouldRefreshScanRun(s, state.lastSeenScanRun);
-    const scanJustFinished = wasScanning && isTerminalScanState(s);
-    if (s.status === 'scanning') {
-      showProgress(s);
-      $('#scanBtn').style.display = 'none';
-      updateScanFolderButton();
-      $('#stopScanBtn').style.display = '';
-      renderLibraryEmptyState();
-    } else {
-      hideProgress();
-      $('#scanBtn').style.display = '';
-      updateScanFolderButton();
-      $('#stopScanBtn').style.display = 'none';
-      renderLibraryEmptyState();
-      if (gate.refresh) {
-        state.lastSeenScanRun = gate.key;
-        if (!(isInitialScanSnapshot && isTerminalScanState(s))) {
-          refreshAfterScan({toast: scanJustFinished});
-        }
-      }
-    }
-  };
-  ws.onerror = () => {
-    // onclose always follows onerror; the backoff loop lives there.
-  };
-  ws.onclose = () => scheduleWsReconnect();
-}
-
-function showProgress(s) {
-  const panel = $('#progressPanel');
-  panel.classList.add('visible');
-  $('#progressTitle').textContent = s.phase === 'discover' ? '发现画师目录' :
-    s.phase === 'scan' ? '扫描画师文件' :
-    s.phase === 'parse' ? '整理文件记录' : '扫描中';
-  const pct = s.total_estimate > 0 ? Math.round(s.scanned_count / s.total_estimate * 100) : 0;
-  $('#progressFill').style.width = Math.min(pct, 100) + '%';
-  $('#progressCount').textContent = `${s.scanned_count} / ${s.total_estimate}`;
-  $('#progressPath').textContent = s.current_path || '';
-}
-
-function hideProgress() {
-  $('#progressPanel').classList.remove('visible');
-}
-
-async function refreshAfterScan(options = {}) {
-  const toastOnFinish = options.toast !== false;
-  try {
-    const seq = await refreshCurrentView({reason: 'scan_complete'});
-    if (toastOnFinish && isCurrentRequestSeq('scanRefreshSeq', seq)) toast('扫描完成', 'success');
-  } catch (e) {
-    toast('扫描刷新失败', 'error');
-    logUiAction('scan_refresh_failed', collectUiLogContext({error: e.message || String(e)}));
-  }
-}
-
-// The all/duplicates views change as scan candidates finish hashing. Poll
-// /api/hash/status while the user is looking at either view and silently
-// reload it when progress moves; refreshCurrentView keeps scroll anchored.
-let duplicatesViewRefreshTimer = null;
-let duplicatesViewRefreshInFlight = false;
-let duplicatesViewRefreshFingerprint = null;
-let duplicatesViewRefreshFailures = 0;
-
-function duplicatesViewRefreshEligible() {
-  if (state.mode !== 'browse') return false;
-  if (document.hidden) return false;
-  const lightbox = $('#lightbox');
-  if (lightbox && lightbox.style && lightbox.style.display && lightbox.style.display !== 'none') return false;
-  return isDuplicateFilesScopeActive();
-}
-
-function hashProgressFingerprint(status) {
-  const items = status.items || {};
-  const candidates = status.scan_candidates || {};
-  return [
-    items.pending, items.processing, items.done, items.error,
-    candidates.pending, candidates.processing, candidates.done, candidates.error,
-  ].join('/');
-}
-
-function hashCheckHasWork(status) {
-  const items = status.items || {};
-  const candidates = status.scan_candidates || {};
-  return Boolean(
-    Number(items.remaining || 0) + Number(candidates.remaining || 0) > 0
-    || (status.worker && status.worker.thread_alive)
-  );
-}
-
-function resetDuplicatesViewRefreshBaseline() {
-  duplicatesViewRefreshFingerprint = null;
-}
-
-function scheduleDuplicatesViewRefresh(delay) {
-  if (duplicatesViewRefreshTimer) clearTimeout(duplicatesViewRefreshTimer);
-  const fallback = duplicatesViewRefreshEligible()
-    ? DUPLICATES_VIEW_ACTIVE_REFRESH_MS
-    : DUPLICATES_VIEW_IDLE_REFRESH_MS;
-  duplicatesViewRefreshTimer = setTimeout(refreshDuplicatesViewAutomatically, delay != null ? delay : fallback);
-}
-
-async function refreshDuplicatesViewAutomatically() {
-  if (!duplicatesViewRefreshEligible() || duplicatesViewRefreshInFlight
-      || state.loadingItems || state.loadingMoreItems) {
-    scheduleDuplicatesViewRefresh();
-    return;
-  }
-  duplicatesViewRefreshInFlight = true;
-  let delay = DUPLICATES_VIEW_IDLE_REFRESH_MS;
-  try {
-    const status = await API.get('/api/hash/status');
-    if (!duplicatesViewRefreshEligible()) return;
-    delay = hashCheckHasWork(status) ? DUPLICATES_VIEW_ACTIVE_REFRESH_MS : DUPLICATES_VIEW_IDLE_REFRESH_MS;
-    const fingerprint = hashProgressFingerprint(status);
-    if (duplicatesViewRefreshFingerprint !== null && fingerprint !== duplicatesViewRefreshFingerprint) {
-      await refreshCurrentView({reason: 'duplicates_hash_progress'});
-    }
-    duplicatesViewRefreshFingerprint = fingerprint;
-    duplicatesViewRefreshFailures = 0;
-  } catch (e) {
-    duplicatesViewRefreshFailures += 1;
-    if (duplicatesViewRefreshFailures === 3) {
-      toast('重复文件自动刷新失败，稍后会继续尝试', 'error');
-    }
-    logUiAction('duplicates_refresh_failed', collectUiLogContext({error: e.message || String(e)}));
-  } finally {
-    duplicatesViewRefreshInFlight = false;
-    scheduleDuplicatesViewRefresh(delay);
-  }
-}
-
-function captureGridScrollAnchor() {
-  const container = $('#gridContainer');
-  if (!container) return null;
-  const containerRect = container.getBoundingClientRect();
-  const cards = [...$$('#grid .card[data-id]')];
-  const fullyVisible = cards.find(card => {
-    const rect = card.getBoundingClientRect();
-    return rect.top >= containerRect.top && rect.bottom <= containerRect.bottom;
-  });
-  const partiallyVisible = cards.find(card => {
-    const rect = card.getBoundingClientRect();
-    return rect.bottom > containerRect.top && rect.top < containerRect.bottom;
-  });
-  const firstVisible = fullyVisible || partiallyVisible || cards[0] || null;
-  const documentScroller = document.scrollingElement || document.documentElement;
-  const containerScrollable = container.scrollHeight > container.clientHeight + 1;
-  const actualScrollSource = containerScrollable ? 'grid' : 'document';
-  const scrollTarget = actualScrollSource === 'grid' ? container : documentScroller;
-  const editBar = $('#editBar');
-  if (!firstVisible) {
-    return {
-      id: null,
-      nextIds: [],
-      orderedIds: [],
-      visibleIndex: -1,
-      viewportTop: null,
-      offset: 0,
-      fallbackScrollTop: scrollTarget ? scrollTarget.scrollTop : 0,
-      gridScrollTop: container.scrollTop,
-      edit_bar_height: editBar ? Math.round(editBar.getBoundingClientRect().height) : 0,
-      actualScrollSource,
-    };
-  }
-  const visibleIndex = cards.indexOf(firstVisible);
-  const firstVisibleRect = firstVisible.getBoundingClientRect();
-  return {
-    id: firstVisible.dataset.id,
-    orderedIds: cards.map(card => card.dataset.id).filter(Boolean),
-    visibleIndex,
-    viewportTop: firstVisibleRect.top,
-    offset: firstVisibleRect.top - containerRect.top,
-    fallbackScrollTop: scrollTarget ? scrollTarget.scrollTop : container.scrollTop,
-    gridScrollTop: container.scrollTop,
-    edit_bar_height: editBar ? Math.round(editBar.getBoundingClientRect().height) : 0,
-    actualScrollSource,
-  };
-}
-
-function restoreGridScrollAnchor(anchor, options = {}) {
-  const container = $('#gridContainer');
-  const seq = options.seq;
-  if (seq != null && !isCurrentRequestSeq('modeSwitchSeq', seq)) return {restored: false, stale: true};
-  if (!anchor || !container) return {restored: false, missing_anchor: true};
-  const cards = [...$$('#grid .card[data-id]')];
-  const cardsById = new Map(cards.map(card => [String(card.dataset.id), card]));
-  let target = anchor.id ? cards.find(card => String(card.dataset.id) === String(anchor.id)) : null;
-  if (!target) {
-    const oldIds = (anchor.orderedIds || []).map(id => String(id));
-    const originalIndex = Math.max(0, Number.isFinite(anchor.visibleIndex) ? anchor.visibleIndex : oldIds.indexOf(String(anchor.id)));
-    const fallbackId = oldIds.slice(originalIndex + 1).find(id => cardsById.has(id));
-    target = fallbackId ? cardsById.get(fallbackId) : null;
-  }
-  const documentScroller = document.scrollingElement || document.documentElement;
-  const scrollTarget = anchor.actualScrollSource === 'document' ? documentScroller : container;
-  const maxScrollTop = Math.max(0, scrollTarget.scrollHeight - scrollTarget.clientHeight);
-  if (target) {
-    const containerRect = container.getBoundingClientRect();
-    const beforeTop = Number.isFinite(anchor.viewportTop) ? anchor.viewportTop : null;
-    const targetRect = target.getBoundingClientRect();
-    const topDelta = Number.isFinite(beforeTop)
-      ? targetRect.top - anchor.viewportTop
-      : targetRect.top - containerRect.top - anchor.offset;
-    const beforeScrollTop = scrollTarget.scrollTop;
-    scrollTarget.scrollTop = Math.max(0, Math.min(scrollTarget.scrollTop + topDelta, maxScrollTop));
-    const afterRect = target.getBoundingClientRect();
-    return {
-      restored: true,
-      id: target.dataset.id ? Number(target.dataset.id) : null,
-      first_visible_id: target.dataset.id ? Number(target.dataset.id) : null,
-      before_top: beforeTop,
-      after_top: afterRect.top,
-      top_delta: beforeTop == null ? null : afterRect.top - beforeTop,
-      requested_delta: topDelta,
-      applied_scroll_delta: scrollTarget.scrollTop - beforeScrollTop,
-      scroll_source: scrollTarget === document.scrollingElement ? 'document' : 'grid',
-      grid_scroll_top: Math.round(container.scrollTop),
-      edit_bar_height: $('#editBar') ? Math.round($('#editBar').getBoundingClientRect().height) : 0,
-    };
-  }
-  scrollTarget.scrollTop = Math.max(0, Math.min(anchor.fallbackScrollTop || 0, maxScrollTop));
-  return {
-    restored: false,
-    fallback: true,
-    first_visible_id: null,
-    before_top: Number.isFinite(anchor.viewportTop) ? anchor.viewportTop : null,
-    after_top: null,
-    top_delta: null,
-    scroll_source: scrollTarget === document.scrollingElement ? 'document' : 'grid',
-    grid_scroll_top: Math.round(container.scrollTop),
-    edit_bar_height: $('#editBar') ? Math.round($('#editBar').getBoundingClientRect().height) : 0,
-  };
-}
-
-function logModeChangeLayout(data = {}) {
-  const restore = data.restore || {};
-  logUiAction('mode_change', collectUiLogContext({
-    from_mode: data.from_mode || '',
-    to_mode: data.to_mode || state.mode,
-    seq: data.seq ?? null,
-    first_visible_id: restore.first_visible_id ?? null,
-    before_top: restore.before_top == null ? null : Math.round(restore.before_top),
-    after_top: restore.after_top == null ? null : Math.round(restore.after_top),
-    top_delta: restore.top_delta == null ? null : Math.round(restore.top_delta),
-    grid_scroll_top: restore.grid_scroll_top ?? ($('#gridContainer') ? Math.round($('#gridContainer').scrollTop) : 0),
-    edit_bar_height: restore.edit_bar_height ?? ($('#editBar') ? Math.round($('#editBar').getBoundingClientRect().height) : 0),
-    restored: Boolean(restore.restored),
-    stale: Boolean(restore.stale),
-    scroll_source: restore.scroll_source || '',
-  }));
-}
-
-async function refreshCurrentView({reason = 'manual'} = {}) {
-  const currentArtistId = state.currentArtist ? state.currentArtist.id : null;
-  // selectArtist bumps artistLoadSeq but not scanRefreshSeq: watch both so a
-  // user switching artists mid-refresh can never be overwritten back to the
-  // previous artist's state or URL.
-  const artistLoadSeqAtStart = Number(state.artistLoadSeq || 0);
-  const artistChanged = () => Number(state.artistLoadSeq || 0) !== artistLoadSeqAtStart;
-  const hadNoArtistsBeforeRefresh = state.artists.length === 0;
-  const activeFolder = state.activeFolder;
-  const currentMode = state.mode;
-  const maintenanceView = state.maintenanceView;
-  const gridScrollAnchor = captureGridScrollAnchor();
-  const seq = nextRequestSeq('scanRefreshSeq');
-  await loadArtists();
-  if (!isCurrentRequestSeq('scanRefreshSeq', seq) || artistChanged()) return seq;
-  if (currentMode === 'moves' || state.mode === 'moves') {
-    setMaintenanceView(maintenanceView || 'overview');
-    await loadMoveWorkbench({preserveScroll: true});
-    logUiAction('refresh_current_view', {reason, mode: 'moves'});
-    return seq;
-  }
-  const shouldAutoSelectFirstScannedArtist =
-    reason === 'scan_complete' &&
-    state.browseUrlRestored &&
-    !currentArtistId &&
-    hadNoArtistsBeforeRefresh &&
-    state.artists.length > 0;
-  if (shouldAutoSelectFirstScannedArtist) {
-    await selectArtist(state.artists[0].id, {history: 'replace'});
-    logUiAction('refresh_current_view', {reason, auto_selected_artist: true});
-    return seq;
-  }
-  if (currentArtistId) {
-    state.currentArtist = state.artists.find(a => a.id === currentArtistId) || null;
-    if (!state.currentArtist) {
-      clearUI();
-      syncBrowseUrl('replace');
-      logUiAction('refresh_current_view', {reason, artist_missing: true});
-      return seq;
-    }
-    state.activeFolder = activeFolder;
-    const [stats, tags, folders] = await Promise.all([
-      API.get(`/api/artists/${currentArtistId}/stats`),
-      API.get(`/api/tags?artist_id=${currentArtistId}`),
-      API.get(`/api/folders?artist_id=${currentArtistId}`),
-    ]);
-    if (!isCurrentRequestSeq('scanRefreshSeq', seq) || artistChanged()) return seq;
-    state.stats = stats;
-    state.tags = tags;
-    state.folders = folders;
-    renderSidebar();
-    renderFolderTree();
-    renderEditTagPicker();
-    renderToolbar();
-    // After a finished scan, make newly scanned files visible on the first
-    // implicit browse page: without an explicit sort or date range, switch the
-    // implicit date_desc order to scanned_desc and mark it explicit so the
-    // 全部 badge reflects the actual order. Explicit sorts and any scoped
-    // browse state (folder, tag/role, search, duplicates) remain untouched.
-    if (reason === 'scan_complete' && !state.itemSortExplicit && state.itemSort === 'date_desc' &&
-        !state.itemDateFrom && !state.itemDateTo &&
-        !state.activeFolder && !state.activeRole && !state.search && !state.duplicatesOnly) {
-      state.itemSort = 'scanned_desc';
-      state.itemSortExplicit = true;
-      syncItemFilterControls();
-    }
-    await loadItems();
-    if (artistChanged()) return seq;
-    restoreGridScrollAnchor(gridScrollAnchor);
-  }
-  if (artistChanged()) return seq;
-  syncBrowseUrl('replace');
-  logUiAction('refresh_current_view', {reason});
-  return seq;
-}
-
-function toast(msg, type) {
-  logUiAction('toast', {message: String(msg ?? ''), type: String(type || '')});
-  const el = document.createElement('div');
-  el.className = `toast ${type}`;
-  el.textContent = msg;
-  document.body.appendChild(el);
-  setTimeout(() => el.remove(), 2500);
-}
-
-function escHtml(s) {
-  if (!s) return '';
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-function formatSize(bytes) {
-  if (!bytes) return '0 B';
-  const units = ['B','KB','MB','GB'];
-  let i = 0;
-  let s = bytes;
-  while (s >= 1024 && i < units.length - 1) { s /= 1024; i++; }
-  return s.toFixed(1) + ' ' + units[i];
-}
-
-function renderTagNames(tags) {
-  if (!tags || tags.length === 0) return '未加标签';
-  return joinUiMeta(tags.map(t => escHtml(t.name)));
-}
-
-function downloadFileName(item) {
-  return (item.file_name || 'image').replace(/[\\/:*?"<>|]/g, '_');
-}
-
-async function copyText(text) {
-  if (!text) return false;
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch (e) {}
-  }
-  const textarea = document.createElement('textarea');
-  textarea.value = text;
-  textarea.setAttribute('readonly', '');
-  textarea.style.position = 'fixed';
-  textarea.style.left = '-9999px';
-  document.body.appendChild(textarea);
-  textarea.select();
-  try {
-    return document.execCommand('copy');
-  } catch (e) {
-    return false;
-  } finally {
-    textarea.remove();
-  }
-}
-
-function debounce(fn, ms) {
-  let timer;
-  return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms); };
-}
-
-installFrontendErrorLogging();
-init();
+// Late imports closing remaining cycles; every use is inside a function body.
+import {
+  maybeLoadMoreOnScroll, isCurrentScanScopeActive, isCurrentFolderScopeActive,
+} from './views/sidebar.js';
+import { toggleItemFavorite } from './views/grid.js';
+import { focusArtistPicker, renderArtistDropdown, moveArtistDropdownActive, selectFirstArtistResult } from './router.js';
+import {
+  openEditTagPicker, selectFirstEditTagResult, classifyItems, classifyFolder, currentEditArtistId,
+} from './views/editbar.js';
+import {
+  toggleArchivePlanConfirmation, undoArchivePlan,
+} from './views/maintenance/organize.js';
+import { isActionBusy, setActionBusy } from './store.js';

@@ -1,6 +1,6 @@
 [package]
 name = "gallery_accel"
-version = "1.1.3"
+version = "1.1.4"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/h-void/gallery"
@@ -40,7 +40,7 @@ url = "2.5"
 # verified cache only after the process deliberately chooses the CUDA core.
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24", "openvino"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+tempfile = "3.25"
 
 [dev-dependencies]
-tempfile = "3.25"
 tower = "0.5"

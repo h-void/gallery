@@ -15,9 +15,13 @@ use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::StreamExt;
 use serde_json::Value;
+
+/// Hard cap for buffered upstream JSON bodies. State/health payloads are
+/// tiny; anything larger is either a bug or an attack.
+const MAX_UPSTREAM_JSON_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Upstream {
@@ -57,12 +61,22 @@ impl Upstream {
             .await
             .with_context(|| format!("upstream GET {url}"))?;
         let status = response.status();
-        let body = response.bytes().await.context("upstream body")?;
+        let body = read_bounded_body(response, MAX_UPSTREAM_JSON_BODY_BYTES).await;
+        let body = match body {
+            Ok(body) => body,
+            Err(error) => {
+                // Details (including the internal URL and body) stay in the
+                // process log; returned errors are generic.
+                log_error!("upstream GET {url} body read failed: {error:#}");
+                return Err(anyhow!("upstream response unavailable"));
+            }
+        };
         if !status.is_success() {
-            return Err(anyhow!(
-                "upstream {url} returned {status}: {}",
+            log_error!(
+                "upstream GET {url} returned {status}: {}",
                 String::from_utf8_lossy(&body)
-            ));
+            );
+            return Err(anyhow!("upstream returned {status}"));
         }
         serde_json::from_slice(&body).context("decode upstream json")
     }
@@ -87,7 +101,9 @@ impl Upstream {
         let url = format!("{}{}", self.base, path_and_query);
         let mut request = self.client.request(method, &url).body(body);
         for (name, value) in headers.iter() {
-            if is_request_hop_by_hop(name) {
+            // Client credentials must never reach the internal upstream, and
+            // hop-by-hop headers stay local.
+            if is_request_hop_by_hop(name) || is_client_credential_header(name) {
                 continue;
             }
             if let Ok(v) = value.to_str() {
@@ -97,10 +113,17 @@ impl Upstream {
         // Bound only the wait for response headers: an upstream that accepts the
         // connection but never replies must not park the handler forever. The
         // response body itself keeps streaming without a timeout (media runs long).
+        // Errors stay generic toward clients; the internal URL is logged only.
         let upstream = tokio::time::timeout(Duration::from_secs(30), request.send())
             .await
-            .map_err(|_| anyhow!("proxy {url} timed out waiting for upstream headers"))?
-            .with_context(|| format!("proxy {url}"))?;
+            .map_err(|_| {
+                log_error!("proxy {url} timed out waiting for upstream headers");
+                anyhow!("upstream did not respond in time")
+            })?
+            .map_err(|error| {
+                log_error!("proxy {url} failed: {error:#}");
+                anyhow!("upstream request failed")
+            })?;
         let status =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut response_builder = Response::builder().status(status);
@@ -117,12 +140,49 @@ impl Upstream {
         }
         // Stream residual chunks (no full-body buffer of media responses).
         let stream = upstream.bytes_stream().map(|chunk| {
-            chunk.map_err(|err| std::io::Error::other(format!("upstream stream: {err}")))
+            chunk.map_err(|err| {
+                log_error!("upstream stream failed: {err}");
+                std::io::Error::other("upstream stream error")
+            })
         });
         response_builder
             .body(Body::from_stream(stream))
             .context("build streaming proxy response")
     }
+}
+
+/// Read a response body fully with a hard size cap.
+async fn read_bounded_body(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<bytes::Bytes> {
+    if let Some(len) = response.content_length() {
+        if len as usize > max_bytes {
+            return Err(anyhow!(
+                "upstream body exceeds the {max_bytes} byte limit"
+            ));
+        }
+    }
+    let mut stream = response.bytes_stream();
+    let mut buffer = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("upstream body chunk")?;
+        if buffer.len() + chunk.len() > max_bytes {
+            return Err(anyhow!(
+                "upstream body exceeds the {max_bytes} byte limit"
+            ));
+        }
+        buffer.put(chunk);
+    }
+    Ok(buffer.freeze())
+}
+
+/// Client credential headers that must not be forwarded to the internal upstream.
+fn is_client_credential_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "authorization" | "cookie" | "proxy-authorization"
+    )
 }
 
 /// Hop-by-hop request headers. Keep `Range` and body-related entity headers.
@@ -240,6 +300,20 @@ mod tests {
     fn request_hop_by_hop_keeps_range_header() {
         let range = HeaderName::from_static("range");
         assert!(!is_request_hop_by_hop(&range));
+    }
+
+    #[test]
+    fn client_credential_headers_are_never_forwarded() {
+        for name in ["authorization", "cookie", "proxy-authorization"] {
+            let header = HeaderName::from_static(name);
+            assert!(
+                is_client_credential_header(&header),
+                "{name} must not be forwarded to the internal upstream"
+            );
+        }
+        assert!(!is_client_credential_header(&HeaderName::from_static(
+            "range"
+        )));
     }
 
     #[tokio::test]

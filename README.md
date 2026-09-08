@@ -127,7 +127,8 @@ Gallery 为 fnOS 提供原生应用安装包（FPK）：单一 Rust 二进制，
      - E:/Art
    ```
 
-   一行一个目录，数量不限。Linux 请填写 `/home/user/pictures` 这样的绝对路径。Windows 路径使用正斜杠 `/`，不支持映射网络盘和 UNC 路径。每个目录下的子文件夹识别为画师。
+   - **路径格式**：一行一个绝对路径，数量不限。Windows 使用正斜杠 `/`（如 `D:/Pictures`、`E:/Art`）；Linux 使用完整路径（如 `/home/user/pictures`）。不支持网络映射盘和 UNC 路径。
+   - **画师结构**：每个目录下的第一层子文件夹自动识别为一个画师（如 `D:/Pictures/画师A/xxx.jpg`，直接散放在目录根下的文件不会收录）。
 3. **一键启动**：Windows 用户双击 `start.cmd`；Linux 用户在项目根目录下运行 `sh start.sh`。
 4. **启动访问**：浏览器打开 `http://localhost:8899/`（局域网其他设备使用宿主机 IP），点击「扫描全库」。模型将在后台自动下载。
 

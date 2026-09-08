@@ -187,8 +187,24 @@ def stage_public_release(output: Path, tracked_files: Iterable[str | Path] | Non
         elif relative == "gallery.yml":
             # Never publish user-entered local media paths or the selected mode.
             destination.write_text(
-                "# cpu：CPU；gpu：Intel 核显；cuda：NVIDIA\n模式: cpu\n\n"
-                "# 一行一个目录，Windows 路径使用 /\n目录:\n  - D:/Pictures\n",
+                "# ==============================================================================\n"
+                "# 运行模式：cpu（通用兼容）、gpu（Linux Intel 核显）、cuda（NVIDIA 显卡）\n"
+                "# ==============================================================================\n"
+                "模式: cpu\n\n"
+                "# ==============================================================================\n"
+                "# 媒体目录：一行一个完整绝对路径（支持多个目录，不支持网络映射盘和 UNC 共享）\n"
+                "# 目录结构：每个目录下的第一层子文件夹会自动识别为一个画师。\n"
+                "#\n"
+                "# 格式示例：\n"
+                "# Windows：\n"
+                "#   - D:/Pictures\n"
+                "#   - E:/Art/Collections\n"
+                "# Linux：\n"
+                "#   - /home/user/pictures\n"
+                "#   - /mnt/storage/art\n"
+                "# ==============================================================================\n"
+                "目录:\n"
+                "  - D:/Pictures\n",
                 encoding="utf-8",
             )
         elif relative in _TEST_MOD_FILES:

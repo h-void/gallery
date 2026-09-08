@@ -127,7 +127,8 @@ Requires Docker Desktop or Docker Engine with Docker Compose, and Python 3.10+ (
      - E:/Art
    ```
 
-   `模式` specifies the mode (`cpu`, `gpu`, or `cuda`); `目录` specifies the directories. Enter one path per line. On Linux, use absolute paths such as `/home/user/pictures`. Use `/` in Windows paths. Local disks only; mapped network drives and UNC paths are not supported.
+   - **Path format**: One absolute path per line, unlimited count. Use `/` in Windows paths (e.g. `D:/Pictures`, `E:/Art`); use full paths on Linux (e.g. `/home/user/pictures`). Local disks only; network shares and UNC paths are not supported.
+   - **Artist hierarchy**: Top-level subfolders are recognized as artists (e.g. `D:/Pictures/ArtistA/001.jpg`; loose files directly under the media root are not indexed).
 3. **Start**: On Windows, double-click `start.cmd`. On Linux, run `sh start.sh` from the project directory.
 4. **Access**: Open `http://localhost:8899/` (use host IP for other LAN devices) and click "Scan All". Models download automatically in the background.
 

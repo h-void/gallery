@@ -40,6 +40,7 @@
 ### 3. AI Character Recognition (CCIP & OpenVINO)
 - CCIP recognition on by default; backend auto-selects CUDA → OpenVINO → CPU and auto-downloads models and CUDA runtime; falls back to CPU when GPU unavailable.
 - Single-character reference libraries capture varied styles; built-in semantic deduplication (≥0.95) and outlier pruning.
+- Manual character creation and reference photo upload for characters not covered by AI.
 - Human-in-the-loop: AI suggests only in Edit Mode and applies only after your confirmation.
 
 ### 4. Content-Hash Deduplication & Path Tracking
@@ -54,7 +55,13 @@
 
 ### 6. Storage Safety & Isolated State
 - Metadata and indexes in SQLite; media stays within authorized directories; organization never crosses boundaries.
-- Safe recycle: deletes prefer the system recycle bin, falling back to gallery/data/recycle, with one-click restore.
+- Safe recycle: deletes prefer the system recycle bin, falling back to gallery/data/recycle, with one-click restore, single-entry permanent purge, and full recycle bin emptying.
+
+### 7. Download Subscriptions & Netdisk Dispatch
+- Subscribe to creator platforms and automatically discover new works with per-artist round scheduling.
+- Netdisk batch dispatch: bridge external links to JDownloader via Event Scripter with manual review and one-click delivery.
+- All Works panel with post link navigation, date folder jumps, and searchable artist filtering.
+- Collapsible variable reference tables for download naming templates and folder archive rules.
 
 > [!WARNING]
 > **Network Security Notice**: Gallery listens on port `8899` by default and **provides no built-in user authentication**. It is intended strictly for trusted local area networks (LAN). When exposing the service to public networks, configure authentication via fnOS or an upstream reverse proxy (such as Nginx or Caddy).
@@ -223,4 +230,4 @@ Redistributing this project or modified derivatives requires providing correspon
 
 ## Third-Party Licenses
 
-Bundled license notices for ONNX Runtime, OpenVINO, and third-party Rust crates in FPK and Docker distributions are available in `fnpack/app/licenses/`.
+Bundled license notices for ONNX Runtime, OpenVINO, 7-Zip (`7zz`, © Igor Pavlov, LGPL-2.1+), and third-party Rust crates in FPK and Docker distributions are available in `fnpack/app/licenses/`.

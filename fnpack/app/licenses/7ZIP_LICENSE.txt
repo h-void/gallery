@@ -1,0 +1,16 @@
+7-Zip
+-----
+
+Copyright (C) 1999-2024 Igor Pavlov
+
+7-Zip is free software distributed under the GNU Lesser General Public
+License (LGPL), version 2.1 or later, with an additional permission
+(the "unRAR restriction"): the unRAR code may not be used to develop a
+RAR-compatible archiver.
+
+The standalone `7zz` binary bundled in this package is built from the
+official 7-Zip source and is used solely for archive listing, preview,
+and extraction.  It is distributed in accordance with the LGPL terms.
+
+Full license text: https://www.7-zip.org/license.txt
+Source code:       https://www.7-zip.org/download.html

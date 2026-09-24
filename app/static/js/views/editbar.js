@@ -977,7 +977,7 @@ export function renderEditTagPicker() {
   const panel = $('#editTagPickerPanel');
   if (!panel) return;
   if (state.editTagContextLoading) {
-    panel.innerHTML = '<div class="tag-picker-empty">正在读取标签</div>';
+    panel.innerHTML = '<div class="tag-picker-empty">正在读取角色</div>';
     updateEditTagPickerSummary();
     return;
   }
@@ -1017,22 +1017,22 @@ export function renderEditTagPicker() {
       ${groupTags.map(renderRow).join('')}
     `;
   };
-  rows.push(renderGroup('已选标签', selectedTags, '点击移除'));
-  rows.push(renderGroup('图上已有标签', existingTags, '点击移除'));
-  rows.push(renderGroup('其他标签', otherTags, ''));
+  rows.push(renderGroup('已选角色', selectedTags, '点击移除'));
+  rows.push(renderGroup('图上已有角色', existingTags, '点击移除'));
+  rows.push(renderGroup('其他角色', otherTags, ''));
   if (state.editGlobalTagSearchLoading) {
-    rows.push('<div class="tag-picker-empty">正在搜索全局标签</div>');
+    rows.push('<div class="tag-picker-empty">正在搜索全局角色</div>');
   }
   if (query && !state.editGlobalTagSearchLoading && !exactEditTagMatch(query)) {
     rows.push(`
       <button class="btn tag-picker-option tag-picker-create" type="button" data-create-tag="${escHtml(query)}">
-        <span>创建标签：${escHtml(query)}</span>
+        <span>创建角色：${escHtml(query)}</span>
       </button>
     `);
   }
   const emptyText = query
-    ? '没有匹配的全局标签，按回车创建'
-    : '输入标签名搜索全局标签';
+    ? '没有匹配的全局角色，按回车创建'
+    : '输入角色名搜索全局角色';
   panel.innerHTML = rows.join('') || `<div class="tag-picker-empty">${emptyText}</div>`;
   bindEditTagPickerPanel(panel);
   updateEditTagPickerSummary();
@@ -1061,9 +1061,9 @@ function bindEditTagPickerPanel(panel) {
 function updateEditTagPickerSummary() {
   const count = selectedEditTagNames().length;
   const summary = $('#editTagPickerSummary');
-  if (summary) summary.textContent = count ? `已选 ${count} 个标签` : '未选标签';
+  if (summary) summary.textContent = count ? `已选 ${count} 个角色` : '未选角色';
   const input = $('#editTagSearch');
-  if (input) input.placeholder = count ? '继续搜索标签' : '选择或搜索标签';
+  if (input) input.placeholder = count ? '继续搜索角色' : '选择或搜索角色';
 }
 
 function clearEditTagQuery() {
@@ -1175,7 +1175,7 @@ function addVirtualEditTag(tagName) {
 async function createOrSelectEditTag(name = '') {
   const tagName = (name || state.editTagQuery || $('#editTagSearch')?.value || '').trim();
   if (!tagName) {
-    toast('请输入标签名', 'error');
+    toast('请输入角色名', 'error');
     return;
   }
   const existing = exactEditTagMatch(tagName);
@@ -1202,10 +1202,10 @@ async function createOrSelectEditTag(name = '') {
     clearEditTagQuery();
     renderEditTagPicker();
     openEditTagPicker();
-    toast('标签已创建', 'success');
+    toast('角色已创建', 'success');
     return created;
   } catch (e) {
-    toast('创建标签失败', 'error');
+    toast('创建角色失败', 'error');
     return null;
   } finally {
     setActionBusy('edit-create-tag', busyId, false);
@@ -1261,7 +1261,7 @@ export function characterSuggestionCoverageWarning(itemIds, tagNames) {
   if (!suggestion) return '';
   const hitIds = new Set((suggestion.item_ids || []).map(Number));
   const hitCount = selectedItemIds.filter(id => hitIds.has(Number(id))).length;
-  return `角色建议命中 ${hitCount}/${selectedItemIds.length} 项，标签仍会应用到全部 ${selectedItemIds.length} 项；是否继续？`;
+  return `角色建议命中 ${hitCount}/${selectedItemIds.length} 项，角色仍会应用到全部 ${selectedItemIds.length} 项；是否继续？`;
 }
 
 export async function classifyItems(ids, tagIds, mode='add') {
@@ -1302,7 +1302,7 @@ export async function classifyItems(ids, tagIds, mode='add') {
     state.selectedIds.clear();
     resetCharacterTagSuggestions();
     updateEditBar();
-    toast('标签已更新', 'success');
+    toast('角色已更新', 'success');
 
     if (refreshArtistId) {
       const [stats, tags] = await Promise.all([
@@ -1387,7 +1387,7 @@ export async function classifyFolder(folder, tagIds, mode='add') {
     });
     clearSelectedEditTags();
     updateEditBar();
-    toast(`文件夹标签已更新：${result.updated} 张`, 'success');
+    toast(`文件夹角色已更新：${result.updated} 张`, 'success');
 
     const [stats, tags, folders] = await Promise.all([
       API.get(`/api/artists/${refreshArtistId}/stats`),
@@ -1426,7 +1426,7 @@ export async function classifyFolder(folder, tagIds, mode='add') {
       folder,
       error: e.message,
     });
-    toast('更新文件夹标签失败：' + e.message, 'error');
+    toast('更新文件夹角色失败：' + e.message, 'error');
   } finally {
     setActionBusy('edit-classify-folder', folder, false);
   }
@@ -1442,7 +1442,7 @@ export async function removeSelectedTagsFromItems() {
     return;
   }
   if (tagIds.length === 0 && tagNames.length === 0) {
-    toast('请选择要移除的标签', 'error');
+    toast('请选择要移除的角色', 'error');
     return;
   }
   setActionBusy('edit-remove-tags', '', true);

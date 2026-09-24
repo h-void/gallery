@@ -13,9 +13,11 @@ import {
 } from './sidebar.js';
 import { toggleSelect, selectOnly, applySelectionChange, scheduleCharacterTagSuggestions } from './editbar.js';
 import { openLightbox } from './lightbox.js';
+import { openArchiveModal } from './archive_modal.js';
 import { selectArtist } from '../router.js';
 
-const SELECTION_MARQUEE_THRESHOLD_PX = 4;
+const SELECTION_MARQUEE_THRESHOLD_PX = 10;
+const CARD_DRAG_MARQUEE_THRESHOLD_PX = 20;
 const MAX_IMAGE_LOADS = 2;
 const IMAGE_OBSERVER_ROOT_MARGIN = '480px';
 const IMAGE_LOAD_TIMEOUT_MS = 12000;
@@ -538,8 +540,21 @@ export function bindGridEvents() {
       return;
     }
     const card = target.closest('.card');
-    if (!card || !grid.contains(card)) return;
+    if (!card || !grid.contains(card)) {
+      if (state.selectedIds.size > 0 && !state.editMode && !selectionModifierActive(e)) {
+        if (state.suppressNextGridClick) {
+          state.suppressNextGridClick = false;
+          e.preventDefault();
+          return;
+        }
+        applySelectionChange([], {reason: 'exit_selection'});
+      }
+      return;
+    }
     activateCard(card, e);
+  });
+  grid.addEventListener('pointerdown', e => {
+    if (e.button === 0) state.suppressNextGridClick = false;
   });
   grid.addEventListener('keydown', e => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
@@ -583,14 +598,22 @@ function activateCard(card, e) {
       selectOnly(parseInt(card.dataset.id), {reason: 'click'});
     }
   } else {
-    if (card.classList.contains('archive-card')) return;
+    if (card.classList.contains('archive-card')) {
+      const id = parseInt(card.dataset.id);
+      if (id) openArchiveModal(id, card);
+      return;
+    }
     const idx = parseInt(card.dataset.idx);
     openLightbox(idx);
   }
 }
 
 export function selectionModifierActive(e) {
-  return Boolean(state.selectionModifierDown || (e && (e.ctrlKey || e.metaKey)));
+  if (e && ('ctrlKey' in e || 'metaKey' in e)) {
+    state.selectionModifierDown = Boolean(e.ctrlKey || e.metaKey);
+    return state.selectionModifierDown;
+  }
+  return Boolean(state.selectionModifierDown);
 }
 
 // Interactive controls that live inside a card and handle themselves: clicks,
@@ -610,15 +633,30 @@ function bindSelectionMarqueeEvents() {
   if (!container || container.dataset.selectionMarqueeBound === '1') return;
   container.dataset.selectionMarqueeBound = '1';
   container.addEventListener('pointerdown', startSelectionMarquee);
+  container.addEventListener('click', e => {
+    const target = e.target instanceof Element ? e.target : null;
+    if (!target) return;
+    if (target.closest('.card, .check, #editBar, .edit-bar, button, a, input, select, textarea, label')) return;
+    if (state.selectedIds.size > 0 && !state.editMode && !selectionModifierActive(e)) {
+      if (state.suppressNextGridClick) {
+        state.suppressNextGridClick = false;
+        e.preventDefault();
+        return;
+      }
+      applySelectionChange([], {reason: 'exit_selection'});
+    }
+  });
 }
 
 function startSelectionMarquee(e) {
   const container = $('#gridContainer');
-  if (!container || state.selectedIds.size === 0) return;
+  if (!container) return;
   if (e.pointerType && e.pointerType !== 'mouse') return;
   if (e.pointerType === 'mouse' && e.button !== 0) return;
   if (selectionMarqueeBlockedTarget(e.target)) return;
   if (!container.contains(e.target instanceof Node ? e.target : null)) return;
+  state.suppressNextGridClick = false;
+  const targetCard = e.target instanceof Element ? e.target.closest('.card') : null;
   state.selectionMarquee = {
     pointerId: e.pointerId,
     startX: e.clientX,
@@ -627,6 +665,7 @@ function startSelectionMarquee(e) {
     currentY: e.clientY,
     active: false,
     moved: false,
+    onCard: Boolean(targetCard),
     modifier: selectionModifierActive(e),
     baseSelectedIds: new Set(state.selectedIds),
     overlay: null,
@@ -643,7 +682,10 @@ function moveSelectionMarquee(e) {
   state.selectionMarquee.modifier = selectionModifierActive(e);
   const movedX = Math.abs(e.clientX - state.selectionMarquee.startX);
   const movedY = Math.abs(e.clientY - state.selectionMarquee.startY);
-  if (!state.selectionMarquee.active && Math.max(movedX, movedY) < SELECTION_MARQUEE_THRESHOLD_PX) return;
+  const threshold = (state.selectionMarquee.onCard || state.selectionMarquee.modifier)
+    ? CARD_DRAG_MARQUEE_THRESHOLD_PX
+    : SELECTION_MARQUEE_THRESHOLD_PX;
+  if (!state.selectionMarquee.active && Math.max(movedX, movedY) < threshold) return;
   if (!state.selectionMarquee.active) {
     state.selectionMarquee.active = true;
     state.selectionMarquee.moved = true;

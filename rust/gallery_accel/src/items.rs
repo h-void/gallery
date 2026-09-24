@@ -12,6 +12,14 @@ use crate::media_roots::split_csv;
 use crate::tags::compare_tag_order;
 use crate::DEFAULT_LIMIT;
 
+/// Test helper: a fixed single-artist page over the query entry point.
+///
+/// Production routes call `items_page_query_response` (and the cursor entry)
+/// directly, passing an optional artist and the cursor/flag set. This wrapper
+/// exists only for behaviour regression that wants the simpler shape — the
+/// plan's M11 note — so it stays inside `cfg(test)` instead of shipping as a
+/// second public way to build the same page.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn items_page_response(
     conn: &Connection,
@@ -198,18 +206,11 @@ fn items_page_query_response_inner(
         page_limit
     }));
     page_params.push(SqlValue::Integer(page_offset));
-    let mut stmt = conn.prepare(&format!(
-        "SELECT i.id, i.artist_id, i.file_path, i.file_name, i.file_size, i.file_mtime,
-                i.folder_name, i.date, i.detected_date, i.manual_date, i.auto_role,
-                i.manual_role, i.is_archive, i.media_type,
-                i.content_hash, i.hash_status, i.hash_updated_at, i.st_dev, i.st_ino, i.missing,
-                i.missing_at, i.scanned_at, i.width, i.height,
-                EXISTS(SELECT 1 FROM item_favorites f WHERE f.item_id=i.id) AS favorite,
-                a.name AS artist_name, a.path AS artist_path
-         FROM items i JOIN artists a ON a.id=i.artist_id
-         WHERE {where_sql} ORDER BY {} LIMIT ? OFFSET ?",
+    let sql = item_page_sql(
+        &where_sql,
         item_order_sql(sort, duplicates_only.unwrap_or(false) && !cursor_mode),
-    ))?;
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let mut page_items = stmt
         .query_map(params_from_iter(page_params.iter()), item_detail_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -534,6 +535,39 @@ fn matching_tag_ids(conn: &Connection, query: &str, artist_id: Option<i64>) -> R
             crate::pinyin_search::text_matches_search(query, &[&name]).then_some(id)
         })
         .collect())
+}
+
+/// The page query. Kept as its own function so the join-order guarantee below
+/// can be asserted by a test instead of living only in a comment.
+///
+/// `CROSS JOIN` returns exactly the same rows as `JOIN` here; its only effect is
+/// that SQLite may not reorder the two tables. That pin is deliberate. With
+/// planner statistics present (the normal state: writable startup bootstraps
+/// `ANALYZE`), the planner otherwise drives this query from `artists` and probes
+/// `items` once per artist -- 488 nested index scans -- which measured 1.7-2.2x
+/// slower than the single `idx_items_hash_queue` range scan it picks when
+/// `items` is the outer loop.
+///
+/// Measured with bundled SQLite on 755,548 items / 488 artists, query-only
+/// medians: default sort 347ms -> 209ms, offset 5000 532ms -> 233ms, sort=name
+/// 428ms -> 197ms, by-artist unchanged at 0.8ms. End-to-end HTTP on the same
+/// library agreed: 595.7 -> 430.7, 770.6 -> 436.5, 598.3 -> 414.3. With the pin,
+/// statistics cost 1.03-1.04x instead of 1.42-1.76x, so the pin removes the
+/// regression rather than trading it for a different one.
+///
+/// Do not "simplify" this back to `JOIN`.
+fn item_page_sql(where_sql: &str, order_sql: &str) -> String {
+    format!(
+        "SELECT i.id, i.artist_id, i.file_path, i.file_name, i.file_size, i.file_mtime,
+                i.folder_name, i.date, i.detected_date, i.manual_date, i.auto_role,
+                i.manual_role, i.is_archive, i.media_type,
+                i.content_hash, i.hash_status, i.hash_updated_at, i.st_dev, i.st_ino, i.missing,
+                i.missing_at, i.scanned_at, i.width, i.height,
+                EXISTS(SELECT 1 FROM item_favorites f WHERE f.item_id=i.id) AS favorite,
+                a.name AS artist_name, a.path AS artist_path
+         FROM items i CROSS JOIN artists a ON a.id=i.artist_id
+         WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?"
+    )
 }
 
 fn item_order_sql(sort: Option<&str>, group_duplicates: bool) -> &'static str {
@@ -879,5 +913,26 @@ mod tests {
         let ranged = page(Some("date_desc"), Some("2020-01-01"), Some("2020-12-31"));
         assert_eq!(page_file_names(&ranged), ["a.jpg"]);
         assert_eq!(ranged["total"], 1);
+    }
+
+    /// §3 regression: the page query must pin `items` as the outer loop.
+    ///
+    /// This asserts the SQL because the effect cannot be asserted on a test-sized
+    /// database: at 4,000 rows the planner picks the same plan for `JOIN` and
+    /// `CROSS JOIN`, so a plan assertion would pass either way and prove nothing.
+    /// The measurement behind the pin is in `item_page_sql`'s comment.
+    #[test]
+    fn items_page_pins_the_artists_join_order() {
+        let sql = item_page_sql("i.missing=0", item_order_sql(Some("name"), false));
+        assert!(
+            sql.contains("FROM items i CROSS JOIN artists a ON a.id=i.artist_id"),
+            "the page query must pin items as the outer loop; reverting to a plain \
+             JOIN reintroduces the artists-driven nested loop and measured \
+             1.7-2.2x slower on a 755k library://n{sql}"
+        );
+        assert!(
+            !sql.contains(" i JOIN artists"),
+            "a reorderable JOIN slipped into the page query://n{sql}"
+        );
     }
 }

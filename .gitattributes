@@ -6,3 +6,12 @@ fnpack/app/licenses/** -whitespace
 
 start.sh text eol=lf
 start.cmd text eol=crlf
+
+# POSIX shell scripts must be LF in the checkout, not only in the index.
+# `core.autocrlf=true` rewrites them to CRLF on checkout, and these files ship
+# or execute as bytes: tools/build_fnpack.py stages fnpack/ verbatim into the
+# FPK, so a CRLF upgrade_callback reaches fnOS's /bin/sh and fails to parse —
+# and that file is the only implementation of the legacy-share migration.
+# tools/*.sh runs under bash.
+fnpack/cmd/* text eol=lf
+tools/*.sh text eol=lf

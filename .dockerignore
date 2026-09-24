@@ -31,3 +31,17 @@ start.cmd
 start.sh
 
 .gallery-empty/
+
+# Build artifacts and local scratch state never reach the image. The builder
+# stage copies only Cargo.toml, Cargo.lock and src/, so a Rust target dir must
+# stay out of the context; leaving it in sent multiple GB per build.
+**/target/
+output/
+node_modules/
+.codegraph/
+.pytest_cache/
+.test-cache/
+.playwright-cli/
+.workbuddy/
+fnnas-docs/
+.git-damaged-*/

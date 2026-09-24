@@ -16,6 +16,11 @@ import { deleteMediaItem } from './lightbox.js';
 
 const CHARACTER_SUGGESTION_SELECTED_LIMIT = 3;
 const CHARACTER_SUGGESTION_DELAY_MS = 120;
+// A cold recognition session build (the model idle-unloads after 10 minutes)
+// can take far longer than the 15s default API timeout; the server itself
+// waits up to 15 minutes for the build, so aborting at 15s fails the first
+// request after idle for no reason.
+const CHARACTER_SUGGESTION_TIMEOUT_MS = 60000;
 
 let editTagContextLoadToken = 0;
 let editTagContextInFlight = null;
@@ -177,7 +182,14 @@ export async function deleteSelectedMediaItems() {
 // is selected yet.
 export function setEditMode(on) {
   const next = Boolean(on);
-  if (state.editMode === next) return;
+  if (state.editMode === next) {
+    if (!next && state.selectedIds.size > 0) {
+      applySelectionChange([], {reason: 'exit_edit_mode'});
+      syncEditModeButton();
+      updateEditBar();
+    }
+    return;
+  }
   state.editMode = next;
   document.body.classList.toggle('edit-mode', next);
   // Leaving the mode ends the session, so browsing starts clean again.
@@ -190,7 +202,7 @@ export function setEditMode(on) {
 export function syncEditModeButton() {
   const btn = $('#editModeBtn');
   if (!btn) return;
-  const on = Boolean(state.editMode);
+  const on = Boolean(state.editMode || state.selectedIds.size > 0);
   btn.textContent = on ? '完成' : '选择';
   btn.title = on ? '退出编辑模式' : '进入编辑模式';
   btn.setAttribute('aria-label', btn.title);
@@ -199,6 +211,7 @@ export function syncEditModeButton() {
 }
 
 export function updateEditBar() {
+  syncEditModeButton();
   const bar = $('#editBar');
   if (!bar) return;
   // Selection context (§4.1) is a state, not a mode: the bar floats in when
@@ -736,7 +749,7 @@ async function recognizeCharacterSuggestionItem(item) {
   if (state.characterSuggestionCache.has(key)) {
     return state.characterSuggestionCache.get(key);
   }
-  const pending = API.postJson(`/api/items/${item.id}/character-recognition?top_k=3`, {});
+  const pending = API.postJson(`/api/items/${item.id}/character-recognition?top_k=3`, {}, {timeoutMs: CHARACTER_SUGGESTION_TIMEOUT_MS});
   state.characterSuggestionCache.set(key, pending);
   trimCharacterSuggestionCache();
   try {
@@ -1333,7 +1346,7 @@ export async function classifyItems(ids, tagIds, mode='add') {
       tag_names: tagNames,
       error: message,
     });
-    toast((mode === 'remove' ? '移除标签失败：' : '添加标签失败：') + message, 'error');
+    toast((mode === 'remove' ? '移除角色失败：' : '添加角色失败：') + message, 'error');
     return {failed: true, error: message};
   } finally {
     setActionBusy('edit-classify-items', '', false);
@@ -1425,7 +1438,7 @@ export async function removeSelectedTagsFromItems() {
   const tagIds = selectedEditTagIds();
   const tagNames = selectedEditTagNames(tagIds);
   if (state.selectedIds.size === 0) {
-    toast('请先选择要移除标签的媒体', 'error');
+    toast('请先选择要移除角色的媒体', 'error');
     return;
   }
   if (tagIds.length === 0 && tagNames.length === 0) {
@@ -1467,7 +1480,7 @@ export async function removeSelectedTagsFromItems() {
       tag_names: tagNames,
       error: e.message,
     });
-    toast('移除标签失败：' + e.message, 'error');
+    toast('移除角色失败：' + e.message, 'error');
   } finally {
     setActionBusy('edit-remove-tags', '', false);
   }

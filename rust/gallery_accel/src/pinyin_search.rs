@@ -66,7 +66,9 @@ fn match_from(
         return cached;
     }
     let matched = match &chars[j] {
-        CharCandidates::Literal(ch) => query[i] == *ch && match_from(query, chars, i + 1, j + 1, memo),
+        CharCandidates::Literal(ch) => {
+            query[i] == *ch && match_from(query, chars, i + 1, j + 1, memo)
+        }
         CharCandidates::Han(readings) => {
             readings.iter().any(|reading| {
                 let syllable: Vec<char> = reading.chars().collect();
@@ -86,9 +88,21 @@ fn match_from(
     matched
 }
 
+/// The longest query this matcher analyzes.
+///
+/// The search box is a name field; a query longer than a real name is not a
+/// search, it is a way to make the matcher allocate. [`query_matches_value`]
+/// sizes a memo table `(query + 1) x (value + 1)` per candidate value, and
+/// `GET /api/tags/search` runs it over every tag, so an unbounded query is an
+/// allocation and CPU cost controlled entirely by the caller. A name longer
+/// than this still matches on the exact-substring path in
+/// [`text_matches_search`]; only the per-character fallback ignores the tail.
+const MAX_SEARCH_QUERY_CHARS: usize = 64;
+
 /// Candidate-aware compact match of `query` against one value: the query may
 /// start anywhere, and every Han character may use any of its readings.
 fn query_matches_value(query: &[char], value: &str) -> bool {
+    let query = &query[..query.len().min(MAX_SEARCH_QUERY_CHARS)];
     let chars = value_candidates(value);
     let mut memo = vec![vec![None; chars.len() + 1]; query.len() + 1];
     (0..chars.len()).any(|start| match_from(query, &chars, 0, start, &mut memo))
@@ -115,7 +129,8 @@ pub fn search_text_for_values(values: &[&str]) -> String {
                 CharCandidates::Han(readings) => {
                     let first = readings[0].clone();
                     primary.push(first.clone());
-                    primary_initials.push(first.chars().next().map(String::from).unwrap_or_default());
+                    primary_initials
+                        .push(first.chars().next().map(String::from).unwrap_or_default());
                     let mut reading_initials: Vec<String> = readings
                         .iter()
                         .filter_map(|reading| reading.chars().next().map(String::from))
@@ -194,7 +209,9 @@ mod tests {
         // 还(hai/huan) 没(mei/mo): candidate-aware matching must accept the
         // combination the primary chain does not contain.
         assert!(text_matches_search("haihuan", &["还没"]));
-        assert!(text_matches_search("hmei", &["还没"]) || text_matches_search("huanmei", &["还没"]));
+        assert!(
+            text_matches_search("hmei", &["还没"]) || text_matches_search("huanmei", &["还没"])
+        );
     }
 
     #[test]
@@ -227,4 +244,3 @@ mod tests {
         assert!(!text_matches_search("yongzhuangx", &["泳装"]));
     }
 }
-

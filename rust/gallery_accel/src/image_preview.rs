@@ -5,8 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use image::DynamicImage;
-use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+use crate::fs_util::safe_canonicalize;
 
 const PREVIEW_BG: [u8; 3] = [15, 23, 42];
 const DEFAULT_QUALITY: u8 = 72;
@@ -82,7 +83,7 @@ pub fn preview_cache_path_for_source(full: &Path, max_edge: u32) -> Option<PathB
         return None;
     }
     let root = preview_cache_root()?;
-    let full = full.canonicalize().ok()?;
+    let full = safe_canonicalize(full).ok()?;
     let (mtime_ns, size) = file_mtime_ns_size(&full)?;
     let path_str = full.to_string_lossy().replace('\\', "/");
     // Python: json.dumps(key_data, sort_keys=True, ensure_ascii=False)
@@ -158,24 +159,23 @@ pub(crate) fn write_exclusive_jpeg_cache(cache_path: &Path, body: &[u8]) -> bool
         std::process::id(),
         PART_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let published =
-        std::fs::write(&part, body).is_ok() && looks_like_jpeg(body) && {
-            #[cfg(windows)]
-            {
-                // A concurrent reader holding the destination open makes
-                // rename fail on Windows; drop the stale destination once.
-                if std::fs::rename(&part, cache_path).is_err() {
-                    let _ = std::fs::remove_file(cache_path);
-                    std::fs::rename(&part, cache_path).is_ok()
-                } else {
-                    true
-                }
-            }
-            #[cfg(not(windows))]
-            {
+    let published = std::fs::write(&part, body).is_ok() && looks_like_jpeg(body) && {
+        #[cfg(windows)]
+        {
+            // A concurrent reader holding the destination open makes
+            // rename fail on Windows; drop the stale destination once.
+            if std::fs::rename(&part, cache_path).is_err() {
+                let _ = std::fs::remove_file(cache_path);
                 std::fs::rename(&part, cache_path).is_ok()
+            } else {
+                true
             }
-        };
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(&part, cache_path).is_ok()
+        }
+    };
     if !published {
         let _ = std::fs::remove_file(&part);
     }
@@ -423,17 +423,6 @@ pub fn image_preview_bytes(path: &str, max_edge: u32) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// JSON envelope used by the HTTP route (callers that want raw bytes use
-/// `image_preview_bytes` directly).
-pub fn image_preview_response(path: &str, max_edge: u32) -> Result<Value> {
-    let bytes = image_preview_bytes(path, max_edge)?;
-    Ok(json!({
-        "path": path,
-        "max_edge": max_edge,
-        "bytes": bytes,
-    }))
-}
-
 fn maybe_cleanup_preview_cache(root: &Path, reserve_bytes: u64) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -457,6 +446,12 @@ fn cleanup_preview_cache(
     max_bytes: u64,
     reserve_bytes: u64,
 ) -> std::io::Result<usize> {
+    // `0` disables size-based cleanup instead of meaning "keep nothing": the
+    // Python implementation reads it that way (`IMAGE_PREVIEW_CACHE_MAX_BYTES
+    // <= 0` skips cleanup) and so does the sibling video-frame cache. Without
+    // this, a `0` would walk the cache and delete the whole target directory —
+    // the opposite of turning the feature off.
+    let trim_entries = max_bytes > 0;
     let mut total = 0u64;
     let mut entries = Vec::new();
     let now = SystemTime::now();
@@ -492,13 +487,20 @@ fn cleanup_preview_cache(
         let size = metadata.len();
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
         total = total.saturating_add(size);
-        entries.push((modified, size, entry.path().to_path_buf()));
+        if trim_entries {
+            entries.push((modified, size, entry.path().to_path_buf()));
+        }
     }
     let target = max_bytes
         .saturating_mul(9)
         .checked_div(10)
         .unwrap_or(0)
         .saturating_sub(reserve_bytes);
+    // With cleanup disabled the walk still ran, and that is the whole point:
+    // stale `.part` leftovers are removed above regardless of the size budget.
+    if !trim_entries {
+        return Ok(0);
+    }
     entries.sort_by_key(|(modified, _, _)| *modified);
     let mut removed = 0usize;
     for (_, size, path) in entries {
@@ -588,5 +590,59 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!old.exists());
         assert!(new.exists());
+    }
+
+    /// `IMAGE_PREVIEW_CACHE_MAX_BYTES=0` means "do not trim", not "delete
+    /// everything".
+    ///
+    /// The target is computed as `max_bytes * 9 / 10`, so a zero budget used to
+    /// evict every cached entry — the opposite of turning the feature off. The
+    /// Python implementation reads `<= 0` as cleanup disabled and so does the
+    /// sibling video-frame cache, which is what this pins.
+    #[test]
+    fn preview_cache_cleanup_is_disabled_by_a_zero_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("aa").join("bb");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let keep = cache_dir.join("keep.jpg");
+        std::fs::write(&keep, b"12345678").unwrap();
+
+        let removed = cleanup_preview_cache(dir.path(), 0, 0).unwrap();
+
+        assert_eq!(removed, 0, "a zero budget must not evict anything");
+        assert!(
+            keep.exists(),
+            "the cache must survive with cleanup disabled"
+        );
+    }
+
+    /// Crash leftovers are reclaimed in both modes: the budget decides whether
+    /// cached previews are trimmed, not whether the walk happens at all.
+    #[test]
+    fn preview_cache_cleanup_reclaims_stale_parts_with_cleanup_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("aa");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let part = cache_dir.join("half.jpg.part");
+        std::fs::write(&part, b"partial").unwrap();
+        let fresh = cache_dir.join("fresh.jpg");
+        std::fs::write(&fresh, b"12345678").unwrap();
+        // `cleanup_preview_cache` treats a part file as stale after 300s; the
+        // file was just written, so this asserts the opposite direction and
+        // the removal below is what a later run would do.
+        let removed = cleanup_preview_cache(dir.path(), 0, 0).unwrap();
+        assert_eq!(removed, 0);
+        assert!(part.exists(), "a fresh part file is not stale yet");
+        assert!(fresh.exists());
+
+        // Age the part file past the staleness window and ask again.
+        let old = SystemTime::now() - Duration::from_secs(600);
+        let file = std::fs::OpenOptions::new().write(true).open(&part).unwrap();
+        file.set_modified(old).unwrap();
+        drop(file);
+        let removed = cleanup_preview_cache(dir.path(), 0, 0).unwrap();
+        assert_eq!(removed, 0, "part reclamation is not a cache eviction");
+        assert!(!part.exists(), "a stale part file is reclaimed regardless");
+        assert!(fresh.exists());
     }
 }

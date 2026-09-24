@@ -102,6 +102,17 @@ export function formatHealthTime(timestamp) {
   return date.toLocaleString();
 }
 
+// Timestamps arrive in two shapes: the health, operation and recycle payloads
+// use epoch seconds, while the Pawchive tables store RFC3339 text. Feeding the
+// text shape to `formatHealthTime` yields NaN and a permanent 无记录, so the
+// text shape gets its own parser rather than a shared guess.
+export function formatServerTime(value) {
+  if (!value) return '无记录';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '无记录';
+  return date.toLocaleString();
+}
+
 export function downloadFileName(item) {
   return (item.file_name || 'image').replace(/[\\/:*?"<>|]/g, '_');
 }

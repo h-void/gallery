@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 
 use crate::archive_format::{self, RenderContext};
 use crate::archive_profiles;
+use crate::fs_util::safe_canonicalize;
+use crate::item_detail::effective_display_date;
 use crate::media_roots::{path_under_authorized_roots, MediaRoots};
 use crate::media_serve::{
     move_file_from_authorized_path_no_overwrite, move_file_to_authorized_path_no_overwrite,
@@ -139,7 +141,7 @@ fn authorized_root_relative(
         .allowed_roots()
         .into_iter()
         .filter_map(|root| {
-            let root = PathBuf::from(root).canonicalize().ok()?;
+            let root = safe_canonicalize(root).ok()?;
             let relative = path.strip_prefix(&root).ok()?.to_path_buf();
             Some((root, relative))
         })
@@ -469,11 +471,11 @@ fn prepare_artist_dir_rename(
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
 
-    let artist = artist.canonicalize()?;
+    let artist = safe_canonicalize(artist)?;
     let authorized_root = roots
         .allowed_roots()
         .into_iter()
-        .filter_map(|root| PathBuf::from(root).canonicalize().ok())
+        .filter_map(|root| safe_canonicalize(root).ok())
         .filter(|root| artist.starts_with(root))
         .max_by_key(|root| root.components().count())
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
@@ -578,7 +580,7 @@ pub(crate) fn backup_retention() -> usize {
 
 pub(crate) fn prune_backup_root(root: &Path, retention: usize) -> Result<usize> {
     std::fs::create_dir_all(root)?;
-    let root = root.canonicalize()?;
+    let root = safe_canonicalize(root)?;
     let mut entries = std::fs::read_dir(&root)?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
@@ -593,7 +595,7 @@ pub(crate) fn prune_backup_root(root: &Path, retention: usize) -> Result<usize> 
                 .is_some_and(|file_type| file_type.is_dir() && !file_type.is_symlink());
             (!hidden && real_directory).then_some(path)
         })
-        .filter_map(|path| path.canonicalize().ok())
+        .filter_map(|path| safe_canonicalize(path).ok())
         .filter(|path| path.starts_with(&root))
         .collect::<Vec<_>>();
     entries.sort();
@@ -640,10 +642,8 @@ pub(crate) fn validate_relative_folder(folder: &str) -> Result<String> {
 }
 
 fn path_under_artist(path: &Path, artist: &Path) -> bool {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let artist = artist
-        .canonicalize()
-        .unwrap_or_else(|_| artist.to_path_buf());
+    let path = safe_canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let artist = safe_canonicalize(artist).unwrap_or_else(|_| artist.to_path_buf());
     path.starts_with(&artist)
 }
 
@@ -1001,7 +1001,7 @@ pub fn folder_error_artists(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
-    let page_limit = limit.clamp(1, 200);
+    let page_limit = limit.clamp(1, crate::MAX_ITEM_PAGE_LIMIT);
     let total = artists.len() as i64;
     let start = offset.max(0) as usize;
     let end = (start + page_limit as usize).min(artists.len());
@@ -1135,6 +1135,76 @@ pub(crate) fn record_plan_execution_failure(
     Ok(())
 }
 
+/// [`record_plan_execution_failure`] for call sites inside the execution loop.
+///
+/// Those sites used `let _ =`, which hid the failure completely: a plan that
+/// could not be demoted to `manual_review` stayed `confirmed`, and the next
+/// automatic run retried the same destructive move with no trace anywhere. They
+/// cannot use `?` either — that aborts the whole batch, and the contract is that
+/// a failing plan never takes the plans after it down with it. So the failure is
+/// logged and the loop continues; what was silent is now in `gallery.log` and in
+/// the health error window.
+fn record_plan_failure_or_log(
+    conn: &Connection,
+    plan_id: i64,
+    reason: &str,
+    source: &str,
+    target: &str,
+    extra: Option<Value>,
+) {
+    if let Err(error) = record_plan_execution_failure(conn, plan_id, reason, source, target, extra)
+    {
+        log_error!(
+            "folder archive: could not record plan {plan_id} failure ({reason}); \
+             the plan stays confirmed and an automatic run may retry it: {error:#}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod failure_visibility_tests {
+    use super::*;
+    use crate::test_support::{EnvVar, ENV_LOCK};
+
+    /// A demotion that cannot be written must leave a trace.
+    ///
+    /// The execution loop cannot propagate this failure — one plan's failure
+    /// must not abort the plans after it — so before this helper the demotion
+    /// was discarded, and a plan that failed to reach `manual_review` looked
+    /// exactly like a plan that never failed while the next automatic run
+    /// retried the same move. The failure now reaches `gallery.log`, which
+    /// `/api/logs/tail` and the health error window read.
+    #[test]
+    fn a_demotion_that_cannot_be_written_is_logged() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("data/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let _data_dir = EnvVar::set("DATA_DIR", dir.path().join("data"));
+
+        let conn = Connection::open_in_memory().unwrap();
+        // A view without an INSTEAD OF trigger accepts SELECT and rejects
+        // UPDATE, which is a deterministic way to make the demotion fail.
+        conn.execute_batch(
+            "CREATE VIEW folder_rename_plans AS
+                 SELECT 1 AS id, '[]' AS execution_log;",
+        )
+        .unwrap();
+
+        record_plan_failure_or_log(&conn, 7, "target_exists", "/a", "/b", None);
+
+        let log = std::fs::read_to_string(logs.join("gallery.log")).unwrap_or_default();
+        assert!(
+            log.contains("could not record plan 7 failure"),
+            "a demotion that cannot be written must be visible in the runtime log: {log:?}"
+        );
+        assert!(
+            log.contains("target_exists"),
+            "the log line must name the reason: {log:?}"
+        );
+    }
+}
+
 fn record_undo_reconciliation_failure(
     conn: &Connection,
     plan_id: i64,
@@ -1224,25 +1294,7 @@ pub fn invalidate_plans_after_item_date_change(
     Ok(affected as i64)
 }
 
-/// Effective raw date of one active item: manual override, else detected date,
-/// else the legacy canonical date. Mirrors `effective_display_date`.
-fn item_effective_date(
-    manual_date: Option<&str>,
-    detected_date: &str,
-    legacy_date: &str,
-) -> String {
-    manual_date
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            if detected_date.is_empty() {
-                None
-            } else {
-                Some(detected_date.to_string())
-            }
-        })
-        .unwrap_or_else(|| legacy_date.to_string())
-}
+// Effective raw date resolution uses `crate::item_detail::effective_display_date`.
 
 /// `YYYY-MM-DD` or `YYYY-MM` key from a manual/recognized effective date.
 /// A full day is preserved whenever the source carries one.
@@ -1310,7 +1362,7 @@ impl ItemDatesByFolder {
             else {
                 continue;
             };
-            let raw = item_effective_date(manual_date.as_deref(), &detected_date, &legacy_date);
+            let raw = effective_display_date(&detected_date, manual_date.as_deref(), &legacy_date);
             if let Some(date) = effective_date_key(&raw) {
                 let dates = by_folder.entry(folder).or_default();
                 if !dates.contains(&date) {
@@ -1500,6 +1552,9 @@ fn render_archive_target(
     title: &str,
     folder: &str,
     index: usize,
+    user_id: Option<i64>,
+    id: Option<i64>,
+    ext: Option<&str>,
 ) -> Result<String> {
     Ok(archive_format::render_profile(
         profile,
@@ -1510,6 +1565,12 @@ fn render_archive_target(
             title: title.to_string(),
             folder: folder.to_string(),
             index,
+            user_id: user_id.map(|v| v.to_string()),
+            id: id.map(|v| v.to_string()),
+            ext: ext.map(|v| v.to_string()),
+            site: None,
+            service: None,
+            task_date: None,
         },
     )?
     .target_folder)
@@ -1614,9 +1675,9 @@ fn build_split_actions(
         .filter(|item| !item.tags.is_empty())
         .enumerate()
     {
-        let raw_date = item_effective_date(
-            item.manual_date.as_deref(),
+        let raw_date = effective_display_date(
             &item.detected_date,
+            item.manual_date.as_deref(),
             &item.legacy_date,
         );
         let Some(_date) = effective_date_key(&raw_date) else {
@@ -1627,6 +1688,9 @@ fn build_split_actions(
         if tag_names.is_empty() {
             continue;
         }
+        let ext = Path::new(&item.file_name)
+            .extension()
+            .and_then(|ext| ext.to_str());
         actions.push(json!({
             "item_id": item.id,
             "source_file_path": item.file_path,
@@ -1639,6 +1703,9 @@ fn build_split_actions(
                 &item.file_name,
                 source_folder,
                 index + 1,
+                Some(artist_id),
+                Some(item.id),
+                ext,
             )?,
             "target_relative_path": item.file_name,
             "format_index": index + 1,
@@ -1801,7 +1868,7 @@ fn prepare_split_file_moves(
         let target_relative_raw = raw["target_relative_path"].as_str().unwrap_or(&file_name);
         let target_relative =
             validate_fixed_target(target_relative_raw).map_err(|_| anyhow!("bad_folder_path"))?;
-        let raw_date = item_effective_date(manual_date.as_deref(), &detected_date, &legacy_date);
+        let raw_date = effective_display_date(&detected_date, manual_date.as_deref(), &legacy_date);
         effective_date_key(&raw_date).ok_or_else(|| anyhow!("stale_split_plan"))?;
         let tag_ids = conn
             .prepare("SELECT tag_id FROM item_tags WHERE item_id=? ORDER BY tag_id")?
@@ -1809,6 +1876,9 @@ fn prepare_split_file_moves(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let tag_names = tag_names_for_ids(conn, artist_id, &tag_ids)?;
         let format_index = raw["format_index"].as_u64().unwrap_or(1) as usize;
+        let ext = Path::new(&file_name)
+            .extension()
+            .and_then(|ext| ext.to_str());
         if tag_names.is_empty()
             || render_archive_target(
                 &profile,
@@ -1818,6 +1888,9 @@ fn prepare_split_file_moves(
                 &file_name,
                 &source_folder,
                 format_index,
+                Some(artist_id),
+                Some(item_id),
+                ext,
             )? != target_folder
         {
             bail!("stale_split_plan");
@@ -1864,6 +1937,16 @@ fn prepare_split_file_moves(
     Ok(moves)
 }
 
+/// Remove the directories a move has just emptied, and only those.
+///
+/// The loop decides for itself whether a directory is empty. It cannot read
+/// `remove_dir` failing as that answer: the call is documented to refuse a
+/// non-empty directory, but nothing guarantees the deletion that actually runs
+/// is the operating system's. A filesystem filter driver or a desktop deletion
+/// interceptor can implement the same call as a recursive move, and then a
+/// folder that still holds files the plan did not select is gone while the call
+/// reports success. Reading the directory first makes the answer independent of
+/// who implements the delete.
 fn remove_empty_parents(paths: impl IntoIterator<Item = PathBuf>, artist_root: &Path) {
     let mut dirs = paths
         .into_iter()
@@ -1873,7 +1956,7 @@ fn remove_empty_parents(paths: impl IntoIterator<Item = PathBuf>, artist_root: &
     dirs.dedup();
     for mut dir in dirs {
         while dir != artist_root && dir.starts_with(artist_root) {
-            if std::fs::remove_dir(&dir).is_err() {
+            if !directory_is_empty(&dir) || std::fs::remove_dir(&dir).is_err() {
                 break;
             }
             let Some(parent) = dir.parent() else {
@@ -1882,6 +1965,16 @@ fn remove_empty_parents(paths: impl IntoIterator<Item = PathBuf>, artist_root: &
             dir = parent.to_path_buf();
         }
     }
+}
+
+/// Whether `path` is a directory that currently holds no entries.
+///
+/// An unreadable or absent path answers `false`: the caller uses this to decide
+/// what it may delete, and "I could not look" is not a reason to delete.
+fn directory_is_empty(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
 }
 
 fn rollback_split_moves(moved: &[SplitFileMove], roots: &MediaRoots) -> Result<()> {
@@ -1918,8 +2011,26 @@ fn execute_split_plan(
         source_folder,
         split_actions,
     )?;
+    // §6.3: same fence as a rename. The split moves files out of the source
+    // directory, so the groups under it are the ones the intent has to cover.
+    let mut intent_guard = register_move_intents(
+        conn,
+        &artist_root.join(source_folder).to_string_lossy(),
+        "split_by_tag",
+    )?;
     let mut moved = Vec::with_capacity(moves.len());
     for file in &moves {
+        // Same window as a rename, one file at a time: a kill after this file
+        // moved but before the ledger committed leaves the item row on the old
+        // path, so a re-run asks for the same move and finds its source gone.
+        // The target is there instead, which is the evidence that this file's
+        // half of the split already happened — carry on and let the transaction
+        // below record it. Without this the whole split fails with
+        // `execution_failed` and the files stay where the interrupted run put
+        // them while every row still names the old directory (V1).
+        if !Path::new(&file.source).exists() && Path::new(&file.target).is_file() {
+            continue;
+        }
         if let Err(error) =
             move_file_to_authorized_path_no_overwrite(&file.source, &file.target, roots)
         {
@@ -1954,6 +2065,20 @@ fn execute_split_plan(
                 bail!("stale_state");
             }
         }
+        // Split moves members out of the source directory, so the groups that
+        // owned them have to be re-pointed in this transaction. Deleting the
+        // plan right after is exactly the "successful plan deletion must not
+        // lose the mapping" case.
+        let moved = moves
+            .iter()
+            .map(|file| (file.source_db.clone(), file.target_db.clone()))
+            .collect::<Vec<_>>();
+        crate::pawchive_groups::relocate_groups_in_tx(
+            &tx,
+            &artist_root.to_string_lossy(),
+            &moved,
+            "split_by_tag",
+        )?;
         let changed = tx.execute(
             "DELETE FROM folder_rename_plans
              WHERE id=? AND status='confirmed' AND plan_kind='split_by_tag'
@@ -1976,6 +2101,7 @@ fn execute_split_plan(
         }
     };
     remove_empty_parents(moves.iter().map(|file| file.source.clone()), &artist_root);
+    intent_guard.finish(crate::pawchive_groups::GROUP_MOVE_INTENT_APPLIED, "");
     Ok(json!({
         "plan_id": plan_id,
         "status": "executed",
@@ -2105,6 +2231,9 @@ pub fn recompute_artist_plan_targets(
                 &original_title,
                 &source_folder,
                 plan_id as usize,
+                Some(artist_id),
+                Some(plan_id),
+                None,
             )?
         };
         if suffix_collisions && !target.is_empty() && target != source_folder {
@@ -2261,8 +2390,7 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
                 },
             ))
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut folders = BTreeMap::<String, (String, Vec<DiscoveredFolderItem>)>::new();
     for (folder_name, item) in discovered_items {
         let Some(folder) = source_folder_for_item(&artist_path, &item.file_path, &folder_name)
@@ -2321,9 +2449,9 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
         let mut groups = BTreeSet::new();
         let mut union_set = BTreeSet::new();
         for item in items.iter().filter(|item| !item.tags.is_empty()) {
-            let raw_date = item_effective_date(
-                item.manual_date.as_deref(),
+            let raw_date = effective_display_date(
                 &item.detected_date,
+                item.manual_date.as_deref(),
                 &item.legacy_date,
             );
             groups.insert((effective_date_key(&raw_date), item.tags.clone()));
@@ -2671,6 +2799,107 @@ pub fn folder_rename_auto_enabled(conn: &Connection) -> Result<bool> {
         .unwrap_or(false))
 }
 
+/// Holds the §6.3 move intents a tidy execution registered, and finishes them
+/// however the execution ends.
+///
+/// The drop is the point: a rename has several exit paths, and an intent left
+/// `pending` by a crash or an early return would refuse every publish into that
+/// group until somebody noticed. A failed intent is kept on purpose — the plan
+/// asks for a recoverable one — so only a successful move clears it.
+struct MoveIntentGuard<'a> {
+    conn: &'a Connection,
+    groups: Vec<String>,
+    finished: bool,
+    _operation_lock: Option<std::fs::File>,
+}
+
+impl MoveIntentGuard<'_> {
+    fn finish(&mut self, state: &str, reason: &str) {
+        if self.finished {
+            return;
+        }
+        for group_id in &self.groups {
+            let _ = crate::pawchive_groups::finish_group_move_intent(
+                self.conn, group_id, state, reason,
+            );
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for MoveIntentGuard<'_> {
+    fn drop(&mut self) {
+        self.finish(
+            crate::pawchive_groups::GROUP_MOVE_INTENT_FAILED,
+            "整理未正常结束",
+        );
+    }
+}
+
+/// Register a move intent for every group whose root is `dir` or sits under it,
+/// committed before the filesystem is touched.
+///
+/// Refuses the whole tidy when a publish holds a reservation for one of them:
+/// §6.3 says 整理 must wait or explicitly block an active publish, and this call
+/// cannot wait for another worker, so it blocks with the reason. Any intent
+/// already registered here is rolled back before the error is returned.
+fn register_move_intents<'a>(
+    conn: &'a Connection,
+    dir: &str,
+    source_operation: &str,
+) -> Result<MoveIntentGuard<'a>> {
+    let operation_lock = crate::pawchive_groups::lock_group_operations(conn, true)?;
+    let groups = crate::pawchive_groups::groups_under_path(conn, dir)?;
+    let mut registered: Vec<String> = Vec::new();
+    for group in &groups {
+        // The lock above is what makes this reclaim honest: a pending intent
+        // with nobody holding the lock cannot belong to a worker that is still
+        // moving anything. Without it, a tidy killed between the rename and its
+        // commit keeps its group fenced off for a full lease, and the recovery
+        // this same function is asked to perform is refused until it lapses.
+        let _ = crate::pawchive_groups::reclaim_orphaned_move_intent(conn, &group.group_id);
+        if let Err(error) =
+            crate::pawchive_groups::begin_group_move_intent(conn, &group.group_id, source_operation)
+        {
+            for group_id in &registered {
+                let _ = crate::pawchive_groups::finish_group_move_intent(
+                    conn,
+                    group_id,
+                    crate::pawchive_groups::GROUP_MOVE_INTENT_FAILED,
+                    "同组整理登记未完成",
+                );
+            }
+            return Err(error);
+        }
+        registered.push(group.group_id.clone());
+    }
+    Ok(MoveIntentGuard {
+        conn,
+        groups: registered,
+        finished: false,
+        _operation_lock: operation_lock,
+    })
+}
+
+#[cfg(test)]
+mod move_fence_regression_tests {
+    use super::*;
+
+    #[test]
+    fn move_registration_refuses_a_live_publisher_and_a_broken_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("gallery.db")).unwrap();
+        let publishing = crate::pawchive_groups::lock_group_operations(&conn, false).unwrap();
+        assert!(register_move_intents(&conn, "/media/artist", "rename").is_err());
+        drop(publishing);
+        conn.execute_batch("CREATE TABLE content_groups (group_id TEXT)")
+            .unwrap();
+        assert!(register_move_intents(&conn, "/media/artist", "rename").is_err());
+        conn.execute_batch("DROP TABLE content_groups").unwrap();
+        assert!(register_move_intents(&conn, "/media/artist", "rename").is_ok());
+    }
+}
+
 /// Execute confirmed plans for an artist: online SQLite backup then rename folders + update item paths.
 pub fn execute_folder_renames(
     conn: &Connection,
@@ -2724,14 +2953,7 @@ pub fn execute_folder_renames_with_backup(
             .iter()
             .map(|(id, source, target, _, _, _)| {
                 if !dry_run {
-                    let _ = record_plan_execution_failure(
-                        conn,
-                        *id,
-                        "outside_artist",
-                        source,
-                        target,
-                        None,
-                    );
+                    record_plan_failure_or_log(conn, *id, "outside_artist", source, target, None);
                 }
                 json!({
                     "plan_id": id,
@@ -2756,7 +2978,7 @@ pub fn execute_folder_renames_with_backup(
             Ok(path) => backup_path = path,
             Err(error) => {
                 for (id, source, target, _, _, _) in &plans {
-                    let _ = record_plan_execution_failure(
+                    record_plan_failure_or_log(
                         conn,
                         *id,
                         "backup_failed",
@@ -2833,7 +3055,7 @@ pub fn execute_folder_renames_with_backup(
                 }
                 Err(error) => {
                     let reason = split_failure_reason(&error);
-                    let _ = record_plan_execution_failure(
+                    record_plan_failure_or_log(
                         conn,
                         id,
                         reason,
@@ -2856,7 +3078,7 @@ pub fn execute_folder_renames_with_backup(
             Ok(v) => v,
             Err(_) => {
                 if !dry_run {
-                    let _ = record_plan_execution_failure(
+                    record_plan_failure_or_log(
                         conn,
                         id,
                         "bad_folder_path",
@@ -2874,7 +3096,7 @@ pub fn execute_folder_renames_with_backup(
             Ok(v) => v,
             Err(_) => {
                 if !dry_run {
-                    let _ = record_plan_execution_failure(
+                    record_plan_failure_or_log(
                         conn,
                         id,
                         "bad_folder_path",
@@ -2955,6 +3177,9 @@ pub fn execute_folder_renames_with_backup(
                         &original_title,
                         &source_raw,
                         id as usize,
+                        Some(artist_id),
+                        Some(id),
+                        None,
                     ) {
                         Ok(derived)
                             if derived == target
@@ -2998,7 +3223,7 @@ pub fn execute_folder_renames_with_backup(
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(error) => {
-                    let _ = record_plan_execution_failure(
+                    record_plan_failure_or_log(
                         conn,
                         id,
                         "revalidation_failed",
@@ -3016,37 +3241,39 @@ pub fn execute_folder_renames_with_backup(
         }
 
         // Revalidate: source exists, target free.
-        if !src.is_dir() {
+        //
+        // A kill between the rename and the ledger commit leaves the opposite
+        // shape — the source name is gone and the target one is already there —
+        // and this used to answer it with `source_missing` and drop the plan:
+        // the directory kept its new name while every item row, the group
+        // location and the plan row still named the old one, so the next scan
+        // read the whole folder as new and a later attachment was rendered into
+        // a directory that no longer existed. The rename is already a fact on
+        // disk, so the ledger is completed against it instead (V1).
+        //
+        // The adoption is not a guess about intent: it still has to pass the
+        // same "this rewrite matched the rows this plan is about" check as a
+        // normal execution further down, so a target directory that the ledger
+        // never pointed at — one the user filled by hand and re-scanned — is
+        // refused exactly as it was before.
+        let adopted_rename = !dry_run && !src.is_dir() && dst.is_dir();
+        if !src.is_dir() && !adopted_rename {
             if !dry_run {
-                let _ = record_plan_execution_failure(
-                    conn,
-                    id,
-                    "source_missing",
-                    &source,
-                    &target,
-                    None,
-                );
+                record_plan_failure_or_log(conn, id, "source_missing", &source, &target, None);
             }
             executed.push(json!({"plan_id": id, "status": "error", "reason": "source_missing"}));
             continue;
         }
-        if dst.exists() {
+        if dst.exists() && !adopted_rename {
             if !dry_run {
-                let _ = record_plan_execution_failure(
-                    conn,
-                    id,
-                    "target_exists",
-                    &source,
-                    &target,
-                    None,
-                );
+                record_plan_failure_or_log(conn, id, "target_exists", &source, &target, None);
             }
             executed.push(json!({"plan_id": id, "status": "error", "reason": "target_exists"}));
             continue;
         }
         if target == source || target.starts_with(&format!("{source}/")) {
             if !dry_run {
-                let _ = record_plan_execution_failure(
+                record_plan_failure_or_log(
                     conn,
                     id,
                     "target_inside_source",
@@ -3063,18 +3290,18 @@ pub fn execute_folder_renames_with_backup(
             continue;
         }
         // Safety: stay under artist path.
-        if !path_under_artist(&src, &artist_root)
+        //
+        // The source is not checked when it has already been renamed away:
+        // `path_under_artist` canonicalizes both sides, and a path that no
+        // longer exists cannot be canonicalized, which would read as "outside
+        // the artist" for the one shape this branch exists to recover. The
+        // target is the directory this plan is claiming either way, and it is
+        // checked in both cases.
+        if (!adopted_rename && !path_under_artist(&src, &artist_root))
             || !target_parent_under_artist(dst.parent().unwrap_or(&dst), &artist_root)
         {
             if !dry_run {
-                let _ = record_plan_execution_failure(
-                    conn,
-                    id,
-                    "outside_artist",
-                    &source,
-                    &target,
-                    None,
-                );
+                record_plan_failure_or_log(conn, id, "outside_artist", &source, &target, None);
             }
             executed.push(json!({"plan_id": id, "status": "error", "reason": "outside_artist"}));
             continue;
@@ -3082,7 +3309,7 @@ pub fn execute_folder_renames_with_backup(
         if let Some(permission_path) = rename_permission_denied_parent(&src, &dst) {
             let permission_path = permission_path.to_string_lossy().replace('\\', "/");
             if !dry_run {
-                let _ = record_plan_execution_failure(
+                record_plan_failure_or_log(
                     conn,
                     id,
                     "permission_denied",
@@ -3105,29 +3332,61 @@ pub fn execute_folder_renames_with_backup(
             );
             continue;
         }
+        // §6.3: the tidy side's half of the fence, registered and committed
+        // before anything is renamed. A publish that starts from here on is
+        // refused until the intent finishes; a live publish blocks this rename
+        // instead, with the reason rather than a silent no-op.
+        let mut intent_guard =
+            match register_move_intents(conn, &src.to_string_lossy(), "folder_rename") {
+                Ok(guard) => guard,
+                Err(error) => {
+                    record_plan_failure_or_log(
+                        conn,
+                        id,
+                        "publish_in_progress",
+                        &source,
+                        &target,
+                        Some(json!({"error": error.to_string()})),
+                    );
+                    executed.push(json!({
+                        "plan_id": id,
+                        "status": "error",
+                        "reason": "publish_in_progress",
+                        "error": error.to_string(),
+                    }));
+                    continue;
+                }
+            };
         // Rename first, then DB in one transaction. On DB failure, restore folder
         // AND reverse any partial item path rewrite.
-        if let Err(error) = rename_artist_dir_no_overwrite(&artist_root, roots, &source, &target) {
-            let reason = if error.kind() == std::io::ErrorKind::PermissionDenied {
-                "permission_denied"
-            } else {
-                "execution_failed"
-            };
-            let _ = record_plan_execution_failure(
-                conn,
-                id,
-                reason,
-                &source,
-                &target,
-                Some(json!({"error": error.to_string()})),
-            );
-            executed.push(json!({
-                "plan_id": id,
-                "status": "error",
-                "reason": reason,
-                "error": error.to_string(),
-            }));
-            continue;
+        //
+        // Skipped when the rename is already a fact on disk: this run is the
+        // recovery of a move another process finished and never recorded.
+        if !adopted_rename {
+            if let Err(error) =
+                rename_artist_dir_no_overwrite(&artist_root, roots, &source, &target)
+            {
+                let reason = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    "permission_denied"
+                } else {
+                    "execution_failed"
+                };
+                record_plan_failure_or_log(
+                    conn,
+                    id,
+                    reason,
+                    &source,
+                    &target,
+                    Some(json!({"error": error.to_string()})),
+                );
+                executed.push(json!({
+                    "plan_id": id,
+                    "status": "error",
+                    "reason": reason,
+                    "error": error.to_string(),
+                }));
+                continue;
+            }
         }
         let db_result = (|| -> Result<i64> {
             let tx = conn.unchecked_transaction()?;
@@ -3145,6 +3404,16 @@ pub fn execute_folder_renames_with_backup(
             if updated_items == 0 && file_count > 0 {
                 bail!("path rewrite matched no items for a non-empty plan");
             }
+            // The work's location has to follow the rename in this same
+            // transaction: the plan row is deleted right after, and without a
+            // persistent location the group ledger would still name the old
+            // directory, so a later attachment would be rendered into it.
+            crate::pawchive_groups::relocate_groups_in_tx(
+                &tx,
+                &artist_root.to_string_lossy(),
+                &[(src_s.clone(), dst_s.clone())],
+                "folder_rename",
+            )?;
             let changed = tx.execute(
                 "DELETE FROM folder_rename_plans
                  WHERE id=? AND status='confirmed'
@@ -3159,6 +3428,27 @@ pub fn execute_folder_renames_with_backup(
         })();
         if let Err(err) = db_result {
             let stale = err.to_string().contains("stale_state");
+            // An adopted rename is not rolled back on disk. Moving the directory
+            // back would rename a directory this run did not create, and the
+            // state it leaves is the same recoverable one it was asked to
+            // repair — the next pass adopts it again.
+            if adopted_rename {
+                record_plan_failure_or_log(
+                    conn,
+                    id,
+                    "db_update_failed",
+                    &source,
+                    &target,
+                    Some(json!({"error": err.to_string(), "adopted_rename": true})),
+                );
+                executed.push(json!({
+                    "plan_id": id,
+                    "status": "error",
+                    "reason": "db_update_failed",
+                    "error": err.to_string(),
+                }));
+                continue;
+            }
             if let Err(rollback_error) =
                 rename_artist_dir_no_overwrite(&artist_root, roots, &target, &source)
             {
@@ -3166,7 +3456,7 @@ pub fn execute_folder_renames_with_backup(
                     "error": err.to_string(),
                     "rollback_error": rollback_error.to_string(),
                 });
-                let _ = record_plan_execution_failure(
+                record_plan_failure_or_log(
                     conn,
                     id,
                     "rollback_failed",
@@ -3183,7 +3473,7 @@ pub fn execute_folder_renames_with_backup(
                 continue;
             }
             if !stale {
-                let _ = record_plan_execution_failure(
+                record_plan_failure_or_log(
                     conn,
                     id,
                     "db_update_failed",
@@ -3201,8 +3491,10 @@ pub fn execute_folder_renames_with_backup(
             continue;
         }
         executed.push(json!(
-            {"plan_id": id, "status": "executed", "source": source, "target": target}
+            {"plan_id": id, "status": "executed", "source": source, "target": target,
+             "adopted_rename": adopted_rename}
         ));
+        intent_guard.finish(crate::pawchive_groups::GROUP_MOVE_INTENT_APPLIED, "");
         // The executed plan rewrote item paths; rebuild the grouping before
         // the next plan's recheck.
         item_dates_cache = None;
@@ -3310,6 +3602,10 @@ pub fn undo_folder_rename_plan(
     }
 
     let backup = create_db_backup(conn)?;
+    // §6.3: an undo is a move like any other. The intent is registered against
+    // the directory as it stands now, before the rename back.
+    let mut intent_guard =
+        register_move_intents(conn, &target_path.to_string_lossy(), "folder_rename_undo")?;
     rename_artist_dir_no_overwrite(&artist_root, roots, &target, &source).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             anyhow!("source_exists")
@@ -3334,6 +3630,15 @@ pub fn undo_folder_rename_plan(
         if updated_items == 0 {
             bail!("path rewrite matched no items for a non-empty plan");
         }
+        // Undoing a rename is a move too, and the ledger has to follow it back:
+        // recording only the forward direction would leave the group named at
+        // the directory that no longer exists.
+        crate::pawchive_groups::relocate_groups_in_tx(
+            &tx,
+            &artist_root.to_string_lossy(),
+            &[(target_db.clone(), source_db.clone())],
+            "folder_rename_undo",
+        )?;
         let mut log = serde_json::from_str::<Value>(&execution_log)
             .ok()
             .and_then(|value| value.as_array().cloned())
@@ -3369,16 +3674,19 @@ pub fn undo_folder_rename_plan(
     })();
 
     match db_result {
-        Ok(updated_items) => Ok(json!({
-            "ok": true,
-            "status": "reverted",
-            "reason": "folder_rename_undo",
-            "plan_id": plan_id,
-            "source": target,
-            "target": source,
-            "updated_items": updated_items,
-            "backup": backup,
-        })),
+        Ok(updated_items) => {
+            intent_guard.finish(crate::pawchive_groups::GROUP_MOVE_INTENT_APPLIED, "");
+            Ok(json!({
+                "ok": true,
+                "status": "reverted",
+                "reason": "folder_rename_undo",
+                "plan_id": plan_id,
+                "source": target,
+                "target": source,
+                "updated_items": updated_items,
+                "backup": backup,
+            }))
+        }
         Err(error) => match rollback_undo_folder_rename(&artist_root, roots, &source, &target) {
             Ok(()) => Err(error),
             Err(rollback_error) => {
@@ -5156,6 +5464,184 @@ mod tests {
         );
     }
 
+    /// The end-to-end version of the same requirement: after the rename the
+    /// group ledger has to name the *new* directory, not the one the user just
+    /// renamed away.
+    ///
+    /// This goes through `execute_folder_renames` rather than the helper, so it
+    /// fails if the wiring is removed even when the helper still works.
+    #[test]
+    fn executing_a_rename_carries_the_group_location_with_it() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        let src = artist.join("old");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.jpg"), b"x").unwrap();
+        let conn = Connection::open(dir.path().join("g.db")).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT);
+            CREATE TABLE items (id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT, file_name TEXT, folder_name TEXT, manual_date TEXT, detected_date TEXT, date TEXT, missing INTEGER DEFAULT 0);
+            ",
+        )
+        .unwrap();
+        let ap = artist.to_string_lossy().replace('\\', "/");
+        conn.execute("INSERT INTO artists VALUES (1,'a',?)", params![ap])
+            .unwrap();
+        let fp = src.join("a.jpg").to_string_lossy().replace('\\', "/");
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, folder_name, detected_date, date)
+             VALUES (1,1,?, 'a.jpg', 'old', '2026-01-01', '2026-01-01')",
+            params![fp],
+        )
+        .unwrap();
+        ensure_folder_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO folder_rename_plans (artist_id, source_folder, target_folder, status)
+             VALUES (1,'old','2026/2026-01 untitled','confirmed')",
+            [],
+        )
+        .unwrap();
+
+        crate::pawchive_groups::ensure_content_group_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO content_groups
+                 (group_id, artist_scope_id, root_relative, artist_root, date, precision,
+                  generation, state, created_at, updated_at)
+             VALUES ('grp-a', 'artist:1', 'old', ?1, '2026-01-01', 'day',
+                     1, 'active', '', '')",
+            params![artist.to_string_lossy().replace('\\', "/")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content_group_locations
+                 (group_id, relative_path, generation, manual_override, source_operation,
+                  created_at, updated_at)
+             VALUES ('grp-a', 'old', 1, 0, 'grouping', '', '')",
+            [],
+        )
+        .unwrap();
+
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+        let roots = MediaRoots {
+            roots: vec![dir.path().to_string_lossy().into()],
+            labels: vec!["r".into()],
+            real_paths: vec![dir.path().to_string_lossy().into()],
+        };
+        let out = execute_folder_renames(&conn, &roots, 1, false).unwrap();
+        assert_eq!(out["ok"], true, "{out}");
+
+        // Without the ledger moving too, this still says `old` — and the next
+        // attachment for this work would be rendered into the pre-rename
+        // directory.
+        let root_relative: String = conn
+            .query_row(
+                "SELECT root_relative FROM content_groups WHERE group_id = 'grp-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_relative, "2026/2026-01 untitled");
+        assert_eq!(
+            crate::pawchive_groups::verified_group_location(&conn, "grp-a", &roots).unwrap(),
+            Some(artist.join("2026").join("2026-01 untitled")),
+            "the work is still findable after the user renamed its directory"
+        );
+    }
+
+    /// §6.3, the other direction: 整理 registers its intent before it renames,
+    /// and refuses to start at all while a publish holds the group. Blocking
+    /// with the reason is the only honest answer — this call cannot wait for
+    /// another worker.
+    #[test]
+    fn a_live_publish_blocks_the_tidy_rename_instead_of_racing_it() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        let src = artist.join("old");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.jpg"), b"x").unwrap();
+        let conn = Connection::open(dir.path().join("g.db")).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT);
+            CREATE TABLE items (id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT, file_name TEXT, folder_name TEXT, manual_date TEXT, detected_date TEXT, date TEXT, missing INTEGER DEFAULT 0);
+            ",
+        )
+        .unwrap();
+        let ap = artist.to_string_lossy().replace('\\', "/");
+        conn.execute("INSERT INTO artists VALUES (1,'a',?)", params![ap])
+            .unwrap();
+        let fp = src.join("a.jpg").to_string_lossy().replace('\\', "/");
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, folder_name, detected_date, date)
+             VALUES (1,1,?, 'a.jpg', 'old', '2026-01-01', '2026-01-01')",
+            params![fp],
+        )
+        .unwrap();
+        ensure_folder_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO folder_rename_plans (artist_id, source_folder, target_folder, status)
+             VALUES (1,'old','2026/2026-01 untitled','confirmed')",
+            [],
+        )
+        .unwrap();
+        crate::pawchive_groups::ensure_content_group_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO content_groups
+                 (group_id, artist_scope_id, root_relative, artist_root, date, precision,
+                  generation, state, created_at, updated_at)
+             VALUES ('grp-a', 'artist:1', 'old', ?1, '2026-01-01', 'day',
+                     1, 'active', '', '')",
+            params![ap],
+        )
+        .unwrap();
+
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+        let roots = MediaRoots {
+            roots: vec![dir.path().to_string_lossy().into()],
+            labels: vec!["r".into()],
+            real_paths: vec![dir.path().to_string_lossy().into()],
+        };
+
+        // A publish is in flight into this group.
+        crate::pawchive_groups::claim_publish_reservation(&conn, "grp-a", "publish:job-9").unwrap();
+        let out = execute_folder_renames(&conn, &roots, 1, false).unwrap();
+        let executed = out["results"].as_array().cloned().unwrap_or_default();
+        assert_eq!(executed.len(), 1, "{out}");
+        assert_eq!(executed[0]["reason"], "publish_in_progress", "{out}");
+        assert!(
+            src.is_dir(),
+            "the directory is not renamed while a publish holds it"
+        );
+
+        // A blocked move is recorded against the plan like any other failure,
+        // so it stops being confirmed — put it back to retry it for real.
+        conn.execute(
+            "UPDATE folder_rename_plans SET status='confirmed' WHERE id=1",
+            [],
+        )
+        .unwrap();
+        // Once the publish finishes, the same plan goes through.
+        crate::pawchive_groups::release_publish_reservation(&conn, "grp-a", "publish:job-9");
+        let out = execute_folder_renames(&conn, &roots, 1, false).unwrap();
+        assert_eq!(out["ok"], true, "{out}");
+        assert!(artist.join("2026").join("2026-01 untitled").is_dir());
+        // The intent a successful move registered is gone, not left pending.
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM group_move_intents WHERE group_id='grp-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending, 0,
+            "an applied move must not leave an intent behind"
+        );
+    }
+
     #[test]
     fn execute_splits_tagged_files_by_date_and_keeps_untagged_files() {
         let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
@@ -5309,6 +5795,46 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn remove_empty_parents_stops_at_a_directory_that_still_holds_files() {
+        let dir = tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        let emptied = artist.join("2022").join("emptied");
+        let kept = artist.join("2022").join("kept");
+        std::fs::create_dir_all(&emptied).unwrap();
+        std::fs::create_dir_all(&kept).unwrap();
+        let moved = emptied.join("moved.jpg");
+        std::fs::write(&moved, b"moved").unwrap();
+        let untagged = kept.join("untagged.jpg");
+        std::fs::write(&untagged, b"untagged").unwrap();
+
+        // The move that emptied the first folder has happened, so that folder
+        // goes; its parent stays, because the other folder is still in it.
+        std::fs::remove_file(&moved).unwrap();
+        remove_empty_parents(vec![moved], &artist);
+        assert!(!emptied.exists(), "the emptied folder is cleaned up");
+        assert!(
+            artist.join("2022").is_dir(),
+            "a parent that still holds another folder stays"
+        );
+
+        // The second folder still holds a file the plan did not select. The
+        // cleanup around it must leave the folder and the file alone: a delete
+        // that reports success is not evidence that the directory was empty.
+        remove_empty_parents(vec![untagged.clone()], &artist);
+        assert!(kept.is_dir(), "a folder with a file in it is not removed");
+        assert!(untagged.is_file(), "and the file stays");
+        assert!(artist.is_dir(), "the artist root is never removed");
+
+        // An empty folder directly under the artist goes, and the walk stops at
+        // the artist root instead of trying to remove it.
+        let childless = artist.join("2023");
+        std::fs::create_dir_all(&childless).unwrap();
+        remove_empty_parents(vec![childless.join("gone.jpg")], &artist);
+        assert!(!childless.exists(), "the empty folder goes");
+        assert!(artist.is_dir(), "the artist root stays");
     }
 
     #[test]
@@ -5941,5 +6467,366 @@ mod tests {
         };
         let out = execute_folder_renames(&conn, &roots, 1, false).unwrap();
         assert_eq!(out["results"][0]["reason"], "bad_folder_path");
+    }
+}
+
+/// V1 — a tidy that is killed after it renamed the directory but before it
+/// committed the ledger.
+///
+/// The window is real and small: `rename_artist_dir_no_overwrite` moves the
+/// folder, then `update_folder_item_paths`, `relocate_groups_in_tx` and the
+/// plan delete run in one transaction. A kill inside it leaves the directory
+/// under its new name while every row still names the old one.
+///
+/// What made that unrecoverable rather than merely untidy: the next run of the
+/// same execution entry saw `!src.is_dir()` and answered `source_missing`, so
+/// the plan was failed and dropped and the rename was never recorded anywhere;
+/// and even when it tried, the intent the killed run had registered was still
+/// inside its 900 second lease, so the fence refused the recovery — the
+/// directory kept its new name, the group location pointed at a directory that
+/// no longer existed, and the next scan read the whole folder as new.
+///
+/// Both halves are fixed above, and this is the regression: two real processes,
+/// the victim being this same test binary run again with an env var that sends
+/// it into `run_tidy_until_killed`.
+#[cfg(test)]
+mod tidy_crash_recovery_tests {
+    use super::*;
+    use rusqlite::hooks::{AuthAction, Authorization};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Env var that turns this test binary into the victim.
+    const VICTIM_DB_ENV: &str = "GALLERY_TIDY_VICTIM_DB";
+    /// Env var carrying the authorized media root for the victim.
+    const VICTIM_ROOT_ENV: &str = "GALLERY_TIDY_VICTIM_ROOT";
+    /// Env var carrying the marker file the victim writes from inside the
+    /// window, so the parent can prove the kill landed where it meant to.
+    const VICTIM_MARKER_ENV: &str = "GALLERY_TIDY_VICTIM_MARKER";
+
+    /// The victim half: run a real 整理 and die between the rename and the
+    /// ledger commit.
+    ///
+    /// The death is raised from a SQLite authorizer on `UPDATE items`, which is
+    /// the first statement of the commit transaction. That is deterministic,
+    /// where killing the process from the outside at a moment that lasts
+    /// microseconds would not be, and it leaves exactly the state a kill
+    /// leaves: no destructors, no rollback, no `MoveIntentGuard` drop.
+    fn run_tidy_until_killed(db_path: &str, root: &str, marker: &str) {
+        let conn = Connection::open(db_path).unwrap();
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let marker = PathBuf::from(marker);
+        conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+            if let AuthAction::Update {
+                table_name,
+                column_name: _,
+            } = ctx.action
+            {
+                if table_name == "items" && !fired.swap(true, Ordering::SeqCst) {
+                    std::fs::write(&marker, b"killed").ok();
+                    std::process::abort();
+                }
+            }
+            Authorization::Allow
+        }));
+        let roots = MediaRoots {
+            roots: vec![root.to_string()],
+            labels: vec!["r".to_string()],
+            real_paths: vec![root.to_string()],
+        };
+        let _ = execute_folder_renames(&conn, &roots, 1, false);
+        // The authorizer always fires; reaching here means the window closed
+        // without the victim dying, and the parent must not read that as a pass.
+        std::process::exit(17);
+    }
+
+    /// A library with one artist, one item, one content group and one confirmed
+    /// rename plan — the smallest shape that can show all three of the facts V1
+    /// asks to be checked afterwards: the file, the item path and the group.
+    fn crashed_tidy_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        let src = artist.join("old");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.jpg"), b"payload").unwrap();
+        let db_path = dir.path().join("g.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT);
+                CREATE TABLE items (id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT,
+                    file_name TEXT, folder_name TEXT, manual_date TEXT, detected_date TEXT,
+                    date TEXT, missing INTEGER DEFAULT 0);
+                ",
+            )
+            .unwrap();
+            let ap = artist.to_string_lossy().replace('\\', "/");
+            conn.execute("INSERT INTO artists VALUES (1,'a',?)", params![ap])
+                .unwrap();
+            let fp = src.join("a.jpg").to_string_lossy().replace('\\', "/");
+            conn.execute(
+                "INSERT INTO items (id, artist_id, file_path, file_name, folder_name,
+                     detected_date, date)
+                 VALUES (1,1,?, 'a.jpg', 'old', '2026-01-01', '2026-01-01')",
+                params![fp],
+            )
+            .unwrap();
+            ensure_folder_schema(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO folder_rename_plans (artist_id, source_folder, target_folder, status)
+                 VALUES (1,'old','2026/2026-01 untitled','confirmed')",
+                [],
+            )
+            .unwrap();
+            crate::pawchive_groups::ensure_content_group_schema(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO content_groups
+                     (group_id, artist_scope_id, root_relative, artist_root, date, precision,
+                      generation, state, created_at, updated_at)
+                 VALUES ('grp-a', 'artist:1', 'old', ?1, '2026-01-01', 'day',
+                         1, 'active', '', '')",
+                params![ap],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO content_group_locations
+                     (group_id, relative_path, generation, manual_override, source_operation,
+                      created_at, updated_at)
+                 VALUES ('grp-a', 'old', 1, 0, 'grouping', '', '')",
+                [],
+            )
+            .unwrap();
+        }
+        (dir, db_path, artist, src)
+    }
+
+    fn media_roots_for(dir: &Path) -> MediaRoots {
+        MediaRoots {
+            roots: vec![dir.to_string_lossy().into()],
+            labels: vec!["r".into()],
+            real_paths: vec![dir.to_string_lossy().into()],
+        }
+    }
+
+    #[test]
+    fn a_tidy_killed_between_the_rename_and_the_commit_is_adopted_by_the_next_run() {
+        const TEST_PATH: &str = "folder_archive::tidy_crash_recovery_tests::\
+             a_tidy_killed_between_the_rename_and_the_commit_is_adopted_by_the_next_run";
+        if let (Ok(db_path), Ok(root), Ok(marker)) = (
+            std::env::var(VICTIM_DB_ENV),
+            std::env::var(VICTIM_ROOT_ENV),
+            std::env::var(VICTIM_MARKER_ENV),
+        ) {
+            run_tidy_until_killed(&db_path, &root, &marker);
+            return;
+        }
+
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (dir, db_path, artist, src) = crashed_tidy_fixture();
+        let marker = dir.path().join("killed.marker");
+        let root = dir.path().to_string_lossy().replace('\\', "/");
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST_PATH, "--exact", "--nocapture"])
+            .env(VICTIM_DB_ENV, &db_path)
+            .env(VICTIM_ROOT_ENV, &root)
+            .env(VICTIM_MARKER_ENV, &marker)
+            .env("DATA_DIR", dir.path().join("data"))
+            .spawn()
+            .expect("spawn the victim process");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the victim never reached the crash window"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        assert!(
+            marker.is_file(),
+            "the victim must die inside the window — status {status}. \
+             A death before the rename proves nothing about this recovery."
+        );
+        assert!(
+            !status.success(),
+            "the victim must not finish the tidy: {status}"
+        );
+
+        // What the kill left behind: the directory under its new name, and
+        // every row still naming the old one.
+        let target = artist.join("2026").join("2026-01 untitled");
+        assert!(!src.is_dir(), "the rename really happened on disk");
+        assert!(target.join("a.jpg").is_file(), "the file survived the kill");
+        let conn = Connection::open(&db_path).unwrap();
+        let stale: String = conn
+            .query_row("SELECT file_path FROM items WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            stale.contains("/old/"),
+            "the kill left the item row on the old path: {stale}"
+        );
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM group_move_intents
+                  WHERE group_id='grp-a' AND state='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "the killed run left its intent pending");
+
+        // Recovery through the ordinary execution entry, with the intent still
+        // well inside its lease — this is the call the lease used to refuse.
+        let roots = media_roots_for(dir.path());
+        let out = execute_folder_renames(&conn, &roots, 1, false).unwrap();
+        assert_eq!(out["ok"], true, "{out}");
+        let executed = out["results"].as_array().cloned().unwrap_or_default();
+        assert_eq!(executed.len(), 1, "{out}");
+        assert_eq!(executed[0]["status"], "executed", "{out}");
+        assert_eq!(
+            executed[0]["adopted_rename"], true,
+            "the execution record has to say the rename was adopted, not performed: {out}"
+        );
+
+        let moved: String = conn
+            .query_row("SELECT file_path FROM items WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            moved.contains("/2026/2026-01 untitled/"),
+            "the item path follows the rename: {moved}"
+        );
+        let root_relative: String = conn
+            .query_row(
+                "SELECT root_relative FROM content_groups WHERE group_id='grp-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_relative, "2026/2026-01 untitled");
+        assert_eq!(
+            crate::pawchive_groups::verified_group_location(&conn, "grp-a", &roots).unwrap(),
+            Some(target.clone()),
+            "the group is findable at the name the killed run gave it"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM folder_rename_plans", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0,
+            "the plan is consumed, not left to be adopted again"
+        );
+
+        // Uniqueness: the folder was renamed once and the rows followed it, so
+        // there is still exactly one copy of the file under the artist.
+        let copies = walk_files(&artist).len();
+        assert_eq!(
+            copies, 1,
+            "the recovery must not duplicate the file: {copies}"
+        );
+
+        // And the group is usable again: a publish into it is no longer refused
+        // by the intent the killed process left.
+        crate::pawchive_groups::claim_publish_reservation(&conn, "grp-a", "publish:after-v1")
+            .expect("the recovered group must accept a publish again");
+        crate::pawchive_groups::release_publish_reservation(&conn, "grp-a", "publish:after-v1");
+    }
+
+    fn walk_files(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// The counterfactual: without adopting the rename the plan is dropped as
+    /// `source_missing` and the ledger keeps pointing at a directory that is
+    /// gone. This drives the same entry point over the same on-disk shape, so
+    /// it fails if the adoption is removed even when the fence half stays.
+    #[test]
+    fn an_adopted_rename_is_not_reported_as_source_missing() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (dir, db_path, artist, src) = crashed_tidy_fixture();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+
+        // The exact shape a kill leaves, without needing a kill: renamed on
+        // disk, every row still on the old path.
+        let target = artist.join("2026").join("2026-01 untitled");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::rename(src.join("a.jpg"), target.join("a.jpg")).unwrap();
+        std::fs::remove_dir(&src).unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let roots = media_roots_for(dir.path());
+        let out = execute_folder_renames(&conn, &roots, 1, false).unwrap();
+        let executed = out["results"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            executed[0]["status"], "executed",
+            "a directory that is already at the target is not a missing source: {out}"
+        );
+        let moved: String = conn
+            .query_row("SELECT file_path FROM items WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(moved.contains("/2026/2026-01 untitled/"), "{moved}");
+    }
+
+    /// The fence half: an intent left by a process that is gone must not cost a
+    /// whole lease. The lock is the proof — a live tidy holds it for the whole
+    /// move — so a reclaim gated on holding it cannot take an intent away from
+    /// a worker that is still working.
+    #[test]
+    fn an_intent_whose_owner_is_gone_is_reclaimed_without_waiting_for_the_lease() {
+        let (_dir, db_path, _artist, _src) = crashed_tidy_fixture();
+        let conn = Connection::open(&db_path).unwrap();
+        crate::pawchive_groups::begin_group_move_intent(&conn, "grp-a", "folder_rename").unwrap();
+
+        // Still inside the lease, and the intent is this process's own, so
+        // another thread of this process must not take it.
+        assert!(
+            !crate::pawchive_groups::reclaim_orphaned_move_intent(&conn, "grp-a").unwrap(),
+            "a live intent of this process is never reclaimed"
+        );
+
+        // Drop this process's claim as a kill would, then reclaim while holding
+        // the lock — the same pair of facts the tidy uses.
+        crate::pawchive_groups::forget_intent(&conn, "grp-a");
+        let _operation_lock = crate::pawchive_groups::lock_group_operations(&conn, true).unwrap();
+        assert!(
+            crate::pawchive_groups::reclaim_orphaned_move_intent(&conn, "grp-a").unwrap(),
+            "a pending intent nobody holds the lock for belongs to a dead worker"
+        );
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM group_move_intents WHERE group_id='grp-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, crate::pawchive_groups::GROUP_MOVE_INTENT_FAILED);
     }
 }

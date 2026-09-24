@@ -2363,8 +2363,11 @@ mod tests {
              );",
         )
         .unwrap();
-        conn.execute("INSERT INTO artists (id, path) VALUES (1, '/pictures/artist')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, path) VALUES (1, '/pictures/artist')",
+            [],
+        )
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.jpg");
         std::fs::write(&path, b"AAAAAAAAAAAAAAAA").unwrap();
@@ -2403,8 +2406,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "superseded");
-        assert_eq!(hash_status, "pending", "stale hash must be requeued, not stored");
+        assert_eq!(
+            hash_status, "pending",
+            "stale hash must be requeued, not stored"
+        );
         assert_eq!(content_hash, "");
     }
 }
-

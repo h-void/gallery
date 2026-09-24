@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use gallery_accel::upstream::Upstream;
@@ -116,7 +117,10 @@ async fn main() -> anyhow::Result<()> {
         // differently-configured peer on the same WAL file.
         match rusqlite::Connection::open(&db_path) {
             Ok(conn) => {
-                let _ = conn.execute_batch("PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL;");
+                let _ = conn.execute_batch(&format!(
+                    "PRAGMA busy_timeout={}; PRAGMA journal_mode=WAL;",
+                    gallery_accel::DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+                ));
                 match gallery_accel::ensure_recycle_schema(&conn) {
                     Ok(()) => {
                         let (finalized, dropped, missing) =
@@ -136,6 +140,30 @@ async fn main() -> anyhow::Result<()> {
                         move_reconciliation["outcome"].as_str().unwrap_or("unknown")
                     );
                 }
+                // A scan marker left behind by a killed process would disable
+                // the panel's scan button and every idle tick that checks it.
+                match gallery_accel::reconcile_interrupted_scan(&conn) {
+                    Ok(1) => log_info!("cleared an interrupted scan marker from a previous run"),
+                    Ok(_) => {}
+                    Err(error) => log_error!("scan state reconciliation failed: {error}"),
+                }
+                // A publish interrupted between creating its staging file and
+                // recording it leaves a file the size of the finished download
+                // that nothing else can find: the scanner skips dot-files and
+                // the ledger never learned the path.
+                match gallery_accel::ingest_publish::sweep_orphaned_publish_parts(
+                    &conn,
+                    &gallery_accel::env_media_roots(),
+                    gallery_accel::ingest_publish::ORPHANED_PART_MIN_AGE,
+                ) {
+                    Ok(sweep) if sweep.files > 0 => log_info!(
+                        "reclaimed {} orphaned publish staging files ({} bytes)",
+                        sweep.files,
+                        sweep.bytes
+                    ),
+                    Ok(_) => {}
+                    Err(error) => log_error!("orphaned publish staging sweep failed: {error}"),
+                }
             }
             Err(error) => log_error!("recycle reconciliation open failed: {error}"),
         }
@@ -149,9 +177,22 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Optional character idle import (CHARACTER_IMPORT_IDLE_ENABLED=1 only).
+    //
+    // The scan control is cloned out of the worker inputs so the shutdown path
+    // can tell every worker loop that the process is leaving, whether or not
+    // the workers were started in this process.
+    let mut shutdown_control: Option<Arc<gallery_accel::ScanControl>> = None;
     if args.primary && !read_only {
-        let (worker_pool, worker_roots, worker_scan, worker_status) = state.worker_inputs();
-        spawn_configured_workers(worker_pool, worker_roots, worker_scan, worker_status);
+        let (worker_pool, worker_roots, worker_scan, worker_status, stats_gate) =
+            state.worker_inputs();
+        shutdown_control = Some(Arc::clone(&worker_scan));
+        spawn_configured_workers(
+            worker_pool,
+            worker_roots,
+            worker_scan,
+            worker_status,
+            stats_gate,
+        );
         if let Ok(idle_pool) = gallery_accel::DbPool::with_config(
             db_path.clone(),
             gallery_accel::DbConfig {
@@ -173,10 +214,66 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     log_info!(
         "gallery_accel listening on http://{} primary={} writes={}",
-        addr, args.primary, args.enable_writes
+        addr,
+        args.primary,
+        args.enable_writes
     );
-    axum::serve(listener, app).await?;
+    // The peer address is published to the handlers, so a route that is only
+    // meant for a local companion (the downloader bridge) can say so.
+    //
+    // Shutdown: the package is stopped with SIGTERM and killed one second
+    // later, so the default disposition would cut whatever is running. The
+    // signal now ends the accept loop, tells the workers to stop between units
+    // of work, and gives the in-flight work a short window to finish. What is
+    // still running after that window is cut anyway — this narrows the window
+    // the startup reconciliation has to repair, it does not remove it.
+    let serve = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    );
+    tokio::select! {
+        result = serve => {
+            result?;
+        }
+        _ = shutdown_signal() => {
+            log_info!("shutdown requested; finishing in-flight work");
+            if let Some(control) = shutdown_control.as_ref() {
+                control.begin_shutdown();
+            }
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            log_info!("shutdown grace period elapsed");
+        }
+    }
     Ok(())
+}
+
+/// How long in-flight work may run after a stop request before the process
+/// exits. fnOS kills five seconds after SIGTERM is ignored, so this stays well
+/// inside that window and only has to cover writing terminal state.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Resolve on SIGTERM (Unix) or Ctrl+C (everywhere).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(term) => term,
+            Err(error) => {
+                log_error!("cannot install the SIGTERM handler: {error}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn default_static_dir() -> PathBuf {

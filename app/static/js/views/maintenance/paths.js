@@ -125,7 +125,7 @@ export function renderMoveCandidates() {
       c.item_hash ? `旧记录 ${c.item_hash}` : '',
     ].filter(Boolean).join(' / ') || '哈希未就绪';
     const warning = isCrossArtist
-      ? '<div class="move-warning">内容相同，但画师不同，需要核对归属。确认同一文件会沿用旧记录和标签；确定不是同一文件时选择「保留为独立文件」。</div>'
+      ? '<div class="move-warning">内容相同，但画师不同，需要核对归属。跨画师移动需在上方画师分组中批量确认；单项请选择「保留为独立文件」或「忽略此匹配」。</div>'
       : (multiOldRecords
         ? '<div class="move-warning">内容相同，但有多个旧记录，尚不能确定对应关系。</div>'
         : (isManual ? '<div class="move-warning">请人工核对旧/新路径；能确定同一文件时再确认。</div>' : ''));

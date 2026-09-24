@@ -618,6 +618,11 @@ export function setCardRatio(ratio, persist = false) {
   document.body.classList.toggle('card-ratio-3x4', state.cardRatio === '3x4');
   const select = $('#cardRatioSelect');
   if (select) select.value = state.cardRatio;
+  $$('#desktopRatioToggle [data-card-ratio]').forEach(btn => {
+    const active = btn.dataset.cardRatio === state.cardRatio;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
   if (persist) {
     try { localStorage.setItem(CARD_RATIO_STORAGE_KEY, String(state.cardRatio)); } catch (e) {}
   }
@@ -937,8 +942,14 @@ export async function loadItems(options = {}) {
   if (!globalSearch && folderScoped) params.set('folder', state.activeFolder);
   if (!globalSearch && state.duplicatesOnly) params.set('duplicates_only', 'true');
 
+  // Tag results depend on the search context, not on which page of media is
+  // being shown, and an append is the same context. Re-requesting them put a
+  // second, unused request into the same Promise.all as the media page, so a
+  // slow or failing tag service could delay or fail an already-successful
+  // "load more". Only the first page of a search (append === false) refreshes
+  // the tag results.
   let tagSearchPromise = Promise.resolve({tags: []});
-  if (state.search && state.searchTarget === 'tags') {
+  if (!append && state.search && state.searchTarget === 'tags') {
     const tagParams = new URLSearchParams({search: state.search, limit: 100});
     if (!globalSearch && state.currentArtist) tagParams.set('artist_id', state.currentArtist.id);
     tagSearchPromise = API.get('/api/tags/search?' + tagParams.toString());

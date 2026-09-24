@@ -72,10 +72,12 @@ fn hash_status_counts(
         counts.insert(status, count);
     }
     let total = counts.values().sum();
+    // The `done` count for this same predicate is already in `counts`: the
+    // GROUP BY above saw exactly the rows the old second `COUNT(*) ... AND
+    // hash_status='done'` asked for. Re-querying it doubled the work and opened
+    // a window where a concurrent write could make the two statements disagree.
     let done_unresolved = if include_done_unresolved {
-        let query =
-            format!("SELECT COUNT(*) FROM {table} WHERE {where_sql} AND hash_status='done'");
-        conn.query_row(&query, [], |row| row.get::<_, i64>(0))?
+        *counts.get("done").unwrap_or(&0)
     } else {
         0
     };

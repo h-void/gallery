@@ -102,27 +102,20 @@ fn env_f32(key: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
-fn model_dir() -> PathBuf {
-    std::env::var("CHARACTER_MODEL_DIR")
-        .or_else(|_| std::env::var("MODEL_CACHE_ROOT").map(|r| format!("{r}/character")))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("data/models/character"))
-}
-
 fn model_variant() -> String {
-    std::env::var("CHARACTER_MODEL_VARIANT").unwrap_or_else(|_| "ccip-caformer_b36-24".into())
+    crate::model_config::character_model_variant()
 }
 
 fn model_file() -> String {
-    std::env::var("CHARACTER_MODEL_FILE").unwrap_or_else(|_| "model_feat.onnx".into())
+    crate::model_config::character_model_file()
 }
 
 fn model_repo_id() -> String {
-    std::env::var("CHARACTER_MODEL_REPO_ID").unwrap_or_else(|_| "deepghs/ccip_onnx".into())
+    crate::model_config::character_model_repo_id()
 }
 
 pub fn character_model_path() -> PathBuf {
-    model_dir().join(model_variant()).join(model_file())
+    crate::model_config::character_model_path()
 }
 
 fn threshold() -> f32 {
@@ -202,60 +195,35 @@ fn start_session_idle_unloader() {
 }
 
 fn requested_provider_raw() -> String {
-    std::env::var("CHARACTER_RECOGNITION_PROVIDER").unwrap_or_else(|_| "auto".into())
+    crate::model_config::requested_provider_raw()
 }
 
 fn provider_lower() -> String {
-    requested_provider_raw().trim().to_ascii_lowercase()
+    crate::model_config::requested_provider()
 }
 
 fn want_cuda() -> bool {
-    let p = provider_lower();
-    matches!(
-        p.as_str(),
-        "auto" | "cuda" | "nvidia" | "cudaexecutionprovider"
-    )
+    crate::model_config::want_cuda()
 }
 
 fn want_openvino() -> bool {
-    let p = provider_lower();
-    matches!(
-        p.as_str(),
-        "" | "auto" | "openvino" | "intel" | "gpu" | "openvinoexecutionprovider"
-    )
+    crate::model_config::want_openvino()
 }
 
 fn force_cpu_only() -> bool {
-    let p = provider_lower();
-    matches!(p.as_str(), "cpu" | "cpuexecutionprovider")
+    crate::model_config::force_cpu_only()
 }
 
 fn openvino_device_type() -> String {
-    std::env::var("CHARACTER_OPENVINO_DEVICE")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "GPU".into())
+    crate::model_config::openvino_device_type()
 }
 
 fn openvino_cache_dir() -> Option<String> {
-    std::env::var("CHARACTER_OPENVINO_CACHE_DIR")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    crate::model_config::openvino_cache_dir()
 }
 
 pub fn allow_cpu_fallback() -> bool {
-    // New preferred: CHARACTER_ALLOW_CPU_FALLBACK.
-    // Backward compat: CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK when the new var
-    // is unset. When neither is set the default is to allow fallback.
-    if std::env::var("CHARACTER_ALLOW_CPU_FALLBACK").is_ok() {
-        env_bool("CHARACTER_ALLOW_CPU_FALLBACK", false)
-    } else if std::env::var("CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK").is_ok() {
-        env_bool("CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK", false)
-    } else {
-        true
-    }
+    crate::model_config::allow_cpu_fallback()
 }
 
 /// Resolve libonnxruntime.so for load-dynamic (next to binary, env, or system).
@@ -627,50 +595,30 @@ fn load_session() -> Result<&'static Mutex<CcipSessionSlot>> {
         return Ok(slot);
     }
     let _building_guard = SessionBuildingGuard;
-    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<CcipSession> {
-        // Give the background preparation round a chance to conclude
-        // before deciding the provider (never blocks a running service).
-        let path = character_model_path();
-        if !path.is_file() {
-            crate::runtime_prepare::wait_for_character_model();
-        }
-        if want_cuda() {
-            crate::runtime_prepare::wait_for_cuda_runtime();
-        }
-        if !path.is_file() {
-            return Err(anyhow!("model file missing: {}", path.display()));
-        }
-        if force_cpu_only() {
-            return build_cpu_session(&path);
-        }
-        let (core, mut fallback_reason) = ensure_ort_loaded()?;
-        let auto_provider = provider_lower() == "auto";
-        // auto/cuda: CUDA session when the process is locked to the CUDA
-        // core; failures fall back to CPU only (never OpenVINO on a CUDA
-        // core).
-        if want_cuda() && core == OrtCoreType::Cuda {
-            match build_cuda_session(&path) {
-                Ok(mut sess) => {
-                    sess.fallback_reason = fallback_reason;
-                    return Ok(sess);
-                }
-                Err(e) if allow_cpu_fallback() => {
-                    append_fallback_reason(
-                        &mut fallback_reason,
-                        format!("CUDAExecutionProvider failed: {e}"),
-                    );
-                    log_error!("gallery-accel: CUDA EP failed ({e}); falling back to CPU EP");
-                }
-                Err(e) => return Err(e),
+    let loaded =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<CcipSession> {
+            // Give the background preparation round a chance to conclude
+            // before deciding the provider (never blocks a running service).
+            let path = character_model_path();
+            if !path.is_file() {
+                crate::runtime_prepare::wait_for_character_model();
             }
-        }
-        // auto/openvino: OpenVINO session on the bundled core. In `auto`
-        // mode this is only attempted when an Intel GPU was detected, so
-        // AMD-only machines never take the OpenVINO path.
-        if want_openvino() && core != OrtCoreType::Cuda {
-            let intel_gpu = crate::runtime_prepare::has_intel_gpu();
-            if !auto_provider || intel_gpu {
-                match build_openvino_session(&path) {
+            if want_cuda() {
+                crate::runtime_prepare::wait_for_cuda_runtime();
+            }
+            if !path.is_file() {
+                return Err(anyhow!("model file missing: {}", path.display()));
+            }
+            if force_cpu_only() {
+                return build_cpu_session(&path);
+            }
+            let (core, mut fallback_reason) = ensure_ort_loaded()?;
+            let auto_provider = provider_lower() == "auto";
+            // auto/cuda: CUDA session when the process is locked to the CUDA
+            // core; failures fall back to CPU only (never OpenVINO on a CUDA
+            // core).
+            if want_cuda() && core == OrtCoreType::Cuda {
+                match build_cuda_session(&path) {
                     Ok(mut sess) => {
                         sess.fallback_reason = fallback_reason;
                         return Ok(sess);
@@ -678,34 +626,55 @@ fn load_session() -> Result<&'static Mutex<CcipSessionSlot>> {
                     Err(e) if allow_cpu_fallback() => {
                         append_fallback_reason(
                             &mut fallback_reason,
-                            format!("OpenVINOExecutionProvider failed: {e}"),
+                            format!("CUDAExecutionProvider failed: {e}"),
                         );
-                        log_error!(
-                            "gallery-accel: OpenVINO GPU failed ({e}); falling back to CPU EP"
-                        );
+                        log_error!("gallery-accel: CUDA EP failed ({e}); falling back to CPU EP");
                     }
                     Err(e) => return Err(e),
                 }
             }
-        }
-        let mut session = build_cpu_session(&path)?;
-        session.fallback_reason = fallback_reason;
-        Ok(session)
-    }))
-    .map(|built| built.map_err(|e| e.to_string()))
-    .unwrap_or_else(|panic| {
-        // A panicking builder becomes an observable failed-session state
-        // instead of a permanently stuck `preparing` flag (the Drop guard
-        // already released the flag).
-        let message = if let Some(s) = panic.downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = panic.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "unknown panic".to_string()
-        };
-        Err(format!("character session build panicked: {message}"))
-    });
+            // auto/openvino: OpenVINO session on the bundled core. In `auto`
+            // mode this is only attempted when an Intel GPU was detected, so
+            // AMD-only machines never take the OpenVINO path.
+            if want_openvino() && core != OrtCoreType::Cuda {
+                let intel_gpu = crate::runtime_prepare::has_intel_gpu();
+                if !auto_provider || intel_gpu {
+                    match build_openvino_session(&path) {
+                        Ok(mut sess) => {
+                            sess.fallback_reason = fallback_reason;
+                            return Ok(sess);
+                        }
+                        Err(e) if allow_cpu_fallback() => {
+                            append_fallback_reason(
+                                &mut fallback_reason,
+                                format!("OpenVINOExecutionProvider failed: {e}"),
+                            );
+                            log_error!(
+                                "gallery-accel: OpenVINO GPU failed ({e}); falling back to CPU EP"
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            let mut session = build_cpu_session(&path)?;
+            session.fallback_reason = fallback_reason;
+            Ok(session)
+        }))
+        .map(|built| built.map_err(|e| e.to_string()))
+        .unwrap_or_else(|panic| {
+            // A panicking builder becomes an observable failed-session state
+            // instead of a permanently stuck `preparing` flag (the Drop guard
+            // already released the flag).
+            let message = if let Some(s) = panic.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            Err(format!("character session build panicked: {message}"))
+        });
     if let Ok(ref sess) = loaded {
         let _ = ACTIVE_PROVIDER.set(sess.provider.clone());
         let _ = ACTIVE_DEVICE.set(sess.active_device.clone());
@@ -964,28 +933,12 @@ pub(crate) fn embed_item_with_roots(
         let (emb, src) = embed_image_path_with_source(&path)?;
         return Ok((emb, file_path, file_name, src));
     }
-    // video: extract a frame via ffmpeg to a temp jpeg in memory path
+    // video: extract a frame via ffmpeg to memory, decode directly
     let jpeg = extract_video_frame_jpeg(&path, 0.1)?;
-    let tmp = std::env::temp_dir().join(format!(
-        "gallery-ccip-{item_id}-{}.jpg",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
-    use std::io::Write;
-    file.write_all(&jpeg)?;
-    drop(file);
-    struct TemporaryFrame(PathBuf);
-    impl Drop for TemporaryFrame {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _guard = TemporaryFrame(tmp.clone());
-    let emb = embed_image_path(&tmp);
-    let emb = emb?;
+    let img = image::load_from_memory(&jpeg)
+        .with_context(|| format!("decode video frame for item {item_id}"))?
+        .to_rgb8();
+    let emb = run_embedding(preprocess_rgb(&img))?;
     Ok((emb, file_path, file_name, "video_frame"))
 }
 
@@ -1017,6 +970,7 @@ pub(crate) const CCIP_EMBEDDING_DIM: usize = EMBEDDING_DIM;
 
 fn extract_video_frame_jpeg(path: &Path, t: f64) -> Result<Vec<u8>> {
     use std::process::{Command, Stdio};
+    let _ffmpeg_slot = crate::media_serve::FfmpegSlotGuard::acquire_blocking()?;
     // Bounded extraction: a broken/truncated video must not park the
     // recognition path indefinitely. The child runs on a helper thread with a
     // kill handle so the timeout actually stops ffmpeg.
@@ -1491,12 +1445,15 @@ mod tests {
 
     #[test]
     fn cpu_fallback_allowed_by_default_and_prefers_new_var() {
+        // `runtime_prepare` and `model_config` read the same `CHARACTER_*`
+        // variables, so this mutation is serialized on the process-wide lock.
+        let _env_lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let new_key = "CHARACTER_ALLOW_CPU_FALLBACK";
         let old_key = "CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK";
-        let previous_new = std::env::var(new_key).ok();
-        let previous_old = std::env::var(old_key).ok();
-        std::env::remove_var(new_key);
-        std::env::remove_var(old_key);
+        let _new = crate::test_support::EnvVar::remove(new_key);
+        let _old = crate::test_support::EnvVar::remove(old_key);
         // Neither variable set -> default allows CPU fallback.
         assert!(allow_cpu_fallback());
         std::env::set_var(new_key, "0");
@@ -1505,21 +1462,14 @@ mod tests {
         std::env::remove_var(new_key);
         std::env::set_var(old_key, "0");
         assert!(!allow_cpu_fallback());
-        if let Some(value) = previous_new {
-            std::env::set_var(new_key, value);
-        } else {
-            std::env::remove_var(new_key);
-        }
-        if let Some(value) = previous_old {
-            std::env::set_var(old_key, value);
-        } else {
-            std::env::remove_var(old_key);
-        }
     }
 
     #[test]
     fn provider_aliases_map_gpu_to_openvino_not_cuda() {
-        let previous = std::env::var("CHARACTER_RECOGNITION_PROVIDER").ok();
+        let _env_lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _provider = crate::test_support::EnvVar::remove("CHARACTER_RECOGNITION_PROVIDER");
         for (raw, cuda, openvino) in [
             ("auto", true, true),
             ("cuda", true, false),
@@ -1538,10 +1488,6 @@ mod tests {
         }
         std::env::set_var("CHARACTER_RECOGNITION_PROVIDER", "");
         assert!(want_openvino());
-        match previous {
-            Some(value) => std::env::set_var("CHARACTER_RECOGNITION_PROVIDER", value),
-            None => std::env::remove_var("CHARACTER_RECOGNITION_PROVIDER"),
-        }
     }
 
     #[test]

@@ -37,7 +37,7 @@ GZIP_MAGIC = b"\x1f\x8b"
 ZIP_MAGIC = b"PK"
 MIN_FNPACK_SIZE = 64
 REQUIRED_FPK_FILES = frozenset(("manifest", "cmd/main", "app.tgz"))
-REQUIRED_APP_FILES = frozenset(("bin/gallery-accel", "ui/config"))
+REQUIRED_APP_FILES = frozenset(("bin/gallery-accel", "bin/7zz", "ui/config"))
 
 
 def _copy_tree(source: Path, target: Path) -> None:
@@ -68,6 +68,20 @@ def _copy_rust_accel(staging_dir: Path) -> None:
     target = bin_dir / "gallery-accel"
     shutil.copy2(RUST_ACCEL_BINARY, target)
     target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    # Stage 7zz standalone binary
+    seven_z = ROOT / "output" / "rust" / "7zz"
+    if not seven_z.is_file():
+        try:
+            from _fetch_7z_binary import fetch_linux_7zz
+            seven_z = fetch_linux_7zz(ROOT / "output" / "rust")
+        except Exception as e:
+            print(f"fnpack notice: failed to auto-fetch 7zz ({e})")
+    if seven_z.is_file():
+        target_7z = bin_dir / "7zz"
+        shutil.copy2(seven_z, target_7z)
+        target_7z.chmod(target_7z.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        print(f"fnpack staged 7-Zip: {target_7z.name} ({target_7z.stat().st_size} bytes)")
 
     # OpenVINO-enabled ORT + GPU plugin (prefer ort-libs with SONAME symlinks).
     ort_dir = ROOT / "output" / "rust" / "ort-libs"
@@ -193,7 +207,7 @@ def load_package_metadata(path: Path = PACKAGE_METADATA_FILE) -> dict:
 
 
 def render_manifest(metadata: dict) -> str:
-    fields = (
+    fields = [
         ("appname", metadata["appname"]),
         ("version", metadata["version"]),
         ("display_name", metadata["display_name"]),
@@ -202,6 +216,14 @@ def render_manifest(metadata: dict) -> str:
         ("platform", metadata["platform"]),
         ("source", metadata["source"]),
         ("maintainer", metadata["maintainer"]),
+    ]
+    if metadata.get("maintainer_url"):
+        fields.append(("maintainer_url", metadata["maintainer_url"]))
+    if metadata.get("distributor"):
+        fields.append(("distributor", metadata["distributor"]))
+    if metadata.get("distributor_url"):
+        fields.append(("distributor_url", metadata["distributor_url"]))
+    fields.extend([
         ("desktop_uidir", metadata["desktop_uidir"]),
         ("desktop_applaunchname", metadata["desktop_applaunchname"]),
         ("service_port", metadata["service_port"]),
@@ -209,7 +231,7 @@ def render_manifest(metadata: dict) -> str:
         ("disable_authorization_path", _bool_manifest(metadata["disable_authorization_path"])),
         ("ctl_stop", _bool_manifest(metadata["ctl_stop"])),
         ("install_dep_apps", metadata["runtime_dependency"]),
-    )
+    ])
     return "".join(f"{key}={value}\n" for key, value in fields)
 
 
@@ -309,6 +331,9 @@ def find_fnpack(explicit_binary: str | None = None) -> str:
     # must never resolve as the executable.
     if path.is_file():
         return str(path.resolve())
+    bundled = DEFAULT_OUTPUT / "fnpack-1.2.3-windows-amd64.exe"
+    if bundled.is_file():
+        return str(bundled.resolve())
     raise FileNotFoundError(
         "fnpack CLI was not found. Install/download the official fnpack binary "
         f"or set {FNPACK_BINARY_ENV} to its path. Refusing to create a fake .fpk."

@@ -3,9 +3,12 @@
 
 import { API } from '../../api.js';
 import { state, isActionBusy, setActionBusy } from '../../store.js';
-import { $, escHtml, formatBytes, formatSize, joinUiMeta, isAbortError } from '../../utils.js';
+import { $, escHtml, formatBytes, formatSize, joinUiMeta, isAbortError, copyText, folderTreeHasPath } from '../../utils.js';
 import { toast } from '../../logging.js';
 import { loadArtists, selectArtist } from '../../router.js';
+import { applyMode } from '../../events.js';
+import { selectFolder } from '../sidebar.js';
+import { renderDownloadArtistFolder } from './downloads.js';
 
 export async function loadArtistFolderMove(options = {}) {
   try {
@@ -34,72 +37,102 @@ function artistFolderMoveRelativeDestination() {
   return [parent, name].filter(Boolean).join('/');
 }
 
-function artistFolderMoveRootIndex() {
-  const rootIndex = Number($('#artistFolderMoveRoot')?.value);
+// Which root the browser walks, and where a confirmed path lands. Each caller
+// keeps its own root select and its own destination field, so one dialog serves
+// both the artist-move destination and a new subscription's parent folder.
+function directoryPickerRootIndex() {
+  const selector = state.directoryPickerPurpose === 'downloadArtist'
+    ? '#downloadSubscriptionRoot'
+    : '#artistFolderMoveRoot';
+  const rootIndex = Number($(selector)?.value);
   return Number.isInteger(rootIndex) ? rootIndex : null;
 }
 
-export function closeArtistFolderMoveDirectoryDialog() {
+function directoryPickerRoots() {
+  const roots = state.directoryPickerPurpose === 'downloadArtist'
+    ? state.downloadArtistRoots
+    : state.artistFolderMoveRoots;
+  return Array.isArray(roots) ? roots : [];
+}
+
+export function closeDirectoryPicker() {
   const dialog = $('#artistFolderMoveDirectoryDialog');
   if (dialog?.open) dialog.close();
 }
 
-function renderArtistFolderMoveDirectoryDialog() {
+function renderDirectoryPicker() {
   const path = $('#artistFolderMoveDirectoryPath');
   const list = $('#artistFolderMoveDirectoryList');
   const up = $('#artistFolderMoveDirectoryUpBtn');
   const select = $('#artistFolderMoveDirectorySelectBtn');
+  const title = $('#artistFolderMoveDirectoryDialogTitle');
   if (!path || !list || !up || !select) return;
-  const currentPath = state.artistFolderMoveDirectoryPath || '';
-  const root = state.artistFolderMoveRoots.find(item => Number(item.index) === artistFolderMoveRootIndex());
+  if (title) {
+    title.textContent = state.directoryPickerPurpose === 'downloadArtist'
+      ? '选择新增目录的位置'
+      : '选择目标存储目录';
+  }
+  const currentPath = state.directoryPickerPath || '';
+  const root = directoryPickerRoots().find(item => Number(item.index) === directoryPickerRootIndex());
   path.textContent = [root?.label || root?.path || '媒体目录', currentPath].filter(Boolean).join(' / ');
-  up.disabled = state.artistFolderMoveDirectoryLoading || !currentPath;
-  select.disabled = state.artistFolderMoveDirectoryLoading;
-  select.textContent = state.artistFolderMoveDirectoryLoading ? '读取中' : '确定选择此目录';
-  list.innerHTML = state.artistFolderMoveDirectoryLoading
+  up.disabled = state.directoryPickerLoading || !currentPath;
+  select.disabled = state.directoryPickerLoading;
+  select.textContent = state.directoryPickerLoading ? '读取中' : '确定选择此目录';
+  list.innerHTML = state.directoryPickerLoading
     ? '<div class="move-empty small">读取目录中</div>'
-    : (state.artistFolderMoveDirectoryEntries.length
-      ? state.artistFolderMoveDirectoryEntries.map(name => `<button class="artist-folder-picker-entry" type="button" data-artist-folder-directory="${escHtml(name)}">${escHtml(name)}</button>`).join('')
+    : (state.directoryPickerEntries.length
+      ? state.directoryPickerEntries.map(name => `<button class="artist-folder-picker-entry" type="button" data-artist-folder-directory="${escHtml(name)}">${escHtml(name)}</button>`).join('')
       : '<div class="move-empty small">这个目录下没有可进入的文件夹</div>');
 }
 
-export async function loadArtistFolderMoveDirectories(path = '') {
-  const rootIndex = artistFolderMoveRootIndex();
-  if (rootIndex == null || state.artistFolderMoveDirectoryLoading) return;
-  state.artistFolderMoveDirectoryLoading = true;
-  renderArtistFolderMoveDirectoryDialog();
+export async function loadDirectoryPicker(path = '') {
+  const rootIndex = directoryPickerRootIndex();
+  if (rootIndex == null || state.directoryPickerLoading) return;
+  state.directoryPickerLoading = true;
+  renderDirectoryPicker();
   try {
     const params = new URLSearchParams({root_index: String(rootIndex)});
     if (path) params.set('path', path);
     const result = await API.get(`/api/media-roots/directories?${params}`);
-    state.artistFolderMoveDirectoryPath = String(result?.path || '');
-    state.artistFolderMoveDirectoryEntries = Array.isArray(result?.directories) ? result.directories : [];
+    state.directoryPickerPath = String(result?.path || '');
+    state.directoryPickerEntries = Array.isArray(result?.directories) ? result.directories : [];
   } catch (error) {
-    state.artistFolderMoveDirectoryEntries = [];
+    state.directoryPickerEntries = [];
     toast('读取目录失败：' + (error.message || error), 'error');
   } finally {
-    state.artistFolderMoveDirectoryLoading = false;
-    renderArtistFolderMoveDirectoryDialog();
+    state.directoryPickerLoading = false;
+    renderDirectoryPicker();
   }
 }
 
-export async function openArtistFolderMoveDirectoryDialog(opener) {
+export async function openDirectoryPicker(purpose, opener) {
   const dialog = $('#artistFolderMoveDirectoryDialog');
-  if (!dialog || typeof dialog.showModal !== 'function' || !state.currentArtist || artistFolderMoveRootIndex() == null) return;
-  state.artistFolderMoveDirectoryPath = '';
-  state.artistFolderMoveDirectoryEntries = [];
+  if (!dialog || typeof dialog.showModal !== 'function') return;
+  state.directoryPickerPurpose = purpose;
+  if (purpose === 'artistMove' && !state.currentArtist) return;
+  if (directoryPickerRootIndex() == null) return;
+  state.directoryPickerPath = '';
+  state.directoryPickerEntries = [];
   dialog.showModal();
-  await loadArtistFolderMoveDirectories();
+  await loadDirectoryPicker();
   opener?.blur();
 }
 
-export function chooseArtistFolderMoveDirectory() {
-  if (!$('#artistFolderMoveDestination')) return;
-  // P6: the picker now fills the parent directory only; the folder name keeps
-  // its own field and the final target is composed from both.
-  state.artistFolderMoveParentPath = String(state.artistFolderMoveDirectoryPath || '').replace(/^\/+|\/+$/g, '');
-  closeArtistFolderMoveDirectoryDialog();
-  invalidateArtistFolderMovePreview();
+export function chooseDirectoryPicker() {
+  const path = String(state.directoryPickerPath || '').replace(/^\/+|\/+$/g, '');
+  if (state.directoryPickerPurpose === 'downloadArtist') {
+    state.downloadArtistParentPath = path;
+    renderDownloadArtistFolder();
+  } else {
+    // The artist-move panel owns the destination field; without it there is
+    // nothing to fill in, and the dialog is left as it was.
+    if (!$('#artistFolderMoveDestination')) return;
+    // P6: the picker fills the parent directory only; the folder name keeps
+    // its own field and the final target is composed from both.
+    state.artistFolderMoveParentPath = path;
+    invalidateArtistFolderMovePreview();
+  }
+  closeDirectoryPicker();
 }
 
 export function renderOrganizeScopeArtist() {
@@ -322,6 +355,12 @@ function archiveProfileById(profileId, settings = archiveSettingsPayload()) {
 function cloneArchiveSettings(settings = archiveSettingsPayload()) {
   return JSON.parse(JSON.stringify(settings || {}));
 }
+
+// The rule editor holds a user draft between saves: a re-render (the debounced
+// draft preview, a plan refresh, or a live update) must not clobber in-progress
+// input back to the saved template. Hydrate once, then only refresh the fields
+// while they still match the persisted rule.
+let archiveEditorHydrated = false;
 
 function populateArchiveProfileEditor(profile) {
   const template = $('#archiveTemplateInput');
@@ -588,6 +627,13 @@ export async function loadArchiveWorkbench(options = {}) {
   }
 }
 
+export const ARCHIVE_PLANS_FOLD_THRESHOLD = 5;
+
+export function toggleArchivePlansFold() {
+  state.archivePlansExpanded = !state.archivePlansExpanded;
+  renderArchiveWorkbench();
+}
+
 export function renderArchiveWorkbench() {
   const planList = $('#archivePlanList');
   const planSummary = $('#archivePlanSummary');
@@ -613,7 +659,10 @@ export function renderArchiveWorkbench() {
   const profile = archiveProfileById(archiveSelectedProfileId(settings), settings);
   if (templateInput) templateInput.disabled = !artistId || !profile;
   if (collisionSelect) collisionSelect.disabled = !artistId || !profile;
-  populateArchiveProfileEditor(profile);
+  if (!archiveEditorHydrated || !archiveEditorIsDirty()) {
+    populateArchiveProfileEditor(profile);
+    archiveEditorHydrated = Boolean(profile);
+  }
 
   if (!artistId) {
     ruleStatus.textContent = '选择画师后编辑 Default 命名规则';
@@ -710,7 +759,26 @@ export function renderArchiveWorkbench() {
     }
   }
 
-  planList.innerHTML = plans.length ? plans.map(plan => {
+  const foldWrap = $('#archivePlansFoldWrap');
+  const foldBtn = $('#archivePlansFoldBtn');
+
+  const shouldFold = plans.length > ARCHIVE_PLANS_FOLD_THRESHOLD;
+  const isExpanded = Boolean(state.archivePlansExpanded);
+  const visiblePlans = (shouldFold && !isExpanded)
+    ? plans.slice(0, ARCHIVE_PLANS_FOLD_THRESHOLD)
+    : plans;
+
+  if (foldWrap && foldBtn) {
+    if (shouldFold) {
+      foldWrap.hidden = false;
+      const hiddenCount = plans.length - ARCHIVE_PLANS_FOLD_THRESHOLD;
+      foldBtn.textContent = isExpanded ? '收起' : `展开剩余 ${hiddenCount} 项`;
+    } else {
+      foldWrap.hidden = true;
+    }
+  }
+
+  planList.innerHTML = visiblePlans.length ? visiblePlans.map(plan => {
     const planId = Number(plan.id);
     const locked = plan.status === 'executed';
     const isSplit = plan.plan_kind === 'split_by_tag';
@@ -741,12 +809,57 @@ export function renderArchiveWorkbench() {
         <div class="archive-plan-row-actions">
           <span>${plan.file_count ? `${plan.file_count} 项` : ''}</span>
           <div class="archive-plan-row-controls">
+            <button class="btn btn-ghost" type="button" data-archive-plan-jump="${planId}" title="在画库中定位对应文件夹">在画库中定位</button>
             ${confirmBtnMarkup}
             ${plan.status === 'executed' && !isSplit ? `<button class="btn btn-ops" type="button" data-archive-plan-undo="${planId}" ${canUndo ? '' : 'disabled'} ${undoing ? 'aria-busy="true"' : ''}>${undoing ? '撤销中' : '撤销整理'}</button>` : ''}
           </div>
         </div>
       </div>`;
   }).join('') : '<div class="move-empty small">暂无待整理的文件夹</div>';
+}
+
+export async function jumpToArchivePlanFolder(planId) {
+  const pid = Number(planId);
+  const plan = (state.archivePlans || []).find(p => Number(p.id) === pid);
+  if (!plan) return;
+  const targetFolder = String(plan.status === 'executed' && plan.target_folder ? plan.target_folder : (plan.source_folder || '')).trim();
+  if (!targetFolder) {
+    toast('无有效文件夹路径', 'warn');
+    return;
+  }
+  const aid = Number(plan.artist_id || archiveCurrentArtistId());
+  if (!Number.isFinite(aid) || aid <= 0) {
+    toast('未关联画师', 'warn');
+    return;
+  }
+  if (!state.artists.length) await loadArtists();
+  const artist = state.artists.find(item => Number(item.id) === aid);
+  if (!artist) {
+    toast('目标画师不存在', 'error');
+    return;
+  }
+
+  let folders = (state.currentArtist && Number(state.currentArtist.id) === aid && state.folders)
+    ? state.folders
+    : null;
+  if (!folders) {
+    try {
+      folders = await API.get(`/api/folders?artist_id=${aid}`);
+    } catch {
+      folders = null;
+    }
+  }
+
+  const exists = folderTreeHasPath(folders, targetFolder);
+  if (exists) {
+    state.returnToView = 'organize';
+    applyMode('browse');
+    await selectArtist(aid, {loadItems: false});
+    selectFolder(targetFolder);
+  } else {
+    const ok = await copyText(targetFolder);
+    toast(ok ? '未在画库树中直接匹配到文件夹，已复制路径至剪贴板' : '未在画库树中直接匹配到文件夹', 'info');
+  }
 }
 
 export async function toggleArchivePlanConfirmation(planId) {

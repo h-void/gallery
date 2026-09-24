@@ -122,7 +122,8 @@ export function renderRecycleBin() {
       ? '文件缺失'
       : (originalExists ? '路径占用' : recycleStatusLabel(status));
     const restoring = isActionBusy('recycle-restore', String(id));
-    const canRestore = Number.isFinite(id) && status === 'recycled' && fileExists && !originalExists && !restoring;
+    const purging = isActionBusy('recycle-purge', String(id));
+    const canRestore = Number.isFinite(id) && status === 'recycled' && fileExists && !originalExists && !restoring && !purging;
     const fileState = !fileExists
       ? '文件已缺失'
       : (originalExists ? '原路径已被占用（不可恢复，避免覆盖现有文件）' : '可以恢复');
@@ -142,10 +143,17 @@ export function renderRecycleBin() {
         ${recycledPath ? `<code class="recycle-bin-location" title="${escHtml(recycledPath)}">${escHtml(recycledPath)}</code>` : ''}
         <div class="recycle-bin-actions">
           <span>${entry.file_name ? escHtml(String(entry.file_name)) : ''}</span>
-          <button class="btn btn-ops" type="button" data-recycle-restore="${id}" ${canRestore ? '' : 'disabled'} title="${escHtml(restoreTitle)}" ${restoring ? 'aria-busy="true"' : ''}>${restoring ? '恢复中' : '恢复'}</button>
+          <div class="recycle-bin-btn-group">
+            <button class="btn btn-ops" type="button" data-recycle-restore="${id}" ${canRestore ? '' : 'disabled'} title="${escHtml(restoreTitle)}" ${restoring ? 'aria-busy="true"' : ''}>${restoring ? '恢复中' : '恢复'}</button>
+            <button class="btn btn-ghost btn-danger" type="button" data-recycle-purge="${id}" ${purging ? 'disabled aria-busy="true"' : ''} title="从回收站彻底删除">${purging ? '删除中' : '彻底删除'}</button>
+          </div>
         </div>
       </div>`;
   }).join('') : '<div class="move-empty small empty-state">回收站中暂无可恢复的文件</div>';
+  const clearBtn = $('#recycleClearBtn');
+  if (clearBtn) {
+    clearBtn.disabled = entries.length === 0;
+  }
   // Backend returns numeric next_offset only when another page exists; the
   // empty bin sends null, which must not surface a load-more button.
   const hasNextPage = entries.length > 0 && typeof recycleBin.next_offset === 'number';
@@ -181,6 +189,47 @@ export async function restoreRecycleEntry(entryId) {
   } finally {
     setActionBusy('recycle-restore', String(id), false);
     renderRecycleBin();
+  }
+}
+
+export async function purgeRecycleEntry(entryId) {
+  const id = Number(entryId);
+  const entry = recycleEntries().find(item => Number(item.id) === id);
+  if (!Number.isFinite(id) || isActionBusy('recycle-purge', String(id))) return;
+  const fileName = entry?.file_name || (entry?.original_path ? entry.original_path.split('/').pop() : '该文件');
+  if (!window.confirm(`确定要彻底删除该文件吗？\n${fileName}\n删除后将无法恢复。`)) return;
+  setActionBusy('recycle-purge', String(id), true);
+  renderRecycleBin();
+  try {
+    const result = await API.delete(`/api/recycle/${id}`);
+    toast(result.message || '已彻底删除', 'success');
+    await loadRecycleBin();
+  } catch (e) {
+    toast('删除失败：' + (e.message || e), 'error');
+  } finally {
+    setActionBusy('recycle-purge', String(id), false);
+    renderRecycleBin();
+  }
+}
+
+export async function clearRecycleBin() {
+  const recycleBin = state.recycleBin;
+  const entries = recycleEntries(recycleBin);
+  if (!entries.length) {
+    toast('回收站为空', 'info');
+    return;
+  }
+  if (!window.confirm(`确定要清空回收站吗？\n共 ${entries.length} 项记录，所有文件将被彻底删除且无法恢复。`)) return;
+  const clearBtn = $('#recycleClearBtn');
+  if (clearBtn) clearBtn.disabled = true;
+  try {
+    const result = await API.post('/api/recycle/clear');
+    toast(result.message || '回收站已清空', 'success');
+    await loadRecycleBin();
+  } catch (e) {
+    toast('清空失败：' + (e.message || e), 'error');
+  } finally {
+    if (clearBtn) clearBtn.disabled = false;
   }
 }
 
@@ -301,6 +350,13 @@ function syncOperationFilterCounts(total, failed, success) {
   if (btnSuccess) btnSuccess.textContent = `仅成功（${success}）`;
 }
 
+export const OPERATION_HISTORY_FOLD_THRESHOLD = 5;
+
+export function toggleOperationHistoryFold() {
+  state.operationHistoryExpanded = !state.operationHistoryExpanded;
+  renderOperationLog();
+}
+
 export function renderOperationLog() {
   const summary = $('#operationLogSummary');
   const runtimeSummary = $('#operationRuntimeLogSummary');
@@ -331,7 +387,25 @@ export function renderOperationLog() {
   const successfulHistory = history.filter(operation => !['failed', 'error'].includes(String(operation.status || '').toLowerCase()));
   summary.textContent = joinUiMeta([`成功 ${successfulHistory.length} 条`, `失败 ${failedHistory.length} 条`]);
   runtimeSummary.textContent = `${errors.length} 条最近运行错误`;
-  successList.innerHTML = renderOperationEntries(successfulHistory, '暂无成功记录');
+  const shouldFold = successfulHistory.length > OPERATION_HISTORY_FOLD_THRESHOLD;
+  const isExpanded = Boolean(state.operationHistoryExpanded);
+  const successfulHistoryVisible = (shouldFold && !isExpanded)
+    ? successfulHistory.slice(0, OPERATION_HISTORY_FOLD_THRESHOLD)
+    : successfulHistory;
+
+  const foldWrap = $('#operationSuccessFoldWrap');
+  const foldBtn = $('#operationSuccessFoldBtn');
+  if (foldWrap && foldBtn) {
+    if (shouldFold) {
+      foldWrap.hidden = false;
+      const hiddenCount = successfulHistory.length - OPERATION_HISTORY_FOLD_THRESHOLD;
+      foldBtn.textContent = isExpanded ? '收起' : `展开剩余 ${hiddenCount} 条记录`;
+    } else {
+      foldWrap.hidden = true;
+    }
+  }
+
+  successList.innerHTML = renderOperationEntries(successfulHistoryVisible, '暂无成功记录');
   failureList.innerHTML = renderOperationEntries(failedHistory, '暂无失败记录');
   errorList.innerHTML = errors.length ? errors.map(row => `
     <div class="operation-error">

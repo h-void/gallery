@@ -88,16 +88,14 @@ header .btn-ghost:hover:not(:disabled):not(.active),
   box-shadow:none;
 }
 .segment-group,
-.view-toggle,
-.maintenance-view-tabs{
+.view-toggle{
   display:inline-flex;align-items:center;gap:2px;padding:2px;
   border-radius:var(--radius);
   background:var(--bg-overlay);
   box-sizing:border-box;min-height:calc(var(--control-height) + 4px);
 }
 .segment-group > .btn,
-.view-toggle > .btn,
-.maintenance-view-tabs > .btn{
+.view-toggle > .btn{
   height:var(--control-height);min-height:var(--control-height);
   padding:0 var(--control-padding-x);box-sizing:border-box;
 }

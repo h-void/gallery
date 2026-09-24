@@ -44,10 +44,26 @@ def _build_fnpack(output_dir: Path, staging_dir: Path, fnpack_binary_arg: str | 
     return artifact
 
 
-def _upload(artifact: Path, version: str) -> None:
+def _upload(artifact: Path, version: str, allow_test_line: bool = False) -> None:
     gh = build_fnpack.shutil.which("gh")
     if not gh:
         raise RuntimeError("gh CLI not found; cannot --upload release")
+    # This repository keeps two version tracks: 1.0.x is the development NAS test
+    # line and 1.1.x is the official release line. `version` comes straight from
+    # fnpack/package.json, so without this guard one `--upload` publishes the
+    # test line as an official GitHub Release, numerically below the release
+    # that is already out there.
+    if not re.fullmatch(r"1\.1\.\d+", version):
+        if not allow_test_line:
+            raise RuntimeError(
+                f"refusing to upload {version}: the official release line is 1.1.x and "
+                f"{version} is a development build. Pass --allow-test-line only for a "
+                "deliberate pre-release upload."
+            )
+        print(
+            f"[build_release] WARNING: uploading the development line {version} "
+            "as a public release (--allow-test-line)"
+        )
     # Only upload to the configured origin of THIS repo. Refuse wrong remotes.
     remote = subprocess.run(
         ["git", "remote", "get-url", "origin"],
@@ -93,6 +109,9 @@ def main() -> int:
                         help="Skip rebuilding the Rust runtime (use existing binary).")
     parser.add_argument("--upload", action="store_true",
                         help="Upload the artifact to a GitHub Release via gh.")
+    parser.add_argument("--allow-test-line", action="store_true",
+                        help="Permit --upload for a 1.0.x development build (official "
+                             "releases are 1.1.x).")
     args = parser.parse_args()
 
     if not args.no_rust:
@@ -104,7 +123,7 @@ def main() -> int:
     metadata = build_fnpack.load_package_metadata()
 
     if args.upload:
-        _upload(artifact, metadata["version"])
+        _upload(artifact, metadata["version"], allow_test_line=args.allow_test_line)
 
     print(f"[build_release] release ready: {artifact}")
     return 0

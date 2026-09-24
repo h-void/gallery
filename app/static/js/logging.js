@@ -116,7 +116,18 @@ export function toast(msg, type) {
   el.textContent = msg;
   // 错误提示立即播报（alert），其余礼貌播报（status），保证辅助技术能收到。
   el.setAttribute('role', type === 'error' ? 'alert' : 'status');
-  document.body.appendChild(el);
+  const openDialogs = typeof document.querySelectorAll === 'function'
+    ? Array.from(document.querySelectorAll('dialog[open]'))
+    : [];
+  const target = openDialogs.length ? openDialogs[openDialogs.length - 1] : (document.body || document.documentElement);
+  target.appendChild(el);
+  if (target !== document.body && typeof target.addEventListener === 'function') {
+    target.addEventListener('close', () => {
+      if (el.isConnected && document.body) {
+        document.body.appendChild(el);
+      }
+    }, { once: true });
+  }
   // Three-second visible window plus a 150ms fade-out before DOM removal.
   setTimeout(() => {
     el.classList.add('toast-leaving');

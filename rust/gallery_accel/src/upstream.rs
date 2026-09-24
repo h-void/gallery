@@ -1,18 +1,24 @@
-//! HTTP reverse-proxy helpers for residual Python routes and scan-state polling.
+//! HTTP reverse-proxy helpers for the optional `--upstream` compatibility chain.
 //!
-//! **Optimization:** keep one public process on :8899 (Rust) while unfinished
-//! domains (scan workers, ML, complex video, folder execute) stay on an
-//! internal Python upstream. Avoids a big-bang rewrite without breaking UI.
+//! The product serves everything itself: scan state, ML, video and folder
+//! execution all run in this process off the local database. An upstream is
+//! only built when `--upstream <url>` is passed (see `main.rs`), and then only
+//! as a dev/compat hop for JSON routes that have not been retired yet — see
+//! the retirement tracked separately from this module.
 //!
-//! **Streaming:** residual media (`/api/file`, stream, HLS, Range 206) must not
-//! be fully buffered in the primary process — forward `bytes_stream` and keep
-//! `Content-Range` / `Accept-Ranges` / `Content-Length` from upstream.
+//! **Streaming:** forwarded media (`/api/file`, stream, HLS, Range 206) must not
+//! be fully buffered in this process — forward `bytes_stream` and keep
+//! `Content-Range` / `Accept-Ranges` / `Content-Length` from the upstream.
+//!
+//! **Trust boundary:** the upstream is internal, so client credential headers
+//! are stripped (`is_hop_by_hop`) and redirects are refused rather than
+//! followed — a compromised upstream must not turn this proxy into an SSRF
+//! springboard toward addresses the client could not otherwise reach.
 
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use axum::body::Body;
-use axum::extract::ws::{Message, WebSocket};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -22,6 +28,34 @@ use serde_json::Value;
 /// Hard cap for buffered upstream JSON bodies. State/health payloads are
 /// tiny; anything larger is either a bug or an attack.
 const MAX_UPSTREAM_JSON_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// How much of a failed upstream response body a diagnostic line may quote.
+///
+/// The body cap above is a *memory* bound, not a logging one: a proxy error
+/// page can be megabytes, and `log_error!` writes one line per event, so
+/// quoting the whole body would put a multi-megabyte line into `gallery.log`
+/// (four of them consume the 16 MiB rotation budget) and let embedded newlines
+/// forge extra timestamp-less log entries in the health window. This is the
+/// same rule the UI log follows: bounded excerpt, never a payload.
+const MAX_UPSTREAM_ERROR_EXCERPT_BYTES: usize = 512;
+
+/// One bounded, single-line excerpt of a failed upstream response body.
+///
+/// Newlines and carriage returns are escaped rather than kept: a body is
+/// untrusted input, and a raw newline would start a line in `gallery.log` that
+/// carries no timestamp of its own — which the health window then attributes to
+/// the previous entry.
+fn upstream_error_excerpt(body: &[u8]) -> String {
+    let truncated = body.len() > MAX_UPSTREAM_ERROR_EXCERPT_BYTES;
+    let end = body.len().min(MAX_UPSTREAM_ERROR_EXCERPT_BYTES);
+    let mut excerpt = String::from_utf8_lossy(&body[..end])
+        .replace('\r', "\\r")
+        .replace('\n', "\\n");
+    if truncated {
+        excerpt.push_str(&format!("… ({} bytes total)", body.len()));
+    }
+    excerpt
+}
 
 #[derive(Clone)]
 pub struct Upstream {
@@ -47,10 +81,6 @@ impl Upstream {
         Ok(Self { base, client })
     }
 
-    pub fn base(&self) -> &str {
-        &self.base
-    }
-
     pub async fn get_json(&self, path: &str) -> Result<Value> {
         let url = format!("{}{}", self.base, path);
         let response = self
@@ -74,7 +104,7 @@ impl Upstream {
         if !status.is_success() {
             log_error!(
                 "upstream GET {url} returned {status}: {}",
-                String::from_utf8_lossy(&body)
+                upstream_error_excerpt(&body)
             );
             return Err(anyhow!("upstream returned {status}"));
         }
@@ -152,15 +182,10 @@ impl Upstream {
 }
 
 /// Read a response body fully with a hard size cap.
-async fn read_bounded_body(
-    response: reqwest::Response,
-    max_bytes: usize,
-) -> Result<bytes::Bytes> {
+async fn read_bounded_body(response: reqwest::Response, max_bytes: usize) -> Result<bytes::Bytes> {
     if let Some(len) = response.content_length() {
         if len as usize > max_bytes {
-            return Err(anyhow!(
-                "upstream body exceeds the {max_bytes} byte limit"
-            ));
+            return Err(anyhow!("upstream body exceeds the {max_bytes} byte limit"));
         }
     }
     let mut stream = response.bytes_stream();
@@ -168,9 +193,7 @@ async fn read_bounded_body(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("upstream body chunk")?;
         if buffer.len() + chunk.len() > max_bytes {
-            return Err(anyhow!(
-                "upstream body exceeds the {max_bytes} byte limit"
-            ));
+            return Err(anyhow!("upstream body exceeds the {max_bytes} byte limit"));
         }
         buffer.put(chunk);
     }
@@ -217,47 +240,6 @@ fn is_response_hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
-/// Bridge `/ws/scan` by polling upstream HTTP `/api/scan/state`.
-///
-/// **Optimization:** avoids a full WebSocket reverse-proxy implementation while
-/// preserving the UI progress protocol (JSON scan-state objects).
-pub async fn scan_ws_bridge(mut socket: WebSocket, upstream: Upstream) {
-    let mut last = String::new();
-    loop {
-        match upstream.get_json("/api/scan/state").await {
-            Ok(state) => {
-                let encoded = state.to_string();
-                if encoded != last {
-                    if socket
-                        .send(Message::Text(encoded.clone().into()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    last = encoded;
-                }
-            }
-            Err(_) => {
-                // Upstream may be briefly down during residual restarts.
-            }
-        }
-        tokio::select! {
-            msg = socket.next() => {
-                match msg {
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = socket.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-        }
-    }
-}
-
 pub fn proxy_error(message: impl Into<String>) -> Response {
     // Serialize through serde_json: raw format! breaks on backslashes, which are
     // routine in Windows-style error paths and produce invalid JSON escapes.
@@ -300,6 +282,41 @@ mod tests {
     fn request_hop_by_hop_keeps_range_header() {
         let range = HeaderName::from_static("range");
         assert!(!is_request_hop_by_hop(&range));
+    }
+
+    /// A failed upstream response must not be able to write a huge or forged
+    /// log line.
+    ///
+    /// `log_error!` writes exactly one line per event, so the body is bounded
+    /// and its newlines are escaped: an upstream that answers 500 with a
+    /// multi-megabyte page, or with text crafted to look like a timestamped log
+    /// entry, would otherwise land in `gallery.log` verbatim and be attributed
+    /// by the health window to whatever line preceded it.
+    #[test]
+    fn upstream_error_excerpt_is_bounded_and_single_line() {
+        let small = upstream_error_excerpt(b"service unavailable");
+        assert_eq!(small, "service unavailable");
+
+        let forged = upstream_error_excerpt(
+            b"bad gateway\n2026-01-01 00:00:00,000 [ERROR] injected by upstream",
+        );
+        assert!(
+            !forged.contains('\n'),
+            "an excerpt must stay on one line: {forged:?}"
+        );
+        assert!(forged.contains("\\n"), "the newline is shown, not dropped");
+
+        let huge = vec![b'x'; MAX_UPSTREAM_ERROR_EXCERPT_BYTES * 8];
+        let excerpt = upstream_error_excerpt(&huge);
+        assert!(
+            excerpt.len() <= MAX_UPSTREAM_ERROR_EXCERPT_BYTES + 64,
+            "the excerpt must stay near its cap, got {} bytes",
+            excerpt.len()
+        );
+        assert!(
+            excerpt.contains("bytes total"),
+            "a truncated excerpt reports the real size: {excerpt:?}"
+        );
     }
 
     #[test]

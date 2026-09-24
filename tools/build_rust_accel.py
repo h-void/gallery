@@ -33,6 +33,9 @@ CARGO_PATH_ENV = (
     "PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:"
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
+# Persistent crate cache, so a rebuild does not re-download the crates.io index
+# and every dependency (a throwaway container layer used to lose them each run).
+CARGO_HOME_VOLUME = "gallery-cargo-home"
 
 
 def _windows_path_as_wsl_path(path: Path) -> str:
@@ -133,26 +136,46 @@ def _wsl_has_podman() -> bool:
 def _build_clean_via_podman_wsl(wsl_root: str, output: Path) -> Path:
     output_wsl = _windows_path_as_wsl_path(output)
     output_parent_wsl = str(PurePosixPath(output_wsl).parent)
-    build_root = f"/tmp/gallery-rust-build-{uuid.uuid4().hex}"
+    session_id = uuid.uuid4().hex[:8]
+    build_root = f"/tmp/gallery-rust-build-$$-{session_id}"
     crate_wsl = f"{build_root}/gallery_accel"
+    target_cache = "$HOME/.cache/gallery-rust/target"
     image = PODMAN_IMAGE
+    # Session ownership cleanup: check stale build trees and only remove ones whose PID is dead.
+    clean_stale_cmd = (
+        'for stale in /tmp/gallery-rust-build-*; do '
+        '[ -d "$stale" ] || continue; '
+        'bname="${stale##*/}"; '
+        'spid="${bname#gallery-rust-build-}"; '
+        'spid="${spid%%-*}"; '
+        'if [ -n "$spid" ] && [ "$spid" -ne "$$" ] 2>/dev/null; then '
+        'if ! kill -0 "$spid" 2>/dev/null; then rm -rf "$stale" 2>/dev/null || true; fi; '
+        'fi; '
+        'done'
+    )
     # DrvFS can preserve a stale Cargo target. Build a temporary WSL copy of
-    # the current crate, then copy only the verified ELF to the Windows tree.
+    # the current crate with persistent native target cache, then copy only the verified ELF.
     command = (
         "set -eu; "
-        f"trap 'rm -rf {shlex.quote(build_root)}' EXIT; "
-        f"mkdir -p {shlex.quote(crate_wsl)}; "
+        f"{clean_stale_cmd}; "
+        f'trap "rm -rf {build_root}" EXIT; '
+        f"mkdir -p {shlex.quote(crate_wsl)} {target_cache}; "
         f"tar -C {shlex.quote(f'{wsl_root}/rust/gallery_accel')} --exclude=target -cf - . "
         f"| tar -xf - -C {shlex.quote(crate_wsl)}; "
         f"podman image exists {shlex.quote(image)} || podman pull {shlex.quote(image)}; "
+        f"podman volume create {shlex.quote(CARGO_HOME_VOLUME)} >/dev/null 2>&1 || true; "
         "podman run --rm "
         f"-v {shlex.quote(f'{crate_wsl}:/src')} "
+        f"-v {shlex.quote(f'{CARGO_HOME_VOLUME}:/cargo-home')} "
+        f"-v \"{target_cache}:/cargo-target\" "
         "-w /src "
         f"-e {shlex.quote(CARGO_PATH_ENV)} "
+        "-e CARGO_HOME=/cargo-home "
+        "-e CARGO_TARGET_DIR=/cargo-target "
         f"{shlex.quote(image)} "
         "cargo build --release --locked --target x86_64-unknown-linux-gnu; "
         f"mkdir -p {shlex.quote(output_parent_wsl)}; "
-        f"cp {shlex.quote(f'{crate_wsl}/target/x86_64-unknown-linux-gnu/release/gallery_accel')} {shlex.quote(output_wsl)}"
+        f"cp {target_cache}/x86_64-unknown-linux-gnu/release/gallery_accel {shlex.quote(output_wsl)}"
     )
     subprocess.run(["wsl", "bash", "-lc", command], check=True)
     return output

@@ -722,7 +722,7 @@ body.mode-browse .toolbar{
 }
 .move-panel.visible{display:flex}
 .maintenance-dashboard{
-  display:flex;flex:0 0 auto;flex-direction:column;gap:24px;padding:18px 24px 28px;min-height:0;
+  display:flex;flex:0 0 auto;flex-direction:column;gap:14px;padding:16px 20px 24px;min-height:0;
   max-width:1280px;width:100%;margin:0 auto;
 }
 .maintenance-hero{
@@ -763,25 +763,41 @@ body.mode-browse .toolbar{
 .maintenance-auto-toggle input:checked{background:var(--accent-soft);border-color:var(--accent)}
 .maintenance-auto-toggle input:checked::after{transform:translateX(14px);background:var(--vermilion)}
 .maintenance-auto-toggle input:disabled{opacity:.52;cursor:not-allowed}
-/* Work-order board: each tab is its own paper card; the active tab is the
-   vermilion-sealed one. Overrides the shared segment-shell styling. */
+/* Editorial underline tab strip: clean typographic labels resting directly on the
+   paper crease line; active tab marked by a vermilion seal underline. */
 .maintenance-view-tabs{
-  align-self:flex-start;background:transparent;padding:0;gap:6px;
-  min-height:var(--control-height);box-shadow:none;
+  position:sticky;top:0;z-index:20;
+  align-self:stretch;background:var(--bg-canvas);padding:8px 0 0;gap:4px;
+  border-radius:0;
+  min-height:var(--control-height);
+  display:flex;align-items:flex-end;
+}
+.maintenance-view-tabs::after{
+  content:'';position:absolute;left:0;right:0;bottom:0;height:1px;
+  background:var(--border-subtle);pointer-events:none;z-index:1;
 }
 .maintenance-view-tabs button{
+  position:relative;z-index:2;
   height:var(--control-height);min-height:var(--control-height);
-  padding:0 16px;border-radius:var(--radius);
-  border:1px solid var(--border-subtle);
-  font-size:var(--fs-small);font-weight:600;white-space:nowrap;box-sizing:border-box;
-  background:var(--bg-raised);box-shadow:none;
+  padding:0 16px;border-radius:var(--radius) var(--radius) 0 0;
+  border:none;background:transparent;box-shadow:none;
+  font-size:var(--fs-small);font-weight:500;white-space:nowrap;box-sizing:border-box;
+  color:var(--text-2);cursor:pointer;
+  transition:color var(--motion),background var(--motion);
 }
-.maintenance-view-tabs button:hover:not(:disabled):not(.active){border-color:var(--vermilion)}
+.maintenance-view-tabs button:hover:not(:disabled):not(.active){
+  color:var(--text-1);background:var(--bg-raised);
+}
 .maintenance-view-tabs .btn-segment.active{
-  background:var(--accent-solid);border-color:var(--accent-solid);color:#FFF6E8;
+  color:var(--vermilion-deep);font-weight:600;
+  background:transparent;border:none;box-shadow:none;
+}
+.maintenance-view-tabs .btn-segment.active::after{
+  content:'';position:absolute;left:10px;right:10px;bottom:0;height:2px;
+  background:var(--vermilion);border-radius:var(--radius-pill);z-index:3;
 }
 .maintenance-view-panel{
-  display:flex;flex-direction:column;gap:24px;min-width:0;
+  display:flex;flex-direction:column;gap:12px;min-width:0;
   animation:maintenance-panel-in .22s ease both;
 }
 @keyframes maintenance-panel-in{
@@ -884,7 +900,7 @@ body.mode-browse .toolbar{
 }
 .ml-runtime-inline-status.is-error{color:var(--danger)}
 .maintenance-tools-dock{
-  display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px;min-width:0;
+  display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;min-width:0;
 }
 /* P5: the global run-all command lives in the hero next to the auto toggle so
    its 全库整理 scope is visible from every maintenance tab; the organize dock
@@ -895,10 +911,10 @@ body.mode-browse .toolbar{
 /* R5: each scope is a named block so the full-library command never reads as
    one of the current-artist tools; a crease rule separates the two. */
 .maintenance-tools-dock .organize-scope{
-  grid-column:1 / -1;display:grid;gap:24px;min-width:0;
+  grid-column:1 / -1;display:grid;gap:12px;min-width:0;
 }
 .organize-scope + .organize-scope{
-  border-top:1px solid var(--border-subtle);padding-top:24px;
+  border-top:1px solid var(--border-subtle);padding-top:12px;
 }
 .organize-scope-head{
   display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;min-width:0;
@@ -1009,8 +1025,8 @@ body.mode-browse .toolbar{
   padding:0 16px 16px;
 }
 .maintenance-overview-card{
-  display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;
-  gap:4px 8px;text-align:left;cursor:pointer;
+  display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;
+  gap:4px 10px;text-align:left;cursor:pointer;
   min-height:0;padding:12px 14px;
   border:1px solid var(--border-subtle);
   border-radius:var(--radius);
@@ -1022,17 +1038,24 @@ body.mode-browse .toolbar{
   background:var(--bg-overlay);border-color:var(--accent);
   outline:none;
 }
+.maintenance-overview-card-icon{
+  grid-column:1;grid-row:1 / span 2;
+  display:inline-flex;align-items:center;justify-content:center;
+  width:32px;height:32px;border-radius:var(--radius);
+  background:var(--bg-overlay);color:var(--accent);
+  flex-shrink:0;
+}
 .maintenance-overview-card b{
-  grid-column:1;grid-row:1;
+  grid-column:2;grid-row:1;
   color:var(--text-1);font-size:var(--fs-body);font-weight:600;
 }
-.maintenance-overview-card span{
-  grid-column:1;grid-row:2;
+.maintenance-overview-card span:not(.maintenance-overview-card-icon){
+  grid-column:2;grid-row:2;
   color:var(--text-3);font-size:var(--fs-small);line-height:1.5;
   max-width:18em;
 }
 .maintenance-overview-card::after{
-  content:'';grid-column:2;grid-row:1 / span 2;justify-self:end;align-self:center;
+  content:'';grid-column:3;grid-row:1 / span 2;justify-self:end;align-self:center;
   width:7px;height:7px;
   border-right:1px solid var(--text-3);border-top:1px solid var(--text-3);
   transform:rotate(45deg);
@@ -1440,7 +1463,7 @@ body.mode-browse .toolbar{
 .archive-template-field{min-width:0}
 .archive-template-field input{font-family:var(--font-mono)}
 .archive-rule-actions,.archive-plan-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.archive-rule-status,.archive-plan-summary,.archive-preview-summary{min-width:0;color:var(--text-2);font-size:var(--fs-small);line-height:1.45}
+.archive-rule-status,.archive-rule-hint,.archive-plan-summary,.archive-preview-summary{min-width:0;color:var(--text-2);font-size:var(--fs-small);line-height:1.45}
 .archive-token-strip{display:flex;gap:6px;flex-wrap:wrap;padding:4px 0 2px}
 .archive-token-strip code{
   display:inline-flex;align-items:center;padding:4px 8px;border:1px solid var(--border-subtle);
@@ -1530,7 +1553,7 @@ body.mode-browse .toolbar{
 
 /* Records view (§5.11) */
 .recycle-bin-summary{padding:10px 16px 0;color:var(--text-3);font-size:var(--fs-small);line-height:1.45}
-.recycle-bin-list{display:flex;flex-direction:column;gap:8px;padding:12px 16px 14px}
+.recycle-bin-list{display:flex;flex-direction:column;gap:8px;padding:12px 16px 14px;max-height:min(55vh,480px);overflow-y:auto}
 .recycle-bin-more{display:flex;justify-content:center;padding:0 16px 14px}
 .recycle-bin-more button{height:var(--control-height);min-height:var(--control-height);padding:0 var(--control-padding-x);font-size:var(--fs-small);box-sizing:border-box}
 .recycle-bin-row{display:grid;gap:7px;min-width:0;padding:10px 12px;border-radius:var(--radius);background:var(--bg-canvas)}
@@ -1543,6 +1566,7 @@ body.mode-browse .toolbar{
 .recycle-bin-meta{font-variant-numeric:tabular-nums}
 .recycle-bin-actions span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .recycle-bin-actions button{height:var(--control-height);min-height:var(--control-height);padding:0 var(--control-padding-x);font-size:var(--fs-small);box-sizing:border-box}
+.recycle-bin-btn-group{display:flex;align-items:center;gap:6px;flex-shrink:0}
 .operation-log-summary{padding:10px 16px 0;color:var(--text-3);font-size:var(--fs-small)}
 .operation-log-filter{display:inline-flex;align-items:center;gap:4px}
 .operation-log-grid{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(260px,.8fr);gap:12px;padding:12px 16px 14px}
@@ -1691,7 +1715,7 @@ body.mode-browse .toolbar{
   color:var(--text-1);
 }
 .character-library-grid{
-  display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1fr) minmax(0,1.15fr);gap:16px;
+  display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:16px;
   padding:14px 16px 16px;
 }
 /* R3: one crease rule between neighbouring library zones. The columns keep the
@@ -1723,6 +1747,17 @@ body.mode-browse .toolbar{
 .character-library-column-head{
   display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;
 }
+.character-library-column-head-actions{display:flex;align-items:center;gap:8px;min-width:0}
+.character-create-box{
+  display:flex;align-items:center;gap:8px;padding:8px 10px;
+  border-radius:var(--radius);background:var(--bg-canvas);border:1px solid var(--border-subtle);
+}
+.character-create-box input{
+  flex:1 1 auto;min-width:0;height:32px;padding:0 8px;border-radius:var(--radius);
+  border:1px solid var(--border-subtle);background:var(--bg-card);color:var(--text-1);
+  font-size:var(--fs-small);
+}
+.character-create-box button{flex:0 0 auto}
 .character-library-views{display:none}
 .character-library-back{display:none}
 .character-library-empty-action{flex:0 0 auto;margin-left:8px}
@@ -1731,10 +1766,18 @@ body.mode-browse .toolbar{
   color:var(--text-3);font-size:var(--fs-small);padding:14px;border-radius:var(--radius);
   background:var(--bg-canvas);
 }
-.character-list{display:flex;flex-direction:column;gap:10px;min-width:0}
+/* §5.10d: one fixed list height for all three zones, bottom-anchored, so the
+   library panel's bottom edge stops moving with the content. The panel is then
+   always the reference column's head plus this list, whether a zone holds one
+   row or forty, and the three scroll areas share one top and one bottom edge
+   instead of ending at three different heights. 530px is the reference list's
+   whole-card cap (106px pitch) so its cards still end on a whole card. Mobile
+   keeps its own viewport-relative height — see the 768px block, where only one
+   zone is on screen at a time. */
+.character-list{display:flex;flex-direction:column;gap:10px;min-width:0;flex:0 0 auto;margin-top:auto;height:calc(106px * 5);overflow-y:auto}
 /* P4: the import list had no container rule at all, so its rows stacked with
    zero spacing; it follows the same vertical list pattern as .character-list. */
-.character-tag-import-list{display:flex;flex-direction:column;gap:10px;min-width:0}
+.character-tag-import-list{display:flex;flex-direction:column;gap:10px;min-width:0;flex:0 0 auto;margin-top:auto;height:calc(106px * 5);overflow-y:auto}
 .character-tag-row{
   display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;
   padding:9px 10px;
@@ -1813,15 +1856,28 @@ body.mode-browse .toolbar{
 }
 .character-card-meta{min-width:0;max-width:100%;overflow:hidden;display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--text-3);font-size:var(--fs-small);overflow-wrap:anywhere}
 .character-card-meta-row{flex:1 1 auto;min-width:0}
-.character-card-created{flex:0 0 auto;color:var(--text-3);font-variant-numeric:tabular-nums}
-.character-reference-list{display:grid;gap:8px}
+/* Always one line box, even with nothing selected: an empty line would shrink
+   the reference column's head and pull the panel's bottom edge up with it —
+   §5.10d anchors every list's bottom on that head. */
+.character-card-created{flex:0 0 auto;color:var(--text-3);font-variant-numeric:tabular-nums;min-height:1.5em}
+/* Reference cards are a fixed 98px tall (80px thumb + 2x9px card padding) on a
+   106px pitch (98px + 8px gap), so any height that is not a multiple of 106px
+   cuts a card in half at the list's bottom edge. That half card sat on the
+   panel's bottom padding and read as the card pressing through the panel. A
+   fixed 5 whole cards: 5*98 + 4*8 = 522px of content, so 530px shows card 6 for
+   0px. No vh term: a 65vh that is not itself a multiple of 106px brings the half
+   card straight back on most windows. The pitch is only exact because
+   .character-reference-detail pins the line-height and every text line is
+   nowrap/ellipsis; changing the thumb size or that line-height needs a new
+   height. §5.10d gives the other two lists this same height. */
+.character-reference-list{display:grid;grid-auto-rows:max-content;align-content:start;gap:8px;flex:0 0 auto;margin-top:auto;height:calc(106px * 5);overflow-y:auto}
 .character-reference-card{
   display:grid;grid-template-columns:80px minmax(0,1fr);gap:10px;align-items:start;
   padding:9px 10px;
   border-radius:var(--radius);background:var(--bg-canvas);min-width:0;max-width:100%;overflow:hidden;
 }
 .character-reference-thumb{
-  width:80px;aspect-ratio:1;border-radius:var(--radius-sm);
+  width:80px;height:80px;aspect-ratio:1;border-radius:var(--radius-sm);
   background:var(--bg-raised);overflow:hidden;display:flex;align-items:center;justify-content:center;
   color:var(--text-3);font-size:var(--fs-small);
 }
@@ -1838,7 +1894,12 @@ body.mode-browse .toolbar{
   background:var(--danger-solid);border-color:var(--danger-solid);color:#fff;
 }
 .character-reference-thumb.failed::after{content:'预览失败'}
-.character-reference-detail{min-width:0;max-width:100%;overflow:hidden;display:grid;gap:8px}
+/* Pins the reference card's height. Every text line inside is single-line
+   (nowrap + ellipsis), so with line-height:1.35 the detail column is
+   38.45 + 8 + 25.55 = 72px — under the 80px thumb, which therefore sets the row
+   height and the card stays 98px on every font. The list's whole-card cap in
+   §5.10 depends on that 98px, so do not let the inherited line-height back in. */
+.character-reference-detail{min-width:0;max-width:100%;overflow:hidden;display:grid;gap:8px;line-height:1.35}
 .character-reference-head{min-width:0;max-width:100%}
 .character-reference-head > div{min-width:0;overflow:hidden;display:grid;gap:2px}
 .character-reference-head > div b,.character-reference-head > div span{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1900,6 +1961,7 @@ body.mode-browse .toolbar{
 .artist-links-controls button{min-width:0}
 .artist-links-status{color:var(--text-3);font-size:var(--fs-small);margin:8px 0;overflow-wrap:anywhere}
 .artist-profile-links-list,.artist-links-list{display:grid;gap:8px;min-width:0}
+.artist-links-group-title{margin:8px 10px 0;color:var(--text-2);font-size:var(--fs-small);font-weight:600}
 .artist-profile-link-row,.artist-link-row{min-width:0;border-radius:var(--radius);padding:8px 10px;background:transparent}
 .artist-profile-link-row:hover,.artist-link-row:hover{background:var(--bg-raised)}
 .artist-link-main,.artist-link-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;min-width:0}
@@ -1959,6 +2021,40 @@ body.mode-browse .toolbar{
 .error-artist-reason{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-3);font-size:var(--fs-small)}
 .error-plan-highlight{box-shadow:0 0 0 2px var(--danger)!important}
 
+/* Archive dialog */
+.archive-dialog{width:min(840px,calc(100vw - 32px))}
+.archive-dialog-body{display:flex;flex-direction:column;gap:12px;max-height:calc(100dvh - 180px);overflow-y:auto}
+.archive-info-summary{display:flex;flex-direction:column;gap:6px}
+.archive-meta-line{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:var(--fs-small)}
+.archive-meta-badge{font-weight:600;color:var(--text-1)}
+.archive-meta-sub{color:var(--text-2)}
+.archive-password-row{display:flex;gap:8px;align-items:center}
+.archive-password-row input{flex:1 1 auto;min-width:0;height:var(--control-height);padding:0 10px;border:1px solid var(--border-subtle);border-radius:var(--radius);background:var(--bg-raised);color:var(--text-1);font:inherit;font-size:var(--fs-small);outline:none}
+.archive-password-row input:focus{border-color:var(--accent);box-shadow:var(--focus-ring)}
+.archive-entries-tree{border:1px solid var(--border-subtle);border-radius:var(--radius);background:var(--bg-raised);min-height:180px;max-height:380px;overflow-y:auto;padding:6px;display:flex;flex-direction:column}
+.archive-list-container{display:flex;flex-direction:column;gap:2px}
+.archive-entry-item{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:var(--radius-sm);font-size:var(--fs-small);color:var(--text-2);user-select:none}
+.archive-entry-item.clickable{cursor:pointer;color:var(--text-1)}
+.archive-entry-item.clickable:hover{background:var(--bg-overlay);color:var(--accent)}
+.archive-entry-icon{flex:0 0 auto;font-size:14px;line-height:1}
+.archive-entry-path{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.archive-entry-size{flex:0 0 auto;font-size:calc(var(--fs-small) - 1px);color:var(--text-3);font-variant-numeric:tabular-nums}
+.archive-more-notice,.archive-empty,.archive-notice,.archive-loading{padding:16px;text-align:center;color:var(--text-3);font-size:var(--fs-small)}
+.archive-inline-preview{margin-top:8px;padding-top:8px;border-top:1px solid var(--border-subtle)}
+.archive-preview-card{display:flex;flex-direction:column;gap:8px;background:var(--bg-overlay);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:10px}
+.archive-preview-header{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:var(--fs-small);color:var(--text-2)}
+.archive-preview-img-wrap{display:flex;justify-content:center;align-items:center;max-height:260px;overflow:hidden;border-radius:var(--radius-sm);background:rgba(0,0,0,.2)}
+.archive-preview-img-wrap img{max-width:100%;max-height:260px;object-fit:contain}
+.archive-options-section{display:flex;flex-direction:column;gap:8px;padding-top:8px;border-top:1px solid var(--border-subtle)}
+.archive-target-modes{display:flex;gap:16px;flex-wrap:wrap}
+.archive-radio-label,.archive-checkbox-label{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:var(--fs-small);color:var(--text-1);user-select:none}
+.archive-custom-folder-input{width:100%;height:var(--control-height);padding:0 10px;border:1px solid var(--border-subtle);border-radius:var(--radius);background:var(--bg-raised);color:var(--text-1);font:inherit;font-size:var(--fs-small);outline:none}
+.archive-custom-folder-input:focus{border-color:var(--accent);box-shadow:var(--focus-ring)}
+.archive-dialog-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 20px;border-top:1px solid var(--border-subtle);background:var(--bg-raised)}
+.archive-status-msg{flex:1 1 auto;min-width:0;font-size:var(--fs-small);color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.archive-status-msg.error{color:var(--danger)}
+.archive-dialog-actions{flex:0 0 auto;display:flex;gap:8px}
+
 /* Toast (§5.14): a non-blocking note pinned to the bottom-center of the
    window, led by a vermilion binding edge; success/error keep semantic bars.
    --toast-tx keeps the centered transform intact across the slide animation.
@@ -2012,11 +2108,13 @@ body.mode-browse .toolbar{
   .maintenance-auto-toggle,
   .maintenance-advanced-form-row select,
   .maintenance-section-actions select,
+  .download-subscription-mode select,
   .organize-artist-select,
   .character-library-search select,
   .character-library-search input{height:44px;min-height:44px}
   header input,.search-control input,.item-filter-field input,.artist-links-controls input,
   .character-library-search input,.artist-folder-move-form input,.archive-field input,
+  .download-subscription-mode select,
   .organize-artist-select{
     font-size:16px;
   }
@@ -2099,6 +2197,7 @@ body.mode-browse .toolbar{
   }
   .media-filter-select{flex:1 1 112px;min-width:100px;max-width:160px}
   .desktop-view-toggle{display:none}
+  .desktop-ratio-toggle{display:none}
   .mobile-column-toggle button{
     flex:1 1 0;min-width:0;height:var(--control-height);min-height:var(--control-height);
     padding:0 8px;white-space:nowrap;box-sizing:border-box;
@@ -2161,7 +2260,7 @@ body.mode-browse .toolbar{
   .lightbox .info-bar .lightbox-meta-name{flex:1 1 100%}
   .lightbox-path-panel{white-space:normal;line-height:1.35}
 
-  .maintenance-dashboard{padding:12px;gap:14px}
+  .maintenance-dashboard{padding:12px;gap:10px}
   .maintenance-hero{align-items:flex-start;flex-direction:column;padding:8px 0}
   .maintenance-hero-actions{
     width:100%;display:flex;flex-direction:column;gap:8px;align-items:stretch;
@@ -2224,7 +2323,13 @@ body.mode-browse .toolbar{
   }
   .character-card-delete.btn::after{content:none}
   .character-reference-card{grid-template-columns:64px minmax(0,1fr)}
-  .character-reference-thumb{width:64px}
+  .character-reference-thumb{width:64px;height:64px}
+  /* The reference card has no fixed height on mobile: the path wraps again
+     (white-space:normal, see S6), so every card is as tall as its own path and
+     no pitch exists to cap on. Drop §5.10d's fixed desktop height and its bottom
+     anchor for all three lists in this range: mobile shows one zone at a time,
+     so each list stays viewport-relative and hugs its own content. */
+  .character-list,.character-tag-import-list,.character-reference-list{height:auto;margin-top:0;max-height:min(65vh,600px)}
   /* §V6-D: the delete button goes full width on mobile, so it stacks under the
      name block instead of pushing it out of the 238px row (8px overflow). */
   .character-reference-head{flex-direction:column;align-items:stretch;gap:6px}
@@ -2234,9 +2339,11 @@ body.mode-browse .toolbar{
      and clipped the 44px ::before extension. Give the tab the real height. */
   .maintenance-view-tabs{
     width:100%;align-self:stretch;overflow-x:auto;justify-content:flex-start;position:relative;
-    min-height:44px;
+    min-height:44px;padding:4px 0 0;
+    box-shadow:0 1px 0 var(--border-subtle);
     scrollbar-width:none;
   }
+  .maintenance-view-tabs::after{content:none}
   .maintenance-view-tabs::-webkit-scrollbar{display:none}
   .maintenance-view-tabs button{
     flex:0 0 auto;min-width:max-content;
@@ -2298,6 +2405,7 @@ body.mode-browse .toolbar{
   .recycle-bin-row-head,.recycle-bin-meta,.recycle-bin-actions{align-items:flex-start;flex-direction:column}
   .recycle-bin-actions{width:100%}
   .recycle-bin-actions button{width:100%}
+  .recycle-bin-btn-group{display:flex;width:100%;gap:6px}
   .operation-entry-head{align-items:flex-start;flex-direction:column;gap:3px}
   .operation-entry-head em{margin-left:0}
   .maintenance-guide-body{padding:0 12px 10px;gap:12px}
@@ -2335,4 +2443,380 @@ body.mode-browse .toolbar{
   .artist-folder-picker-path{
     white-space:normal;overflow-wrap:anywhere;text-overflow:clip;
   }
+}
+
+/* 下载与订阅面板：开关行、类型过滤、命名模板与订阅列表。 */
+.download-toggle-row{display:flex;gap:8px;flex-wrap:wrap;padding:12px 16px 4px}
+.download-option-row{
+  display:flex;gap:16px;flex-wrap:wrap;align-items:end;padding:8px 16px 16px;
+}
+.download-interval-field{width:140px}
+.download-type-field{min-width:0}
+.download-type-segments{flex-wrap:wrap;max-width:100%}
+.download-artist-combo{position:relative;min-width:0}
+.download-artist-combo input{width:100%}
+.download-artist-listbox{
+  position:absolute;z-index:30;left:0;right:0;top:calc(100% + 4px);margin:0;padding:4px;list-style:none;
+  max-height:min(48vh,360px);overflow:auto;border:1px solid var(--border-strong);border-radius:var(--radius);
+  background:var(--bg-overlay);box-shadow:var(--shadow-pop);box-sizing:border-box;min-width:0;
+}
+.download-artist-listbox[hidden]{display:none}
+.download-artist-listbox li{
+  padding:6px 10px;border-radius:var(--radius);color:var(--text-1);font-size:var(--fs-small);
+  cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.download-artist-listbox li:hover,.download-artist-listbox li.active{background:var(--accent-soft);color:var(--vermilion-deep)}
+.download-artist-listbox li.create-new{color:var(--text-2)}
+.download-subscription-status{color:var(--text-2);font-size:var(--fs-small);min-height:1.4em}
+.download-subscription-coverage{color:var(--text-3);font-size:var(--fs-small)}
+.download-settings-panel .health-subtitle{padding:8px 16px 14px}
+.download-template-fields{display:grid;gap:10px;padding:12px 16px 4px}
+.download-token-strip{display:flex;gap:6px;flex-wrap:wrap;padding:4px 16px 14px}
+.download-token-strip code{
+  display:inline-flex;align-items:center;padding:4px 8px;border:1px solid var(--border-subtle);
+  border-radius:var(--radius);background:var(--bg-raised);color:var(--text-2);
+  font-size:var(--fs-small);font-family:var(--font-mono);letter-spacing:0;
+  cursor:pointer;user-select:none;transition:border-color var(--motion),color var(--motion);
+}
+.download-token-strip code:hover{border-color:var(--accent);color:var(--text-1)}
+.archive-template-guide,.download-template-guide{display:grid;gap:6px;padding:0 0 10px;color:var(--text-3);font-size:var(--fs-small);line-height:1.5}
+.download-template-guide{padding:0 16px 14px}
+.archive-template-guide code,.download-template-guide code{font-family:var(--font-mono);color:var(--text-2);background:var(--bg-raised);padding:1px 4px;border-radius:var(--radius-sm)}
+.archive-template-guide b,.download-template-guide b{color:var(--text-2);font-weight:600}
+.archive-template-guide-desc,.download-template-guide-desc{margin-top:2px;color:var(--text-3);font-size:var(--fs-micro)}
+.template-vars-detail{margin-top:4px;border-radius:var(--radius);background:var(--bg-canvas);border:1px solid var(--border-subtle);overflow:hidden}
+.template-vars-detail summary{padding:7px 12px;cursor:pointer;user-select:none;font-size:var(--fs-small);color:var(--text-2);font-weight:500}
+.template-vars-detail summary:hover{color:var(--text-1)}
+.template-vars-table-wrap{overflow-x:auto;padding:0 12px 10px}
+.template-vars-table{width:100%;border-collapse:collapse;font-size:var(--fs-micro);line-height:1.5}
+.template-vars-table th,.template-vars-table td{padding:5px 8px;text-align:left;border-bottom:1px solid var(--border-subtle)}
+.template-vars-table th{color:var(--text-2);font-weight:600;white-space:nowrap}
+.template-vars-table td{color:var(--text-3)}
+.template-vars-table td b{color:var(--text-1);white-space:nowrap}
+.template-vars-table tr:last-child td{border-bottom:none}
+.download-subscription-form{
+  display:grid;grid-template-columns:minmax(220px,1.4fr) minmax(170px,1fr) minmax(210px,1fr) minmax(130px,.5fr) auto;
+  gap:10px;align-items:end;padding:12px 16px 0;
+}
+/* 新建位置：媒体根目录 + 选目录按钮 + 已选父目录。父目录可能很深，所以它
+   省略而不是把这一行撑开。 */
+.download-subscription-folder-row{display:flex;gap:6px;align-items:center;min-width:0}
+.download-subscription-folder-row select{min-width:0;max-width:50%}
+.download-subscription-folder-row output{
+  min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:var(--text-2);font-size:var(--fs-small);
+}
+.download-subscription-actions{display:flex;align-items:center}
+/* The five columns above need about 880px; below that the form reflows to
+   three and the folder field puts its picked path on its own line, so a deep
+   path is readable instead of being ellipsised down to a few characters. */
+@media(max-width:1180px){
+  .download-subscription-form{grid-template-columns:minmax(200px,1.4fr) minmax(170px,1fr) minmax(190px,1fr)}
+  .download-subscription-folder-row{flex-wrap:wrap}
+  .download-subscription-folder-row output{flex:1 1 100%}
+}
+.download-subscription-list{display:flex;flex-direction:column;gap:10px;padding:12px 16px 16px}
+.download-subscription-item{
+  display:flex;gap:12px;align-items:flex-start;justify-content:space-between;min-width:0;
+  padding:12px 14px;border:1px solid var(--border-subtle);border-radius:var(--radius);
+  background:var(--bg-raised);
+}
+.download-subscription-main{display:grid;gap:4px;min-width:0;flex:1}
+.download-subscription-title{color:var(--text-1);font-size:var(--fs-body);font-weight:600}
+.download-subscription-meta{color:var(--text-2);font-size:var(--fs-small)}
+.download-subscription-path{
+  color:var(--text-3);font-size:var(--fs-small);font-family:var(--font-mono);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.download-subscription-error{color:var(--danger);font-size:var(--fs-small);overflow-wrap:anywhere}
+.download-subscription-item-actions{display:flex;gap:8px;align-items:center;flex-shrink:0}
+/* 手动请求的结果单独一行：和作品自己的状态分开显示，避免混成同一个结论。 */
+.download-day-post-attempt{color:var(--text-3);font-size:var(--fs-small)}
+/* 自动/手动：订阅自己的领取规则，和「启用」开关并排放在操作区，不占标题行。 */
+.download-subscription-mode{
+  display:flex;align-items:center;gap:6px;
+  color:var(--text-2);font-size:var(--fs-small);white-space:nowrap;
+}
+.download-subscription-mode select{
+  height:var(--control-height);min-height:var(--control-height);box-sizing:border-box;
+  background:var(--bg-raised);color:var(--text-1);border:1px solid var(--border-subtle);
+  border-radius:var(--radius);padding:0 8px;font-size:var(--fs-small);cursor:pointer;
+}
+.download-subscription-mode select:hover{border-color:var(--border-strong)}
+.download-subscription-mode select:disabled{opacity:.45;cursor:not-allowed;color:var(--text-2)}
+.download-subscription-mode select:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+/* 订阅覆盖率日历：53 周 × 7 天，颜色用面板自己的朱砂系，深浅代表还缺多少。
+   每周列固定 10px + 3px 间距，月份标题按列数分配 flex 权重，因此与网格对齐。 */
+.download-calendar{display:flex;flex-direction:column;gap:4px;padding:6px 0 2px;max-width:100%}
+/* Gutter + weeks sit in one grid: the weekday column and the week columns both
+   occupy row 2 with identical row sizing, so the labels cannot drift out of
+   line with the days. The month captions span row 1 over the weeks only. */
+/* overflow-y:hidden is deliberate: `overflow-x:auto` alone silently computes
+   overflow-y to auto as well, and the resulting vertical scrollbar sat on top of
+   the right-hand columns. The grid only ever scrolls sideways, and only when the
+   card is too narrow for 53 weeks. */
+.download-calendar-grid-wrap{
+  display:grid;grid-template-columns:auto max-content;
+  justify-content:start;width:max-content;max-width:100%;
+  grid-template-rows:auto auto;column-gap:6px;row-gap:4px;
+  overflow-x:auto;overflow-y:hidden;
+  scrollbar-width:thin;
+}
+.download-calendar-months{grid-column:2;grid-row:1;display:flex;color:var(--text-3);font-size:var(--fs-small);line-height:1.2}
+.download-calendar-month{min-width:0;overflow:visible;white-space:nowrap}
+.download-calendar-weekdays{
+  grid-column:1;grid-row:2;display:grid;grid-template-rows:repeat(7,10px);gap:3px;
+  color:var(--text-3);font-size:var(--fs-micro);
+}
+.download-calendar-weekday{
+  display:flex;align-items:center;justify-content:flex-end;
+  height:10px;line-height:1;overflow:visible;
+}
+.download-calendar-grid{grid-column:2;grid-row:2;display:flex;gap:3px}
+.download-calendar-week{display:grid;grid-template-rows:repeat(7,10px);gap:3px;flex:0 0 10px}
+/* Cells and legend swatches share one base. --bg-overlay keeps the empty grid
+   visible against the card (--bg-raised), and the 1px inset rule gives the empty
+   cells the same edge definition the filled ones get from their colour: without
+   it a pale cell's soft edge reads as a smaller dot than a saturated one, which
+   is what "the dots are different sizes" was. */
+.download-calendar-cell,
+.download-calendar-key i{
+  position:relative;display:block;width:10px;height:10px;
+  border-radius:var(--radius-sm);background:var(--bg-overlay);
+  box-shadow:inset 0 0 0 1px var(--border-subtle);
+}
+.download-calendar-cell::after,
+.download-calendar-key i::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;
+  background:var(--accent);opacity:0;
+}
+/* The ramp stops at .42 rather than fading to a near-invisible wash. Every cell
+   is an identical 10px box (measured: 371 cells, all 10x10 at whole-pixel
+   offsets), but a low-alpha fill has low edge contrast and so READS as a
+   smaller dot than a saturated one — four uneven-looking dot sizes instead of a
+   colour ramp. Keeping the lightest level at .42 gives every filled day a crisp
+   edge, so only the colour varies. */
+.download-calendar-cell[data-download-calendar-level="1"]::after,
+.download-calendar-key i[data-download-calendar-level="1"]::after{opacity:.42}
+.download-calendar-cell[data-download-calendar-level="2"]::after,
+.download-calendar-key i[data-download-calendar-level="2"]::after{opacity:.64}
+.download-calendar-cell[data-download-calendar-level="3"]::after,
+.download-calendar-key i[data-download-calendar-level="3"]::after{opacity:.84}
+.download-calendar-cell[data-download-calendar-level="4"]::after,
+.download-calendar-key i[data-download-calendar-level="4"]::after{opacity:1}
+.download-calendar-cell.is-future{background:transparent;box-shadow:none}
+.download-calendar-legend{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  color:var(--text-3);font-size:var(--fs-small);
+}
+.download-calendar-summary{color:var(--text-2)}
+.download-calendar-key{display:inline-flex;align-items:center;gap:4px}
+.download-log-list{
+  display:flex;flex-direction:column;gap:2px;padding:4px 16px 16px;
+  max-height:340px;overflow-y:auto;
+}
+.download-log-row{
+  position:relative;display:flex;gap:10px;align-items:baseline;min-width:0;
+  padding:6px 10px;border-radius:var(--radius);background:var(--bg-canvas);
+}
+/* Level reads from the same 2px left rule the operation log uses, so severity
+   is scannable without tinting the whole row. */
+.download-log-row::before{
+  content:'';position:absolute;left:0;top:0;bottom:0;width:2px;
+  background:var(--text-3);border-radius:var(--radius) 0 0 var(--radius);
+}
+.download-log-row[data-download-log-level="warn"]::before{background:var(--warn)}
+.download-log-row[data-download-log-level="error"]::before{background:var(--danger)}
+.download-log-time{
+  flex:0 0 auto;color:var(--text-3);font-size:var(--fs-small);font-family:var(--font-mono);
+  font-variant-numeric:tabular-nums;
+}
+.download-log-text{min-width:0;color:var(--text-2);font-size:var(--fs-small);overflow-wrap:anywhere}
+.download-log-who{color:var(--text-1)}
+.download-log-row[data-download-log-level="error"] .download-log-text{color:var(--danger)}
+/* A day with works opens its post list; a day without stays inert, so only the
+   cells that do something show the pointer. */
+.download-calendar-cell[data-download-day]{cursor:pointer}
+.download-calendar-cell.is-open::after{opacity:1}
+.download-day-posts{
+  display:flex;flex-direction:column;gap:4px;margin-top:8px;padding-top:8px;
+  border-top:1px solid var(--border-subtle);
+}
+.download-day-posts-head{color:var(--text-3);font-size:var(--fs-small)}
+.download-day-post{
+  display:flex;gap:10px;align-items:flex-start;justify-content:space-between;
+  padding:6px 10px;border-radius:var(--radius);background:var(--bg-canvas);
+}
+.download-day-post-main{min-width:0;flex:1}
+.download-day-post-title{color:var(--text-1);font-size:var(--fs-small);overflow-wrap:anywhere}
+.download-day-post-title a{color:inherit}
+.download-day-post-meta{color:var(--text-3);font-size:var(--fs-small);overflow-wrap:anywhere}
+/* 停止 / 文件 / 入库 joined 下载所选 and 校验 here in 1.0.378. Six controls do
+   not fit one line on a phone, and the mobile rule below right-aligns this row,
+   so without wrapping they overflow the *left* edge and become unclickable. */
+.download-day-post-actions{display:flex;gap:6px;align-items:center;flex:0 0 auto;flex-wrap:wrap}
+/* 单文件重试: the per-resource list under one work. Same card rhythm as the
+   candidate list; the row stacks on narrow screens like its neighbours. */
+.download-post-files{display:flex;flex-direction:column;gap:4px;margin-top:6px}
+.download-file-row{
+  display:flex;gap:8px;align-items:center;justify-content:space-between;min-width:0;
+  padding:6px 8px;border:1px solid var(--border-subtle);border-radius:var(--radius);
+  background:var(--bg-canvas);
+}
+.download-file-main{display:grid;gap:2px;min-width:0;flex:1}
+.download-file-name{color:var(--text-2);font-size:var(--fs-small);overflow-wrap:anywhere}
+.download-file-meta{color:var(--text-3);font-size:var(--fs-small);overflow-wrap:anywhere}
+.download-file-actions{display:flex;gap:6px;align-items:center;flex:0 0 auto}
+.download-file-linked{color:var(--ok);font-size:var(--fs-small);white-space:nowrap}
+.download-day-post-state{color:var(--text-2);font-size:var(--fs-small);white-space:nowrap}
+.download-day-post-state[data-download-post-state="unverified"],
+.download-day-post-state[data-download-post-state="unavailable"]{color:var(--warn)}
+.download-day-post-state[data-download-post-state="verified"],
+.download-day-post-state[data-download-post-state="confirmed"]{color:var(--ok)}
+.download-candidates{
+  display:flex;flex-direction:column;gap:2px;margin-top:4px;padding:4px 6px;
+  border-radius:var(--radius-sm);background:var(--bg-overlay);
+}
+.download-candidate{
+  display:flex;gap:8px;align-items:center;justify-content:space-between;min-width:0;
+}
+.download-candidate-path{
+  min-width:0;color:var(--text-3);font-size:var(--fs-small);font-family:var(--font-mono);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.download-candidate-size{flex:0 0 auto;color:var(--text-3);font-size:var(--fs-small)}
+/* 全部作品视图：跨订阅的筛选行、选择条与可勾选的作品行。 */
+.download-works-filters{
+  display:grid;grid-template-columns:minmax(180px,1.4fr) minmax(140px,1fr) minmax(140px,.8fr) minmax(120px,.7fr);
+  gap:10px;align-items:end;padding:12px 16px 4px;
+}
+.download-works-actions{
+  display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:8px 16px 12px;
+  border-bottom:1px solid var(--border-subtle);
+}
+.download-works-list{display:flex;flex-direction:column;gap:6px;padding:12px 16px 8px;max-height:min(60vh,540px);overflow-y:auto}
+.download-works-row{
+  display:flex;gap:10px;align-items:flex-start;min-width:0;padding:8px 10px;
+  border:1px solid var(--border-subtle);border-radius:var(--radius);background:var(--bg-raised);
+}
+.download-works-row.is-selected{border-color:var(--accent);background:var(--accent-soft)}
+.download-works-pick{
+  display:flex;align-items:center;justify-content:center;flex:0 0 auto;
+  width:34px;height:34px;margin:-4px 0;
+}
+.download-works-main{display:grid;gap:3px;min-width:0;flex:1}
+.download-works-title{color:var(--text-1);font-size:var(--fs-small);overflow-wrap:anywhere}
+.download-works-title a{color:inherit;text-decoration:none}
+.download-works-title a:hover{text-decoration:underline}
+.download-works-meta{color:var(--text-3);font-size:var(--fs-small);overflow-wrap:anywhere}
+.download-works-day-jump{appearance:none;background:transparent;border:0;padding:0;margin:0;font:inherit;color:inherit;cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+.download-works-day-jump:hover{color:var(--text-1)}
+.download-works-side{display:flex;gap:8px;align-items:center;flex:0 0 auto}
+.download-works-state{font-size:var(--fs-small);color:var(--text-2);white-space:nowrap}
+.download-works-state[data-download-post-state="unverified"],
+.download-works-state[data-download-post-state="unavailable"]{color:var(--warn)}
+.download-works-state[data-download-post-state="verified"],
+.download-works-state[data-download-post-state="confirmed"]{color:var(--ok)}
+.download-works-badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:var(--radius-pill);font-size:var(--fs-small);font-weight:var(--fw-medium);white-space:nowrap}
+.download-works-badge.is-missing{background:var(--accent-soft);color:var(--accent);border:1px solid var(--accent)}
+.download-works-badge.is-complete{background:var(--bg-canvas);color:var(--text-3);border:1px solid var(--border-subtle)}
+.download-works-badge.is-external{background:var(--bg-canvas);color:var(--text-2);border:1px dashed var(--border-subtle)}
+.browse-return-btn{font-weight:var(--fw-medium);font-size:var(--fs-small)}
+.download-works-more{display:flex;justify-content:center;padding:4px 16px 16px}
+.download-works-note{color:var(--text-3);font-size:var(--fs-small);padding:8px 16px 0}
+.download-works-error{color:var(--danger);font-size:var(--fs-small);padding:8px 16px 0;overflow-wrap:anywhere}
+@media(max-width:768px){
+  .download-option-row{gap:10px}
+  .download-interval-field{width:100%}
+  .download-type-field{width:100%}
+  .download-subscription-form{grid-template-columns:1fr}
+  .download-subscription-item{flex-direction:column}
+  /* Stacking the card left `align-items:flex-start` sizing the body to its
+     content, and the 53-week calendar cannot shrink below ~700px — so the whole
+     card grew past the viewport and everything to its right (including the
+     per-post buttons) was pushed off-screen. Pinning the body to the row width
+     and giving its single grid track a zero minimum hands the overflow back to
+     the calendar wrapper, which already scrolls sideways on purpose. */
+  .download-subscription-main{width:100%;grid-template-columns:minmax(0,1fr)}
+  .download-subscription-item-actions{width:100%;justify-content:flex-end}
+  .download-subscription-path{white-space:normal;overflow-wrap:anywhere}
+  .download-day-post{flex-direction:column}
+  /* Same reason as the subscription card above: stacking leaves the body sized
+     to its content, and a long candidate path is one unbreakable run. */
+  .download-day-post-main{width:100%}
+  .download-day-post-actions{width:100%;justify-content:flex-end}
+  .download-file-row{flex-wrap:wrap}
+  .download-works-filters{grid-template-columns:1fr}
+  .download-works-actions{gap:8px}
+  .download-works-row{flex-wrap:wrap}
+  .download-works-side{width:100%;justify-content:flex-end}
+}
+
+/* 网盘下载 — the local-bridge panel. Same card rhythm as the other download
+   lists; the job row stacks on narrow screens instead of scrolling sideways. */
+.netdisk-field-row{
+  display:flex;gap:16px;flex-wrap:wrap;align-items:end;padding:8px 16px 8px;
+}
+.netdisk-field-row .archive-field{flex:1 1 240px;min-width:0}
+.netdisk-number-field{flex:0 1 180px}
+.netdisk-actions{display:flex;gap:8px;flex-wrap:wrap;padding:8px 16px 12px}
+.netdisk-status{font-weight:600}
+.netdisk-status[data-netdisk-state="已连接"]{color:var(--ok)}
+.netdisk-status[data-netdisk-state="设备离线"],
+.netdisk-status[data-netdisk-state="凭据失效"],
+.netdisk-status[data-netdisk-state="路径不可用"]{color:var(--warn)}
+.netdisk-job-head,
+.download-subscription-head{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:4px 16px 0;flex-wrap:wrap;
+}
+.download-subscription-head input[type="search"]{flex:1 1 240px;max-width:320px;height:var(--control-height);padding:0 10px;border:1px solid var(--border-subtle);border-radius:var(--radius);background:var(--bg-raised);color:var(--text-1);font:inherit;font-size:var(--fs-small);box-sizing:border-box}
+.download-subscription-head input[type="search"]:focus{outline:none;border-color:var(--accent)}
+.filter-count{font-size:.85em;opacity:.8;font-weight:normal;margin-left:2px}
+.netdisk-jobs-fold-wrap,
+.download-subscriptions-fold-wrap,
+.download-log-fold-wrap,
+.operation-log-fold-wrap,
+.archive-plans-fold-wrap{display:flex;justify-content:center;padding:4px 16px 12px}
+.download-subscription-calendar-details{margin-top:4px}
+.download-subscription-calendar-summary{
+  cursor:pointer;color:var(--text-3);font-size:var(--fs-small);
+  user-select:none;display:inline-flex;align-items:center;gap:4px;margin-bottom:4px;
+}
+.download-subscription-calendar-summary:hover{color:var(--text-1)}
+.netdisk-job-list{display:flex;flex-direction:column;gap:6px;padding:8px 16px 16px}
+.netdisk-job-item{
+  display:flex;gap:10px;align-items:flex-start;min-width:0;padding:8px 10px;
+  border:1px solid var(--border-subtle);border-radius:var(--radius);background:var(--bg-raised);
+}
+.netdisk-job-main{display:grid;gap:3px;min-width:0;flex:1}
+.netdisk-job-title{color:var(--text-1);font-size:var(--fs-small);overflow-wrap:anywhere}
+.netdisk-job-meta{color:var(--text-3);font-size:var(--fs-small);overflow-wrap:anywhere}
+.netdisk-job-actions{display:flex;gap:6px;flex-wrap:wrap;flex:0 0 auto;justify-content:flex-end}
+.netdisk-script-box{padding:0 16px 12px}
+.netdisk-script-header{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.netdisk-script-text{
+  margin:8px 0 0;padding:10px 12px;max-height:280px;overflow:auto;
+  border:1px solid var(--border-subtle);border-radius:var(--radius);background:var(--bg-canvas);
+  color:var(--text-2);font-size:var(--fs-small);white-space:pre-wrap;overflow-wrap:anywhere;
+}
+.netdisk-dispatch-section{padding:0 16px 12px}
+.netdisk-dispatch-bar{display:flex;gap:8px;align-items:end;flex-wrap:wrap}
+.netdisk-dispatch-input-wrap{flex:1 1 280px;min-width:0}
+.netdisk-dispatch-preview{
+  margin:8px 0 0;padding:10px 12px;
+  border:1px solid var(--border-subtle);border-radius:var(--radius);background:var(--bg-canvas);
+  font-size:var(--fs-small);color:var(--text-2);line-height:1.5;
+}
+.netdisk-dispatch-preview strong{color:var(--text-1)}
+@media(max-width:768px){
+  .netdisk-field-row{gap:10px}
+  .netdisk-number-field{flex:1 1 140px}
+  .netdisk-job-item{flex-wrap:wrap}
+  .netdisk-job-actions{width:100%}
+  .netdisk-dispatch-bar{flex-direction:column;align-items:stretch}
+  /* The column direction turns the desktop flex-basis into a height; without
+     this reset the 280px stretches the label block and leaves a hole between
+     the label text and the input. */
+  .netdisk-dispatch-input-wrap{flex:0 0 auto}
 }

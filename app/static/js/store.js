@@ -2,38 +2,25 @@
 // C3 (G1) replaces the original single mutable state blob with three named
 // stores (browse / selection / maintenance). Every field is declared up front
 // and set/patch reject undeclared keys. The legacy `state` export is a
-// read-only proxy that resolves `state.field` into the matching domain so
+// read-write proxy that resolves `state.field` into the matching domain so
 // the existing call sites keep working without rewrites.
 //
 // Store API:
 //   store.get(key) / store.set(key, value) / store.patch({...})
-//   store.subscribe(listener) -> unsubscribe()
 //   store.keys() / store.fields() for inspection and tests.
 //
 // Request-sequence and busy-guard tools (nextRequestSeq, isCurrentRequestSeq,
 // setActionBusy, ...) still operate through the selection store, so they keep
 // the same observable behavior as before.
+//
+// There is deliberately no subscribe/emit: no product module ever subscribed,
+// and static controls bind their own DOM listeners (see events.js), so the
+// change-notification plumbing carried no consumer.
 
 const FIELDS = Symbol('fields');
-const LISTENERS = Symbol('listeners');
 
 function createStore(initial) {
   const fields = {...initial};
-  const listeners = new Set();
-
-  function emit(key, value) {
-    for (const listener of listeners) {
-      try {
-        listener(key, value, fields);
-      } catch (err) {
-        // Listener failures must not break the store contract; surface through
-        // the global error logger but keep other listeners running.
-        if (typeof globalThis !== 'undefined' && globalThis.console) {
-          globalThis.console.error('store listener failed:', err);
-        }
-      }
-    }
-  }
 
   function assertField(key) {
     if (!Object.prototype.hasOwnProperty.call(fields, key)) {
@@ -43,7 +30,6 @@ function createStore(initial) {
 
   return {
     [FIELDS]: fields,
-    [LISTENERS]: listeners,
     has(key) {
       return Object.prototype.hasOwnProperty.call(fields, key);
     },
@@ -59,9 +45,7 @@ function createStore(initial) {
     },
     set(key, value) {
       assertField(key);
-      const prev = fields[key];
       fields[key] = value;
-      if (!Object.is(prev, value)) emit(key, value);
       return value;
     },
     patch(updates) {
@@ -78,15 +62,7 @@ function createStore(initial) {
           changed.push(key);
         }
       }
-      for (const key of changed) emit(key, fields[key]);
       return changed;
-    },
-    subscribe(listener) {
-      if (typeof listener !== 'function') {
-        throw new Error('store.subscribe requires a function');
-      }
-      listeners.add(listener);
-      return () => listeners.delete(listener);
     },
   };
 }
@@ -131,6 +107,7 @@ const browse = createStore({
   urlRestoreSeq: 0,
   scanRefreshSeq: 0,
   browseUrlRestored: false,
+  returnToView: null,
   tags: [],
   tagSearchResults: [],
   folders: null,
@@ -227,9 +204,16 @@ const maintenance = createStore({
   artistFolderMoveLoading: false,
   artistFolderMoveError: '',
   artistFolderMoveParentPath: '',
-  artistFolderMoveDirectoryPath: '',
-  artistFolderMoveDirectoryEntries: [],
-  artistFolderMoveDirectoryLoading: false,
+  // One directory browser serves every caller that has to pick a folder under
+  // a media root (the artist move destination, a new subscription's parent).
+  // `directoryPickerPurpose` names which field the confirmed path lands in.
+  directoryPickerPurpose: '',
+  directoryPickerPath: '',
+  directoryPickerEntries: [],
+  directoryPickerLoading: false,
+  downloadArtistRoots: [],
+  downloadArtistRootIndex: 0,
+  downloadArtistParentPath: '',
   artistLinks: null,
   artistLinksLoading: false,
   artistLinksCategory: 'all',
@@ -263,6 +247,69 @@ const maintenance = createStore({
   errorArtistsLoading: false,
   errorArtistsScrollTop: 0,
   operationLog: null,
+  // 下载与订阅面板（Pawchive 订阅下载 + 命名模板）
+  downloadSettings: null,
+  downloadDefaults: null,
+  downloadSubscriptions: [],
+  downloadEvents: [],
+  downloadArtists: [],
+  downloadSyncStatus: null,
+  downloadLoading: false,
+  // The day whose post list is open under its subscription, and that list. The
+  // per-post verdicts are derived by the backend, so the panel shows what it
+  // last read rather than a guess made from the click.
+  downloadOpenDay: null,
+  downloadDayPosts: null,
+  // Candidate lists the panel has asked for, keyed by post id. Cleared for a
+  // post once its candidate is bound.
+  downloadCandidates: {},
+  // 全部作品视图：跨订阅的稳定游标列表、当前筛选、以及跨页选择。
+  // `downloadAllSelection` 是显式勾选的 post id；`downloadAllSelectAll` 表示
+  // 「当前筛选的全部作品」——它不是一个 id 列表，所以不能与前者混为一谈。
+  downloadAllWorks: null,
+  // Bumped when the panel is opened, so the 全部作品 list is re-read then and not
+  // on every auto-refresh tick; `...LoadedRevision` records what has been read.
+  downloadAllWorksRevision: 0,
+  downloadAllWorksLoadedRevision: 0,
+  downloadAllFilter: {subscriptionId: null, day: '', state: '', search: '', artistId: null},
+  downloadAllSelection: new Set(),
+  downloadAllSelectAll: false,
+  downloadAllSearchTimer: null,
+  downloadSyncPolling: false,
+  downloadSyncPollTimer: null,
+  downloadActiveTemplateInput: '',
+  // True while the settings form holds edits that have not been saved yet.
+  // The page auto-refresh re-reads the settings; without this it would
+  // repopulate the form from the server and silently drop those edits.
+  downloadSettingsDirty: false,
+  downloadSubscriptionSearch: '',
+  downloadLogExpanded: false,
+  operationHistoryExpanded: false,
+  archivePlansExpanded: false,
+  // 网盘下载面板（JDownloader 本地桥）。
+  netdiskSettings: null,
+  netdiskConnection: null,
+  netdiskJobs: [],
+  netdiskJobFilter: 'all',
+  netdiskJobsExpanded: false,
+  netdiskLoading: false,
+  // Same reason as `downloadSettingsDirty`: the maintenance page re-reads the
+  // panel on a timer, and repopulating the form on every tick would drop
+  // whatever the user has typed but not saved.
+  netdiskSettingsDirty: false,
+  // The generated pairing script and its token, held only in memory. The
+  // backend never returns the token again, so it is shown once and not kept in
+  // a store that a refresh could clear while the user is copying it.
+  netdiskScript: null,
+  // The netdisk panel's manual dispatch form: the post resolved from an id /
+  // link, or the raw link when it matches no library post. Held until submit
+  // or re-resolve so the busy submit button keeps its enabled state in sync.
+  netdiskResolvedPost: null,
+  netdiskResolvedLink: null,
+  // Per-work file lists for 单文件重试, keyed by post id. Read on demand: a
+  // subscription day can hold dozens of works and the list is only interesting
+  // once the user asks for one.
+  downloadPostFiles: {},
   _filterFocusReturn: null,
 });
 

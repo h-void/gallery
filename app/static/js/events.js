@@ -8,7 +8,7 @@ import { $, $$, debounce } from './utils.js';
 import { toast, logUiAction, collectUiLogContext } from './logging.js';
 import {
   restoreBrowseUrl, syncBrowseUrl, browseUrlParams, saveItemSort, saveItemDates,
-  getSavedTagSort, saveTagSort, loadArtists, closeArtistDropdown,
+  getSavedTagSort, saveTagSort, loadArtists, closeArtistDropdown, updateBrowseReturnButton,
 } from './router.js';
 import {
   syncFilterDrawer, openFilterDrawer, closeFilterDrawer, closeFilterDrawerIfMobile,
@@ -35,6 +35,7 @@ import {
   setEditMode, syncEditModeButton,
 } from './views/editbar.js';
 import { bindArtistLinks, bindArtistProfileLinks, renderArtistLinks, renderArtistProfileLinks, closeArtistLinksDialog } from './views/links.js';
+import { bindArchiveModal, closeArchiveModal } from './views/archive_modal.js';
 import {
   loadMoveWorkbench, refreshActiveMaintenanceView, startMaintenanceAutoRefresh,
   stopMaintenanceAutoRefresh, scheduleMaintenanceAutoRefresh, setMaintenanceView, syncMaintenanceTabsEdge, handleMaintenanceJump,
@@ -49,16 +50,47 @@ import {
   saveArchiveSettings, refreshArchivePlans, previewArchivePlans, applyArchiveTemplate, syncArchiveRuleDirtyState,
   scheduleArchiveDraftPreview, switchOrganizeArtist, stepOrganizeArtist,
   toggleAllArchivePlansConfirmation, executeArchivePlans, invalidateArtistFolderMovePreview,
-  previewArtistFolderMove, executeArtistFolderMove, openArtistFolderMoveDirectoryDialog,
-  closeArtistFolderMoveDirectoryDialog, chooseArtistFolderMoveDirectory, loadArtistFolderMoveDirectories,
+  previewArtistFolderMove, executeArtistFolderMove, openDirectoryPicker,
+  closeDirectoryPicker, chooseDirectoryPicker, loadDirectoryPicker, toggleArchivePlansFold,
 } from './views/maintenance/organize.js';
 import {
   rebuildCharacterIndex, importCharacterLibraryReferences, cancelCharacterImportJob,
   deleteCharacter, deleteCharacterReference, loadCharacterLibrary, renderCharacterLibrary,
   setCharacterLibraryMobileView, gotoCharacterLibraryPanel, openCharacterReferences,
   applyCharacterLibraryMobileView,
+  uploadCharacterReference, createCharacter,
 } from './views/maintenance/characters.js';
-import { loadRecycleBin, restoreRecycleEntry, setOperationHistoryFilter } from './views/maintenance/records.js';
+import {
+  loadRecycleBin, restoreRecycleEntry, purgeRecycleEntry, clearRecycleBin, setOperationHistoryFilter,
+  toggleOperationHistoryFold,
+} from './views/maintenance/records.js';
+import {
+  saveDownloadsSettings, resetDownloadTemplates, addDownloadSubscription, deleteDownloadSubscription,
+  toggleDownloadSubscription, setDownloadSubscriptionMode, startDownloadSync,
+  downloadPostByHand, insertDownloadTemplateToken, rememberDownloadTemplateInput,
+  downloadTemplateInputSelector, toggleDownloadType, openDownloadArtistCombo, closeDownloadArtistCombo,
+  pickDownloadArtist, renderDownloadArtistCombo, markDownloadSettingsDirty,
+  checkDownloadMissing, refreshDownloadLog, reconcileDownloadLibrary, openDownloadDay,
+  checkSubscriptionMissing, reconcileSubscriptionLibrary, renderDownloadArtistFolder,
+  loadMoreDownloadDayPosts, decideDownloadPost, loadDownloadCandidates,
+  bindDownloadCandidate, verifyDownloadPost, stopDownloadPost, importDownloadPost,
+  openDownloadPostFiles, retryDownloadFile, applyDownloadWorksFilter,
+  scheduleDownloadWorksSearch, toggleDownloadWorksSelectAll, clearDownloadWorksSelection,
+  loadMoreDownloadWorks, downloadWorksSelection, downloadWorksPost,
+  toggleDownloadWorkSelection, downloadWorksSelected,
+  openDownloadWorksArtistCombo, closeDownloadWorksArtistCombo,
+  pickDownloadWorksArtist, renderDownloadWorksArtistCombo,
+  jumpToDownloadWorkFolder,
+  deliverPostToNetdisk,
+  renderDownloadsPanel,
+  renderDownloadSubscriptions, setDownloadSubscriptionFilter, toggleDownloadSubscriptionsFold, toggleDownloadLogFold,
+} from './views/maintenance/downloads.js';
+import {
+  saveNetdiskSettings, testNetdiskConnection, checkNetdiskPaths, connectNetdisk, disconnectNetdisk,
+  generateNetdiskScript, resetNetdiskPairing, copyNetdiskScript, runNetdiskJobAction, markNetdiskSettingsDirty,
+  resolveNetdiskDispatchPost, submitNetdiskDispatch,
+  setNetdiskJobFilter, toggleNetdiskJobsFold,
+} from './views/maintenance/netdisk.js';
 import { toggleTheme, setThemeMode } from './views/theme.js';
 
 const DUPLICATES_VIEW_ACTIVE_REFRESH_MS = 10000;
@@ -89,6 +121,7 @@ export function applyMode(mode) {
   $('#searchOptionsBtn').disabled = isMoves;
   if (isMoves) closeSearchOptions();
   updateDuplicateFilesButton();
+  updateBrowseReturnButton();
   renderArtistLinks();
   renderArtistProfileLinks();
   renderLibraryEmptyState();
@@ -324,11 +357,82 @@ export async function refreshDuplicatesViewAutomatically() {
   }
 }
 
+// The 网盘下载 section under 下载. Everything here is one command the plan
+// names; there is deliberately no global speed limit, stop-downloader or
+// account management button, because those belong to the downloader itself.
+function bindNetdiskPanel() {
+  const saveBtn = $('#netdiskSaveBtn');
+  if (saveBtn) saveBtn.addEventListener('click', saveNetdiskSettings);
+  const testBtn = $('#netdiskTestBtn');
+  if (testBtn) testBtn.addEventListener('click', testNetdiskConnection);
+  const pathBtn = $('#netdiskPathCheckBtn');
+  if (pathBtn) pathBtn.addEventListener('click', checkNetdiskPaths);
+  const scriptBtn = $('#netdiskScriptBtn');
+  if (scriptBtn) scriptBtn.addEventListener('click', generateNetdiskScript);
+  const resetPairingBtn = $('#netdiskResetPairingBtn');
+  if (resetPairingBtn) resetPairingBtn.addEventListener('click', resetNetdiskPairing);
+  const scriptCopyBtn = $('#netdiskScriptCopyBtn');
+  if (scriptCopyBtn) scriptCopyBtn.addEventListener('click', copyNetdiskScript);
+  const disconnectBtn = $('#netdiskDisconnectBtn');
+  const connectBtn = $('#netdiskConnectBtn');
+  if (connectBtn) connectBtn.addEventListener('click', connectNetdisk);
+  if (disconnectBtn) disconnectBtn.addEventListener('click', disconnectNetdisk);
+
+  const resolveBtn = $('#netdiskDispatchResolveBtn');
+  if (resolveBtn) resolveBtn.addEventListener('click', resolveNetdiskDispatchPost);
+  const submitBtn = $('#netdiskDispatchSubmitBtn');
+  if (submitBtn) submitBtn.addEventListener('click', submitNetdiskDispatch);
+  const dispatchInput = $('#netdiskDispatchInput');
+  if (dispatchInput) {
+    dispatchInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        resolveNetdiskDispatchPost();
+      }
+    });
+  }
+
+  const panel = $('#netdiskPanel');
+  if (panel) {
+    // Same reason as the subscription settings: the page re-reads on a timer and
+    // must not overwrite edits the user has not saved.
+    for (const eventName of ['change', 'input']) {
+      panel.addEventListener(eventName, e => {
+        if (e?.target?.closest('#netdiskDispatchSection')) return;
+        markNetdiskSettingsDirty();
+      });
+    }
+    panel.addEventListener('click', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+      const tagBtn = target.closest('[data-netdisk-filter]');
+      if (tagBtn && panel.contains(tagBtn)) {
+        setNetdiskJobFilter(tagBtn.dataset.netdiskFilter || 'all');
+        return;
+      }
+      const foldBtn = target.closest('#netdiskJobsFoldBtn');
+      if (foldBtn && panel.contains(foldBtn)) {
+        toggleNetdiskJobsFold();
+        return;
+      }
+      const button = target.closest('[data-netdisk-job-action]');
+      if (!button || !panel.contains(button)) return;
+      runNetdiskJobAction(button.dataset.netdiskJob || '', button.dataset.netdiskJobAction);
+    });
+  }
+}
+
 export function bindEvents() {
   $('#mobileHeaderToggle').addEventListener('click', toggleMobileHeaderTools);
   syncMobileHeaderTools();
   syncSearchOptionsControl();
-  $('#editModeBtn').addEventListener('click', () => setEditMode(!state.editMode));
+  $('#editModeBtn').addEventListener('click', () => {
+    if (state.editMode || state.selectedIds.size > 0) {
+      setEditMode(false);
+    } else {
+      setEditMode(true);
+    }
+  });
   syncEditModeButton();
   $('#mobileFilterBtn').addEventListener('click', openFilterDrawer);
   $('#filterBackdrop').addEventListener('click', closeFilterDrawer);
@@ -527,6 +631,19 @@ export function bindEvents() {
       // stranding the check marks behind it.
       if (nextMode === 'moves') setEditMode(false);
       applyMode(nextMode);
+      syncBrowseUrl('push');
+    });
+  }
+
+  const browseReturnBtn = $('#browseReturnBtn');
+  if (browseReturnBtn) {
+    browseReturnBtn.addEventListener('click', () => {
+      const returnTarget = state.returnToView || 'downloads';
+      state.returnToView = null;
+      updateBrowseReturnButton();
+      applyMode('moves');
+      setMaintenanceView(returnTarget);
+      syncBrowseUrl('push');
     });
   }
 
@@ -541,6 +658,15 @@ export function bindEvents() {
       state.view = btn.dataset.view;
       syncBrowseUrl('push');
       renderGrid();
+    });
+  }
+
+  const desktopRatioToggle = $('#desktopRatioToggle');
+  if (desktopRatioToggle) {
+    desktopRatioToggle.addEventListener('click', e => {
+      const btn = e.target instanceof Element ? e.target.closest('button[data-card-ratio]') : null;
+      if (!btn || !desktopRatioToggle.contains(btn)) return;
+      setCardRatio(btn.dataset.cardRatio, true);
     });
   }
 
@@ -640,16 +766,344 @@ export function bindEvents() {
     const undo = target.closest('[data-archive-plan-undo]');
     if (undo && archivePlanList.contains(undo)) return void undoArchivePlan(undo.dataset.archivePlanUndo);
     const confirm = target.closest('[data-archive-plan-confirm]');
-    if (confirm && archivePlanList.contains(confirm)) toggleArchivePlanConfirmation(confirm.dataset.archivePlanConfirm);
+    if (confirm && archivePlanList.contains(confirm)) return void toggleArchivePlanConfirmation(confirm.dataset.archivePlanConfirm);
+    const jump = target.closest('[data-archive-plan-jump]');
+    if (jump && archivePlanList.contains(jump)) return void jumpToArchivePlanFolder(jump.dataset.archivePlanJump);
   });
+  const archivePlansFoldBtn = $('#archivePlansFoldBtn');
+  if (archivePlansFoldBtn) archivePlansFoldBtn.addEventListener('click', toggleArchivePlansFold);
+  bindNetdiskPanel();
+  const downloadSettingsSaveBtn = $('#downloadSettingsSaveBtn');
+  if (downloadSettingsSaveBtn) downloadSettingsSaveBtn.addEventListener('click', saveDownloadsSettings);
+  const downloadCheckBtn = $('#downloadCheckBtn');
+  if (downloadCheckBtn) downloadCheckBtn.addEventListener('click', checkDownloadMissing);
+  const downloadReconcileBtn = $('#downloadReconcileBtn');
+  if (downloadReconcileBtn) downloadReconcileBtn.addEventListener('click', reconcileDownloadLibrary);
+  const downloadLogRefreshBtn = $('#downloadLogRefreshBtn');
+  if (downloadLogRefreshBtn) downloadLogRefreshBtn.addEventListener('click', refreshDownloadLog);
+  const downloadLogFoldBtn = $('#downloadLogFoldBtn');
+  if (downloadLogFoldBtn) downloadLogFoldBtn.addEventListener('click', toggleDownloadLogFold);
+  const downloadSubSearch = $('#downloadSubscriptionSearch');
+  if (downloadSubSearch) {
+    downloadSubSearch.addEventListener('input', e => {
+      state.downloadSubscriptionSearch = e.target.value;
+      renderDownloadSubscriptions();
+    });
+  }
+  const downloadSettingsPanel = $('#downloadSettingsPanel');
+  if (downloadSettingsPanel) {
+    downloadSettingsPanel.addEventListener('click', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      const segment = target?.closest('[data-download-type]');
+      if (segment && downloadSettingsPanel.contains(segment)) {
+        toggleDownloadType(segment.dataset.downloadType);
+      }
+    });
+    // Any hand edit to the switches, interval or template fields marks the form
+    // dirty, so the page auto-refresh stops repopulating it from the server.
+    for (const eventName of ['change', 'input']) {
+      downloadSettingsPanel.addEventListener(eventName, () => markDownloadSettingsDirty());
+    }
+  }
+  const downloadTemplateResetBtn = $('#downloadTemplateResetBtn');
+  if (downloadTemplateResetBtn) downloadTemplateResetBtn.addEventListener('click', resetDownloadTemplates);
+  const downloadSubscriptionForm = $('#downloadSubscriptionForm');
+  if (downloadSubscriptionForm) {
+    downloadSubscriptionForm.addEventListener('submit', e => {
+      e.preventDefault();
+      addDownloadSubscription();
+    });
+  }
+  const downloadSyncBtn = $('#downloadSyncBtn');
+  if (downloadSyncBtn) downloadSyncBtn.addEventListener('click', startDownloadSync);
+  const downloadArtistInput = $('#downloadSubscriptionArtistInput');
+  if (downloadArtistInput) {
+    downloadArtistInput.addEventListener('focus', openDownloadArtistCombo);
+    downloadArtistInput.addEventListener('input', () => {
+      // Typing clears a previous pick: the box is a search again, not a name.
+      const hidden = $('#downloadSubscriptionArtistSelect');
+      if (hidden) hidden.value = '';
+      openDownloadArtistCombo();
+    });
+    downloadArtistInput.addEventListener('keydown', e => {
+      if (e.key === 'Escape') closeDownloadArtistCombo();
+    });
+  }
+  const downloadArtistListbox = $('#downloadSubscriptionArtistListbox');
+  if (downloadArtistListbox) {
+    downloadArtistListbox.addEventListener('click', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      const option = target?.closest('[data-download-artist-value]');
+      if (option && downloadArtistListbox.contains(option)) {
+        pickDownloadArtist(option.dataset.downloadArtistValue);
+        renderDownloadArtistCombo();
+      }
+    });
+  }
+  const downloadSubscriptionRoot = $('#downloadSubscriptionRoot');
+  if (downloadSubscriptionRoot) {
+    // A different root invalidates the picked parent: a relative path means a
+    // different folder under a different root.
+    downloadSubscriptionRoot.addEventListener('change', () => {
+      state.downloadArtistRootIndex = Number(downloadSubscriptionRoot.value) || 0;
+      state.downloadArtistParentPath = '';
+      renderDownloadArtistFolder();
+    });
+  }
+  const downloadSubscriptionFolderBrowseBtn = $('#downloadSubscriptionFolderBrowseBtn');
+  if (downloadSubscriptionFolderBrowseBtn) {
+    downloadSubscriptionFolderBrowseBtn.addEventListener('click', () => openDirectoryPicker('downloadArtist', downloadSubscriptionFolderBrowseBtn));
+  }
+  document.addEventListener('click', e => {
+    const target = e.target instanceof Element ? e.target : null;
+    if (!target?.closest('#downloadWorksArtistCombo')) closeDownloadWorksArtistCombo();
+    if (!target?.closest('.download-subscription-artist .download-artist-combo')) closeDownloadArtistCombo();
+  });
+  // Remember which template input the variable chips should insert into: the
+  // chips sit below all three fields, so the caret target is ambiguous.
+  for (const inputId of ['folder', 'image', 'attachment']) {
+    const selector = downloadTemplateInputSelector(inputId);
+    const input = selector ? $(selector) : null;
+    if (input) input.addEventListener('focus', () => rememberDownloadTemplateInput(inputId));
+  }
+  $$('.download-token-strip [data-download-token]').forEach(token => {
+    token.addEventListener('click', () => {
+      insertDownloadTemplateToken(token.dataset.downloadToken || token.textContent || '');
+    });
+  });
+  const downloadSubscriptionList = $('#downloadSubscriptionList');
+  if (downloadSubscriptionList) {
+    // A day cell is a span with `role="button"`, so it needs the key handling a
+    // real button would have given it for free.
+    const activateDay = target => {
+      const day = target.closest('[data-download-day]');
+      if (!day || !downloadSubscriptionList.contains(day)) return false;
+      const item = day.closest('[data-download-subscription]');
+      if (!item) return false;
+      openDownloadDay(item.dataset.downloadSubscription, day.dataset.downloadDay);
+      return true;
+    };
+    downloadSubscriptionList.addEventListener('click', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+      const remove = target.closest('[data-download-subscription-delete]');
+      if (remove && downloadSubscriptionList.contains(remove)) {
+        deleteDownloadSubscription(remove.dataset.downloadSubscriptionDelete);
+        return;
+      }
+      // Per-artist halves of 立即操作: same rounds, one subscription.
+      const subCheck = target.closest('[data-download-subscription-check]');
+      if (subCheck && downloadSubscriptionList.contains(subCheck)) {
+        checkSubscriptionMissing(subCheck.dataset.downloadSubscriptionCheck);
+        return;
+      }
+      const subReconcile = target.closest('[data-download-subscription-reconcile]');
+      if (subReconcile && downloadSubscriptionList.contains(subReconcile)) {
+        reconcileSubscriptionLibrary(subReconcile.dataset.downloadSubscriptionReconcile);
+        return;
+      }
+      const decision = target.closest('[data-download-post-decision]');
+      if (decision && downloadSubscriptionList.contains(decision)) {
+        decideDownloadPost(decision.dataset.downloadPostId, decision.dataset.downloadPostDecision);
+        return;
+      }
+      const bind = target.closest('[data-download-post-candidate-bind]');
+      if (bind && downloadSubscriptionList.contains(bind)) {
+        bindDownloadCandidate(bind.dataset.downloadPostCandidateBind, bind.dataset.downloadCandidatePath);
+        return;
+      }
+      // 停止 / 单文件重试 / 手动导入. Each is one work's own instruction, so
+      // they sit next to the work rather than in the panel header.
+      const stopPost = target.closest('[data-download-post-stop]');
+      if (stopPost && downloadSubscriptionList.contains(stopPost)) {
+        stopDownloadPost(stopPost.dataset.downloadPostStop);
+        return;
+      }
+      const importPost = target.closest('[data-download-post-import]');
+      if (importPost && downloadSubscriptionList.contains(importPost)) {
+        importDownloadPost(importPost.dataset.downloadPostImport);
+        return;
+      }
+      const postFiles = target.closest('[data-download-post-files]');
+      if (postFiles && downloadSubscriptionList.contains(postFiles)) {
+        openDownloadPostFiles(postFiles.dataset.downloadPostFiles);
+        return;
+      }
+      const fileRetry = target.closest('[data-download-file-retry]');
+      if (fileRetry && downloadSubscriptionList.contains(fileRetry)) {
+        retryDownloadFile(fileRetry.dataset.downloadFilePost, fileRetry.dataset.downloadFileRetry);
+        return;
+      }
+      const verify = target.closest('[data-download-post-verify]');
+      if (verify && downloadSubscriptionList.contains(verify)) {
+        verifyDownloadPost(verify.dataset.downloadPostVerify);
+        return;
+      }
+      const candidates = target.closest('[data-download-post-candidates]');
+      if (candidates && downloadSubscriptionList.contains(candidates)) {
+        loadDownloadCandidates(candidates.dataset.downloadPostCandidates);
+        return;
+      }
+      if (target.closest('[data-download-day-more]')) {
+        loadMoreDownloadDayPosts();
+        return;
+      }
+      activateDay(target);
+    });
+    downloadSubscriptionList.addEventListener('keydown', e => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target || !activateDay(target)) return;
+      e.preventDefault();
+    });
+    downloadSubscriptionList.addEventListener('click', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+      const fetch = target.closest('[data-download-post-fetch]');
+      if (fetch && downloadSubscriptionList.contains(fetch)) {
+        downloadPostByHand(fetch.dataset.downloadPostFetch);
+      }
+    });
+    downloadSubscriptionList.addEventListener('change', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+      const mode = target.closest('[data-download-subscription-mode]');
+      if (mode && downloadSubscriptionList.contains(mode)) {
+        setDownloadSubscriptionMode(mode.dataset.downloadSubscriptionMode, mode.value);
+        return;
+      }
+      const toggle = target.closest('[data-download-subscription-toggle]');
+      if (toggle && downloadSubscriptionList.contains(toggle)) {
+        toggleDownloadSubscription(toggle.dataset.downloadSubscriptionToggle, toggle.checked);
+      }
+    });
+  }
+  const downloadWorksPanel = $('#downloadWorksPanel');
+  if (downloadWorksPanel) {
+    downloadWorksPanel.addEventListener('click', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+      const pick = target.closest('[data-download-works-pick]');
+      if (pick && downloadWorksPanel.contains(pick)) {
+        toggleDownloadWorkSelection(pick.dataset.downloadWorksPick, pick.checked);
+        return;
+      }
+      const dayJump = target.closest('[data-download-works-jump-day]');
+      if (dayJump && downloadWorksPanel.contains(dayJump)) {
+        jumpToDownloadWorkFolder(
+          dayJump.dataset.downloadWorksJumpArtist,
+          dayJump.dataset.downloadWorksJumpDay,
+          dayJump.dataset.downloadWorksJumpTitle || ''
+        );
+        return;
+      }
+      const fetch = target.closest('[data-download-works-fetch]');
+      if (fetch && downloadWorksPanel.contains(fetch)) {
+        downloadWorksPost(fetch.dataset.downloadWorksFetch);
+        return;
+      }
+      const netdisk = target.closest('[data-download-works-netdisk]');
+      if (netdisk && downloadWorksPanel.contains(netdisk)) {
+        deliverPostToNetdisk(netdisk.dataset.downloadWorksNetdisk);
+        return;
+      }
+    });
+    const downloadWorksList = $('#downloadWorksList');
+    if (downloadWorksList) {
+      downloadWorksList.addEventListener('scroll', () => {
+        if (downloadWorksList.scrollTop + downloadWorksList.clientHeight >= downloadWorksList.scrollHeight - 150) {
+          if (!state.downloadAllWorks?.loading && state.downloadAllWorks?.next_cursor) {
+            loadMoreDownloadWorks();
+          }
+        }
+      });
+    }
+    const downloadWorksArtistInput = $('#downloadWorksArtistInput');
+    if (downloadWorksArtistInput) {
+      downloadWorksArtistInput.addEventListener('focus', openDownloadWorksArtistCombo);
+      downloadWorksArtistInput.addEventListener('input', () => {
+        const hidden = $('#downloadWorksArtist');
+        if (hidden && !downloadWorksArtistInput.value.trim()) {
+          hidden.value = '';
+          applyDownloadWorksFilter({artistId: null});
+        }
+        openDownloadWorksArtistCombo();
+      });
+      downloadWorksArtistInput.addEventListener('keydown', e => {
+        if (e.key === 'Escape') closeDownloadWorksArtistCombo();
+      });
+    }
+    const downloadWorksArtistListbox = $('#downloadWorksArtistListbox');
+    if (downloadWorksArtistListbox) {
+      downloadWorksArtistListbox.addEventListener('click', e => {
+        const target = e.target instanceof Element ? e.target : null;
+        const option = target?.closest('[data-download-works-artist-value]');
+        if (option && downloadWorksArtistListbox.contains(option)) {
+          pickDownloadWorksArtist(option.dataset.downloadWorksArtistValue, option.textContent);
+        }
+      });
+    }
+    downloadWorksPanel.addEventListener('change', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+      const pick = target.closest('[data-download-works-pick]');
+      if (pick && downloadWorksPanel.contains(pick)) {
+        toggleDownloadWorkSelection(pick.dataset.downloadWorksPick, pick.checked);
+        return;
+      }
+      const selectAll = target.closest('#downloadWorksSelectAll');
+      if (selectAll && downloadWorksPanel.contains(selectAll)) {
+        toggleDownloadWorksSelectAll(selectAll.checked);
+        return;
+      }
+      const artist = target.closest('#downloadWorksArtist');
+      if (artist && downloadWorksPanel.contains(artist)) {
+        applyDownloadWorksFilter({artistId: artist.value ? Number(artist.value) : null});
+        return;
+      }
+      const day = target.closest('#downloadWorksDay');
+      if (day && downloadWorksPanel.contains(day)) {
+        applyDownloadWorksFilter({day: day.value || ''});
+        return;
+      }
+      const stateFilter = target.closest('#downloadWorksState');
+      if (stateFilter && downloadWorksPanel.contains(stateFilter)) {
+        applyDownloadWorksFilter({state: stateFilter.value || ''});
+      }
+    });
+    downloadWorksPanel.addEventListener('input', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+      // The search box re-reads after the typing stops; the other controls are
+      // discrete and commit on `change`.
+      if (target.closest('#downloadWorksSearch')) scheduleDownloadWorksSearch(target.value);
+    });
+  }
+  const downloadWorksClearBtn = $('#downloadWorksClearBtn');
+  if (downloadWorksClearBtn) {
+    downloadWorksClearBtn.addEventListener('click', () => clearDownloadWorksSelection());
+  }
+  const downloadWorksDownloadBtn = $('#downloadWorksDownloadBtn');
+  if (downloadWorksDownloadBtn) {
+    downloadWorksDownloadBtn.addEventListener('click', () => downloadWorksSelection(downloadWorksSelected()));
+  }
   const recycleRefreshBtn = $('#recycleRefreshBtn');
   if (recycleRefreshBtn) recycleRefreshBtn.addEventListener('click', () => loadRecycleBin());
+  const recycleClearBtn = $('#recycleClearBtn');
+  if (recycleClearBtn) recycleClearBtn.addEventListener('click', () => clearRecycleBin());
   const operationHistoryPanel = $('#operationHistoryPanel');
   if (operationHistoryPanel) {
     operationHistoryPanel.addEventListener('click', e => {
-      const btn = e.target instanceof Element ? e.target.closest('[data-operation-filter]') : null;
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+      const btn = target.closest('[data-operation-filter]');
       if (btn && operationHistoryPanel.contains(btn)) {
         setOperationHistoryFilter(btn.dataset.operationFilter || 'all');
+        return;
+      }
+      const foldBtn = target.closest('#operationSuccessFoldBtn');
+      if (foldBtn && operationHistoryPanel.contains(foldBtn)) {
+        toggleOperationHistoryFold();
       }
     });
   }
@@ -666,30 +1120,32 @@ export function bindEvents() {
   const artistFolderMoveDestination = $('#artistFolderMoveDestination');
   if (artistFolderMoveDestination) artistFolderMoveDestination.addEventListener('input', invalidateArtistFolderMovePreview);
   const artistFolderMoveBrowseBtn = $('#artistFolderMoveBrowseBtn');
-  if (artistFolderMoveBrowseBtn) artistFolderMoveBrowseBtn.addEventListener('click', () => openArtistFolderMoveDirectoryDialog(artistFolderMoveBrowseBtn));
+  if (artistFolderMoveBrowseBtn) artistFolderMoveBrowseBtn.addEventListener('click', () => openDirectoryPicker('artistMove', artistFolderMoveBrowseBtn));
   const artistFolderMoveExecuteBtn = $('#artistFolderMoveExecuteBtn');
   if (artistFolderMoveExecuteBtn) artistFolderMoveExecuteBtn.addEventListener('click', executeArtistFolderMove);
   const artistFolderMoveDirectoryDialog = $('#artistFolderMoveDirectoryDialog');
   if (artistFolderMoveDirectoryDialog) {
-    artistFolderMoveDirectoryDialog.addEventListener('cancel', event => { event.preventDefault(); closeArtistFolderMoveDirectoryDialog(); });
-    artistFolderMoveDirectoryDialog.addEventListener('click', event => { if (event.target === artistFolderMoveDirectoryDialog) closeArtistFolderMoveDirectoryDialog(); });
+    artistFolderMoveDirectoryDialog.addEventListener('cancel', event => { event.preventDefault(); closeDirectoryPicker(); });
+    artistFolderMoveDirectoryDialog.addEventListener('click', event => { if (event.target === artistFolderMoveDirectoryDialog) closeDirectoryPicker(); });
   }
   const artistFolderMoveDirectoryCloseBtn = $('#artistFolderMoveDirectoryCloseBtn');
-  if (artistFolderMoveDirectoryCloseBtn) artistFolderMoveDirectoryCloseBtn.addEventListener('click', closeArtistFolderMoveDirectoryDialog);
+  if (artistFolderMoveDirectoryCloseBtn) artistFolderMoveDirectoryCloseBtn.addEventListener('click', closeDirectoryPicker);
   const artistFolderMoveDirectoryUpBtn = $('#artistFolderMoveDirectoryUpBtn');
-  if (artistFolderMoveDirectoryUpBtn) artistFolderMoveDirectoryUpBtn.addEventListener('click', () => loadArtistFolderMoveDirectories(state.artistFolderMoveDirectoryPath.split('/').slice(0, -1).join('/')));
+  if (artistFolderMoveDirectoryUpBtn) artistFolderMoveDirectoryUpBtn.addEventListener('click', () => loadDirectoryPicker(state.directoryPickerPath.split('/').slice(0, -1).join('/')));
   const artistFolderMoveDirectorySelectBtn = $('#artistFolderMoveDirectorySelectBtn');
-  if (artistFolderMoveDirectorySelectBtn) artistFolderMoveDirectorySelectBtn.addEventListener('click', chooseArtistFolderMoveDirectory);
+  if (artistFolderMoveDirectorySelectBtn) artistFolderMoveDirectorySelectBtn.addEventListener('click', chooseDirectoryPicker);
   const artistFolderMoveDirectoryList = $('#artistFolderMoveDirectoryList');
   if (artistFolderMoveDirectoryList) artistFolderMoveDirectoryList.addEventListener('click', event => {
     const target = event.target instanceof Element ? event.target.closest('[data-artist-folder-directory]') : null;
-    if (target && artistFolderMoveDirectoryList.contains(target)) loadArtistFolderMoveDirectories([state.artistFolderMoveDirectoryPath, target.dataset.artistFolderDirectory].filter(Boolean).join('/'));
+    if (target && artistFolderMoveDirectoryList.contains(target)) loadDirectoryPicker([state.directoryPickerPath, target.dataset.artistFolderDirectory].filter(Boolean).join('/'));
   });
   const recycleBinList = $('#recycleBinList');
   if (recycleBinList) recycleBinList.addEventListener('click', e => {
     const target = e.target instanceof Element ? e.target : null;
     const restore = target ? target.closest('[data-recycle-restore]') : null;
-    if (restore && recycleBinList.contains(restore)) restoreRecycleEntry(restore.dataset.recycleRestore);
+    if (restore && recycleBinList.contains(restore)) return void restoreRecycleEntry(restore.dataset.recycleRestore);
+    const purge = target ? target.closest('[data-recycle-purge]') : null;
+    if (purge && recycleBinList.contains(purge)) return void purgeRecycleEntry(purge.dataset.recyclePurge);
   });
   const recycleBinMore = $('#recycleBinMore');
   if (recycleBinMore) recycleBinMore.addEventListener('click', e => {
@@ -697,7 +1153,8 @@ export function bindEvents() {
     const more = target ? target.closest('[data-recycle-load-more]') : null;
     if (more && recycleBinMore.contains(more)) loadRecycleBin({append: true});
   });
-  $('#characterImportBtn').addEventListener('click', () => {
+  const characterImportBtn = $('#characterImportBtn');
+  if (characterImportBtn) characterImportBtn.addEventListener('click', () => {
     const scope = $('#characterImportScopeSelect')?.value === 'all' ? 'all' : 'artist';
     if (scope === 'artist' && !state.currentArtist) {
       toast('请先在上方选择画师', 'error');
@@ -711,6 +1168,66 @@ export function bindEvents() {
     });
   });
   $('#characterRebuildIndexBtn').addEventListener('click', rebuildCharacterIndex);
+
+  const characterCreateBtn = $('#characterCreateBtn');
+  const characterCreateBox = $('#characterCreateBox');
+  const characterCreateInput = $('#characterCreateInput');
+  const characterCreateConfirmBtn = $('#characterCreateConfirmBtn');
+  const characterCreateCancelBtn = $('#characterCreateCancelBtn');
+
+  function openCharacterCreate() {
+    if (!characterCreateBox || !characterCreateInput) return;
+    characterCreateBox.hidden = false;
+    characterCreateInput.value = '';
+    characterCreateInput.focus();
+  }
+
+  function closeCharacterCreate() {
+    if (!characterCreateBox || !characterCreateInput) return;
+    characterCreateBox.hidden = true;
+    characterCreateInput.value = '';
+  }
+
+  async function handleCharacterCreate() {
+    if (!characterCreateInput) return;
+    const name = characterCreateInput.value.trim();
+    if (!name) {
+      toast('请输入角色名称', 'warning');
+      characterCreateInput.focus();
+      return;
+    }
+    const result = await createCharacter(name);
+    if (result) {
+      closeCharacterCreate();
+    }
+  }
+
+  if (characterCreateBtn) {
+    characterCreateBtn.addEventListener('click', () => {
+      if (characterCreateBox && !characterCreateBox.hidden) {
+        closeCharacterCreate();
+      } else {
+        openCharacterCreate();
+      }
+    });
+  }
+  if (characterCreateConfirmBtn) {
+    characterCreateConfirmBtn.addEventListener('click', handleCharacterCreate);
+  }
+  if (characterCreateCancelBtn) {
+    characterCreateCancelBtn.addEventListener('click', closeCharacterCreate);
+  }
+  if (characterCreateInput) {
+    characterCreateInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        handleCharacterCreate();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeCharacterCreate();
+      }
+    });
+  }
   const characterImportScopeSelect = $('#characterImportScopeSelect');
   if (characterImportScopeSelect) {
     characterImportScopeSelect.addEventListener('change', () => renderCharacterLibrary());
@@ -745,6 +1262,17 @@ export function bindEvents() {
       const target = e.target instanceof Element ? e.target : null;
       const cancelBtn = target ? target.closest('[data-character-import-cancel]') : null;
       if (cancelBtn && characterTagImportList.contains(cancelBtn)) {
+        cancelCharacterImportJob(cancelBtn.dataset.characterImportCancel);
+        return;
+      }
+    });
+  }
+  const characterImportJobContainer = $('#characterImportJobContainer');
+  if (characterImportJobContainer) {
+    characterImportJobContainer.addEventListener('click', e => {
+      const target = e.target instanceof Element ? e.target : null;
+      const cancelBtn = target ? target.closest('[data-character-import-cancel]') : null;
+      if (cancelBtn && characterImportJobContainer.contains(cancelBtn)) {
         cancelCharacterImportJob(cancelBtn.dataset.characterImportCancel);
         return;
       }
@@ -788,8 +1316,15 @@ export function bindEvents() {
     characterList.addEventListener('click', e => {
       const target = e.target instanceof Element ? e.target : null;
       const gotoBtn = target ? target.closest('[data-character-library-goto]') : null;
-      if (!gotoBtn || !characterList.contains(gotoBtn)) return;
-      gotoCharacterLibraryPanel(gotoBtn.dataset.characterLibraryGoto);
+      if (gotoBtn && characterList.contains(gotoBtn)) {
+        gotoCharacterLibraryPanel(gotoBtn.dataset.characterLibraryGoto);
+        return;
+      }
+      const createTrigger = target ? target.closest('[data-character-create-trigger]') : null;
+      if (createTrigger && characterList.contains(createTrigger)) {
+        openCharacterCreate();
+        return;
+      }
     });
   }
   const characterLibraryViews = $('#characterLibraryViews');
@@ -805,6 +1340,26 @@ export function bindEvents() {
   if (characterLibraryBackBtn) {
     characterLibraryBackBtn.addEventListener('click', () => {
       setCharacterLibraryMobileView('characters');
+    });
+  }
+  const characterReferenceUploadBtn = $('#characterReferenceUploadBtn');
+  const characterReferenceUploadInput = $('#characterReferenceUploadInput');
+  if (characterReferenceUploadBtn && characterReferenceUploadInput) {
+    characterReferenceUploadBtn.addEventListener('click', () => {
+      if (!state.characterLibrarySelectedCharacterId) {
+        toast('请先选择角色', 'error');
+        return;
+      }
+      characterReferenceUploadInput.click();
+    });
+    characterReferenceUploadInput.addEventListener('change', () => {
+      const file = characterReferenceUploadInput.files && characterReferenceUploadInput.files[0];
+      // Clear before uploading, otherwise re-picking the same file never fires
+      // `change` again.
+      characterReferenceUploadInput.value = '';
+      if (file) {
+        uploadCharacterReference(state.characterLibrarySelectedCharacterId, file);
+      }
     });
   }
   const characterReferenceList = $('#characterReferenceList');
@@ -1155,12 +1710,17 @@ export function bindEvents() {
   });
   bindArtistLinks();
   bindArtistProfileLinks();
+  bindArchiveModal();
 }
 
 function closeTopmostOverlay() {
   const artistLinksDialog = $('.artist-links-dialog[open]');
   if (artistLinksDialog) {
-    closeArtistLinksDialog(artistLinksDialog);
+    if (artistLinksDialog.id === 'archiveDialog') {
+      closeArchiveModal();
+    } else {
+      closeArtistLinksDialog(artistLinksDialog);
+    }
     return true;
   }
   if ($('#lightbox').style.display === 'flex') {
@@ -1187,7 +1747,7 @@ function closeTopmostOverlay() {
     closeMobileHeaderTools();
     return true;
   }
-  if (state.editMode) {
+  if (state.editMode || state.selectedIds.size > 0) {
     setEditMode(false);
     return true;
   }
@@ -1204,6 +1764,6 @@ import {
   openEditTagPicker, selectFirstEditTagResult, classifyItems, classifyFolder, currentEditArtistId,
 } from './views/editbar.js';
 import {
-  toggleArchivePlanConfirmation, undoArchivePlan,
+  toggleArchivePlanConfirmation, undoArchivePlan, jumpToArchivePlanFolder,
 } from './views/maintenance/organize.js';
 import { isActionBusy, setActionBusy } from './store.js';

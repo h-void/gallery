@@ -66,6 +66,20 @@ export const API = {
     });
     return this.parseResponse(r);
   },
+  // Raw-body upload: the File is the request body, so there is no JSON encoding
+  // and the server, not a multipart boundary, decides the type from the bytes.
+  // No `keepalive` either: it is capped at 64 KiB and throws on a real photo.
+  async postFile(path, file, options = {}) {
+    const {timeoutMs = 60000, ...rest} = options;
+    const r = await fetchWithTimeout(path, {
+      method:'POST',
+      headers:{'Content-Type': (file && file.type) || 'application/octet-stream'},
+      body: file,
+      timeoutMs,
+      ...rest
+    });
+    return this.parseResponse(r);
+  },
   async del(path) {
     const r = await fetchWithTimeout(path, {method:'DELETE'});
     return this.parseResponse(r);

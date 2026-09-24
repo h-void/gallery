@@ -22,10 +22,8 @@ pub fn character_recognition_status(conn: &Connection) -> Result<Value> {
     let enabled = env_bool("CHARACTER_RECOGNITION_ENABLED", true);
     let model_path = crate::character_ccip::character_model_path();
     let present = model_path.is_file();
-    let variant =
-        std::env::var("CHARACTER_MODEL_VARIANT").unwrap_or_else(|_| "ccip-caformer_b36-24".into());
-    let model_file =
-        std::env::var("CHARACTER_MODEL_FILE").unwrap_or_else(|_| "model_feat.onnx".into());
+    let variant = crate::model_config::character_model_variant();
+    let model_file = crate::model_config::character_model_file();
     let (indexed_characters, indexed_references): (i64, i64) = (
         conn.query_row("SELECT COUNT(*) FROM characters", [], |r| r.get(0))
             .unwrap_or(0),
@@ -79,10 +77,10 @@ pub fn character_recognition_status(conn: &Connection) -> Result<Value> {
         "reason": reason,
         "backend": "onnxruntime",
         "provider": provider,
-        "requested_provider": std::env::var("CHARACTER_RECOGNITION_PROVIDER").unwrap_or_else(|_| "auto".into()),
+        "requested_provider": crate::model_config::requested_provider_raw(),
         "allow_cpu_fallback": crate::character_ccip::allow_cpu_fallback(),
         "active_device": active_device,
-        "openvino_device": std::env::var("CHARACTER_OPENVINO_DEVICE").unwrap_or_else(|_| "GPU".into()),
+        "openvino_device": crate::model_config::openvino_device_type(),
         "gpu_access": gpu_access,
         "model_variant": variant,
         "model_file": model_file,
@@ -120,11 +118,20 @@ pub fn artist_recognition_status() -> Value {
         .filter(|m| m["present"] == false)
         .filter_map(|m| m["file"].as_str().map(|s| s.to_string()))
         .collect();
-    let available = enabled && missing.is_empty();
+    // Artist recognition has no native inference pipeline wired in pure-Rust runtime.
+    // Model files existing on disk do not report ready without an inference chain.
+    let available = false;
+    let reason = if !enabled {
+        "disabled"
+    } else if !missing.is_empty() {
+        "missing_models"
+    } else {
+        "no_inference_pipeline"
+    };
     json!({
         "enabled": enabled,
         "available": available,
-        "reason": if !enabled { "disabled" } else if missing.is_empty() { "ready" } else { "missing_models" },
+        "reason": reason,
         "backend": "onnxruntime-rust",
         "model_dir": model_dir,
         "models": models,
@@ -135,16 +142,14 @@ pub fn artist_recognition_status() -> Value {
 }
 
 pub fn character_model_signature() -> Value {
-    let variant =
-        std::env::var("CHARACTER_MODEL_VARIANT").unwrap_or_else(|_| "ccip-caformer_b36-24".into());
-    let model_file =
-        std::env::var("CHARACTER_MODEL_FILE").unwrap_or_else(|_| "model_feat.onnx".into());
+    let variant = crate::model_config::character_model_variant();
+    let model_file = crate::model_config::character_model_file();
+    let repo_id = crate::model_config::character_model_repo_id();
     json!({
         "model_variant": variant,
         "model_file": model_file,
         // Align with historical Python signature components used for stale detection.
-        "model_repo_id": std::env::var("CHARACTER_MODEL_REPO_ID")
-            .unwrap_or_else(|_| "deepghs/ccip_onnx".into()),
+        "model_repo_id": repo_id,
         "signature": format!("rust:{variant}/{model_file}"),
     })
 }
@@ -152,11 +157,14 @@ pub fn character_model_signature() -> Value {
 pub fn suggest_artists_native(conn: &Connection, item_id: i64, limit: i64) -> Result<Value> {
     // Pure-Rust metadata fallback: return empty model candidates when embeddings
     // are absent; never call Python.
-    let _item_exists: i64 = conn.query_row(
+    let item_exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM items WHERE id=?",
         rusqlite::params![item_id],
         |r| r.get(0),
     )?;
+    if item_exists == 0 {
+        anyhow::bail!("item not found");
+    }
     Ok(json!({
         "item_id": item_id,
         "candidates": [],

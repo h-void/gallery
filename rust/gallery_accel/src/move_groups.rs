@@ -6,12 +6,12 @@ use serde_json::{json, Value};
 
 use crate::media_roots::MediaRoots;
 use crate::move_filters::move_candidate_where;
-use crate::path_display::display_path;
 use crate::move_group_logic::{
     can_apply_group, compare_groups, duplicate_target_move_ids, group_key, group_source_from_row,
     is_stale_group_row, GroupRow, GroupSourceRow,
 };
 use crate::move_rows::{query_move_rows, MoveRow};
+use crate::path_display::display_path;
 
 pub fn move_candidate_groups_response(
     conn: &Connection,
@@ -139,36 +139,45 @@ fn list_move_candidate_groups(
                  live.candidate_artist_id, ca.name, ca.path, live.reason
         ",
     ))?;
-    let totals: GroupTotals =
-        total_stmt
-            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                Ok((
-                    row.get::<_, Option<i64>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(
-                |(item_artist_id, item_name, item_path, candidate_artist_id, cand_name, cand_path, reason, candidate_count, blocked_count)| {
-                    let identity = GroupIdentity {
-                        item_artist_name: item_name.unwrap_or_default(),
-                        item_artist_path: item_path.unwrap_or_default(),
-                        candidate_artist_name: cand_name.unwrap_or_default(),
-                        candidate_artist_path: cand_path.unwrap_or_default(),
-                    };
-                    let key = (item_artist_id, Some(candidate_artist_id), reason);
-                    (key, (candidate_count, blocked_count, identity))
-                },
-            )
-            .collect();
+    let totals: GroupTotals = total_stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(
+            |(
+                item_artist_id,
+                item_name,
+                item_path,
+                candidate_artist_id,
+                cand_name,
+                cand_path,
+                reason,
+                candidate_count,
+                blocked_count,
+            )| {
+                let identity = GroupIdentity {
+                    item_artist_name: item_name.unwrap_or_default(),
+                    item_artist_path: item_path.unwrap_or_default(),
+                    candidate_artist_name: cand_name.unwrap_or_default(),
+                    candidate_artist_path: cand_path.unwrap_or_default(),
+                };
+                let key = (item_artist_id, Some(candidate_artist_id), reason);
+                (key, (candidate_count, blocked_count, identity))
+            },
+        )
+        .collect();
 
     let mut groups_by_key: HashMap<(Option<i64>, Option<i64>, String), GroupRow> = HashMap::new();
     for (key, (candidate_count, blocked_count, identity)) in totals {
@@ -225,7 +234,8 @@ fn list_move_candidate_groups(
                 sample_ids: Vec::new(),
                 move_ids: Vec::new(),
                 blocked_move_ids: Vec::new(),
-            });
+            },
+        );
     }
 
     // Attach the windowed ids (samples / blocked id listing) to their groups.

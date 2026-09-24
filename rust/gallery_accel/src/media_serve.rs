@@ -17,6 +17,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::io::ReaderStream;
 
+use crate::fs_util::safe_canonicalize;
 use crate::image_preview::{clamp_max_edge, image_preview_bytes};
 #[cfg(not(target_os = "linux"))]
 use crate::media_roots::path_under_authorized_roots;
@@ -63,10 +64,10 @@ const TRANSCODE_TOTAL_LIMIT: Duration = Duration::from_secs(2 * 60 * 60);
 /// Bounds concurrent ffmpeg child processes across every spawn site. Requests
 /// queue for a free slot instead of being rejected, so a burst of uncached
 /// videos cannot fan out into unbounded transcode/frame processes.
-struct FfmpegSlotGuard;
+pub(crate) struct FfmpegSlotGuard;
 
 impl FfmpegSlotGuard {
-    fn acquire_blocking() -> Result<Self> {
+    pub(crate) fn acquire_blocking() -> Result<Self> {
         let (lock, condvar) = ffmpeg_gate();
         let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = std::time::Instant::now() + FFMPEG_SLOT_WAIT;
@@ -142,7 +143,7 @@ fn real_media_roots(roots: &MediaRoots) -> Vec<String> {
 }
 
 fn is_under_allowed_root(path: &Path, allowed: &[String]) -> bool {
-    let Ok(canon) = path.canonicalize() else {
+    let Ok(canon) = safe_canonicalize(path) else {
         // If file does not exist yet, check logical path only.
         let logical = normalize_slashes(&path.to_string_lossy());
         return allowed.iter().any(|root| {
@@ -151,16 +152,22 @@ fn is_under_allowed_root(path: &Path, allowed: &[String]) -> bool {
         });
     };
     let logical = normalize_slashes(&canon.to_string_lossy());
+    // A canonical Windows path carries the `\\?\` verbatim prefix. Roots that
+    // answer the final-path query are canonicalized the same way and compare with
+    // the prefix; a root that cannot be canonicalized - a virtual alias, or any
+    // root on a volume that refuses the query, such as the ImDisk RamDisk - is
+    // configured in plain form, so that case compares without it.
+    let logical_plain = logical.strip_prefix("//?/").unwrap_or(&logical);
     allowed.iter().any(|root| {
         let root_path = PathBuf::from(root);
-        if let Ok(root_canon) = root_path.canonicalize() {
+        if let Ok(root_canon) = safe_canonicalize(&root_path) {
             let root_s = normalize_slashes(&root_canon.to_string_lossy());
             logical == root_s
                 || logical.starts_with(&format!("{root_s}/"))
                 || logical.starts_with(&format!("{root_s}\\"))
         } else {
             let root_s = root.trim_end_matches(['/', '\\']);
-            logical == root_s || logical.starts_with(&format!("{root_s}/"))
+            logical_plain == root_s || logical_plain.starts_with(&format!("{root_s}/"))
         }
     })
 }
@@ -184,7 +191,7 @@ pub fn resolve_allowed_path(path: &str, roots: &MediaRoots) -> Result<PathBuf> {
     candidates.push(PathBuf::from(&cleaned));
 
     for cand in candidates {
-        let Ok(canonical) = cand.canonicalize() else {
+        let Ok(canonical) = safe_canonicalize(&cand) else {
             continue;
         };
         if is_under_allowed_root(&canonical, &allowed) && canonical.is_file() {
@@ -238,43 +245,194 @@ fn attachment_disposition(name: &str) -> String {
     format!("attachment; filename=\"{fallback}\"")
 }
 
-pub async fn serve_file_response(
-    path: &str,
-    roots: &MediaRoots,
-    headers: &HeaderMap,
-) -> Result<Response, (StatusCode, Value)> {
-    let full = resolve_allowed_path(path, roots)
-        .map_err(|e| (StatusCode::NOT_FOUND, json!({"error": e.to_string()})))?;
-    let meta = tokio::fs::metadata(&full)
-        .await
-        .map_err(|e| (StatusCode::NOT_FOUND, json!({"error": e.to_string()})))?;
-    let len = meta.len();
-    let (mime, disposition) = inline_media_headers(&full);
+/// One open handle together with the metadata read *from that handle*.
+///
+/// The length and the bytes have to come from the same `open`. Taking the
+/// length from a `metadata(path)` call and then opening the path again lets a
+/// replacement land between the two calls, and the response then describes a
+/// file whose bytes it is not reading: a `Content-Length` that does not match
+/// the body, or a `206` that streams the tail of a different version. The
+/// validator has the same requirement — an `ETag` derived from path metadata
+/// would be a claim about a file that may already be gone.
+struct OpenedMedia {
+    file: File,
+    len: u64,
+    modified: Option<SystemTime>,
+}
 
-    if let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        match parse_bytes_range(range, len) {
+impl OpenedMedia {
+    async fn open(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path).await?;
+        let meta = file.metadata().await?;
+        Ok(Self {
+            file,
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+/// A strong validator over the length and the modification time, so a
+/// same-size replacement at a different time is still a different version.
+///
+/// The frontend's own cache key is `size-mtime` at one-second resolution, which
+/// is why a same-size replacement inside the same second produces a
+/// byte-identical URL. The validator is what lets the client revalidate that
+/// URL instead of trusting it, and `If-Range` is what stops a range request
+/// from splicing two versions together.
+fn media_etag(len: u64, modified: Option<SystemTime>) -> String {
+    let stamp = modified
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|delta| delta.as_nanos())
+        .unwrap_or(0);
+    format!("\"{:x}-{:x}\"", len, stamp)
+}
+
+/// Format an instant as an HTTP-date (RFC 9110 §5.6.7 IMF-fixdate).
+fn http_date(time: SystemTime) -> String {
+    let moment: chrono::DateTime<chrono::Utc> = time.into();
+    moment.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+fn parse_http_date(value: &str) -> Option<SystemTime> {
+    chrono::DateTime::parse_from_rfc2822(value.trim())
+        .ok()
+        .map(|parsed| parsed.with_timezone(&chrono::Utc).into())
+}
+
+/// Whether the request's conditional headers say the client already holds this
+/// version, which is answered `304` rather than with a body.
+///
+/// `If-None-Match` wins when both are present, because it is the field that can
+/// tell two same-second revisions apart; `If-Modified-Since` is only consulted
+/// on its own, and a date it cannot parse is not a match.
+fn not_modified_since(
+    headers: &HeaderMap,
+    etag: &str,
+    last_modified: Option<&str>,
+    modified: Option<SystemTime>,
+) -> bool {
+    if let Some(value) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
+        let value = value.trim();
+        if value == "*" {
+            return true;
+        }
+        // Weak comparison is the correct one here: `If-None-Match` only asks
+        // whether the representation is the same one.
+        return value.split(',').any(|candidate| {
+            let candidate = candidate.trim();
+            candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+        });
+    }
+    let (Some(value), Some(modified)) = (
+        headers
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(|value| value.to_str().ok()),
+        modified,
+    ) else {
+        return false;
+    };
+    // The comparison is at one-second resolution because that is the resolution
+    // of the field, so "not newer than" is the condition.
+    let _ = last_modified;
+    parse_http_date(value).is_some_and(|since| modified <= since + Duration::from_secs(1))
+}
+
+/// Whether an `If-Range` still names the current version.
+///
+/// A range is only answered when this holds; otherwise the whole body is sent,
+/// because a `206` built from a validator that no longer matches would stitch
+/// the client's old copy to bytes from the new one.
+fn if_range_allows(value: &str, etag: &str, modified: Option<SystemTime>) -> bool {
+    let value = value.trim();
+    if value.starts_with('"') || value.starts_with("W/") {
+        // The field requires a strong comparison, so a weak validator never
+        // authorises a partial response.
+        return !value.starts_with("W/") && value == etag;
+    }
+    match (parse_http_date(value), modified) {
+        (Some(since), Some(modified)) => modified <= since + Duration::from_secs(1),
+        _ => false,
+    }
+}
+
+/// Build the response for an already-open media file.
+///
+/// One constructor decides `200` / `206` / `304` for every media route, and the
+/// validator it emits and the range it answers both come from the same handle,
+/// so a response cannot describe one version of a file while streaming another.
+async fn file_response(
+    opened: OpenedMedia,
+    mime: &str,
+    disposition: Option<&str>,
+    headers: &HeaderMap,
+    allow_ranges: bool,
+) -> Result<Response, (StatusCode, Value)> {
+    let OpenedMedia {
+        file,
+        len,
+        modified,
+    } = opened;
+    let etag = media_etag(len, modified);
+    let last_modified = modified.map(http_date);
+
+    if not_modified_since(headers, &etag, last_modified.as_deref(), modified) {
+        let mut builder = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag);
+        if let Some(value) = &last_modified {
+            builder = builder.header(header::LAST_MODIFIED, value);
+        }
+        return builder.body(Body::empty()).map_err(internal);
+    }
+
+    // A range is honoured only when the client is not also asking us to check
+    // it first, or when the check still passes.
+    let range = match headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) if allow_ranges => {
+            match headers
+                .get(header::IF_RANGE)
+                .and_then(|value| value.to_str().ok())
+            {
+                Some(if_range) if !if_range_allows(if_range, &etag, modified) => None,
+                _ => Some(value),
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(value) = range {
+        match parse_bytes_range(value, len) {
             ParsedRange::Satisfiable(start, end) => {
-                let mut file = File::open(&full).await.map_err(internal)?;
+                let mut file = file;
                 use tokio::io::{AsyncSeekExt, SeekFrom};
                 file.seek(SeekFrom::Start(start)).await.map_err(internal)?;
                 let take = end - start + 1;
-                let limited = file.take(take);
-                let stream = ReaderStream::new(limited);
-                let body = Body::from_stream(stream);
                 let mut builder = Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
-                    .header(header::CONTENT_TYPE, &mime)
+                    .header(header::CONTENT_TYPE, mime)
                     .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::ETAG, &etag)
                     .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
                     .header(header::CONTENT_LENGTH, take);
-                if let Some(name) = &disposition {
-                    builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
+                if let Some(value) = &last_modified {
+                    builder = builder.header(header::LAST_MODIFIED, value);
                 }
-                return builder.body(body).map_err(internal);
+                if let Some(name) = disposition {
+                    builder =
+                        builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
+                }
+                return builder
+                    .body(Body::from_stream(ReaderStream::new(file.take(take))))
+                    .map_err(internal);
             }
             ParsedRange::Unsatisfiable => {
-                // Malformed, multi-part, suffix-of-zero, and out-of-bounds
-                // ranges must not degrade to a 200 full-body response.
                 return Response::builder()
                     .status(StatusCode::RANGE_NOT_SATISFIABLE)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -284,50 +442,82 @@ pub async fn serve_file_response(
                     ))
                     .map_err(internal);
             }
+            // RFC 9110 §14.2: a `Range` the server does not understand, or does
+            // not support, is *ignored* — so this falls through to the full
+            // body rather than answering 416 for a request we could serve.
+            ParsedRange::Ignored => {}
         }
     }
 
-    let file = File::open(&full).await.map_err(internal)?;
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, &mime)
+        .header(header::CONTENT_TYPE, mime)
         .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::ETAG, &etag)
         .header(header::CONTENT_LENGTH, len);
-    if let Some(name) = &disposition {
+    if let Some(value) = &last_modified {
+        builder = builder.header(header::LAST_MODIFIED, value);
+    }
+    if let Some(name) = disposition {
         builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
     }
-    builder.body(body).map_err(internal)
+    builder
+        .body(Body::from_stream(ReaderStream::new(file)))
+        .map_err(internal)
+}
+
+pub async fn serve_file_response(
+    path: &str,
+    roots: &MediaRoots,
+    headers: &HeaderMap,
+) -> Result<Response, (StatusCode, Value)> {
+    let full = resolve_allowed_path(path, roots)
+        .map_err(|e| (StatusCode::NOT_FOUND, json!({"error": e.to_string()})))?;
+    let opened = OpenedMedia::open(&full)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, json!({"error": e.to_string()})))?;
+    let (mime, disposition) = inline_media_headers(&full);
+    file_response(opened, &mime, disposition.as_deref(), headers, true).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum ParsedRange {
     /// Inclusive (start, end) byte range inside the body.
     Satisfiable(u64, u64),
-    /// Malformed, unsupported (multi-part), or out-of-bounds: respond 416.
+    /// A well-formed `bytes=` range this representation cannot satisfy:
+    /// out of bounds, or a suffix of zero. Answered `416` with
+    /// `Content-Range: bytes */len` — the only case RFC 9110 §14.4 reserves
+    /// that status for.
     Unsatisfiable,
+    /// A `Range` the server does not understand or does not support: another
+    /// unit, a malformed field, or a multi-part set. RFC 9110 §14.2 requires
+    /// these to be *ignored*, so the request is answered with the full body.
+    /// A client that asks for something we cannot parse is still asking for the
+    /// file, and 416 would deny it the bytes it could have had.
+    Ignored,
 }
 
 fn parse_bytes_range(header: &str, len: u64) -> ParsedRange {
     let header = header.trim();
-    if header.is_empty() {
-        return ParsedRange::Unsatisfiable;
-    }
+    // An empty field, or one naming a unit we do not implement, is ignored.
     let Some(rest) = header.strip_prefix("bytes=") else {
-        return ParsedRange::Unsatisfiable;
+        return ParsedRange::Ignored;
     };
-    // Multi-range responses are not supported.
+    // Multi-range responses are not supported. A set of ranges is still a
+    // request this server can answer in full, so it is ignored rather than
+    // refused.
     if rest.contains(',') {
-        return ParsedRange::Unsatisfiable;
+        return ParsedRange::Ignored;
     }
     let Some((first, last)) = rest.split_once('-') else {
-        return ParsedRange::Unsatisfiable;
+        return ParsedRange::Ignored;
     };
     if first.is_empty() {
-        // Suffix form `bytes=-N`: the final N bytes; N=0 is unsatisfiable.
+        // Suffix form `bytes=-N`: the final N bytes. A suffix of zero is a
+        // well-formed request for nothing, so it is unsatisfiable rather than
+        // malformed.
         let Ok(suffix) = last.parse::<u64>() else {
-            return ParsedRange::Unsatisfiable;
+            return ParsedRange::Ignored;
         };
         if suffix == 0 || len == 0 {
             return ParsedRange::Unsatisfiable;
@@ -335,18 +525,25 @@ fn parse_bytes_range(header: &str, len: u64) -> ParsedRange {
         return ParsedRange::Satisfiable(len.saturating_sub(suffix), len - 1);
     }
     let Ok(start) = first.parse::<u64>() else {
-        return ParsedRange::Unsatisfiable;
+        return ParsedRange::Ignored;
     };
     let end = if last.is_empty() {
         len.saturating_sub(1)
     } else {
         let Ok(end) = last.parse::<u64>() else {
-            return ParsedRange::Unsatisfiable;
+            return ParsedRange::Ignored;
         };
         end
     };
-    if start > end || len == 0 || start >= len {
+    // The bounds check comes first: an open-ended range past the end of the
+    // file has `last` empty, so `end` is already clamped to the final byte and
+    // the reversal test below would misread it as malformed.
+    if len == 0 || start >= len {
         return ParsedRange::Unsatisfiable;
+    }
+    // A reversed pair is malformed, not unsatisfiable.
+    if start > end {
+        return ParsedRange::Ignored;
     }
     ParsedRange::Satisfiable(start, end.min(len - 1))
 }
@@ -427,7 +624,7 @@ fn lookup_active_item_id(conn: &rusqlite::Connection, variants: &[String]) -> Re
 }
 
 /// fnOS trash root + relative path under user volume, if path matches /volN/user/...
-fn fnos_recycle_target(full: &Path) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn fnos_recycle_target(full: &Path) -> Option<(PathBuf, PathBuf)> {
     let logical = normalize_slashes(&full.to_string_lossy());
     let parts: Vec<&str> = logical.split('/').filter(|p| !p.is_empty()).collect();
     for (idx, part) in parts.iter().enumerate() {
@@ -452,9 +649,209 @@ fn fnos_recycle_target(full: &Path) -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-fn gallery_recycle_dir() -> PathBuf {
+/// Candidate recycle directories and relative paths on the same volume/space as `full`.
+/// Prioritizes same-volume targets so file moves are fast O(1) links/renames without crossing disks:
+/// 1. fnOS volume and user system trash folders (.@#local/trash, .Recycle_bin, .recycle)
+/// 2. Media root same-volume stores (#recycle, .Recycle_bin, .recycle, .gallery_recycle)
+/// 3. Same-volume DATA_DIR/recycle if DATA_DIR shares the device/volume
+pub(crate) fn candidate_recycle_targets(
+    full: &Path,
+    roots: Option<&MediaRoots>,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut candidates = Vec::new();
+    let logical = normalize_slashes(&full.to_string_lossy());
+    let parts: Vec<&str> = logical.split('/').filter(|p| !p.is_empty()).collect();
+
+    // 1. Volume-based trash candidates
+    for (idx, part) in parts.iter().enumerate() {
+        let lower = part.to_ascii_lowercase();
+        let is_vol = (lower.starts_with("vol") || lower.starts_with("volume"))
+            && lower
+                .chars()
+                .skip_while(|c| c.is_ascii_alphabetic())
+                .all(|c| c.is_ascii_digit())
+            && lower.chars().any(|c| c.is_ascii_digit());
+        if !is_vol {
+            continue;
+        }
+
+        let vol_root = {
+            let mut p = PathBuf::from("/");
+            for segment in &parts[..=idx] {
+                p.push(segment);
+            }
+            p
+        };
+
+        if idx + 1 < parts.len() {
+            let mut user_space = PathBuf::from("/");
+            for segment in &parts[..=idx + 1] {
+                user_space.push(segment);
+            }
+            let rel_from_user: PathBuf = parts[idx + 2..].iter().collect();
+
+            candidates.push((user_space.join(".@#local").join("trash"), rel_from_user.clone()));
+            candidates.push((user_space.join(".Recycle_bin"), rel_from_user.clone()));
+            candidates.push((user_space.join(".recycle"), rel_from_user.clone()));
+
+            if idx + 2 < parts.len() {
+                let mut user_home = PathBuf::from("/");
+                for segment in &parts[..=idx + 2] {
+                    user_home.push(segment);
+                }
+                let rel_from_home: PathBuf = parts[idx + 3..].iter().collect();
+
+                candidates.push((user_home.join(".@#local").join("trash"), rel_from_home.clone()));
+                candidates.push((user_home.join(".Recycle_bin"), rel_from_home.clone()));
+                candidates.push((user_home.join(".recycle"), rel_from_home.clone()));
+                candidates.push((user_home.join(".gallery_recycle"), rel_from_home));
+            }
+
+            candidates.push((user_space.join(".gallery_recycle"), rel_from_user));
+        }
+
+        let rel_from_vol: PathBuf = parts[idx + 1..].iter().collect();
+        candidates.push((vol_root.join(".@#local").join("trash"), rel_from_vol.clone()));
+        candidates.push((vol_root.join(".Recycle_bin"), rel_from_vol.clone()));
+        candidates.push((vol_root.join(".gallery_recycle"), rel_from_vol));
+        break;
+    }
+
+    // 2. Media root same-volume locations
+    if let Some(roots) = roots {
+        let canonical_full = safe_canonicalize(full).ok().unwrap_or_else(|| full.to_path_buf());
+        for root_str in roots.allowed_roots() {
+            let root_path = PathBuf::from(&root_str);
+            let canonical_root = safe_canonicalize(&root_path).ok().unwrap_or_else(|| root_path.clone());
+            let matched_root = if canonical_full.starts_with(&canonical_root) {
+                let rel = canonical_full.strip_prefix(&canonical_root).ok().map(|p| p.to_path_buf());
+                Some((canonical_root, rel))
+            } else if full.starts_with(&root_path) {
+                let rel = full.strip_prefix(&root_path).ok().map(|p| p.to_path_buf());
+                Some((root_path, rel))
+            } else {
+                None
+            };
+
+            if let Some((root, Some(rel))) = matched_root {
+                candidates.push((root.join(".Recycle_bin"), rel.clone()));
+                candidates.push((root.join("#recycle"), rel.clone()));
+                candidates.push((root.join(".recycle"), rel.clone()));
+                candidates.push((root.join(".gallery_recycle"), rel.clone()));
+
+                if let Some(parent) = root.parent() {
+                    if let Some(root_name) = root.file_name() {
+                        let parent_rel = PathBuf::from(root_name).join(&rel);
+                        candidates.push((parent.join(".gallery_recycle"), parent_rel));
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // 3. Same-volume check with DATA_DIR
+    let data_recycle = gallery_recycle_dir();
+    let same_volume_as_data = {
+        let data_dir = data_recycle.parent().unwrap_or(&data_recycle);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match (std::fs::metadata(full), std::fs::metadata(data_dir)) {
+                (Ok(fm), Ok(dm)) => fm.dev() == dm.dev(),
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            full.components().next() == data_dir.components().next()
+        }
+    };
+
+    if same_volume_as_data {
+        let rel_for_data: PathBuf = if let Some((_, rel)) = fnos_recycle_target(full) {
+            rel
+        } else {
+            parts.iter().collect()
+        };
+        candidates.push((data_recycle, rel_for_data));
+    }
+
+    let mut deduped = Vec::new();
+    for (root, rel) in candidates {
+        if !deduped.iter().any(|(r, _)| r == &root) {
+            deduped.push((root, rel));
+        }
+    }
+    deduped
+}
+
+pub(crate) fn gallery_recycle_dir() -> PathBuf {
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into());
     PathBuf::from(data_dir).join("recycle")
+}
+
+/// `uuid::Uuid::new_v4().simple()` renders as 32 lowercase hex digits. Both the
+/// collision suffix in [`move_file_no_overwrite`] and the flat gallery recycle
+/// prefix are built from it, so recognising the token lets a recovery scan tell
+/// a file this code stored from an unrelated file that merely shares a name.
+fn is_simple_uuid(token: &str) -> bool {
+    token.len() == 32
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// True when `candidate` is a file name [`move_file_no_overwrite`] could have
+/// produced for an original named `base`. Four shapes are reachable: the name
+/// unchanged, the same name with a `__<uuid>` collision suffix inserted before
+/// the extension, and each of those behind the flat fallback's `<uuid>_`
+/// prefix. Anything else is a different file.
+pub(crate) fn recycle_name_matches_base(base: &str, candidate: &str) -> bool {
+    if candidate == base {
+        return true;
+    }
+    let name = match candidate.split_once('_') {
+        Some((prefix, tail)) if is_simple_uuid(prefix) => tail,
+        _ => candidate,
+    };
+    if name == base {
+        return true;
+    }
+    let (stem, ext) = match base.rsplit_once('.') {
+        Some((stem, ext)) => (stem, ext),
+        None => (base, ""),
+    };
+    let Some(token) = name.strip_prefix(&format!("{stem}__")) else {
+        return false;
+    };
+    if ext.is_empty() {
+        is_simple_uuid(token)
+    } else {
+        token
+            .strip_suffix(&format!(".{ext}"))
+            .is_some_and(is_simple_uuid)
+    }
+}
+
+/// Persist the recycle destination as soon as the move returns.
+///
+/// The delete records `'moving'` before it touches the filesystem and only
+/// names the destination in the finalizing transaction, so a process that dies
+/// in between leaves a row that cannot say where the bytes went. Writing the
+/// destination here closes that window to a single statement. Callers treat a
+/// failure as best effort: the finalizing update rewrites the same value, and
+/// an early-write failure must not abandon a delete that can still complete.
+pub(crate) fn record_recycled_path(
+    conn: &rusqlite::Connection,
+    id: i64,
+    recycled: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE recycle_entries SET recycled_path=? WHERE id=? AND status='moving'",
+        rusqlite::params![recycled, id],
+    )?;
+    Ok(())
 }
 
 /// Move `src` to `dest` without overwriting, adding a UUID suffix on collision.
@@ -498,16 +895,47 @@ pub(crate) fn move_file_no_overwrite(src: &Path, dest: &Path) -> Result<(PathBuf
 }
 
 fn path_is_within_existing_root(path: &Path, root: &Path) -> bool {
-    path.canonicalize()
+    safe_canonicalize(path)
         .ok()
-        .zip(root.canonicalize().ok())
+        .zip(safe_canonicalize(root).ok())
         .is_some_and(|(path, root)| path == root || path.starts_with(root))
 }
 
-pub(crate) fn recycle_source_is_trusted(recycled: &Path, original: &Path) -> bool {
-    path_is_within_existing_root(recycled, &gallery_recycle_dir())
-        || fnos_recycle_target(original)
-            .is_some_and(|(trash, _)| path_is_within_existing_root(recycled, &trash))
+pub(crate) fn recycle_source_is_trusted(
+    recycled: &Path,
+    original: &Path,
+    roots: Option<&MediaRoots>,
+) -> bool {
+    if path_is_within_existing_root(recycled, &gallery_recycle_dir()) {
+        return true;
+    }
+    for (trash, _) in candidate_recycle_targets(original, roots) {
+        if path_is_within_existing_root(recycled, &trash) {
+            return true;
+        }
+    }
+    if let Some(roots) = roots {
+        for root_str in roots.allowed_roots() {
+            let root = PathBuf::from(root_str);
+            for folder in [".gallery_recycle", ".recycle", "#recycle", ".Recycle_bin"] {
+                if path_is_within_existing_root(recycled, &root.join(folder)) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let (Some(rec_str), Some(orig_str)) = (recycled.to_str(), original.to_str()) {
+        let rec_norm = normalize_slashes(rec_str);
+        let orig_norm = normalize_slashes(orig_str);
+        for marker in ["/.gallery_recycle/", "/.recycle/", "/.Recycle_bin/", "/#recycle/"] {
+            if let Some((prefix, _)) = rec_norm.split_once(marker) {
+                if orig_norm.starts_with(prefix) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 pub(crate) fn move_file_exact_no_overwrite(src: &Path, dest: &Path) -> std::io::Result<()> {
@@ -668,12 +1096,17 @@ fn authorized_file_path(
 /// Move `src` to `dest` exactly once. `Ok(Some(warning))` means the move
 /// succeeded but source-side cleanup failed (best-effort retire); callers
 /// surface the warning rather than claiming complete success.
-fn move_file_exact_impl(src: &Path, dest: &Path, force_copy: bool) -> std::io::Result<Option<String>> {
+fn move_file_exact_impl(
+    src: &Path,
+    dest: &Path,
+    force_copy: bool,
+) -> std::io::Result<Option<String>> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let source_file = open_source_file(src)?;
     let source_meta = source_file.metadata()?;
+    let mut copy_reason: Option<String> = None;
     if !force_copy {
         match std::fs::hard_link(src, dest) {
             Ok(()) => {
@@ -696,7 +1129,15 @@ fn move_file_exact_impl(src: &Path, dest: &Path, force_copy: bool) -> std::io::R
                 return Ok(cleanup_warning);
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(error),
-            Err(_) => {}
+            Err(error) => {
+                // A link fails across filesystems (EXDEV) and on mounts that
+                // refuse links. Copying is still the right fallback, but it is
+                // not equivalent: until the source retires, the bytes exist
+                // twice, so an interruption in that window leaves two copies
+                // for the caller to choose between. Report why the move
+                // degraded rather than hiding it behind a silent success.
+                copy_reason = Some(format!("hard link unavailable ({error}); copied instead"));
+            }
         }
     }
 
@@ -735,7 +1176,21 @@ fn move_file_exact_impl(src: &Path, dest: &Path, force_copy: bool) -> std::io::R
     };
     fsync_parent_dir_best_effort(dest);
     fsync_parent_dir_best_effort(src);
-    Ok(cleanup_warning)
+    Ok(merge_move_warnings(copy_reason, cleanup_warning))
+}
+
+/// Fold the reason a move had to copy into the warning it returns, so a
+/// degraded (cross-volume) move is reported instead of looking like a clean
+/// link-based one. Either input alone is still a warning worth surfacing.
+fn merge_move_warnings(
+    copy_reason: Option<String>,
+    cleanup_warning: Option<String>,
+) -> Option<String> {
+    match (copy_reason, cleanup_warning) {
+        (Some(reason), Some(warning)) => Some(format!("{reason}; {warning}")),
+        (Some(reason), None) => Some(reason),
+        (None, warning) => warning,
+    }
 }
 
 #[cfg(unix)]
@@ -923,28 +1378,30 @@ pub(crate) fn fsync_parent_dir_best_effort(path: &Path) {
     }
 }
 
-fn move_into_recycle(full: &Path) -> Result<(PathBuf, Option<String>)> {
+pub(crate) fn move_into_recycle(
+    full: &Path,
+    roots: Option<&MediaRoots>,
+) -> Result<(PathBuf, Option<String>)> {
     let base = full
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into());
 
-    if let Some((trash_root, rel)) = fnos_recycle_target(full) {
-        // Prefer nested structure under fnOS trash.
+    let candidates = candidate_recycle_targets(full, roots);
+    for (trash_root, rel) in &candidates {
         if !rel.as_os_str().is_empty() {
-            let nested = trash_root.join(&rel);
+            let nested = trash_root.join(rel);
             if let Ok((dest, warning)) = move_file_no_overwrite(full, &nested) {
                 return Ok((dest, warning));
             }
         }
-        // Flat under trash root.
         let flat = trash_root.join(&base);
         if let Ok((dest, warning)) = move_file_no_overwrite(full, &flat) {
             return Ok((dest, warning));
         }
     }
 
-    // Gallery-owned DATA_DIR/recycle fallback (always try; do not claim fnOS trash).
+    // Gallery-owned DATA_DIR/recycle fallback (global fallback)
     let recycle = gallery_recycle_dir();
     std::fs::create_dir_all(&recycle)?;
     if let Some((_, rel)) = fnos_recycle_target(full) {
@@ -1030,7 +1487,7 @@ pub fn delete_item_to_recycle(
     // Phase 2: move the file into recycle storage (dir fsyncs inside). A
     // source-side cleanup warning must reach the result: it means the move
     // succeeded but a placeholder may linger at the source path.
-    let (recycled, move_cleanup_warning) = match move_into_recycle(&full) {
+    let (recycled, move_cleanup_warning) = match move_into_recycle(&full, Some(roots)) {
         Ok((recycled, warning)) => (recycled, warning),
         Err(error) => {
             let _ = conn.execute(
@@ -1041,6 +1498,16 @@ pub fn delete_item_to_recycle(
         }
     };
     let recycled_s = recycled.display().to_string();
+
+    // Phase 2b: name the destination before anything else can fail. A crash
+    // from here on leaves a 'moving' row that points at a real file, so the
+    // startup reconciliation finalizes the delete instead of declaring the
+    // bytes lost. Best effort — phase 3 rewrites the same value, so a failure
+    // here must not abandon a delete that can still complete.
+    if let Err(error) = record_recycled_path(conn, moving_id, &recycled_s) {
+        log_error!("media: could not record recycle destination for entry {moving_id}: {error}");
+    }
+
     if let Some(warning) = &move_cleanup_warning {
         log_error!("media: delete of {original_s} completed with cleanup warning: {warning}");
     }
@@ -1184,7 +1651,12 @@ pub async fn video_frame_jpeg(
     let _ffmpeg_slot = tokio::task::spawn_blocking(FfmpegSlotGuard::acquire_blocking)
         .await
         .map_err(|error| internal(error.to_string()))?
-        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, json!({"error": error.to_string()})))?;
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": error.to_string()}),
+            )
+        })?;
     let mut child = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -1286,7 +1758,7 @@ fn video_frame_cache_root() -> Option<PathBuf> {
 
 fn video_frame_cache_path(full: &Path, t: f64) -> Option<PathBuf> {
     let root = video_frame_cache_root()?;
-    let full = full.canonicalize().ok()?;
+    let full = safe_canonicalize(full).ok()?;
     let metadata = std::fs::metadata(&full).ok()?;
     let modified = metadata
         .modified()
@@ -1407,15 +1879,6 @@ pub fn preview_jpeg_allowed(
         .map_err(|e| (StatusCode::BAD_REQUEST, json!({"error": e.to_string()})))
 }
 
-/// Back-compat alias used by older call sites.
-pub fn preview_or_fallback(
-    path: &str,
-    roots: &MediaRoots,
-    max: Option<u32>,
-) -> Result<Vec<u8>, (StatusCode, Value)> {
-    preview_jpeg_allowed(path, roots, max)
-}
-
 /// HTTP choke-point for content-hash of a client-supplied path.
 pub fn content_hash_allowed(path: &str, roots: &MediaRoots) -> Result<Value> {
     use crate::content_hash::hash_file;
@@ -1499,7 +1962,7 @@ fn cleanup_transcode_cache(
 }
 
 fn transcode_paths(path: &str, roots: &MediaRoots) -> Result<(String, PathBuf, PathBuf)> {
-    let full = resolve_allowed_path(path, roots)?.canonicalize()?;
+    let full = safe_canonicalize(resolve_allowed_path(path, roots)?)?;
     let metadata = std::fs::metadata(&full)?;
     if !metadata.is_file() {
         anyhow::bail!("video source is not a file");
@@ -1777,64 +2240,20 @@ pub async fn serve_transcoded_hls_segment(
     let root = transcode_cache_root();
     let key_dir = root.join(key);
     let full = key_dir.join(segment);
-    let key_dir = key_dir
-        .canonicalize()
+    let key_dir = safe_canonicalize(&key_dir)
         .map_err(|_| (StatusCode::NOT_FOUND, json!({"error": "segment not found"})))?;
-    let full = full
-        .canonicalize()
+    let full = safe_canonicalize(&full)
         .map_err(|_| (StatusCode::NOT_FOUND, json!({"error": "segment not found"})))?;
     if !full.starts_with(&key_dir) || !full.is_file() {
         return Err((StatusCode::NOT_FOUND, json!({"error": "segment not found"})));
     }
-    let len = tokio::fs::metadata(&full).await.map_err(internal)?.len();
+    // Same constructor as every other media route: one open, one validator,
+    // one place that decides 200 / 206 / 304. This route used to carry its own
+    // copy of the range logic, which is how it drifted into answering 416 for a
+    // `Range` the media route would have ignored.
+    let opened = OpenedMedia::open(&full).await.map_err(internal)?;
     let (mime, disposition) = inline_media_headers(&full);
-    if let Some(range) = headers
-        .get(header::RANGE)
-        .and_then(|value| value.to_str().ok())
-    {
-        match parse_bytes_range(range, len) {
-            ParsedRange::Satisfiable(start, end) => {
-                use tokio::io::{AsyncSeekExt, SeekFrom};
-                let mut file = File::open(&full).await.map_err(internal)?;
-                file.seek(SeekFrom::Start(start)).await.map_err(internal)?;
-                let take = end - start + 1;
-                let mut builder = Response::builder()
-                    .status(StatusCode::PARTIAL_CONTENT)
-                    .header(header::CONTENT_TYPE, &mime)
-                    .header(header::ACCEPT_RANGES, "bytes")
-                    .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
-                    .header(header::CONTENT_LENGTH, take);
-                if let Some(name) = &disposition {
-                    builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
-                }
-                return builder
-                    .body(Body::from_stream(ReaderStream::new(file.take(take))))
-                    .map_err(internal);
-            }
-            ParsedRange::Unsatisfiable => {
-                return Response::builder()
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::CONTENT_RANGE, format!("bytes */{len}"))
-                    .body(Body::from(
-                        json!({"error": "requested range not satisfiable"}).to_string(),
-                    ))
-                    .map_err(internal);
-            }
-        }
-    }
-    let file = File::open(&full).await.map_err(internal)?;
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, &mime)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_LENGTH, len);
-    if let Some(name) = &disposition {
-        builder = builder.header(header::CONTENT_DISPOSITION, attachment_disposition(name));
-    }
-    builder
-        .body(Body::from_stream(ReaderStream::new(file)))
-        .map_err(internal)
+    file_response(opened, &mime, disposition.as_deref(), headers, true).await
 }
 
 /// Compatible progressive stream: serve original with Range (ffmpeg filter optional later).
@@ -1883,22 +2302,195 @@ mod tests {
             parse_bytes_range("bytes=-100", 1000),
             ParsedRange::Satisfiable(900, 999)
         );
-        // Out-of-bounds, zero-suffix, multi-part, and malformed ranges are
-        // unsatisfiable (416), never a 200 full-body fallback.
-        assert_eq!(parse_bytes_range("bytes=1000-", 1000), ParsedRange::Unsatisfiable);
-        assert_eq!(parse_bytes_range("bytes=-0", 1000), ParsedRange::Unsatisfiable);
+        // A well-formed range this file cannot satisfy is 416: out of bounds,
+        // and a suffix of zero.
         assert_eq!(
-            parse_bytes_range("bytes=0-1,3-4", 1000),
+            parse_bytes_range("bytes=1000-", 1000),
             ParsedRange::Unsatisfiable
         );
-        assert_eq!(parse_bytes_range("chars=0-1", 1000), ParsedRange::Unsatisfiable);
-        assert_eq!(parse_bytes_range("bytes=x-y", 1000), ParsedRange::Unsatisfiable);
-        assert_eq!(parse_bytes_range("bytes=5-2", 1000), ParsedRange::Unsatisfiable);
+        assert_eq!(
+            parse_bytes_range("bytes=-0", 1000),
+            ParsedRange::Unsatisfiable
+        );
+        // A `Range` this server cannot parse or does not support is *ignored*
+        // (RFC 9110 §14.2) and answered with the full body. All four of these
+        // used to be 416, which denied the client bytes it could have had.
+        assert_eq!(
+            parse_bytes_range("bytes=0-1,3-4", 1000),
+            ParsedRange::Ignored
+        );
+        assert_eq!(parse_bytes_range("chars=0-1", 1000), ParsedRange::Ignored);
+        assert_eq!(parse_bytes_range("bytes=x-y", 1000), ParsedRange::Ignored);
+        assert_eq!(parse_bytes_range("bytes=5-2", 1000), ParsedRange::Ignored);
+        assert_eq!(parse_bytes_range("", 1000), ParsedRange::Ignored);
         // A trailing end beyond the file clamps to the last byte.
         assert_eq!(
             parse_bytes_range("bytes=10-9999", 100),
             ParsedRange::Satisfiable(10, 99)
         );
+    }
+
+    /// A media root holding one file, plus the path the route takes.
+    fn one_file_root(name: &str, bytes: &[u8]) -> (tempfile::TempDir, MediaRoots, String) {
+        let dir = tempdir().unwrap();
+        let media = dir.path().join("pictures");
+        std::fs::create_dir_all(&media).unwrap();
+        let file = media.join(name);
+        std::fs::write(&file, bytes).unwrap();
+        let roots = MediaRoots {
+            roots: vec![media.to_string_lossy().replace('\\', "/")],
+            labels: vec!["p1".into()],
+            real_paths: vec![media.to_string_lossy().replace('\\', "/")],
+        };
+        let path = file.to_string_lossy().replace('\\', "/");
+        (dir, roots, path)
+    }
+
+    /// The response must describe the file it is actually reading: the length
+    /// and the validator come from one handle, and a client that presents the
+    /// validator is told its copy is current instead of being sent the bytes
+    /// again. Before this the media path emitted no validator at all, so a
+    /// `Content-Length` could disagree with the body and every request was a
+    /// full transfer.
+    #[tokio::test]
+    async fn a_media_response_validates_and_honours_a_conditional_request() {
+        use http_body_util::BodyExt;
+
+        let (_dir, roots, path) = one_file_root("a.jpg", b"0123456789");
+
+        let response = serve_file_response(&path, &roots, &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .expect("a media response must carry a validator")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            response.headers().get(header::LAST_MODIFIED).is_some(),
+            "and a date to fall back on"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "10"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            body.len(),
+            10,
+            "the declared length and the bytes must describe one file"
+        );
+
+        // The client already holds this version.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, etag.parse().unwrap());
+        let response = serve_file_response(&path, &roots, &headers).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            etag
+        );
+        assert!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty(),
+            "a 304 carries no body"
+        );
+
+        // A validator for some other version still gets the file.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, "\"not-this-one\"".parse().unwrap());
+        let response = serve_file_response(&path, &roots, &headers).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// RFC 9110 §14.2: a `Range` the server does not understand, or does not
+    /// support, is ignored — the client still gets the whole file. An
+    /// out-of-bounds range is the one case that stays 416, because it *is* well
+    /// formed and simply cannot be satisfied.
+    #[tokio::test]
+    async fn an_unsupported_range_is_ignored_while_an_unsatisfiable_one_is_not() {
+        use http_body_util::BodyExt;
+
+        let (_dir, roots, path) = one_file_root("a.jpg", b"0123456789");
+
+        for value in ["bytes=0-1,3-4", "chars=0-1", "bytes=x-y", "bytes=5-2"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::RANGE, value.parse().unwrap());
+            let response = serve_file_response(&path, &roots, &headers).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{value} must be ignored, not refused"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body.len(), 10, "{value} must still deliver the whole body");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=9999-".parse().unwrap());
+        let response = serve_file_response(&path, &roots, &headers).await.unwrap();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    /// `If-Range` is what keeps a resumed transfer from splicing two versions
+    /// together: when the validator no longer matches, the range is dropped and
+    /// the whole body is sent rather than a tail from a different file.
+    #[tokio::test]
+    async fn a_stale_if_range_serves_the_whole_body() {
+        use http_body_util::BodyExt;
+
+        let (_dir, roots, path) = one_file_root("a.jpg", b"0123456789");
+        let response = serve_file_response(&path, &roots, &HeaderMap::new())
+            .await
+            .unwrap();
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=4-".parse().unwrap());
+        headers.insert(header::IF_RANGE, etag.parse().unwrap());
+        let response = serve_file_response(&path, &roots, &headers).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"456789");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=4-".parse().unwrap());
+        headers.insert(
+            header::IF_RANGE,
+            "\"a-version-the-client-does-not-hold\"".parse().unwrap(),
+        );
+        let response = serve_file_response(&path, &roots, &headers).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a range against a version the client does not hold must not be spliced"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), 10);
     }
 
     #[test]
@@ -2361,6 +2953,95 @@ mod tests {
     }
 
     #[test]
+    fn delete_records_the_recycle_destination_before_the_finalizing_commit() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (dir, conn, roots, _, data_dir) = delete_fixture();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", data_dir);
+        ensure_recycle_schema(&conn).unwrap();
+        let original = dir
+            .path()
+            .join("pictures")
+            .join("ArtistA")
+            .join("a")
+            .join("same.jpg");
+        let path = original.to_string_lossy().replace('\\', "/");
+        let worker_conn = rusqlite::Connection::open(dir.path().join("g.db")).unwrap();
+        DELETE_TEST_PAUSE_AFTER_MOVE.store(true, Ordering::SeqCst);
+        struct ResetPause;
+        impl Drop for ResetPause {
+            fn drop(&mut self) {
+                DELETE_TEST_PAUSE_AFTER_MOVE.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset_pause = ResetPause;
+
+        let worker =
+            std::thread::spawn(move || delete_item_to_recycle(&worker_conn, &path, &roots));
+        for _ in 0..1000 {
+            if !original.exists() {
+                let current: String = conn
+                    .query_row(
+                        "SELECT recycled_path FROM recycle_entries WHERE status='moving'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or_default();
+                if !current.is_empty() {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!original.exists(), "delete did not reach recycle move");
+
+        // Still paused between the filesystem move and the finalizing
+        // transaction. The row has to name the destination already, or an
+        // interruption here leaves a 'moving' row that cannot say where the
+        // bytes went and the startup reconciliation declares them lost.
+        let (status, current_recorded): (String, String) = conn
+            .query_row(
+                "SELECT status, recycled_path FROM recycle_entries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "moving");
+        assert!(
+            !current_recorded.is_empty(),
+            "the destination must be recorded before the finalizing commit"
+        );
+        assert!(
+            Path::new(&current_recorded).is_file(),
+            "the recorded destination must be the moved file"
+        );
+
+        drop(_reset_pause);
+        let result = worker.join().unwrap().unwrap();
+        assert_eq!(result["recycled_to"], current_recorded.as_str());
+    }
+
+    #[test]
+    fn a_same_volume_delete_reports_no_cleanup_warning() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (dir, conn, roots, _, data_dir) = delete_fixture();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", data_dir);
+        let original = dir
+            .path()
+            .join("pictures")
+            .join("ArtistA")
+            .join("a")
+            .join("same.jpg");
+        let path = original.to_string_lossy().replace('\\', "/");
+
+        let result = delete_item_to_recycle(&conn, &path, &roots).unwrap();
+
+        // The media root and the recycle store share a filesystem here, so the
+        // move links and nothing about the move needs reporting.
+        assert!(result["cleanup_warning"].is_null());
+        assert!(Path::new(result["recycled_to"].as_str().unwrap()).is_file());
+    }
+
+    #[test]
     fn delete_same_basename_twice_keeps_both() {
         let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
         let (dir, conn, roots, _, data_dir) = delete_fixture();
@@ -2416,6 +3097,86 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&src).unwrap(), b"new");
         assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+    }
+
+    #[test]
+    fn a_recycled_name_is_recognised_only_for_its_own_base() {
+        let uuid = "0123456789abcdef0123456789abcdef";
+
+        // Every shape the mover can produce: unchanged, the nested collision
+        // suffix, the flat fallback prefix, and both together.
+        assert!(recycle_name_matches_base("same.jpg", "same.jpg"));
+        assert!(recycle_name_matches_base(
+            "same.jpg",
+            &format!("same__{uuid}.jpg")
+        ));
+        assert!(recycle_name_matches_base(
+            "same.jpg",
+            &format!("{uuid}_same.jpg")
+        ));
+        assert!(recycle_name_matches_base(
+            "same.jpg",
+            &format!("{uuid}_same__{uuid}.jpg")
+        ));
+        assert!(recycle_name_matches_base("same", &format!("same__{uuid}")));
+
+        // A different base, a different extension, a uuid that is not one, and
+        // a longer name are all different files.
+        assert!(!recycle_name_matches_base("same.jpg", "other.jpg"));
+        assert!(!recycle_name_matches_base(
+            "same.jpg",
+            &format!("other__{uuid}.jpg")
+        ));
+        assert!(!recycle_name_matches_base(
+            "same.jpg",
+            &format!("{uuid}_other.jpg")
+        ));
+        assert!(!recycle_name_matches_base("same.jpg", "same"));
+        assert!(!recycle_name_matches_base("same.jpg", "same.jpg.bak"));
+        assert!(!recycle_name_matches_base(
+            "same.jpg",
+            &format!("same__{uuid}.png")
+        ));
+        assert!(!recycle_name_matches_base(
+            "same.jpg",
+            &format!("same__{}.jpg", &uuid[..31])
+        ));
+        assert!(!recycle_name_matches_base(
+            "same.jpg",
+            &format!("same__{}.jpg", uuid.to_uppercase())
+        ));
+    }
+
+    #[test]
+    fn a_degraded_move_reports_the_copy_and_any_cleanup_failure() {
+        // The reason a move had to copy, and a source-side cleanup failure,
+        // both have to survive into the single warning the callers surface.
+        assert_eq!(
+            merge_move_warnings(Some("copied".into()), None).as_deref(),
+            Some("copied")
+        );
+        assert_eq!(
+            merge_move_warnings(None, Some("cleanup".into())).as_deref(),
+            Some("cleanup")
+        );
+        assert_eq!(
+            merge_move_warnings(Some("copied".into()), Some("cleanup".into())).as_deref(),
+            Some("copied; cleanup")
+        );
+        assert_eq!(merge_move_warnings(None, None), None);
+    }
+
+    #[test]
+    fn a_deliberate_copy_is_not_reported_as_degraded() {
+        // `force_copy` skips the link attempt on purpose, so the move is not
+        // degraded and must not carry the cross-volume reason.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dest = dir.path().join("dest.bin");
+        std::fs::write(&src, b"payload").unwrap();
+
+        assert_eq!(move_file_exact_impl(&src, &dest, true).unwrap(), None);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
     }
 
     #[cfg(target_os = "linux")]
@@ -2645,5 +3406,42 @@ mod tests {
         }
         assert!(result.is_err());
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn candidate_recycle_targets_matches_same_storage_volume() {
+        let path = Path::new("/vol1/1000/Harry/合购/- futa/art.jpg");
+        let roots = MediaRoots {
+            roots: vec!["/vol1/1000/Harry/合购".into()],
+            labels: vec!["p1".into()],
+            real_paths: vec!["/vol1/1000/Harry/合购".into()],
+        };
+        let candidates = candidate_recycle_targets(path, Some(&roots));
+        assert!(!candidates.is_empty());
+        for (trash_root, _) in &candidates {
+            let trash_str = trash_root.to_string_lossy().replace('\\', "/");
+            assert!(
+                trash_str.starts_with("/vol1/"),
+                "every candidate trash root must stay on the same volume /vol1, got {trash_str}"
+            );
+        }
+        let roots_strs: Vec<String> = candidates.iter().map(|(r, _)| r.to_string_lossy().replace('\\', "/")).collect();
+        assert!(roots_strs.iter().any(|r| r.contains("/vol1/1000/.@#local/trash")));
+        assert!(roots_strs.iter().any(|r| r.contains("/vol1/1000/Harry/合购/.gallery_recycle")));
+    }
+
+    #[test]
+    fn recycle_source_is_trusted_accepts_same_volume_gallery_recycle() {
+        let original = Path::new("/vol1/1000/Harry/合购/- futa/art.jpg");
+        let same_volume_recycled = Path::new("/vol1/1000/Harry/合购/.gallery_recycle/- futa/art.jpg");
+        let cross_volume_untrusted = Path::new("/vol2/untrusted/art.jpg");
+        let roots = MediaRoots {
+            roots: vec!["/vol1/1000/Harry/合购".into()],
+            labels: vec!["p1".into()],
+            real_paths: vec!["/vol1/1000/Harry/合购".into()],
+        };
+
+        assert!(recycle_source_is_trusted(same_volume_recycled, original, Some(&roots)));
+        assert!(!recycle_source_is_trusted(cross_volume_untrusted, original, Some(&roots)));
     }
 }

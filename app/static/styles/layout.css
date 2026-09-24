@@ -55,11 +55,18 @@ header #scanBtn,header .scan-folder-btn,header #stopScanBtn{
   position:relative;display:flex;align-items:center;gap:4px;
   flex:1 1 330px;max-width:430px;min-width:240px;
 }
-.search-control input{flex:1 1 auto;width:100%;max-width:none;min-width:0;cursor:text}
+.search-input-icon{
+  position:absolute;left:10px;top:50%;transform:translateY(-50%);
+  display:inline-flex;align-items:center;justify-content:center;
+  color:var(--text-3);pointer-events:none;z-index:2;
+}
+.search-control input{flex:1 1 auto;width:100%;max-width:none;min-width:0;cursor:text;padding-left:30px}
 .search-clear-btn{flex:0 0 auto}
 .search-options-btn{
-  flex:0 0 auto;min-width:58px;white-space:nowrap;
+  flex:0 0 auto;min-width:58px;white-space:nowrap;gap:4px;
 }
+.search-options-chevron{display:inline-flex;align-items:center;transition:transform var(--motion)}
+.search-options-btn[aria-expanded="true"] .search-options-chevron{transform:rotate(180deg)}
 .search-control input,.search-control .search-options-btn{
   font-family:inherit;font-size:var(--header-control-font-size);line-height:1.2;
 }
@@ -309,7 +316,10 @@ header .btn:hover:not(:disabled),
    margin) while spacing inside a group stays 6-8px. Desktop only; mobile
    keeps the tight 6px gap. */
 @media(min-width:769px){
-  .toolbar #duplicateFilesToggle,.toolbar #desktopViewToggle,.toolbar .artist-links-launcher{margin-left:6px}
+  .toolbar #duplicateFilesToggle{margin-left:6px}
+  .toolbar #desktopRatioToggle{margin-left:auto}
+  .toolbar #desktopViewToggle{margin-left:6px}
+  .toolbar .artist-links-launcher{margin-left:6px}
 }
 
 /* ---- Grid frame: the artwork zone. The paper fiber, the soft warm light and

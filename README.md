@@ -27,6 +27,7 @@
 
 ### 1. 多格式媒体浏览与流畅播放
 - 图片支持 JPG/PNG/WebP/AVIF/BMP，GIF 动图悬停预览；视频支持 MP4/WebM/MOV/MKV 流播（ffmpeg 转码 / HLS）；同时管理 .txt/.md/.html 文本与 PSD/CLIP/PSB/ZIP/RAR 源文件和压缩包。
+- 压缩包预览与解压：点击 ZIP/RAR/7Z 卡片即可免解压查看包内目录树与文件大小，支持直接预览包内图片，支持解压到当前目录或新建文件夹，解压后原压缩包可选移入回收站。
 - 卡片比例可选：维护页「状态」提供 4:3 完整（默认）与 3:4 竖版两种网格缩略图比例；选择保存在当前浏览器。
 - 灯箱：全屏高清、滚轮缩放、拖拽平移、移动端捏合；←/→ 切换、Esc 退出，支持下载、收藏、删除快捷键。
 - URL 状态同步：画师/文件夹/标签/日期/排序/搜索实时写入地址栏，支持前进后退与分享。
@@ -95,7 +96,7 @@ Gallery 为 fnOS 提供原生应用安装包（FPK）：单一 Rust 二进制，
 | `docker-compose.cuda.yml` | **NVIDIA 显卡独立预设**。已配置 GPU 资源分配与 CUDA 镜像，填写路径直接启动。 |
 | `gallery.yml` | **极简启动清单**。仅含模式和目录两项，供本地运行 `start.cmd` / `start.sh` 使用。 |
 | `.env` | **运行参数配置**。修改端口、扫描周期、备份策略、AI 识别等高级参数，启动时自动读取。 |
-| `docker-compose.launcher.yml` | **启动器底层模板**。供启动脚本自动调用，用户无需手动编辑。 |
+| `docker-compose.launcher.yml` | **启动器底层模板**。已内置于项目目录供启动脚本调用，无需单独下载或编辑。 |
 
 #### 方式 A：NAS 图形界面部署（无需 SSH 或 Python）
 
@@ -112,12 +113,14 @@ Gallery 为 fnOS 提供原生应用安装包（FPK）：单一 Rust 二进制，
 > - **硬件加速**：Intel 核显需要 NAS 支持 `/dev/dri` 设备直通；若遇权限不足，可在 `.env` 填入 NAS 对应的 `GALLERY_RENDER_GID` 与 `GALLERY_VIDEO_GID`。NVIDIA 需要宿主机已安装显卡驱动和 NVIDIA Container Toolkit。镜像适用 x86_64 架构。
 > - **媒体安全与只读**：媒体目录默认只读挂载（`:ro`）；需要使用移入回收站或物理整理文件夹时，将挂载行尾的 `:ro` 删除后重新部署。
 > - **数据持久化**：数据库、日志、备份、缓存和模型保存在 `gallery-storage` 数据卷中。升级或切换模式时保留该数据卷，切勿执行带 `-v` 的删除命令。
+> - **压缩包预览与解压**：fnOS 原生 FPK 安装包已内置 7-Zip (`7zz`) 执行引擎，开箱即用。若使用 Docker 部署，容器内如需使用压缩包解压与预览功能，需在容器或环境中安装 7-Zip（如 `7zz` 或 `p7zip-full`），或通过环境变量 `GALLERY_7Z_PATH` 指定可执行文件路径。
 
 #### 方式 B：脚本一键启动（适合 Windows / Linux 本地电脑）
 
 需要 Docker Desktop 或 Docker Engine 与 Docker Compose，以及 Python 3.10+（仅使用标准库，无需安装任何额外 Python 包）：
 
-1. **填写配置**：打开 `gallery.yml`，填写运行模式与本地媒体目录：
+1. **获取项目**：下载仓库 ZIP 压缩包并解压（或执行 `git clone`），保留完整目录结构（启动脚本依赖的 `docker-compose.launcher.yml` 与 `tools/` 已内置其中，无需单独下载）。
+2. **填写配置**：打开 `gallery.yml`，填写运行模式与本地媒体目录：
 
    ```yaml
    模式: cpu
@@ -126,9 +129,10 @@ Gallery 为 fnOS 提供原生应用安装包（FPK）：单一 Rust 二进制，
      - E:/Art
    ```
 
-   一行一个目录，数量不限。Linux 请填写 `/home/user/pictures` 这样的绝对路径。Windows 路径使用正斜杠 `/`，不支持映射网络盘和 UNC 路径。每个目录下的子文件夹识别为画师。
-2. **一键启动**：Windows 用户双击 `start.cmd`；Linux 用户在项目根目录下运行 `sh start.sh`。
-3. **启动访问**：浏览器打开 `http://localhost:8899/`（局域网其他设备使用宿主机 IP），点击「扫描全库」。模型将在后台自动下载。
+   - **路径格式**：一行一个绝对路径，数量不限。Windows 使用正斜杠 `/`（如 `D:/Pictures`、`E:/Art`）；Linux 使用完整路径（如 `/home/user/pictures`）。不支持网络映射盘和 UNC 路径。
+   - **画师结构**：每个目录下的第一层子文件夹自动识别为一个画师（如 `D:/Pictures/画师A/xxx.jpg`，直接散放在目录根下的文件不会收录）。
+3. **一键启动**：Windows 用户双击 `start.cmd`；Linux 用户在项目根目录下运行 `sh start.sh`。
+4. **启动访问**：浏览器打开 `http://localhost:8899/`（局域网其他设备使用宿主机 IP），点击「扫描全库」。模型将在后台自动下载。
 
 | 模式 | 适用硬件与环境 |
 | :--- | :--- |
@@ -175,7 +179,7 @@ Gallery 为 fnOS 提供原生应用安装包（FPK）：单一 Rust 二进制，
 
 ### 1. 构建前置要求（Windows 环境）
 - 启用 **WSL 2**，并在 WSL 2 内部安装 **Podman**（构建脚本将调用隔离的 Debian Bookworm 容器进行 Linux 交叉编译）。
-- 准备好官方 `fnpack` 工具（如未安装，可下载 `output/fnpack/fnpack-1.2.3-windows-amd64.exe`）。
+- 准备好官方 `fnpack` 工具：下载地址见 [docs/FNOS_NATIVE.md](docs/FNOS_NATIVE.md)，将 `fnpack-1.2.3-windows-amd64.exe` 放到 `output/fnpack/`。
 
 ### 2. 一键编译与 FPK 打包
 在 Windows PowerShell 终端中执行一键发布脚本（将自动完成 Linux 纯 Rust 运行时交叉编译与 FPK 标准打包）：

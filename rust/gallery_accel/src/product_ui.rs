@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,11 +38,11 @@ pub fn operation_log_response(
     error_limit: Option<i64>,
 ) -> Result<Value> {
     let history_limit = match limit {
-        Some(v) if v > 0 => v.min(300),
-        _ => 80,
+        Some(v) if v > 0 => v.min(crate::MAX_OPERATION_LOG_LIMIT),
+        _ => crate::DEFAULT_PREVIEW_RECYCLE_LIMIT,
     };
     let err_limit = match error_limit {
-        Some(v) if v > 0 => v.min(120),
+        Some(v) if v > 0 => v.min(crate::MAX_RECENT_ERRORS_LIMIT),
         _ => 40,
     };
     let mut hist = operation_history_response(conn, roots, Some(history_limit))?;
@@ -235,13 +235,9 @@ fn folder_item_ids(conn: &Connection, artist_id: i64, folder: &str) -> Result<Ve
             .to_string();
         format!("{base}/{folder}/")
     };
-    sql.push_str(
-        " AND substr(replace(file_path,'\\\\','/'), 1, length(?)) = ? COLLATE BINARY",
-    );
+    sql.push_str(" AND substr(replace(file_path,'\\\\','/'), 1, length(?)) = ? COLLATE BINARY");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![artist_id, prefix, prefix], |r| {
-        r.get::<_, i64>(0)
-    })?;
+    let rows = stmt.query_map(params![artist_id, prefix, prefix], |r| r.get::<_, i64>(0))?;
     for row in rows {
         ids.push(row?);
     }
@@ -358,8 +354,7 @@ pub fn confirm_all_artist_plans(
                AND (target_folder != '' OR (plan_kind='split_by_tag' AND split_actions != '[]'))",
         )?
         .query_map(params![artist_id], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut confirmed = 0i64;
     let mut failed = 0i64;
@@ -489,10 +484,10 @@ pub fn merge_move_candidate_group_with_roots(
                 applied.push(json!({"id": id, "item_id": v.get("item_id")}));
             }
             Ok(v) => {
-                let reason = v
-                    .get("reason")
+                let reason = v.get("reason").cloned().unwrap_or(json!(v
+                    .get("action")
                     .cloned()
-                    .unwrap_or(json!(v.get("action").cloned().unwrap_or(json!("not_moved"))));
+                    .unwrap_or(json!("not_moved"))));
                 if reason == json!("candidate_stale") {
                     stale += 1;
                 }
@@ -568,7 +563,11 @@ pub fn auto_resolve_move_candidates_with_roots(
     roots: &MediaRoots,
     limit: i64,
 ) -> Result<Value> {
-    let limit = if limit > 0 { limit.min(5000) } else { 1000 };
+    let limit = if limit > 0 {
+        limit.min(crate::MAX_BATCH_ITEM_LIMIT)
+    } else {
+        crate::DEFAULT_BATCH_ITEM_LIMIT
+    };
     let moves: Vec<AutoResolveMoveRow> = conn
         .prepare(
             // An auto-eligible row is one the loop below will actually apply
@@ -659,7 +658,8 @@ pub fn auto_resolve_move_candidates_with_roots(
         // one pending candidate for the scan candidate, one for the new path,
         // a missing old record, no live copy sharing the hash, and hash
         // agreement whenever both sides know it.
-        let hash_agrees = item_hash.is_empty() || candidate_hash.is_empty() || item_hash == candidate_hash;
+        let hash_agrees =
+            item_hash.is_empty() || candidate_hash.is_empty() || item_hash == candidate_hash;
         let auto_appliable = AUTO_APPLY_MOVE_REASONS.contains(&reason.as_str())
             && group_count == 1
             && target_count == 1
@@ -700,9 +700,7 @@ pub fn auto_resolve_move_candidates_with_roots(
                 }
             }
             match resolve_ambiguous_cluster_as_new_response(conn, roots, id) {
-                Ok(v)
-                    if v.get("action").and_then(|a| a.as_str()) == Some("new") =>
-                {
+                Ok(v) if v.get("action").and_then(|a| a.as_str()) == Some("new") => {
                     added_as_new += 1;
                 }
                 _ => {
@@ -822,20 +820,180 @@ pub fn confirm_artist_suggestion(conn: &Connection, item_id: i64, artist_id: i64
 // Character reference delete + rebuild index + import jobs
 // ---------------------------------------------------------------------------
 
+/// Where manually uploaded reference photos live. Kept under `DATA_DIR`, which
+/// `media_roots` deliberately excludes from the authorized roots, so the scanner
+/// and the folder organizer never see these files and `/api/file/preview`
+/// policy is unchanged (uploads are served by their own id-based route).
+pub fn character_references_dir() -> PathBuf {
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into());
+    Path::new(&data_dir).join("character-references")
+}
+
+/// Upload cap for one reference photo.
+pub const REFERENCE_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+/// Sniff the image type from the leading bytes. Neither the client's file name
+/// nor its `Content-Type` is trusted: a `.jpg` label on arbitrary bytes must not
+/// be accepted, and the stored extension has to describe what we actually got.
+/// Returns the canonical extension, or `None` for anything that is not one of
+/// the supported photo formats.
+pub fn reference_image_extension_for_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpg");
+    }
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("png");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("bmp");
+    }
+    None
+}
+
+/// Store an uploaded photo under `DATA_DIR/character-references/<id>/`.
+/// The name is generated here and the extension is the sniffed one, so nothing
+/// the client sends can reach the stored path.
+pub fn store_manual_reference_image(
+    character_id: i64,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    let dir = character_references_dir().join(character_id.to_string());
+    std::fs::create_dir_all(&dir)?;
+    let target = dir.join(format!("{}.{extension}", uuid::Uuid::new_v4().simple()));
+    // Write beside the target then rename, so a failed write never leaves a
+    // half-file that a preview request could serve.
+    let staging = dir.join(format!(".{}.upload", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&staging, bytes)?;
+    std::fs::rename(&staging, &target)?;
+    Ok(target)
+}
+
+/// Best-effort removal of an uploaded reference file. A missing file is fine;
+/// a path outside our own upload directory is refused, so a tampered or stale
+/// `image_path` value cannot turn a reference delete into an arbitrary unlink.
+pub fn remove_reference_image_file(image_path: &str) {
+    if image_path.trim().is_empty() {
+        return;
+    }
+    let path = Path::new(image_path);
+    if !path.starts_with(character_references_dir()) {
+        log_warn!("character reference: refusing to delete outside upload dir: {image_path}");
+        return;
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// Drop every uploaded file owned by a character's manual references, then the
+/// per-character directory itself when it is empty.
+pub fn remove_character_reference_images(conn: &Connection, character_id: i64) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT image_path FROM character_references
+         WHERE character_id=? AND image_path IS NOT NULL",
+    )?;
+    let paths = stmt
+        .query_map(params![character_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for path in paths {
+        remove_reference_image_file(&path);
+    }
+    let _ = std::fs::remove_dir(character_references_dir().join(character_id.to_string()));
+    Ok(())
+}
+
+/// Insert a manually added reference. Mirrors `insert_tag_single_reference`
+/// (same model metadata) but stores the uploaded file instead of an item id.
+pub fn insert_manual_reference(
+    conn: &Connection,
+    character_id: i64,
+    image_path: &Path,
+    embedding: &[f32],
+) -> Result<i64> {
+    let blob = crate::character_ccip::pack_embedding_blob(embedding)?;
+    let (repo, variant, file) = crate::character_ccip::embedding_model_meta();
+    let dim = crate::character_ccip::CCIP_EMBEDDING_DIM as i64;
+    conn.execute(
+        "INSERT INTO character_references
+         (character_id, embedding, embedding_dim, source_type, item_id, created_at,
+          embedding_model_repo_id, embedding_model_variant, embedding_model_file,
+          embedding_updated_at, image_path)
+         VALUES (?, ?, ?, 'manual', NULL, ?, ?, ?, ?, ?, ?)",
+        params![
+            character_id,
+            blob,
+            dim,
+            now(),
+            repo,
+            variant,
+            file,
+            now(),
+            image_path.to_string_lossy()
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Embed a stored reference photo. Tests bypass the ONNX model the same way the
+/// tag import does, so the upload path stays testable without OpenVINO.
+pub fn embed_manual_reference_image(image_path: &Path) -> Result<Vec<f32>> {
+    if fake_import_embedding_enabled() {
+        return Ok(fake_embedding_for_item(1));
+    }
+    crate::character_ccip::embed_image_path(image_path)
+}
+
+/// Cheap pre-check before accepting an upload. A *cold* session is deliberately
+/// not a refusal: the session loads on demand and is idle-unloaded after 10
+/// minutes, so demanding `session_loaded` would reject the first upload after
+/// every idle period. Only a structural problem — recognizer disabled, model
+/// file missing, or a cached load failure — is worth refusing up front.
+pub fn manual_reference_embedding_blocker() -> Option<&'static str> {
+    if fake_import_embedding_enabled() {
+        return None;
+    }
+    match crate::character_ccip::session_status()
+        .get("reason")
+        .and_then(|value| value.as_str())
+    {
+        Some("disabled") => Some("识别功能已关闭"),
+        Some("ccip_model_not_found") => Some("识别模型未就绪，请先在「模型与推理」中准备"),
+        Some("session_load_failed") => Some("识别模型加载失败，请先在「模型与推理」中重试准备"),
+        _ => None,
+    }
+}
+
 pub fn delete_character_reference(
     conn: &Connection,
     character_id: i64,
     reference_id: i64,
 ) -> Result<Value> {
-    let n = conn.execute(
-        "DELETE FROM character_references WHERE id=? AND character_id=?",
-        params![reference_id, character_id],
-    )?;
+    // `RETURNING` keeps "which file belongs to this row" and "the row is gone"
+    // in one statement, so two concurrent deletes of the same reference cannot
+    // both decide they own the file. A NULL image_path is a tag_single row: the
+    // row is still deleted, it just owns no uploaded file.
+    let deleted_row: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "DELETE FROM character_references WHERE id=? AND character_id=?
+             RETURNING id, image_path",
+            params![reference_id, character_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((_, Some(path))) = deleted_row.as_ref() {
+        remove_reference_image_file(path);
+    }
+    let deleted = deleted_row.is_some() as i64;
     Ok(json!({
-        "ok": n > 0,
+        "ok": deleted > 0,
         "character_id": character_id,
         "reference_id": reference_id,
-        "deleted": n,
+        "deleted": deleted,
     }))
 }
 
@@ -1870,11 +2028,8 @@ mod tests {
              );",
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO artists (id, path) VALUES (1, '/root')",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO artists (id, path) VALUES (1, '/root')", [])
+            .unwrap();
         for (id, path) in [
             (1, "/root/Foo/a.jpg"),
             (2, "/root/foo/b.jpg"),
@@ -2745,5 +2900,62 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 0);
         assert_eq!(REBUILD_INDEX_CALLS_FOR_TESTS.with(|c| c.get()), 1);
+    }
+
+    #[test]
+    fn reference_image_type_is_sniffed_from_the_bytes() {
+        assert_eq!(
+            reference_image_extension_for_bytes(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("jpg")
+        );
+        assert_eq!(
+            reference_image_extension_for_bytes(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            Some("png")
+        );
+        assert_eq!(
+            reference_image_extension_for_bytes(b"GIF89a...."),
+            Some("gif")
+        );
+        assert_eq!(
+            reference_image_extension_for_bytes(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+            Some("webp")
+        );
+        assert_eq!(reference_image_extension_for_bytes(b"BM...."), Some("bmp"));
+        // A script wearing a .jpg label must not be accepted.
+        assert_eq!(
+            reference_image_extension_for_bytes(b"<?php echo 1; ?>"),
+            None
+        );
+        // RIFF alone is not WebP (an AVI would otherwise pass).
+        assert_eq!(
+            reference_image_extension_for_bytes(b"RIFF\x00\x00\x00\x00AVI "),
+            None
+        );
+        assert_eq!(reference_image_extension_for_bytes(b""), None);
+    }
+
+    #[test]
+    fn reference_files_are_stored_by_bytes_and_delete_refuses_foreign_paths() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+
+        let stored = store_manual_reference_image(7, "png", &[0x89, b'P', b'N', b'G']).unwrap();
+        assert!(stored.is_file());
+        assert_eq!(
+            stored.extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
+        assert!(stored.starts_with(character_references_dir().join("7")));
+
+        remove_reference_image_file(&stored.to_string_lossy());
+        assert!(!stored.exists());
+
+        // A path outside the upload directory must survive: a stale or tampered
+        // image_path cannot turn a reference delete into an arbitrary unlink.
+        let foreign = dir.path().join("keep.txt");
+        std::fs::write(&foreign, b"keep").unwrap();
+        remove_reference_image_file(&foreign.to_string_lossy());
+        assert!(foreign.is_file());
     }
 }

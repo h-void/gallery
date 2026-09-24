@@ -9,7 +9,10 @@ import { loadHealthSummary, loadHashStatus, loadFolderRenameAutoStatus, loadErro
 import { renderMovePathSummary, renderMoveCandidates, renderMoveCandidateGroups, renderMoveHistory } from './paths.js';
 import { loadArtistFolderMove, loadArchiveWorkbench, renderArtistFolderMove, renderArchiveWorkbench } from './organize.js';
 import { loadCharacterLibrary, characterImportJobBusy, renderCharacterLibrary } from './characters.js';
+import { loadDownloadsPanel, renderDownloadsPanel, stopDownloadSyncPolling, openDownloadAllWorks } from './downloads.js';
+import { loadNetdiskPanel, renderNetdiskPanel } from './netdisk.js';
 import { loadOperationLog, loadRecycleBin, renderOperationLog, renderRecycleBin } from './records.js';
+import { syncBrowseUrl } from '../../router.js';
 
 export const MAINTENANCE_AUTO_REFRESH_MS = 10000;
 export const MAINTENANCE_IDLE_REFRESH_MS = 60000;
@@ -102,6 +105,12 @@ const maintenanceLoaders = {
       loadCharacterLibrary(loadOptions),
     ]);
   },
+  downloads: async loadOptions => {
+    // The netdisk panel is a sibling of the subscription panel under 下载, so
+    // it rides the same refresh. Its own loader swallows failures: a bridge that
+    // was never configured must not blank the settings the user is editing.
+    await Promise.all([loadDownloadsPanel(loadOptions), loadNetdiskPanel(loadOptions)]);
+  },
   records: async loadOptions => {
     await Promise.all([
       loadOperationLog(loadOptions),
@@ -130,6 +139,15 @@ function activeMaintenanceViewHasActiveWork() {
   }
   if (view === 'characters') {
     return characterImportJobBusy();
+  }
+  if (view === 'downloads') {
+    // A running sync round is active work; keep the panel on the short tick so
+    // the result shows up as soon as the round finishes.
+    if (state.downloadSyncStatus && state.downloadSyncStatus.running) return true;
+    // A task the bridge is still working on is the same: the plan's 10s tick is
+    // for installs with active tasks, and the idle 60s is for ones without.
+    return (Array.isArray(state.netdiskJobs) ? state.netdiskJobs : []).some(job =>
+      job.state === 'submitted' || job.state === 'issued');
   }
   return false;
 }
@@ -163,6 +181,11 @@ function renderActiveMaintenanceView(view) {
   }
   if (view === 'characters') {
     renderCharacterLibrary();
+    return;
+  }
+  if (view === 'downloads') {
+    renderDownloadsPanel();
+    renderNetdiskPanel();
     return;
   }
   if (view === 'records') {
@@ -275,6 +298,19 @@ export function setMaintenanceView(view, options = {}) {
     panel.hidden = !active;
     panel.classList.toggle('active', active);
   });
+  // Leaving the downloads tab must stop its sync poll: the panel is hidden, so
+  // nobody can see the updates, and `activeMaintenanceViewHasActiveWork` has
+  // already stopped treating the running round as active work for this view.
+  // Without this the poll keeps hitting /api/pawchive/status every 2s for up to
+  // SYNC_POLL_MAX ticks after the user has navigated away.
+  if (selected !== 'downloads') stopDownloadSyncPolling();
+  // 全部作品 is read when the panel is shown, not on every auto-refresh tick:
+  // it is a paged list the user is building a selection in. The call is
+  // fire-and-forget because the view renders from store state, and its own error
+  // state is where a failure shows.
+  if (selected === 'downloads') {
+    openDownloadAllWorks().catch(() => {});
+  }
   if (selected === 'paths') {
     const target = $('.maintenance-workbench');
     if (target && options.scrollToWorkbench) {
@@ -282,6 +318,9 @@ export function setMaintenanceView(view, options = {}) {
         target.scrollIntoView({block: 'start', behavior: 'smooth'});
       });
     }
+  }
+  if (state.mode === 'moves' && options.syncUrl !== false) {
+    syncBrowseUrl(options.history || 'replace');
   }
 }
 
@@ -304,6 +343,10 @@ export function handleMaintenanceJump(jump) {
   if (jump === 'characters') {
     setMaintenanceView('characters');
     loadMoveWorkbench({view: 'characters'}).catch(() => {});
+  }
+  if (jump === 'downloads') {
+    setMaintenanceView('downloads');
+    loadMoveWorkbench({view: 'downloads'}).catch(() => {});
   }
 }
 

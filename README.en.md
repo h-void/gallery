@@ -27,6 +27,7 @@
 
 ### 1. Multi-Format Browsing & Smooth Playback
 - Images (JPG/PNG/WebP/AVIF/BMP), inline GIF hover preview, and in-browser video streaming (MP4/WebM/MOV/MKV via ffmpeg/HLS); plus .txt/.md/.html text and PSD/CLIP/PSB/ZIP/RAR sources.
+- Archive preview and extraction: Click ZIP/RAR/7Z cards to inspect directory tree and file sizes without extraction, preview internal image covers on demand, and safely extract to current directory or a new folder with optional recycling of the source archive.
 - Card ratio option: the maintenance Status page offers 4:3 full (default) and 3:4 portrait grid thumbnails; the choice is stored per browser.
 - Lightbox: full-screen zoom, drag-pan, mobile pinch; ←/→ navigate, Esc close, download/favorite/delete shortcuts.
 - URL-synced state: artist, folder, tags, date, sort, and search are written to the address bar for back/forward and sharing.
@@ -95,7 +96,7 @@ Prefer the native fnOS FPK for production. Choose either Docker workflow below:
 | `docker-compose.cuda.yml` | **NVIDIA GPU preset**. Preconfigured with GPU resource reservations; fill in your media path to launch. |
 | `gallery.yml` | **Minimal launcher configuration**. Contains only mode and directories; used by `start.cmd` / `start.sh`. |
 | `.env` | **Common parameter configuration**. Modify ports, scan/backup intervals, AI settings, etc.; read automatically on startup. |
-| `docker-compose.launcher.yml` | **Internal launcher template**. Used automatically by the startup script; manual editing is not required. |
+| `docker-compose.launcher.yml` | **Internal launcher template**. Bundled in the project directory for the startup script; manual download or editing is not required. |
 
 #### Workflow A: NAS Graphical Interface (No SSH or Python)
 
@@ -112,12 +113,14 @@ Suitable for Synology Container Manager, fnOS Docker, QNAP Container Station, UG
 > - **Hardware Acceleration**: Intel graphics requires NAS `/dev/dri` passthrough; if permission issues arise, specify `GALLERY_RENDER_GID` and `GALLERY_VIDEO_GID` in `.env`. NVIDIA requires host GPU drivers and NVIDIA Container Toolkit. Images target x86_64 architecture.
 > - **Media Safety & Read-Only**: Media folders are mounted read-only (`:ro`) by default. To enable recycle bin or archive operations, remove the trailing `:ro` and redeploy.
 > - **Data Persistence**: Database, logs, backups, caches, and models are persisted in the `gallery-storage` volume. Switching modes preserves all data. Never delete the volume (avoid `docker compose down -v`).
+> - **Archive Preview & Extraction**: The fnOS native FPK package bundles the 7-Zip (`7zz`) engine out of the box. When running via Docker, if you wish to use archive preview and extraction, ensure 7-Zip (`7zz` or `p7zip-full`) is installed in your container or environment, or specify its path via the `GALLERY_7Z_PATH` environment variable.
 
 #### Workflow B: One-Click Script Startup (Windows / Linux PC)
 
 Requires Docker Desktop or Docker Engine with Docker Compose, and Python 3.10+ (standard library only, no extra Python packages required):
 
-1. **Configure**: Open `gallery.yml` and set the running mode and media directories:
+1. **Get Project**: Download the repository ZIP and extract it (or run `git clone`), keeping the directory structure intact (the launcher template `docker-compose.launcher.yml` and `tools/` are bundled inside).
+2. **Configure**: Open `gallery.yml` and set the running mode and media directories:
 
    ```yaml
    模式: cpu
@@ -126,9 +129,10 @@ Requires Docker Desktop or Docker Engine with Docker Compose, and Python 3.10+ (
      - E:/Art
    ```
 
-   `模式` specifies the mode (`cpu`, `gpu`, or `cuda`); `目录` specifies the directories. Enter one path per line. On Linux, use absolute paths such as `/home/user/pictures`. Use `/` in Windows paths. Local disks only; mapped network drives and UNC paths are not supported.
-2. **Start**: On Windows, double-click `start.cmd`. On Linux, run `sh start.sh` from the project directory.
-3. **Access**: Open `http://localhost:8899/` (use host IP for other LAN devices) and click "Scan All". Models download automatically in the background.
+   - **Path format**: One absolute path per line, unlimited count. Use `/` in Windows paths (e.g. `D:/Pictures`, `E:/Art`); use full paths on Linux (e.g. `/home/user/pictures`). Local disks only; network shares and UNC paths are not supported.
+   - **Artist hierarchy**: Top-level subfolders are recognized as artists (e.g. `D:/Pictures/ArtistA/001.jpg`; loose files directly under the media root are not indexed).
+3. **Start**: On Windows, double-click `start.cmd`. On Linux, run `sh start.sh` from the project directory.
+4. **Access**: Open `http://localhost:8899/` (use host IP for other LAN devices) and click "Scan All". Models download automatically in the background.
 
 | Mode | Supported Hardware & Environment |
 | :--- | :--- |
@@ -175,7 +179,7 @@ For the remaining runtime variables and their defaults, see `fnpack/cmd/main` an
 
 ### 1. Prerequisites for Release Builds (Windows)
 - **WSL 2** with **Podman** installed (build scripts cross-compile the Linux binary inside an isolated Debian Bookworm container).
-- Official `fnpack` packaging binary (available at `output/fnpack/fnpack-1.2.3-windows-amd64.exe`).
+- Official `fnpack` packaging binary: download URL is in [docs/FNOS_NATIVE.md](docs/FNOS_NATIVE.md); place `fnpack-1.2.3-windows-amd64.exe` in `output/fnpack/`.
 
 ### 2. Full Release Build (Compile Rust & Package FPK)
 In Windows PowerShell, run the release pipeline:

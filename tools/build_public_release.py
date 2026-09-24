@@ -160,8 +160,58 @@ def _tracked_files() -> list[str]:
     return [item.decode("utf-8") for item in result.stdout.split(b"\0") if item]
 
 
-def stage_public_release(output: Path, tracked_files: Iterable[str | Path] | None = None) -> list[str]:
-    """Copy selected tracked files into an empty destination directory."""
+def _dirty_tracked_files() -> set[str]:
+    """Tracked paths whose worktree content differs from the index/HEAD.
+
+    `git status --porcelain -z` marks them ` M`, `M ` or `MM`; untracked (`??`)
+    and ignored entries are not listed at all, which is the distinction that
+    matters here: an untracked file is not in the selection either, so it cannot
+    be published, but the *tracked* file that references it can.
+
+    A staging root that is not itself a git repository answers "nothing dirty".
+    That case is not hypothetical: `git -C <dir>` walks *up* to the enclosing
+    repository, so asking about a scratch directory inside a checkout would
+    otherwise report the checkout's own modifications. The gate exists for this
+    repository's worktree, and no other tree needs it.
+    """
+    if not (ROOT / ".git").exists():
+        return set()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "status", "--porcelain", "-z", "--untracked-files=no"],
+            check=True,
+            capture_output=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return set()
+    dirty: set[str] = set()
+    for entry in result.stdout.split(b"\0"):
+        if len(entry) < 4:
+            continue
+        status = entry[:2]
+        path = entry[3:].decode("utf-8", errors="replace")
+        if status != b"  ":
+            dirty.add(path)
+    return dirty
+
+
+def stage_public_release(
+    output: Path,
+    tracked_files: Iterable[str | Path] | None = None,
+    allow_dirty: bool = False,
+) -> list[str]:
+    """Copy selected tracked files into an empty destination directory.
+
+    The file *list* comes from the index and the file *content* from the
+    worktree, so a dirty public file would be published in a form that exists in
+    no commit — and a module whose source file is still untracked makes the
+    published tree uncompilable while this function reports success. The gate
+    below refuses that, naming the files; `allow_dirty` is the deliberate
+    override for previewing a release tree while iterating.
+
+    `tracked_files` is an explicit selection (used by tests): it is trusted as
+    given, so the gate applies to the files actually being copied.
+    """
     output = Path(output).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"public release destination is not empty: {output}")
@@ -171,6 +221,25 @@ def stage_public_release(output: Path, tracked_files: Iterable[str | Path] | Non
     missing = sorted(REQUIRED_FILES.difference(selected))
     if missing:
         raise RuntimeError(f"public release is missing required files: {', '.join(missing)}")
+
+    if not allow_dirty:
+        # Only a file that is both dirty *and* part of the tree being staged can
+        # be published in a state no commit contains. Without the second half
+        # the gate would also refuse while the staging tool itself is being
+        # edited, and would fire for callers that stage an explicit file list
+        # from somewhere other than this worktree (the test suite does).
+        dirty = sorted(
+            path
+            for path in _dirty_tracked_files().intersection(selected)
+            if ROOT.joinpath(*path.split("/")).is_file()
+        )
+        if dirty:
+            raise RuntimeError(
+                "refusing to stage a public release from a dirty worktree; these "
+                "files would be published in a state no commit contains: "
+                + ", ".join(dirty)
+                + " (commit them, or pass --allow-dirty to stage a preview)"
+            )
 
     for relative in selected:
         source = ROOT.joinpath(*relative.split("/"))
@@ -187,8 +256,24 @@ def stage_public_release(output: Path, tracked_files: Iterable[str | Path] | Non
         elif relative == "gallery.yml":
             # Never publish user-entered local media paths or the selected mode.
             destination.write_text(
-                "# cpu：CPU；gpu：Intel 核显；cuda：NVIDIA\n模式: cpu\n\n"
-                "# 一行一个目录，Windows 路径使用 /\n目录:\n  - D:/Pictures\n",
+                "# ==============================================================================\n"
+                "# 运行模式：cpu（通用兼容）、gpu（Linux Intel 核显）、cuda（NVIDIA 显卡）\n"
+                "# ==============================================================================\n"
+                "模式: cpu\n\n"
+                "# ==============================================================================\n"
+                "# 媒体目录：一行一个完整绝对路径（支持多个目录，不支持网络映射盘和 UNC 共享）\n"
+                "# 目录结构：每个目录下的第一层子文件夹会自动识别为一个画师。\n"
+                "#\n"
+                "# 格式示例：\n"
+                "# Windows：\n"
+                "#   - D:/Pictures\n"
+                "#   - E:/Art/Collections\n"
+                "# Linux：\n"
+                "#   - /home/user/pictures\n"
+                "#   - /mnt/storage/art\n"
+                "# ==============================================================================\n"
+                "目录:\n"
+                "  - D:/Pictures\n",
                 encoding="utf-8",
             )
         elif relative in _TEST_MOD_FILES:
@@ -208,8 +293,18 @@ def stage_public_release(output: Path, tracked_files: Iterable[str | Path] | Non
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="empty directory to populate")
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help=(
+            "stage even when public files have uncommitted changes. The result is a "
+            "preview: it may contain code no commit has, and it may not compile."
+        ),
+    )
     args = parser.parse_args()
-    selected = stage_public_release(args.output)
+    selected = stage_public_release(args.output, allow_dirty=args.allow_dirty)
+    if args.allow_dirty:
+        print("[build_public_release] WARNING: staged with changes that are not committed")
     print(f"staged {len(selected)} public files in {args.output.resolve()}")
     return 0
 

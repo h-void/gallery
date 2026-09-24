@@ -1,6 +1,6 @@
-data/
-data/logs/
-data/db-backups/
+/data/
+/data/logs/
+/data/db-backups/
 *.db
 *.db-wal
 *.db-shm
@@ -18,10 +18,10 @@ htmlcov/
 .venv/
 venv/
 node_modules/
-preview-cache/
-transcode-cache/
-test-data/
-test-data/data/
+/preview-cache/
+/transcode-cache/
+/test-data/
+/test-data/data/
 docs/superpowers/plans/
 *.log
 *.tmp
@@ -30,12 +30,29 @@ docs/superpowers/plans/
 output/
 fnnas-docs/
 rust/**/target/
-media/
-media-placeholder-*/
+/media/
+/media-placeholder-*/
 .gallery-launcher/
 
 # Local tool configs and damaged-git forensic backup (never tracked)
 /.commandcode/
 /.git-damaged-*/
+/.git-destroyed-*/
 
 .gallery-empty/
+
+# Test scratch space (see .cargo/config.toml for why the wrappers redirect it)
+/tmp/
+
+# Agent session state and work logs for this repository
+/.workbuddy-ai/
+
+# Local cargo configuration. The wrappers own the scratch rules, and a
+# machine-specific target directory override must not travel with the checkout.
+/.cargo/
+
+# Runtime state a test binary creates next to the crate when it resolves
+# DATA_DIR from its own working directory: this is the same `data/`
+# (`gallery.db`, `db-backups`, `retained-dirs`) the root rule keeps out, one
+# level down, and `data/` is anchored at the repository root.
+/rust/gallery_accel/data/

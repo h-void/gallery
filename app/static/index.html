@@ -20,10 +20,10 @@
 </script>
 <title>画廊</title>
 <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%23F4ECDD"/><circle cx="24" cy="24" r="7" fill="%23C04B3A"/><path d="M12 48l14-18 10 12 6-7 10 13z" fill="%23C04B3A"/></svg>'>
-<link rel="stylesheet" href="/static/styles/tokens.css?v=1.1.4">
-<link rel="stylesheet" href="/static/styles/base.css?v=1.1.4">
-<link rel="stylesheet" href="/static/styles/layout.css?v=1.1.4">
-<link rel="stylesheet" href="/static/styles/views.css?v=1.1.4">
+<link rel="stylesheet" href="/static/styles/tokens.css?v=1.1.5">
+<link rel="stylesheet" href="/static/styles/base.css?v=1.1.5">
+<link rel="stylesheet" href="/static/styles/layout.css?v=1.1.5">
+<link rel="stylesheet" href="/static/styles/views.css?v=1.1.5">
 </head>
 <body>
 
@@ -39,11 +39,17 @@
 <header id="appHeader" class="mobile-tools-collapsed">
   <h1>画廊</h1>
   <div class="artist-picker" id="artistPicker">
-    <input type="text" id="artistSearch" role="combobox" aria-expanded="false" aria-controls="artistDropdown" aria-autocomplete="list" placeholder="搜索画师名称或拼音" autocomplete="off" maxlength="256">
+    <input type="text" id="artistSearch" role="combobox" aria-expanded="false" aria-controls="artistDropdown" aria-autocomplete="list" placeholder="搜索画师或拼音" autocomplete="off" maxlength="256">
     <div class="artist-dropdown" id="artistDropdown" role="listbox" aria-label="画师候选"></div>
   </div>
   <button id="mobileHeaderToggle" class="btn btn-ghost mobile-header-toggle" type="button" aria-expanded="false" aria-label="展开搜索和扫描" title="展开搜索和扫描">搜索</button>
   <div class="search-control" id="searchControl">
+    <span class="search-input-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8"></circle>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+      </svg>
+    </span>
     <input type="text" id="searchInput" placeholder="搜索标签或文件名" maxlength="256">
     <button id="clearSearchBtn" class="btn btn-ghost btn-icon search-clear-btn" type="button" aria-label="清空搜索" title="清空搜索" hidden>
       <span class="btn-glyph" aria-hidden="true">
@@ -53,7 +59,14 @@
         </svg>
       </span>
     </button>
-    <button id="searchOptionsBtn" class="btn btn-ghost search-options-btn" type="button" aria-expanded="false" aria-controls="searchOptionsMenu" title="搜索范围">范围</button>
+    <button id="searchOptionsBtn" class="btn btn-ghost search-options-btn" type="button" aria-expanded="false" aria-controls="searchOptionsMenu" title="搜索范围">
+      <span>范围</span>
+      <span class="btn-glyph search-options-chevron" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 9l6 6 6-6"></path>
+        </svg>
+      </span>
+    </button>
     <div class="search-options-menu" id="searchOptionsMenu" hidden>
       <div class="search-options-title">搜索范围</div>
       <div class="search-scope-list" role="group" aria-label="搜索范围">
@@ -208,6 +221,7 @@
 
   <div class="content">
     <div class="toolbar">
+      <button id="browseReturnBtn" class="btn btn-primary browse-return-btn" type="button" hidden title="返回下载">← 返回下载</button>
       <button id="editModeBtn" class="btn btn-ghost edit-mode-btn" type="button" aria-pressed="false" title="进入编辑模式" aria-label="进入编辑模式">选择</button>
       <button id="mobileFilterBtn" class="btn btn-ghost mobile-filter-btn" type="button" aria-expanded="false" aria-controls="filterSidebar">筛选</button>
       <select id="mediaFilter" class="media-filter-select" aria-label="媒体筛选" title="媒体筛选" disabled>
@@ -216,6 +230,10 @@
       <div id="duplicateFilesToggle" class="view-toggle duplicate-files-toggle" style="display:none" role="group" aria-label="文件范围">
         <button class="btn btn-segment active" type="button" data-duplicates="all" aria-pressed="true">全部</button>
         <button class="btn btn-segment" type="button" data-duplicates="duplicates" aria-pressed="false">重复</button>
+      </div>
+      <div class="view-toggle desktop-ratio-toggle" id="desktopRatioToggle" role="group" aria-label="卡片比例">
+        <button class="btn btn-segment active" type="button" data-card-ratio="4x3" aria-pressed="true" title="4:3 完整展示">4:3</button>
+        <button class="btn btn-segment" type="button" data-card-ratio="3x4" aria-pressed="false" title="3:4 竖版裁切">3:4</button>
       </div>
       <div class="view-toggle desktop-view-toggle" id="desktopViewToggle">
         <button class="btn btn-segment active" type="button" data-view="grid" aria-pressed="true">网格</button>
@@ -250,8 +268,8 @@
             <span class="character-suggestions-status" id="characterSuggestionsStatus">未识别</span>
             <div class="character-suggestions-list" id="characterSuggestionsList"></div>
           </div>
-          <button class="btn btn-primary" id="editApplyBtn" type="button">添加标签</button>
-          <button class="btn btn-ghost" id="editDeleteRoleBtn" type="button">移除标签</button>
+          <button class="btn btn-primary" id="editApplyBtn" type="button">添加角色</button>
+          <button class="btn btn-ghost" id="editDeleteRoleBtn" type="button">移除角色</button>
         </div>
         <div class="edit-bar-group" data-group="date" role="group" aria-label="日期编辑">
           <div class="edit-date-picker" id="editDatePicker">
@@ -304,6 +322,7 @@
           <button class="btn btn-segment" type="button" data-maintenance-view="paths" role="tab" aria-selected="false">路径核对</button>
           <button class="btn btn-segment" type="button" data-maintenance-view="organize" role="tab" aria-selected="false">文件整理</button>
           <button class="btn btn-segment" type="button" data-maintenance-view="characters" role="tab" aria-selected="false">角色库</button>
+          <button class="btn btn-segment" type="button" data-maintenance-view="downloads" role="tab" aria-selected="false">下载</button>
           <button class="btn btn-segment" type="button" data-maintenance-view="records" role="tab" aria-selected="false">记录</button>
         </div>
 
@@ -327,7 +346,7 @@
         </section>
 
         <section class="maintenance-section maintenance-advanced-collapsible ml-runtime-detail" id="mlRuntimePanel">
-          <details open>
+          <details>
             <summary>
               <span class="ml-runtime-summary-title">模型与推理</span>
               <span class="ml-runtime-summary-status" id="mlRuntimeSummaryStatus">等待读取</span>
@@ -364,20 +383,57 @@
           </div>
           <div class="maintenance-overview-cards" id="overviewActionCards">
             <button type="button" class="maintenance-overview-card" data-maintenance-jump="paths">
+              <span class="maintenance-overview-card-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                </svg>
+              </span>
               <b>待确认的移动与改名</b>
               <span id="overviewPathsHint">仅歧义或冲突时需确认</span>
             </button>
             <button type="button" class="maintenance-overview-card" data-maintenance-jump="organize">
+              <span class="maintenance-overview-card-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="16 3 21 3 21 8"></polyline>
+                  <line x1="4" y1="20" x2="21" y2="3"></line>
+                  <polyline points="21 16 21 21 16 21"></polyline>
+                  <line x1="15" y1="15" x2="21" y2="21"></line>
+                  <line x1="4" y1="4" x2="9" y2="9"></line>
+                </svg>
+              </span>
               <b>文件整理</b>
               <span>按画师批量改名与路径归档</span>
             </button>
             <button type="button" class="maintenance-overview-card" data-maintenance-jump="history">
+              <span class="maintenance-overview-card-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="10"></circle>
+                  <polyline points="12 6 12 12 16 14"></polyline>
+                </svg>
+              </span>
               <b>文件整理记录</b>
               <span>查看重命名与整理历史</span>
             </button>
             <button type="button" class="maintenance-overview-card" data-maintenance-jump="characters">
+              <span class="maintenance-overview-card-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                  <circle cx="12" cy="7" r="4"></circle>
+                </svg>
+              </span>
               <b>角色特征库</b>
               <span>管理单角色参考图，提升智能识别准确率</span>
+            </button>
+            <button type="button" class="maintenance-overview-card" data-maintenance-jump="downloads">
+              <span class="maintenance-overview-card-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                  <polyline points="7 10 12 15 17 10"></polyline>
+                  <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+              </span>
+              <b>订阅下载</b>
+              <span>按画师订阅自动下载新作品，设置命名规则</span>
             </button>
           </div>
         </section>
@@ -498,6 +554,9 @@
           </div>
           <div class="archive-preview-summary" id="archivePreviewSummary" aria-live="polite"></div>
           <div class="archive-plan-list" id="archivePlanList"></div>
+          <div class="archive-plans-fold-wrap" id="archivePlansFoldWrap" hidden>
+            <button class="btn btn-ghost btn-sm" id="archivePlansFoldBtn" type="button"></button>
+          </div>
           <details class="archive-advanced-tools maintenance-advanced-detail" id="archiveAdvancedTools">
             <summary>高级选项与规则设置</summary>
             <div class="archive-advanced-body">
@@ -517,8 +576,40 @@
                   <button id="archivePlansPreviewBtn" class="btn btn-ghost" type="button" title="预览目标路径及冲突">预览目标</button>
                 </div>
               </div>
+              <p class="archive-rule-hint">规则在画师目录下生成目标文件夹：{year}/{date} 会先建年份子目录。{date} 有具体日期时为「年-月-日」，只有年月时为「年-月」。变量可点击插入，悬停查看含义。</p>
               <div class="archive-rule-status" id="archiveRuleStatus"></div>
-              <div class="archive-token-strip" aria-label="可用命名变量"><code role="button" tabindex="0" title="插入变量" data-insert-token="{year}">{year}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{date}">{date}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{tags}">{tags}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{artist}">{artist}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{title}">{title}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{folder}">{folder}</code><code role="button" tabindex="0" title="插入变量" data-insert-token="{index}">{index}</code></div>
+              <div class="archive-token-strip" aria-label="可用命名变量"><code role="button" tabindex="0" title="四位年份，如 2024" data-insert-token="{year}">{year}</code><code role="button" tabindex="0" title="两位月份，如 03" data-insert-token="{month}">{month}</code><code role="button" tabindex="0" title="日期：有具体日期为 2024-03-15，只有年月为 2024-03" data-insert-token="{date}">{date}</code><code role="button" tabindex="0" title="标签，多个用 &amp; 连接" data-insert-token="{tags}">{tags}</code><code role="button" tabindex="0" title="画师名" data-insert-token="{artist}">{artist}</code><code role="button" tabindex="0" title="画师名，同 {artist}" data-insert-token="{user}">{user}</code><code role="button" tabindex="0" title="画师在来源站点的 ID" data-insert-token="{userID}">{userID}</code><code role="button" tabindex="0" title="同 {userID}" data-insert-token="{user_id}">{user_id}</code><code role="button" tabindex="0" title="原文件夹标题" data-insert-token="{title}">{title}</code><code role="button" tabindex="0" title="原文件夹名" data-insert-token="{folder}">{folder}</code><code role="button" tabindex="0" title="同批顺序编号" data-insert-token="{index}">{index}</code><code role="button" tabindex="0" title="条目 ID，没有则用编号" data-insert-token="{id}">{id}</code><code role="button" tabindex="0" title="同 {folder}" data-insert-token="{name}">{name}</code><code role="button" tabindex="0" title="文件扩展名，如 png" data-insert-token="{ext}">{ext}</code><code role="button" tabindex="0" title="来源站点" data-insert-token="{site}">{site}</code><code role="button" tabindex="0" title="来源服务" data-insert-token="{service}">{service}</code><code role="button" tabindex="0" title="下载任务日期" data-insert-token="{task_date}">{task_date}</code></div>
+              <div class="archive-template-guide">
+                <div><b>规则作用</b>：在画师目录下自动创建规范的归档子文件夹（如 <code>{year}/{date} {tags}/</code>），并移动未冲突的已打标文件。</div>
+                <div class="archive-template-guide-desc">常用分类变量：<code>{year}</code> 发布年份 &#183; <code>{month}</code> 发布月份 &#183; <code>{date}</code> 发布日期 &#183; <code>{tags}</code> 作品标签 &#183; <code>{folder}</code> 原文件夹名 &#183; <code>{user}</code> 画师名 &#183; <code>{title}</code> 作品标题</div>
+                <details class="template-vars-detail">
+                  <summary>查看文件夹整理变量详细说明</summary>
+                  <div class="template-vars-table-wrap">
+                    <table class="template-vars-table">
+                      <thead>
+                        <tr>
+                          <th>变量</th>
+                          <th>对应含义</th>
+                          <th>详细行为</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr><td><code>{year}</code></td><td><b>发布年份</b></td><td>四位年份数字（如 2024），常用于按年建立顶层归档目录</td></tr>
+                        <tr><td><code>{month}</code></td><td><b>发布月份</b></td><td>两位月份数字（如 03、12），可与年份组合使用</td></tr>
+                        <tr><td><code>{date}</code></td><td><b>作品日期</b></td><td>作品发布时间。有具体日期为 <code>YYYY-MM-DD</code>，仅有年月自动为 <code>YYYY-MM</code></td></tr>
+                        <tr><td><code>{tags}</code></td><td><b>作品标签</b></td><td>作品打上的分类标签（多个标签以 &amp; 连接），未打标则为空</td></tr>
+                        <tr><td><code>{folder}</code></td><td><b>原文件夹名</b></td><td>整理前的原始子文件夹名称，用于在重命名中保留旧目录名</td></tr>
+                        <tr><td><code>{user}</code></td><td><b>画师名称</b></td><td>画师在库中的展示名称（等同于 <code>{artist}</code>）</td></tr>
+                        <tr><td><code>{title}</code></td><td><b>作品标题</b></td><td>作品标题文本，包含的非法路径字符会自动替换为安全下划线</td></tr>
+                        <tr><td><code>{userID}</code></td><td><b>画师 ID</b></td><td>画师在源站或本地库中的作者标识（等同于 <code>{user_id}</code>）</td></tr>
+                        <tr><td><code>{id}</code></td><td><b>记录 ID</b></td><td>作品或整理条目在数据库中的唯一识别编号</td></tr>
+                        <tr><td><code>{service}</code></td><td><b>来源服务</b></td><td>作品关联的发布平台名称（如 fanbox、patreon、fantia）</td></tr>
+                        <tr><td><code>{site}</code></td><td><b>来源站点</b></td><td>数据来源镜像或源站名称（如 kemono、coomer）</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              </div>
             </div>
           </details>
         </details>
@@ -531,34 +622,38 @@
           <summary>角色库</summary>
           <div class="maintenance-section-head">
             <div>
-              <div class="move-section-title">建库与导入</div>
-              <div class="health-subtitle">用单角色作品建库，提升识别准确率</div>
+              <div class="move-section-title">角色特征库</div>
+              <div class="health-subtitle">管理角色与参考图，提升识别准确率</div>
             </div>
             <div class="maintenance-section-actions">
-              <select id="characterImportScopeSelect" aria-label="导入范围"><option value="artist">当前画师</option><option value="all">全库</option></select>
-              <button id="characterImportBtn" class="btn btn-ops" type="button">导入单角色标签</button>
               <button id="characterRebuildIndexBtn" class="btn btn-ops" type="button">刷新角色参考</button>
             </div>
           </div>
           <div class="character-library-summary" id="characterLibrarySummary">角色库读取中</div>
+          <div class="character-import-job-container" id="characterImportJobContainer"></div>
           <div class="character-library-toolbar">
             <div class="character-library-search">
-              <input id="characterLibrarySearchInput" type="search" placeholder="搜索角色或可导入标签" autocomplete="off" aria-label="搜索角色库">
+              <input id="characterLibrarySearchInput" type="search" placeholder="搜索角色" autocomplete="off" aria-label="搜索角色库">
               <button id="characterLibrarySearchClearBtn" class="btn btn-ghost btn-icon" type="button" aria-label="清空搜索" title="清空搜索" hidden><span class="btn-glyph" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12"></path><path d="M18 6 6 18"></path></svg></span></button>
             </div>
           </div>
           <div class="character-library-views" id="characterLibraryViews" role="tablist" aria-label="角色库视图">
-            <button class="btn btn-segment" type="button" data-character-library-view="import" role="tab" aria-selected="false">导入标签</button>
             <button class="btn btn-segment active" type="button" data-character-library-view="characters" role="tab" aria-selected="true">已建角色</button>
             <button class="btn btn-segment" type="button" data-character-library-view="references" role="tab" aria-selected="false">参考图</button>
           </div>
           <div class="character-library-grid" id="characterLibraryGrid">
-            <div class="character-library-column" data-character-library-panel="import">
-              <div class="operation-log-title">可导入的单角色标签</div>
-              <div class="character-tag-import-list" id="characterTagImportList"></div>
-            </div>
             <div class="character-library-column" data-character-library-panel="characters">
-              <div class="operation-log-title">已建角色</div>
+              <div class="character-library-column-head">
+                <div class="operation-log-title">已建角色</div>
+                <div class="character-library-column-head-actions">
+                  <button class="btn btn-ghost" id="characterCreateBtn" type="button">新建角色</button>
+                </div>
+              </div>
+              <div class="character-create-box" id="characterCreateBox" hidden>
+                <input id="characterCreateInput" type="text" placeholder="输入角色名称" maxlength="100" autocomplete="off" aria-label="新建角色名称">
+                <button id="characterCreateConfirmBtn" class="btn btn-ops" type="button">确定</button>
+                <button id="characterCreateCancelBtn" class="btn btn-ghost" type="button">取消</button>
+              </div>
               <div class="character-list" id="characterList"></div>
             </div>
             <div class="character-library-column" data-character-library-panel="references">
@@ -567,10 +662,310 @@
                   <div class="operation-log-title">参考图</div>
                   <div class="character-card-created" id="characterLibrarySelectedMeta"></div>
                 </div>
-                <button class="btn btn-ghost character-library-back" id="characterLibraryBackBtn" type="button">返回角色</button>
+                <div class="character-library-column-head-actions">
+                  <button class="btn btn-ghost" id="characterReferenceUploadBtn" type="button" title="从本机选一张照片作为该角色的参考图">添加照片</button>
+                  <button class="btn btn-ghost character-library-back" id="characterLibraryBackBtn" type="button">返回角色</button>
+                </div>
               </div>
+              <input type="file" id="characterReferenceUploadInput" accept="image/*" hidden>
               <div class="character-reference-list" id="characterReferenceList"></div>
             </div>
+          </div>
+        </details>
+        </div>
+
+        <div class="maintenance-view-panel" data-maintenance-view-panel="downloads" hidden>
+        <section class="maintenance-section download-action-panel" id="downloadActionPanel">
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">立即操作</div>
+              <div class="health-subtitle">检查只更新缺失列表，同步还会下载新作品</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <button id="downloadCheckBtn" class="btn btn-ghost" type="button" title="只发现新作品并重算每天的缺失，不下载文件">检查缺失</button>
+              <button id="downloadReconcileBtn" class="btn btn-ghost" type="button" title="只读取本地目录与账本，重算每篇作品的状态，不访问源站也不下载">核对本地</button>
+              <button id="downloadSyncBtn" class="btn btn-ops" type="button">立即同步全部</button>
+              <span id="downloadSyncStatus" role="status"></span>
+            </div>
+          </div>
+        </section>
+
+        <details class="maintenance-section download-subscription-panel maintenance-advanced-detail" id="downloadSubscriptionPanel" open>
+          <summary>画师订阅</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">画师订阅</div>
+              <div class="health-subtitle">粘贴画师主页链接，绑定画师目录后开始下载</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <span id="downloadSubscriptionCount" class="health-subtitle"></span>
+            </div>
+          </div>
+          <form class="download-subscription-form" id="downloadSubscriptionForm">
+            <label class="archive-field download-subscription-url"><span>作者主页链接</span><input id="downloadSubscriptionUrl" type="text" maxlength="500" autocomplete="off"></label>
+            <div class="archive-field download-subscription-artist"><span id="downloadSubscriptionArtistLabel">绑定画师文件夹</span>
+              <div class="download-artist-combo">
+                <input id="downloadSubscriptionArtistInput" type="text" maxlength="200" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="downloadSubscriptionArtistListbox" aria-labelledby="downloadSubscriptionArtistLabel" placeholder="输入名字搜索画师，没有匹配时按该名字新建目录">
+                <input id="downloadSubscriptionArtistSelect" type="hidden" value="">
+                <ul class="download-artist-listbox" id="downloadSubscriptionArtistListbox" role="listbox" aria-labelledby="downloadSubscriptionArtistLabel" hidden></ul>
+              </div>
+            </div>
+            <div class="archive-field download-subscription-folder"><span id="downloadSubscriptionFolderLabel">新建位置</span>
+              <div class="download-subscription-folder-row">
+                <select id="downloadSubscriptionRoot" aria-label="媒体根目录"></select>
+                <button class="btn btn-ghost" id="downloadSubscriptionFolderBrowseBtn" type="button">选择目录</button>
+                <output id="downloadSubscriptionFolderParent">根目录</output>
+              </div>
+            </div>
+            <label class="archive-field"><span>起始日期</span><input id="downloadSubscriptionSince" type="date"></label>
+            <div class="download-subscription-actions">
+              <button class="btn btn-primary" type="submit">添加订阅</button>
+              <div class="download-subscription-status" id="downloadSubscriptionStatus" role="status"></div>
+            </div>
+          </form>
+          <div class="download-subscription-head" id="downloadSubscriptionHead">
+            <input id="downloadSubscriptionSearch" type="search" placeholder="搜索已订阅画师或作者 ID" autocomplete="off" aria-label="搜索已订阅画师">
+          </div>
+          <div class="download-subscription-list" id="downloadSubscriptionList"></div>
+        </details>
+
+        <details class="maintenance-section download-settings-panel maintenance-advanced-detail" id="downloadSettingsPanel">
+          <summary>订阅下载设置</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">订阅下载设置</div>
+              <div class="health-subtitle">按画师订阅发现新作品并下载到画师目录</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <button id="downloadSettingsSaveBtn" class="btn btn-primary" type="button">保存设置</button>
+              <span id="downloadSettingsStatus" role="status"></span>
+            </div>
+          </div>
+          <div class="download-toggle-row">
+            <label class="maintenance-auto-toggle" title="开启后按检查间隔自动检查订阅并下载新作品">
+              <input id="downloadEnabledToggle" type="checkbox">
+              <span>启用订阅下载</span>
+            </label>
+            <label class="maintenance-auto-toggle" title="新发现的网盘链接自动创建下载任务；旧链接需手动投递">
+              <input id="downloadJdownloaderToggle" type="checkbox">
+              <span>自动投递网盘至 JDownloader</span>
+            </label>
+            <label class="maintenance-auto-toggle" title="开启后下载完成的文件会自动登记入库">
+              <input id="downloadAutoIngestToggle" type="checkbox">
+              <span>下载后自动入库</span>
+            </label>
+          </div>
+          <div class="download-option-row">
+            <label class="archive-field download-interval-field"><span>检查间隔</span>
+              <select id="downloadIntervalSelect" aria-label="检查间隔">
+                <option value="1">1 小时</option>
+                <option value="3">3 小时</option>
+                <option value="6">6 小时</option>
+                <option value="12">12 小时</option>
+                <option value="24">24 小时</option>
+              </select>
+            </label>
+            <div class="archive-field download-type-field"><span id="downloadTypeLabel">下载文件类型</span>
+              <div class="download-type-segments segment-group" role="group" aria-labelledby="downloadTypeLabel">
+                <button class="btn btn-segment" type="button" data-download-type="images" role="switch" aria-checked="false">图片</button>
+                <button class="btn btn-segment" type="button" data-download-type="videos" role="switch" aria-checked="false">视频</button>
+                <button class="btn btn-segment" type="button" data-download-type="audio" role="switch" aria-checked="false">音频</button>
+                <button class="btn btn-segment" type="button" data-download-type="archives" role="switch" aria-checked="false" title="压缩包按原样下载，不解压">压缩包</button>
+                <button class="btn btn-segment" type="button" data-download-type="others" role="switch" aria-checked="false" title="源文件与文档等其他附件，如 psd、clip、pdf、txt">其他文件</button>
+                <button class="btn btn-segment" type="button" data-download-type="content" role="switch" aria-checked="false" title="保存帖子正文为文本文件">正文</button>
+                <button class="btn btn-segment" type="button" data-download-type="links" role="switch" aria-checked="false" title="提取帖子外链为链接文本文件">外链</button>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details class="maintenance-section netdisk-panel maintenance-advanced-detail" id="netdiskPanel">
+          <summary>网盘下载</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">网盘下载</div>
+              <div class="health-subtitle">通过本地连接脚本把作品里的网盘链接交给 JDownloader；Gallery 不接管任何网盘账号</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <span id="netdiskStatusText" class="health-subtitle netdisk-status" role="status" data-netdisk-state="未配置">未配置</span>
+              <span id="netdiskDirtyBadge" class="health-subtitle" hidden>未保存</span>
+            </div>
+          </div>
+          <div class="download-toggle-row">
+            <label class="maintenance-auto-toggle" title="开启后接受新任务；关闭后不新建、解析或启动任务，也不执行自动入库。已投递的任务会继续下载">
+              <input id="netdiskEnabledToggle" type="checkbox">
+              <span>网盘下载</span>
+            </label>
+            <label class="maintenance-auto-toggle" title="新任务完成解析和 Gallery 校验后自动提交到下载列表；关闭则停在待开始，不受 JDownloader 自己的全局自动确认策略绕过">
+              <input id="netdiskAutoStartToggle" type="checkbox">
+              <span>自动开始</span>
+            </label>
+            <label class="maintenance-auto-toggle" title="能力检查通过后允许开启；仅导入该任务已验证清单，部分失败或清单不完整则等用户处理">
+              <input id="netdiskAutoImportToggle" type="checkbox">
+              <span>下载后入库</span>
+            </label>
+            <label class="maintenance-auto-toggle" title="能力检查通过后允许开启；入库成功后删除暂存文件并从下载器移除已完成任务">
+              <input id="netdiskCleanupAfterImportToggle" type="checkbox">
+              <span>入库后清理</span>
+            </label>
+          </div>
+          <div class="netdisk-field-row">
+            <label class="archive-field"><span>暂存目录</span><input id="netdiskStagingDirInput" type="text" maxlength="500" autocomplete="off" spellcheck="false" placeholder="留空自动使用根目录下的 .staging 目录"></label>
+            <label class="archive-field"><span>入库目录</span><input id="netdiskImportDirInput" type="text" maxlength="500" autocomplete="off" spellcheck="false" placeholder="留空则使用任务自己的目标目录"></label>
+          </div>
+          <div class="netdisk-field-row">
+            <label class="archive-field netdisk-number-field"><span>检查间隔（秒）</span><input id="netdiskIntervalInput" type="number" min="5" max="300" step="1" inputmode="numeric"></label>
+            <label class="archive-field netdisk-number-field"><span>保留空间（GiB）</span><input id="netdiskReserveInput" type="number" min="1" step="1" inputmode="numeric"></label>
+          </div>
+          <div class="netdisk-actions">
+            <button id="netdiskSaveBtn" class="btn btn-primary" type="button">保存</button>
+            <button id="netdiskTestBtn" class="btn btn-ghost" type="button">测试连接</button>
+            <button id="netdiskPathCheckBtn" class="btn btn-ghost" type="button">检查目录</button>
+            <button id="netdiskScriptBtn" class="btn btn-ghost" type="button">连接脚本</button>
+            <button id="netdiskResetPairingBtn" class="btn btn-ghost" type="button">重置配对</button>
+            <button id="netdiskConnectBtn" class="btn btn-primary" type="button" hidden>重新连接</button>
+            <button id="netdiskDisconnectBtn" class="btn btn-ghost" type="button" title="彻底断开连接；已投递的任务会继续下载">断开连接</button>
+          </div>
+          <div class="netdisk-script-box" id="netdiskScriptBox" hidden>
+            <div class="netdisk-script-header">
+              <div class="health-subtitle" id="netdiskScriptHint"></div>
+              <button id="netdiskScriptCopyBtn" class="btn btn-ghost btn-sm" type="button">复制脚本</button>
+            </div>
+            <pre class="netdisk-script-text" id="netdiskScriptText"></pre>
+          </div>
+          <div class="netdisk-dispatch-section" id="netdiskDispatchSection">
+            <div class="netdisk-dispatch-bar" id="netdiskDispatchBar">
+              <label class="archive-field netdisk-dispatch-input-wrap">
+                <span>手动投递作品</span>
+                <input id="netdiskDispatchInput" type="text" maxlength="500" autocomplete="off" spellcheck="false" placeholder="输入作品 ID 或 Kemono 链接">
+              </label>
+              <button id="netdiskDispatchResolveBtn" class="btn btn-ghost" type="button">解析作品</button>
+              <button id="netdiskDispatchSubmitBtn" class="btn btn-primary" type="button" disabled>投递到下载器</button>
+            </div>
+            <div class="netdisk-dispatch-preview" id="netdiskDispatchPreview" hidden></div>
+          </div>
+          <div class="netdisk-job-head" id="netdiskJobHead">
+            <div class="netdisk-job-tags segment-group" id="netdiskJobTags" role="group" aria-label="任务状态">
+              <button class="btn btn-segment active" type="button" data-netdisk-filter="all">全部<span id="netdiskJobCountAll" class="filter-count"></span></button>
+              <button class="btn btn-segment" type="button" data-netdisk-filter="pending">未完成<span id="netdiskJobCountPending" class="filter-count"></span></button>
+              <button class="btn btn-segment" type="button" data-netdisk-filter="completed">已完成<span id="netdiskJobCountCompleted" class="filter-count"></span></button>
+            </div>
+            <span id="netdiskJobCount" class="health-subtitle"></span>
+          </div>
+          <div class="netdisk-job-list" id="netdiskJobList"></div>
+          <div class="netdisk-jobs-fold-wrap" id="netdiskJobsFoldWrap" hidden>
+            <button class="btn btn-ghost btn-sm" id="netdiskJobsFoldBtn" type="button"></button>
+          </div>
+        </details>
+
+        <details class="maintenance-section download-template-panel maintenance-advanced-detail" id="downloadTemplatePanel">
+          <summary>命名模板</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">命名模板</div>
+              <div class="health-subtitle">点击下方变量插入到最近编辑的输入框</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <button id="downloadTemplateResetBtn" class="btn btn-ghost" type="button">恢复默认</button>
+            </div>
+          </div>
+          <div class="download-template-fields">
+            <label class="archive-field archive-template-field"><span>文件夹命名模板</span><input id="downloadFolderTemplateInput" type="text" maxlength="500" autocomplete="off" placeholder="{user}/{date} {title}/"></label>
+            <label class="archive-field archive-template-field"><span>图片文件名模板</span><input id="downloadImageTemplateInput" type="text" maxlength="500" autocomplete="off" placeholder="{date} {index}.{ext}"></label>
+            <label class="archive-field archive-template-field"><span>附件文件名模板</span><input id="downloadAttachmentTemplateInput" type="text" maxlength="500" autocomplete="off" placeholder="{date} {name}"></label>
+          </div>
+          <div class="download-token-strip" aria-label="可用命名变量"><code role="button" tabindex="0" title="画师名称，如 阿戈魔AGM" data-download-token="{user}">{user}</code><code role="button" tabindex="0" title="画师在源站的用户 ID，如 123456" data-download-token="{userID}">{userID}</code><code role="button" tabindex="0" title="画师在源站的用户 ID（同 {userID}）" data-download-token="{user_id}">{user_id}</code><code role="button" tabindex="0" title="作品发布日期：有具体日期为 2024-03-15，只有年月为 2024-03" data-download-token="{date}">{date}</code><code role="button" tabindex="0" title="作品或帖子标题" data-download-token="{title}">{title}</code><code role="button" tabindex="0" title="作品在源站的帖子 ID，如 98765432" data-download-token="{id}">{id}</code><code role="button" tabindex="0" title="附件原始文件名（含后缀则保持原名）" data-download-token="{name}">{name}</code><code role="button" tabindex="0" title="同篇作品内图片顺序编号，从 0 开始递增" data-download-token="{index}">{index}</code><code role="button" tabindex="0" title="文件扩展名，如 png、jpg、zip" data-download-token="{ext}">{ext}</code><code role="button" tabindex="0" title="来源服务平台，如 fanbox、patreon、fantia" data-download-token="{service}">{service}</code><code role="button" tabindex="0" title="来源站点域名，如 kemono、coomer" data-download-token="{site}">{site}</code></div>
+          <div class="download-template-guide">
+            <div><b>文件夹模板</b>：定义画师目录下的子目录路径结构，如 <code>{date} {title}/</code> 或 <code>{user}/{date} {title}/</code></div>
+            <div><b>图片模板</b>：定义多张图片的编号与命名规则，如 <code>{date} {index}.{ext}</code>（必须包含 <code>{index}</code> 序号以防多图覆盖）</div>
+            <div><b>附件模板</b>：定义压缩包、PSD、文档等非图片附件命名，如 <code>{date} {name}</code>（<code>{name}</code> 为创作者上传的原始文件名）</div>
+            <div class="download-template-guide-desc">常用变量：<code>{user}</code> 画师名 &#183; <code>{userID}</code> 作者ID &#183; <code>{date}</code> 发布日期 &#183; <code>{title}</code> 帖子标题 &#183; <code>{id}</code> 帖子ID &#183; <code>{name}</code> 原文件名 &#183; <code>{index}</code> 图片序号 &#183; <code>{ext}</code> 后缀名 &#183; <code>{service}</code> 平台</div>
+            <details class="template-vars-detail">
+              <summary>查看下载命名变量详细说明</summary>
+              <div class="template-vars-table-wrap">
+                <table class="template-vars-table">
+                  <thead>
+                    <tr>
+                      <th>变量</th>
+                      <th>对应含义</th>
+                      <th>详细行为</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr><td><code>{user}</code></td><td><b>画师名</b></td><td>画师在源站的展示名称（等同于 <code>{artist}</code>）</td></tr>
+                    <tr><td><code>{userID}</code></td><td><b>画师源站 ID</b></td><td>画师在源平台的唯一数字或文本 ID（等同于 <code>{user_id}</code>）</td></tr>
+                    <tr><td><code>{date}</code></td><td><b>作品发布日期</b></td><td>源站发布时间。有具体日期为 <code>YYYY-MM-DD</code>，仅有年月自动为 <code>YYYY-MM</code></td></tr>
+                    <tr><td><code>{year}</code></td><td><b>发布年份</b></td><td>作品发布的四位年份数字（例如 2024）</td></tr>
+                    <tr><td><code>{month}</code></td><td><b>发布月份</b></td><td>作品发布的两位月份数字（例如 03、12）</td></tr>
+                    <tr><td><code>{title}</code></td><td><b>帖子标题</b></td><td>作品在源站的标题内容。非法文件名符号会自动替换为安全下划线</td></tr>
+                    <tr><td><code>{id}</code></td><td><b>帖子 ID</b></td><td>本篇作品在源站的唯一帖子 ID</td></tr>
+                    <tr><td><code>{index}</code></td><td><b>图片序号</b></td><td>同篇作品内多张插画的递增顺序编号，从 <code>0</code> 开始递增（避免多图同名覆盖）</td></tr>
+                    <tr><td><code>{name}</code></td><td><b>附件原名</b></td><td>创作者上传压缩包、PSD、视频等附件时的原始文件名（若自带后缀会保留）</td></tr>
+                    <tr><td><code>{ext}</code></td><td><b>文件扩展名</b></td><td>文件的格式后缀（如 png、jpg、zip 等，不带点）</td></tr>
+                    <tr><td><code>{service}</code></td><td><b>平台服务名</b></td><td>作品原始赞助平台名称（如 fanbox、patreon、fantia、afdian）</td></tr>
+                    <tr><td><code>{site}</code></td><td><b>抓取源站名</b></td><td>数据抓取镜像源站点（如 kemono、coomer）</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          </div>
+        </details>
+
+        <details class="maintenance-section download-works-panel maintenance-advanced-detail" id="downloadWorksPanel" open>
+          <summary>全部作品</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">全部作品</div>
+              <div class="health-subtitle">跨订阅列出所有已发现的作品，勾选后手动下载</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <span id="downloadWorksCount" class="health-subtitle"></span>
+            </div>
+          </div>
+          <div class="download-works-filters">
+            <label class="archive-field"><span>搜索</span><input id="downloadWorksSearch" type="text" maxlength="200" autocomplete="off" placeholder="标题或作品 ID"></label>
+            <div class="archive-field download-works-artist-field"><span id="downloadWorksArtistLabel">画师</span>
+              <div class="download-artist-combo" id="downloadWorksArtistCombo">
+                <input id="downloadWorksArtistInput" type="text" maxlength="200" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="downloadWorksArtistListbox" aria-labelledby="downloadWorksArtistLabel" placeholder="全部画师（输入搜索）">
+                <input id="downloadWorksArtist" type="hidden" value="">
+                <ul class="download-artist-listbox" id="downloadWorksArtistListbox" role="listbox" aria-labelledby="downloadWorksArtistLabel" hidden></ul>
+              </div>
+            </div>
+            <label class="archive-field"><span>日期</span><input id="downloadWorksDay" type="date" aria-label="日期"></label>
+            <label class="archive-field"><span>状态</span>
+              <select id="downloadWorksState" aria-label="状态">
+                <option value="missing">只看缺失</option>
+                <option value="" selected>全部作品</option>
+                <option value="completed">已下齐</option>
+              </select>
+            </label>
+          </div>
+          <div class="download-works-actions">
+            <label class="maintenance-auto-toggle" title="当前筛选下的全部作品，不只是这一屏">
+              <input id="downloadWorksSelectAll" type="checkbox">
+              <span>全选当前筛选</span>
+            </label>
+            <button id="downloadWorksClearBtn" class="btn btn-ghost" type="button">清空选择</button>
+            <button id="downloadWorksDownloadBtn" class="btn btn-ops" type="button">下载所选</button>
+            <span id="downloadWorksSelection" class="health-subtitle" role="status"></span>
+          </div>
+          <div class="download-works-list" id="downloadWorksList"></div>
+        </details>
+
+        <details class="maintenance-section download-log-panel maintenance-advanced-detail" id="downloadLogPanel">
+          <summary>下载日志</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">下载日志</div>
+              <div class="health-subtitle">检查、同步与下载的最近 50 条记录</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <button id="downloadLogRefreshBtn" class="btn btn-ghost" type="button">刷新日志</button>
+            </div>
+          </div>
+          <div class="download-log-list" id="downloadLogList"></div>
+          <div class="download-log-fold-wrap" id="downloadLogFoldWrap" hidden>
+            <button class="btn btn-ghost btn-sm" id="downloadLogFoldBtn" type="button"></button>
           </div>
         </details>
         </div>
@@ -578,7 +973,7 @@
         <div class="maintenance-view-panel" data-maintenance-view-panel="records" hidden>
         <details class="maintenance-section recycle-bin-panel maintenance-advanced-detail" id="recycleBinPanel" open>
           <summary>回收站</summary>
-          <div class="maintenance-section-head"><div><div class="move-section-title">已删除作品</div><div class="health-subtitle">支持一键恢复至原位置</div></div><div class="maintenance-section-actions"><button id="recycleRefreshBtn" class="btn btn-ghost" type="button">刷新列表</button></div></div>
+          <div class="maintenance-section-head"><div><div class="move-section-title">已删除作品</div><div class="health-subtitle">支持一键恢复至原位置</div></div><div class="maintenance-section-actions"><button id="recycleClearBtn" class="btn btn-ghost btn-danger" type="button" title="清空回收站">清空回收站</button><button id="recycleRefreshBtn" class="btn btn-ghost" type="button">刷新列表</button></div></div>
           <div class="recycle-bin-summary" id="recycleBinSummary">回收站读取中</div><div class="recycle-bin-list" id="recycleBinList"></div><div class="recycle-bin-more" id="recycleBinMore"></div>
         </details>
 
@@ -602,6 +997,9 @@
             <div class="operation-log-column" data-column="success">
               <div class="operation-log-title">成功</div>
               <div class="operation-history-list" id="operationSuccessList"></div>
+              <div class="operation-log-fold-wrap" id="operationSuccessFoldWrap" hidden>
+                <button class="btn btn-ghost btn-sm" id="operationSuccessFoldBtn" type="button"></button>
+              </div>
             </div>
             <div class="operation-log-column" data-column="failure">
               <div class="operation-log-title">失败</div>
@@ -706,6 +1104,52 @@
   </div>
 </dialog>
 
+<dialog class="artist-links-dialog archive-dialog" id="archiveDialog" aria-labelledby="archiveDialogTitle">
+  <div class="artist-links-dialog-head">
+    <h2 id="archiveDialogTitle">压缩包预览与解压</h2>
+    <button class="btn btn-ghost btn-icon" id="archiveDialogCloseBtn" type="button" aria-label="关闭压缩包窗口" title="关闭压缩包窗口">
+      <span class="btn-glyph" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path d="M6 6l12 12"></path>
+          <path d="M18 6 6 18"></path>
+        </svg>
+      </span>
+    </button>
+  </div>
+  <div class="artist-links-dialog-body archive-dialog-body">
+    <div class="archive-info-summary" id="archiveInfoSummary"></div>
+    <div class="archive-password-row" id="archivePasswordRow" style="display:none">
+      <input type="password" id="archivePasswordInput" placeholder="输入解压密码" autocomplete="off" aria-label="解压密码">
+      <button class="btn btn-ghost" type="button" id="archivePasswordRetryBtn">解锁预览</button>
+    </div>
+    <div class="archive-entries-tree" id="archiveEntriesTree"></div>
+    <div class="archive-options-section">
+      <div class="archive-target-modes">
+        <label class="archive-radio-label">
+          <input type="radio" name="archiveTargetMode" value="current_folder" checked>
+          <span>解压到当前目录</span>
+        </label>
+        <label class="archive-radio-label">
+          <input type="radio" name="archiveTargetMode" value="new_folder">
+          <span>解压到新建文件夹</span>
+        </label>
+      </div>
+      <input type="text" id="archiveCustomFolderName" class="archive-custom-folder-input" placeholder="新建文件夹名称" autocomplete="off" aria-label="新建文件夹名称" style="display:none">
+      <label class="archive-checkbox-label">
+        <input type="checkbox" id="archiveRecycleSource" checked>
+        <span>解压后将原压缩包移入回收站</span>
+      </label>
+    </div>
+  </div>
+  <div class="archive-dialog-footer">
+    <div class="archive-status-msg" id="archiveStatusMsg"></div>
+    <div class="archive-dialog-actions">
+      <button class="btn btn-ghost" type="button" id="archiveCancelBtn">取消</button>
+      <button class="btn btn-danger" type="button" id="archiveExtractBtn">立即解压</button>
+    </div>
+  </div>
+</dialog>
+
 <dialog class="artist-links-dialog error-artists-dialog" id="errorArtistsDialog" aria-labelledby="errorArtistsDialogTitle">
   <div class="artist-links-dialog-head">
     <h2 id="errorArtistsDialogTitle">出错画师</h2>
@@ -772,6 +1216,22 @@
         </section>
 
         <section class="maintenance-guide-block">
+          <h3>角色库</h3>
+          <div class="maintenance-guide-item">
+            <b>导入标签</b>
+            <span>把库里已有的单角色标签导入角色库，用该标签下的作品建立参考图。</span>
+          </div>
+          <div class="maintenance-guide-item">
+            <b>已建角色</b>
+            <span>已导入的角色；参考图越多，识别越稳。</span>
+          </div>
+          <div class="maintenance-guide-item">
+            <b>参考图</b>
+            <span>识别角色时比对的图片，来自单角色标签或手动添加；在「参考图」页签点「添加照片」可从本机补充。</span>
+          </div>
+        </section>
+
+        <section class="maintenance-guide-block">
           <h3>状态与记录</h3>
           <p class="maintenance-guide-lead">维护页集中显示运行状态、备份和最近操作：</p>
           <div class="maintenance-guide-item">
@@ -793,6 +1253,10 @@
           <div class="maintenance-guide-item">
             <b>整理目标</b>
             <span>规范为「年 / 日期 标签」结构；已符合规则者保持不动。</span>
+          </div>
+          <div class="maintenance-guide-item">
+            <b>命名规则</b>
+            <span>默认「{year}/{date} {tags}」在画师目录下生成目标文件夹；{year}/{date} 会先建年份子目录。{date} 有具体日期时为年-月-日，只有年月时为年-月。可在「高级选项与规则设置」自定义，变量悬停可看含义。</span>
           </div>
           <div class="maintenance-guide-item">
             <b>移动规则</b>
@@ -829,6 +1293,10 @@
           <div class="maintenance-guide-item">
             <b>「找不到」是什么意思？</b>
             <span>文件已被移走、删除，或当前路径无法对应。记录会保留 90 天用于找回路径和标签；超过 90 天且没有待判断路径时，系统会自动从数据库清理，不会删除任何磁盘文件。</span>
+          </div>
+          <div class="maintenance-guide-item">
+            <b>识别模型什么时候能用？</b>
+            <span>服务启动后自动在后台准备识别模型，进度在「模型与推理」查看；准备完成前角色识别不可用。</span>
           </div>
         </section>
       </div>
@@ -892,7 +1360,7 @@
   </div>
 </div>
 
-<script type="module" src="/static/js/main.js?v=1.1.4"></script>
+<script type="module" src="/static/js/main.js?v=1.1.5"></script>
 
 </body>
 </html>

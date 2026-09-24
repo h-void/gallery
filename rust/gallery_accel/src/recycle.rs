@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 
 use crate::media_roots::{normalize_slashes, path_under_authorized_roots, MediaRoots};
 use crate::media_serve::{
-    move_file_from_authorized_path_no_overwrite, move_file_to_authorized_path_no_overwrite,
+    candidate_recycle_targets, gallery_recycle_dir, move_file_from_authorized_path_no_overwrite,
+    move_file_to_authorized_path_no_overwrite, recycle_name_matches_base,
     recycle_source_is_trusted,
 };
 
@@ -74,33 +75,42 @@ pub fn reconcile_moving_recycle_entries(conn: &Connection) -> (usize, usize, usi
     let mut finalized = 0;
     let mut dropped = 0;
     let mut missing = 0;
+
+    // Finish the delete the interrupted transaction would have committed.
+    let finalize = |id: i64, item_id: i64, note: &str| -> bool {
+        (|| -> Result<()> {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM character_references WHERE item_id=? AND source_type='tag_single'",
+                params![item_id],
+            )?;
+            tx.execute("DELETE FROM items WHERE id=?", params![item_id])?;
+            tx.execute(
+                "UPDATE recycle_entries SET status='recycled', last_error=?
+                 WHERE id=? AND status='moving'",
+                params![note, id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })()
+        .is_ok()
+    };
+
     for (id, item_id, original, recycled) in rows {
         if !recycled.is_empty() && Path::new(&recycled).is_file() {
-            // The file reached recycle storage before the crash; finish the
-            // delete the interrupted transaction would have committed.
-            let done = (|| -> Result<()> {
-                let tx = conn.unchecked_transaction()?;
-                tx.execute(
-                    "DELETE FROM character_references WHERE item_id=? AND source_type='tag_single'",
-                    params![item_id],
-                )?;
-                tx.execute("DELETE FROM items WHERE id=?", params![item_id])?;
-                tx.execute(
-                    "UPDATE recycle_entries SET status='recycled',
-                        last_error='finalized after interrupted delete'
-                     WHERE id=? AND status='moving'",
-                    params![id],
-                )?;
-                tx.commit()?;
-                Ok(())
-            })()
-            .is_ok();
-            if done {
+            // The file reached recycle storage before the crash, and the row
+            // names it; finish the delete.
+            if finalize(id, item_id, "finalized after interrupted delete") {
                 finalized += 1;
             }
-        } else if Path::new(&original).is_file() {
+            continue;
+        }
+        if Path::new(&original).is_file() {
             // Crash before the file moved: nothing happened on disk, and the
-            // item row is still active — drop the stale marker entirely.
+            // item row is still active — drop the stale marker entirely. The
+            // delete never reached the move, so a same-named file already
+            // sitting in recycle storage belongs to some earlier delete and
+            // must not be claimed here.
             if conn
                 .execute(
                     "DELETE FROM recycle_entries WHERE id=? AND status='moving'",
@@ -110,19 +120,117 @@ pub fn reconcile_moving_recycle_entries(conn: &Connection) -> (usize, usize, usi
             {
                 dropped += 1;
             }
-        } else if conn
-            .execute(
-                "UPDATE recycle_entries SET status='recycled',
-                    last_error='interrupted delete: file missing from original and recycle locations'
-                 WHERE id=? AND status='moving'",
-                params![id],
-            )
-            .is_ok()
-        {
-            missing += 1;
+            continue;
+        }
+        // The original is gone and the row names no reachable file: the move
+        // returned and the process died before the destination was recorded,
+        // or the row predates that early write. Look for the copy the move
+        // would have left before declaring the bytes lost.
+        match find_recycled_file_for(Path::new(&original)) {
+            Some(found) => {
+                let found_text = found.to_string_lossy().to_string();
+                let recorded = conn
+                    .execute(
+                        "UPDATE recycle_entries SET recycled_path=? WHERE id=? AND status='moving'",
+                        params![found_text, id],
+                    )
+                    .is_ok();
+                if recorded
+                    && finalize(
+                        id,
+                        item_id,
+                        "finalized after interrupted delete; destination recovered from recycle storage",
+                    )
+                {
+                    finalized += 1;
+                }
+            }
+            None => {
+                if conn
+                    .execute(
+                        "UPDATE recycle_entries SET status='recycled',
+                            last_error='interrupted delete: file missing from original and recycle locations'
+                         WHERE id=? AND status='moving'",
+                        params![id],
+                    )
+                    .is_ok()
+                {
+                    missing += 1;
+                }
+            }
         }
     }
     (finalized, dropped, missing)
+}
+
+/// Find the file an interrupted delete left behind when its row never learned
+/// the destination: the move had already returned when the process died, so the
+/// bytes are in one of the locations [`crate::media_serve`] could have chosen.
+///
+/// A name is only accepted if [`recycle_name_matches_base`] says the mover can
+/// produce it for this original, and a second candidate makes the answer
+/// ambiguous — claiming either could restore the wrong bytes later — so the
+/// caller keeps the row marked missing instead of guessing.
+fn find_recycled_file_for(original: &Path) -> Option<PathBuf> {
+    let base = original.file_name()?.to_string_lossy().to_string();
+    let mut matches: Vec<PathBuf> = Vec::new();
+
+    // 1. Check candidate volume/space targets for this original
+    for (trash, rel) in candidate_recycle_targets(original, None) {
+        if !trash.exists() {
+            continue;
+        }
+        let nested = trash.join(&rel);
+        let mut dirs = vec![trash.clone()];
+        if let Some(parent) = nested.parent() {
+            if parent != trash && parent.exists() {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && recycle_name_matches_base(&base, &entry.file_name().to_string_lossy())
+                {
+                    if !matches.contains(&entry.path()) {
+                        matches.push(entry.path());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. The gallery-owned store DATA_DIR/recycle
+    let mut stack = vec![gallery_recycle_dir()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file()
+                && recycle_name_matches_base(&base, &entry.file_name().to_string_lossy())
+            {
+                if !matches.contains(&path) {
+                    matches.push(path);
+                }
+            }
+        }
+    }
+
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
 }
 
 pub fn ensure_recycle_schema(conn: &Connection) -> Result<()> {
@@ -240,7 +348,9 @@ pub fn recycle_entries_response(
     {
         return Ok(json!({"entries": [], "total": 0, "next_offset": Value::Null}));
     }
-    let limit = limit.unwrap_or(80).clamp(1, 100);
+    let limit = limit
+        .unwrap_or(crate::DEFAULT_PREVIEW_RECYCLE_LIMIT)
+        .clamp(1, crate::MAX_PREVIEW_RECYCLE_LIMIT);
     let offset = offset.unwrap_or(0).max(0);
     let total: i64 = conn.query_row(
         "SELECT COUNT(*) FROM recycle_entries WHERE status=?",
@@ -262,12 +372,53 @@ pub fn recycle_entries_response(
             "file_name": serde_json::from_str::<Value>(&snapshot).ok().and_then(|v| v.get("file_name").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default(),
             "created_at": created_at,
             "last_error": last_error,
-            "recycled_file_exists": Path::new(&recycled).is_file() && recycle_source_is_trusted(Path::new(&recycled), Path::new(&original)),
+            "recycled_file_exists": Path::new(&recycled).is_file() && recycle_source_is_trusted(Path::new(&recycled), Path::new(&original), Some(roots)),
             "original_file_exists": target.map(|p| p.exists()).unwrap_or(false),
         }))
     })?.collect::<rusqlite::Result<Vec<_>>>()?;
     let next = (offset + (entries.len() as i64) < total).then_some(offset + entries.len() as i64);
     Ok(json!({"entries": entries, "total": total, "next_offset": next}))
+}
+
+/// Whether the row a restore is about to reference still exists.
+///
+/// Checked before the insert rather than inferred from its failure: `INSERT OR
+/// IGNORE` never reports a foreign-key violation (it ignores the row silently),
+/// so a deleted tag would disappear from the restored item without a trace.
+fn reference_target_exists(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<bool> {
+    Ok(conn
+        .query_row(sql, params, |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// Insert a relationship the snapshot recorded, treating "it is already there"
+/// as success and everything else as a failure the caller must see.
+///
+/// Only the two "this row is already present" codes are accepted. The
+/// `rusqlite` portable view collapses every constraint failure into
+/// `ConstraintViolation`, and treating that whole class as success is how a
+/// discarded error turns into a silently incomplete restore — the exact shape
+/// this helper exists to remove — so the extended code decides.
+fn insert_restored_reference(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<()> {
+    match conn.execute(sql, params) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(inner, _))
+            if inner.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                || inner.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+        {
+            Ok(())
+        }
+        Err(other) => Err(other.into()),
+    }
 }
 
 fn restore_tag_single_refs(conn: &Connection, item_id: i64, raw: &str) -> Result<i64> {
@@ -379,7 +530,7 @@ pub fn restore_recycle_entry(
         return Err(conflict("original path is already occupied"));
     }
     let recycled_path = PathBuf::from(&recycled);
-    if !recycled_path.is_file() || !recycle_source_is_trusted(&recycled_path, Path::new(&original))
+    if !recycled_path.is_file() || !recycle_source_is_trusted(&recycled_path, Path::new(&original), Some(roots))
     {
         return Err(conflict("recycled file is missing or untrusted"));
     }
@@ -445,11 +596,27 @@ pub fn restore_recycle_entry(
             rusqlite::params_from_iter(sql_values.iter()),
         )?;
         let new_id = tx.last_insert_rowid();
+        // Restoring the row is not the same as restoring the item. These two
+        // inserts used to be `let _ =`, so a failure was invisible: the
+        // transaction still committed, the route still answered `ok:true`, and
+        // the item came back without its tags or its favorite.
+        //
+        // The reference is checked instead of relying on `INSERT OR IGNORE`,
+        // because OR IGNORE suppresses foreign-key violations too — a tag
+        // deleted while the item sat in the recycle bin would vanish without a
+        // trace, which is the same silent loss by another route. A reference
+        // whose tag is gone is skipped deliberately, and everything else (a
+        // uniqueness conflict from the snapshot, a NOT NULL fault, a full disk)
+        // aborts the restore.
         for tag_id in tags {
-            let _ = tx.execute(
-                "INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?,?)",
+            if !reference_target_exists(&tx, "SELECT 1 FROM tags WHERE id=?1", params![tag_id])? {
+                continue;
+            }
+            insert_restored_reference(
+                &tx,
+                "INSERT INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
                 params![new_id, tag_id],
-            );
+            )?;
         }
         restore_tag_single_refs(&tx, new_id, &tag_refs_raw)?;
         reattach_non_tag_refs(&tx, new_id, &non_tag_refs_raw)?;
@@ -458,10 +625,11 @@ pub fn restore_recycle_entry(
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            let _ = tx.execute(
-                "INSERT OR IGNORE INTO item_favorites (item_id) VALUES (?)",
+            insert_restored_reference(
+                &tx,
+                "INSERT INTO item_favorites (item_id) VALUES (?1)",
                 [new_id],
-            );
+            )?;
         }
         if tx.execute("UPDATE recycle_entries SET status='restored', restored_at=strftime('%s','now'), restore_path=?, last_error='' WHERE id=? AND status='recycled'", params![target.to_string_lossy().to_string(), entry_id])? != 1 {
             return Err(anyhow!("restore conflict: recycle entry changed during restore"));
@@ -507,6 +675,111 @@ pub fn restore_recycle_entry(
             }
         }
     }
+}
+
+pub fn purge_recycle_entry(
+    conn: &Connection,
+    roots: &MediaRoots,
+    entry_id: i64,
+) -> Result<Value, (StatusCode, Value)> {
+    let record = conn
+        .query_row(
+            "SELECT original_path, recycled_path FROM recycle_entries WHERE id=?",
+            [entry_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+
+    let Some((original, recycled)) = record else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            json!({"error": "recycle entry not found"}),
+        ));
+    };
+
+    let recycled_path = PathBuf::from(&recycled);
+    let mut file_removed = false;
+    if recycled_path.is_file()
+        && recycle_source_is_trusted(&recycled_path, Path::new(&original), Some(roots))
+    {
+        if std::fs::remove_file(&recycled_path).is_ok() {
+            file_removed = true;
+            if let Some(parent) = recycled_path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+
+    conn.execute("DELETE FROM recycle_entries WHERE id=?", [entry_id])
+        .map_err(internal)?;
+
+    Ok(json!({
+        "ok": true,
+        "id": entry_id,
+        "file_removed": file_removed,
+        "message": "已从回收站彻底删除"
+    }))
+}
+
+pub fn clear_recycle_entries(
+    conn: &Connection,
+    roots: &MediaRoots,
+    status: Option<&str>,
+) -> Result<Value, (StatusCode, Value)> {
+    let status_filter = status.unwrap_or("recycled");
+    if !matches!(status_filter, "recycled" | "all") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({"error": "invalid status filter"}),
+        ));
+    }
+
+    let mut stmt = if status_filter == "all" {
+        conn.prepare("SELECT id, original_path, recycled_path FROM recycle_entries")
+            .map_err(internal)?
+    } else {
+        conn.prepare("SELECT id, original_path, recycled_path FROM recycle_entries WHERE status='recycled'")
+            .map_err(internal)?
+    };
+
+    let rows: Vec<(i64, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)?;
+
+    let mut cleared_count = 0;
+    let mut files_removed = 0;
+    for (id, original, recycled) in rows {
+        let recycled_path = PathBuf::from(&recycled);
+        if recycled_path.is_file()
+            && recycle_source_is_trusted(&recycled_path, Path::new(&original), Some(roots))
+        {
+            if std::fs::remove_file(&recycled_path).is_ok() {
+                files_removed += 1;
+                if let Some(parent) = recycled_path.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+        }
+        if conn.execute("DELETE FROM recycle_entries WHERE id=?", [id]).is_ok() {
+            cleared_count += 1;
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "cleared_count": cleared_count,
+        "files_removed": files_removed,
+        "message": format!("已清理 {cleared_count} 项回收站记录")
+    }))
 }
 
 fn conflict(message: impl Into<String>) -> (StatusCode, Value) {
@@ -615,7 +888,11 @@ mod tests {
     #[test]
     fn reconcile_marks_moving_entry_when_file_is_lost() {
         let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
-        let (_dir, pool, _roots, original, _data_dir) = fixture();
+        let (_dir, pool, _roots, original, data_dir) = fixture();
+        // Point the recovery scan at a store that genuinely lacks the file, so
+        // "lost" is asserted against a known-empty location instead of
+        // whatever DATA_DIR the ambient environment happens to name.
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", &data_dir);
         let conn = pool.get().unwrap();
         std::fs::remove_file(&original).unwrap();
         insert_moving_entry(&conn, &original.to_string_lossy().replace('\\', "/"), "");
@@ -631,6 +908,114 @@ mod tests {
             )
             .unwrap();
         assert!(!last_error.is_empty());
+    }
+
+    #[test]
+    fn reconcile_recovers_a_move_whose_destination_was_never_recorded() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (_dir, pool, _roots, original, data_dir) = fixture();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", &data_dir);
+        let conn = pool.get().unwrap();
+        // The move mirrors the source's relative path under the recycle root
+        // and is the last thing that happens before the destination is
+        // recorded, so this is exactly the state an interruption leaves.
+        let recycled = data_dir.join("recycle").join("Artist").join("same.jpg");
+        std::fs::create_dir_all(recycled.parent().unwrap()).unwrap();
+        std::fs::rename(&original, &recycled).unwrap();
+        insert_moving_entry(&conn, &original.to_string_lossy().replace('\\', "/"), "");
+
+        let (finalized, dropped, missing) = reconcile_moving_recycle_entries(&conn);
+
+        assert_eq!((finalized, dropped, missing), (1, 0, 0));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM items"), 0);
+        let recorded: String = conn
+            .query_row(
+                "SELECT recycled_path FROM recycle_entries WHERE status='recycled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            Path::new(&recorded),
+            recycled.as_path(),
+            "the recovered destination must be recorded on the entry"
+        );
+        assert!(recycled.is_file(), "the recovered copy must be preserved");
+    }
+
+    #[test]
+    fn reconcile_recovers_a_collision_suffixed_recycled_file() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (_dir, pool, _roots, original, data_dir) = fixture();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", &data_dir);
+        let conn = pool.get().unwrap();
+        // A name already taken at the destination makes the mover suffix the
+        // stored file; the scan has to recognise that as this delete's copy.
+        let recycled = data_dir
+            .join("recycle")
+            .join("same__0123456789abcdef0123456789abcdef.jpg");
+        std::fs::create_dir_all(recycled.parent().unwrap()).unwrap();
+        std::fs::rename(&original, &recycled).unwrap();
+        insert_moving_entry(&conn, &original.to_string_lossy().replace('\\', "/"), "");
+
+        let (finalized, dropped, missing) = reconcile_moving_recycle_entries(&conn);
+
+        assert_eq!((finalized, dropped, missing), (1, 0, 0));
+        let recorded: String = conn
+            .query_row(
+                "SELECT recycled_path FROM recycle_entries WHERE status='recycled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(Path::new(&recorded), recycled.as_path());
+    }
+
+    #[test]
+    fn reconcile_leaves_an_ambiguous_recovery_marked_missing() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (_dir, pool, _roots, original, data_dir) = fixture();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", &data_dir);
+        let conn = pool.get().unwrap();
+        // Two stored copies of the same name: an earlier delete's file and this
+        // one's. Claiming either risks restoring the wrong bytes later, so the
+        // row must stay missing instead of guessing.
+        for (dir, bytes) in [
+            (data_dir.join("recycle"), &b"earlier"[..]),
+            (data_dir.join("recycle").join("Artist"), &b"this-delete"[..]),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("same.jpg"), bytes).unwrap();
+        }
+        std::fs::remove_file(&original).unwrap();
+        insert_moving_entry(&conn, &original.to_string_lossy().replace('\\', "/"), "");
+
+        let (finalized, dropped, missing) = reconcile_moving_recycle_entries(&conn);
+
+        assert_eq!((finalized, dropped, missing), (0, 0, 1));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM items"), 1);
+    }
+
+    #[test]
+    fn reconcile_does_not_claim_a_stored_file_when_the_original_survived() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let (_dir, pool, _roots, original, data_dir) = fixture();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", &data_dir);
+        let conn = pool.get().unwrap();
+        // The delete never reached the move, so the copy already in recycle
+        // storage belongs to an earlier delete of a same-named file and must be
+        // left where it is.
+        let stale = data_dir.join("recycle").join("same.jpg");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"earlier").unwrap();
+        insert_moving_entry(&conn, &original.to_string_lossy().replace('\\', "/"), "");
+
+        let (finalized, dropped, missing) = reconcile_moving_recycle_entries(&conn);
+
+        assert_eq!((finalized, dropped, missing), (0, 1, 0));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM items"), 1);
+        assert!(original.is_file(), "untouched file must stay in place");
+        assert_eq!(std::fs::read(&stale).unwrap(), b"earlier");
     }
 
     fn fixture() -> (tempfile::TempDir, Arc<DbPool>, MediaRoots, PathBuf, PathBuf) {
@@ -791,5 +1176,134 @@ mod tests {
         restore_recycle_entry(&conn, &mixed_roots, entry_id).unwrap();
 
         assert_eq!(std::fs::read(original).unwrap(), b"original");
+    }
+
+    /// A restore reports success only when the item really came back whole.
+    ///
+    /// The tag and favorite inserts used to be `let _ =`, so a failure there
+    /// still committed the transaction and still answered `ok:true`, and the
+    /// item reappeared without the tags the recycle snapshot had recorded.
+    ///
+    /// `INSERT OR IGNORE` is not a fix for that: it suppresses foreign-key
+    /// violations as silently as `let _ =` suppressed the error, so a tag
+    /// deleted while the item sat in the recycle bin would vanish the same way.
+    /// The reference is probed instead, and every other failure aborts.
+    #[test]
+    fn a_failed_tag_restore_aborts_instead_of_reporting_success() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE item_tags (
+                 item_id INTEGER NOT NULL,
+                 tag_id INTEGER NOT NULL REFERENCES tags(id) CHECK (tag_id > 0),
+                 PRIMARY KEY (item_id, tag_id)
+             );
+             INSERT INTO tags (id, name) VALUES (1, 'keep');",
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+
+        // The tag still exists: the reference is written.
+        assert!(
+            reference_target_exists(&conn, "SELECT 1 FROM tags WHERE id=?1", params![1i64])
+                .unwrap()
+        );
+        insert_restored_reference(
+            &conn,
+            "INSERT INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
+            params![7i64, 1i64],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM item_tags", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        // The tag is gone: the probe says so, so no insert is attempted and no
+        // orphan row can appear.
+        assert!(
+            !reference_target_exists(&conn, "SELECT 1 FROM tags WHERE id=?1", params![99i64])
+                .unwrap()
+        );
+
+        // A fault the schema can state plainly is not swallowed: the table
+        // refuses a negative tag id, and `execute` reports the violation to the
+        // caller rather than hiding it behind `let _ =`.
+        let mut statement = conn
+            .prepare("INSERT INTO item_tags (item_id, tag_id) VALUES (?1, ?2)")
+            .unwrap();
+        let error = statement.execute(params![7i64, -1i64]).unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("constraint"),
+            "unexpected error: {error}"
+        );
+        drop(statement);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM item_tags", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the failed insert must not have written a row"
+        );
+
+        // Re-inserting a relationship the snapshot already recorded is success:
+        // the row exists, which is the state the restore wanted.
+        insert_restored_reference(
+            &conn,
+            "INSERT INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
+            params![7i64, 1i64],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn purge_and_clear_recycle_entries_test() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_recycle_schema(&conn).unwrap();
+        let roots_dir = tempfile::tempdir().unwrap();
+        let roots = MediaRoots {
+            roots: vec![roots_dir.path().to_string_lossy().to_string()],
+            labels: vec!["root".into()],
+            real_paths: vec![roots_dir.path().to_string_lossy().to_string()],
+        };
+
+        // Create dummy recycled files
+        let recycle_store = roots_dir.path().join(".Recycle_bin");
+        std::fs::create_dir_all(&recycle_store).unwrap();
+        let file1 = recycle_store.join("file1.jpg");
+        let file2 = recycle_store.join("file2.jpg");
+        std::fs::write(&file1, b"recycled 1").unwrap();
+        std::fs::write(&file2, b"recycled 2").unwrap();
+
+        let orig1 = roots_dir.path().join("orig1.jpg").to_string_lossy().to_string();
+        let orig2 = roots_dir.path().join("orig2.jpg").to_string_lossy().to_string();
+
+        conn.execute(
+            "INSERT INTO recycle_entries (id, original_item_id, artist_id, original_path, recycled_path, item_snapshot, status)
+             VALUES (1, 10, 1, ?1, ?2, '{}', 'recycled')",
+            params![orig1, file1.to_string_lossy().to_string()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO recycle_entries (id, original_item_id, artist_id, original_path, recycled_path, item_snapshot, status)
+             VALUES (2, 20, 1, ?1, ?2, '{}', 'recycled')",
+            params![orig2, file2.to_string_lossy().to_string()],
+        ).unwrap();
+
+        // 1. Purge single entry #1
+        let purge_res = purge_recycle_entry(&conn, &roots, 1).unwrap();
+        assert_eq!(purge_res["ok"], true);
+        assert_eq!(purge_res["file_removed"], true);
+        assert!(!file1.exists());
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM recycle_entries WHERE id=1", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+
+        // 2. Clear remaining entries
+        let clear_res = clear_recycle_entries(&conn, &roots, None).unwrap();
+        assert_eq!(clear_res["ok"], true);
+        assert_eq!(clear_res["cleared_count"], 1);
+        assert_eq!(clear_res["files_removed"], 1);
+        assert!(!file2.exists());
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM recycle_entries", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 }

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::archive_format::{self, RenderContext};
 use crate::folder_archive::{recompute_artist_plan_targets, validate_relative_folder};
+use crate::fs_util::safe_canonicalize;
 use crate::media_roots::{path_under_authorized_roots, MediaRoots};
 
 fn target_key(target: &str) -> String {
@@ -28,7 +29,7 @@ fn artist_relative_path(artist_root: &PathBuf, value: &str) -> Result<PathBuf> {
             return Err(anyhow!("folder path is outside artist root"));
         }
     }
-    let canonical = existing.canonicalize()?;
+    let canonical = safe_canonicalize(&existing)?;
     if !canonical.starts_with(artist_root) {
         return Err(anyhow!("folder path escapes artist root"));
     }
@@ -101,9 +102,8 @@ pub fn preview_folder_rename_template(
         conn.query_row("SELECT path FROM artists WHERE id=?", [artist_id], |row| {
             row.get::<_, String>(0)
         })?;
-    let artist_root = roots
-        .map_to_real(&artist_path)?
-        .canonicalize()
+    let real_path = roots.map_to_real(&artist_path)?;
+    let artist_root = safe_canonicalize(&real_path)
         .map_err(|error| anyhow!("artist path is unavailable: {error}"))?;
     if !artist_root.is_dir() || !path_under_authorized_roots(&artist_root, roots) {
         return Err(anyhow!("artist path is outside configured media roots"));
@@ -185,7 +185,12 @@ pub fn preview_folder_rename_template(
                  ORDER BY t.name",
             ) {
                 if let Ok(item_tags) = stmt.query_map(params![artist_id, folder], |r| r.get(0)) {
-                    tags = item_tags.filter_map(|r| r.ok()).collect();
+                    // The failed prepare above is tolerated because the schema
+                    // may simply not exist yet, which is a real "no tags" answer.
+                    // A *row* that cannot be read is not that: the query ran and
+                    // returned something undecodable, and dropping it would show
+                    // a folder holding fewer tags than it has.
+                    tags = item_tags.collect::<rusqlite::Result<Vec<_>>>()?;
                 }
             }
         }
@@ -198,6 +203,12 @@ pub fn preview_folder_rename_template(
                 title,
                 folder: folder.clone(),
                 index,
+                user_id: Some(artist_id.to_string()),
+                id: Some(id.to_string()),
+                ext: None,
+                site: None,
+                service: None,
+                task_date: None,
             },
         ) {
             Ok(rendered) => rendered,

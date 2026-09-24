@@ -65,8 +65,8 @@ pub fn operation_history_response(
 
 fn normalize_operation_log_limit(limit: Option<i64>) -> i64 {
     match limit {
-        Some(value) if value > 0 => value.min(300),
-        _ => 80,
+        Some(value) if value > 0 => value.min(crate::MAX_OPERATION_LOG_LIMIT),
+        _ => crate::DEFAULT_PREVIEW_RECYCLE_LIMIT,
     }
 }
 

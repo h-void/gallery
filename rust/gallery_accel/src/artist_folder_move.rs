@@ -12,6 +12,7 @@ use crate::folder_archive::{
 use crate::folder_archive::{
     create_db_backup, rename_directory_under_authorized_roots_no_overwrite_expected,
 };
+use crate::fs_util::safe_canonicalize;
 use crate::media_roots::{normalize_slashes, path_under_authorized_roots, MediaRoots};
 
 fn validate_relative_destination(raw: &str) -> Result<String> {
@@ -56,7 +57,7 @@ pub fn list_media_root_directories(
     let root = roots
         .real_root_at(root_index)
         .ok_or_else(|| anyhow!("media root not found"))?;
-    let root = PathBuf::from(root).canonicalize()?;
+    let root = safe_canonicalize(root)?;
     if !root.is_dir() {
         bail!("media root directory is missing");
     }
@@ -66,16 +67,16 @@ pub fn list_media_root_directories(
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         bail!("directory not found");
     }
-    if !current.canonicalize()?.starts_with(&root) {
+    if !safe_canonicalize(&current)?.starts_with(&root) {
         bail!("directory escapes the configured media root");
     }
     let mut directories = fs::read_dir(&current)?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let metadata = fs::symlink_metadata(entry.path()).ok()?;
-            (metadata.is_dir() && !metadata.file_type().is_symlink())
-                .then(|| entry.file_name().into_string().ok())
-                .flatten()
+            let name = entry.file_name().into_string().ok()?;
+            (metadata.is_dir() && !metadata.file_type().is_symlink() && !name.starts_with('.'))
+                .then_some(name)
         })
         .collect::<Vec<_>>();
     directories.sort_by_key(|name| name.to_lowercase());
@@ -121,8 +122,8 @@ fn root_for_source(source: &Path, roots: &MediaRoots) -> Option<usize> {
         .enumerate()
         .filter_map(|(index, root)| {
             let root_path = PathBuf::from(root);
-            let canonical = root_path.canonicalize().ok()?;
-            let source_canonical = source.canonicalize().ok()?;
+            let canonical = safe_canonicalize(&root_path).ok()?;
+            let source_canonical = safe_canonicalize(source).ok()?;
             source_canonical
                 .starts_with(&canonical)
                 .then_some((index, canonical))
@@ -132,14 +133,13 @@ fn root_for_source(source: &Path, roots: &MediaRoots) -> Option<usize> {
 }
 
 fn target_parent_stays_under_root(target: &Path, root: &Path) -> bool {
-    let Ok(root) = root.canonicalize() else {
+    let Ok(root) = safe_canonicalize(root) else {
         return false;
     };
     let mut current = Some(target);
     while let Some(path) = current {
         if path.exists() {
-            return path
-                .canonicalize()
+            return safe_canonicalize(path)
                 .map(|canonical| canonical.starts_with(&root))
                 .unwrap_or(false);
         }
@@ -208,8 +208,8 @@ pub fn preview_artist_folder_move(
     if !target_parent_stays_under_root(&target, &root_path) {
         bail!("destination escapes the configured media root");
     }
-    let source_canonical = source.canonicalize()?;
-    let target_canonical = target.canonicalize().unwrap_or_else(|_| target.clone());
+    let source_canonical = safe_canonicalize(&source)?;
+    let target_canonical = safe_canonicalize(&target).unwrap_or_else(|_| target.clone());
     if target_canonical == source_canonical || target_canonical.starts_with(&source_canonical) {
         bail!("destination cannot be the source or inside it");
     }
@@ -820,6 +820,95 @@ fn apply_artist_move_db_updates(
             target_text,
         )?;
     }
+    if table_has_column(&transaction, "kemono_subscriptions", "target_dir")?
+        && table_has_column(&transaction, "kemono_subscriptions", "artist_id")?
+    {
+        updated += update_path_column(
+            &transaction,
+            "kemono_subscriptions",
+            "target_dir",
+            artist_id,
+            source_text,
+            target_text,
+        )?;
+    }
+    if table_has_column(&transaction, "download_publish_jobs", "target_path")? {
+        let mut stmt = transaction.prepare("SELECT id, target_path FROM download_publish_jobs")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (id, path) in rows {
+            if let Some(next) = remap_path(&path, source_text, target_text) {
+                transaction.execute(
+                    "UPDATE download_publish_jobs SET target_path=? WHERE id=?",
+                    params![next, id],
+                )?;
+                updated += 1;
+            }
+        }
+    }
+    // `kemono_files.target_path` is the per-resource destination reserved when
+    // the resource was first claimed and reused on every retry, and the
+    // downloader publishes into *that* path. Leaving it behind made the next
+    // attempt rebuild the abandoned source directory next to the artist's new
+    // one — a second tree for the same creator, which the scan then registered
+    // as a second artist — and split one work between the two.
+    if table_has_column(&transaction, "kemono_files", "target_path")? {
+        let mut stmt = transaction.prepare("SELECT id, target_path FROM kemono_files")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (id, path) in rows {
+            if let Some(next) = remap_path(&path, source_text, target_text) {
+                transaction.execute(
+                    "UPDATE kemono_files SET target_path=? WHERE id=?",
+                    params![next, id],
+                )?;
+                updated += 1;
+            }
+        }
+    }
+    if table_has_column(&transaction, "netdisk_task_naming", "snapshot")? {
+        let mut stmt = transaction.prepare("SELECT task_id, snapshot FROM netdisk_task_naming")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (task_id, snap_str) in rows {
+            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&snap_str) {
+                let mut changed = false;
+                if val.get("artist_id").and_then(|v| v.as_i64()) == Some(artist_id) {
+                    if let Some(p) = val.get("artist_path").and_then(|v| v.as_str()) {
+                        if let Some(next) = remap_path(p, source_text, target_text) {
+                            val["artist_path"] = serde_json::Value::String(next);
+                            changed = true;
+                        }
+                    }
+                    if let Some(p) = val.get("target_dir").and_then(|v| v.as_str()) {
+                        if let Some(next) = remap_path(p, source_text, target_text) {
+                            val["target_dir"] = serde_json::Value::String(next);
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    transaction.execute(
+                        "UPDATE netdisk_task_naming SET snapshot=?1 WHERE task_id=?2",
+                        params![serde_json::to_string(&val)?, task_id],
+                    )?;
+                    updated += 1;
+                }
+            }
+        }
+    }
     // Active recycle entries follow the move so a later restore lands in the
     // new directory instead of rebuilding the abandoned source path.
     updated += update_recycle_entries_for_move(&transaction, artist_id, source_text, target_text)?;
@@ -1061,7 +1150,10 @@ mod tests {
             .unwrap();
         assert!(rows[0].0.starts_with("/new/Artist"), "{}", rows[0].0);
         assert!(rows[0].1.contains("/new/Artist/pic.jpg"), "{}", rows[0].1);
-        assert_eq!(rows[1].0, "/old/Artist/gone.jpg", "unremappable pair keeps original");
+        assert_eq!(
+            rows[1].0, "/old/Artist/gone.jpg",
+            "unremappable pair keeps original"
+        );
         assert_eq!(
             rows[1].1, r#"{"file_path": "/elsewhere/pic.jpg"}"#,
             "unremappable pair keeps snapshot"
@@ -1616,8 +1708,14 @@ mod tests {
             .collect();
         // The case-only sibling `/root/foo` must not block the move; the exact
         // `/root/Foo` artist and its items must.
-        assert!(ids.contains(&3), "exact path conflict is reported: {conflicts:?}");
-        assert!(!ids.contains(&2), "case-only sibling must not be a conflict: {conflicts:?}");
+        assert!(
+            ids.contains(&3),
+            "exact path conflict is reported: {conflicts:?}"
+        );
+        assert!(
+            !ids.contains(&2),
+            "case-only sibling must not be a conflict: {conflicts:?}"
+        );
         let paths: Vec<String> = conflicts
             .iter()
             .filter_map(|value| value["path"].as_str().map(str::to_owned))
@@ -1644,7 +1742,13 @@ mod tests {
             .collect();
         // `%` in the destination is a literal character: the LIKE-free prefix
         // test must not report items under the unrelated `100Xfoo` directory.
-        assert!(paths.contains(&"/root/100%foo/real/z.jpg".to_string()), "{paths:?}");
-        assert!(!paths.contains(&"/root/100Xfoo/deep/y.jpg".to_string()), "{paths:?}");
+        assert!(
+            paths.contains(&"/root/100%foo/real/z.jpg".to_string()),
+            "{paths:?}"
+        );
+        assert!(
+            !paths.contains(&"/root/100Xfoo/deep/y.jpg".to_string()),
+            "{paths:?}"
+        );
     }
 }

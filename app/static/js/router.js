@@ -15,7 +15,7 @@ import {
 } from './views/sidebar.js';
 import { updateEditBar, resetCharacterTagSuggestions, renderEditTagPicker } from './views/editbar.js';
 import { resetArtistLinks, resetArtistProfileLinks, loadArtistLinks, loadArtistProfileLinks } from './views/links.js';
-import { loadMoveWorkbench, movePanelScrollTop, restoreMovePanelScroll } from './views/maintenance/index.js';
+import { loadMoveWorkbench, movePanelScrollTop, restoreMovePanelScroll, setMaintenanceView } from './views/maintenance/index.js';
 
 const BROWSE_KINDS = {
   untagged: '__untagged__',
@@ -259,6 +259,10 @@ export function artistFromBrowsePath() {
 
 export function browseUrlParams() {
   const params = new URLSearchParams();
+  if (state.mode === 'moves') {
+    params.set('tab', state.maintenanceView || 'overview');
+    return params;
+  }
   const activeRole = String(state.activeRole || '');
   if (activeRole && !activeRole.startsWith('__')) {
     params.set('tag', activeRole);
@@ -275,12 +279,13 @@ export function browseUrlParams() {
   if (state.itemDateTo) params.set('to', state.itemDateTo);
   if (state.view !== 'grid') params.set('view', state.view);
   if (state.duplicatesOnly && isDuplicateFilesScopeActive()) params.set('duplicates', '1');
+  if (state.returnToView) params.set('return_to', state.returnToView);
   return params;
 }
 
 export function syncBrowseUrl(method = 'replace') {
   const query = browseUrlParams().toString();
-  const path = state.currentArtist ? artistRoutePath(state.currentArtist) : '/';
+  const path = (state.mode !== 'moves' && state.currentArtist) ? artistRoutePath(state.currentArtist) : '/';
   const url = path + (query ? `?${query}` : '') + location.hash;
   if (method === 'push') {
     if (url !== location.pathname + location.search + location.hash) history.pushState(null, '', url);
@@ -289,9 +294,39 @@ export function syncBrowseUrl(method = 'replace') {
   }
 }
 
+export function updateBrowseReturnButton() {
+  const btn = $('#browseReturnBtn');
+  if (!btn) return;
+  const from = state.returnToView;
+  if (from && state.mode !== 'moves') {
+    btn.hidden = false;
+    btn.textContent = from === 'downloads' ? '← 返回下载' : '← 返回维护';
+  } else {
+    btn.hidden = true;
+  }
+}
+
 export async function restoreBrowseUrl() {
   const seq = nextRequestSeq('urlRestoreSeq');
   const params = new URLSearchParams(location.search);
+  const tab = params.get('tab');
+  if (tab) {
+    state.maintenanceView = tab;
+    state.returnToView = null;
+    updateBrowseReturnButton();
+    const { applyMode } = await import('./events.js');
+    applyMode('moves');
+    setMaintenanceView(tab, {syncUrl: false});
+    return;
+  }
+
+  if (state.mode === 'moves') {
+    const { applyMode } = await import('./events.js');
+    applyMode('browse');
+  }
+  state.returnToView = params.get('return_to') || null;
+  updateBrowseReturnButton();
+
   const legacyArtist = state.artists.find(row => String(row.id) === (params.get('artist') || '')) || null;
   const artist = artistFromBrowsePath() || legacyArtist;
   const dateFrom = validBrowseDate(params.get('from'));
@@ -359,6 +394,7 @@ export async function restoreBrowseUrl() {
   renderSidebar();
   renderFolderTree();
   renderToolbar();
+  updateBrowseReturnButton();
   syncBrowseUrl('replace');
   state.browseUrlRestored = true;
   if (state.currentArtist || isGlobalSearchActive()) await loadItems();

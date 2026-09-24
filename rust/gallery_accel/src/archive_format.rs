@@ -14,8 +14,24 @@ const DEFAULT_PROFILE_ID: &str = "default";
 const MAX_TEMPLATE_LEN: usize = 512;
 const MAX_TOKEN_VALUE_LEN: usize = 160;
 
-const TOKENS: [&str; 8] = [
-    "artist", "date", "year", "month", "tags", "title", "folder", "index",
+const TOKENS: [&str; 17] = [
+    "artist",
+    "date",
+    "year",
+    "month",
+    "tags",
+    "title",
+    "folder",
+    "index",
+    "user",
+    "userID",
+    "user_id",
+    "id",
+    "name",
+    "ext",
+    "site",
+    "service",
+    "task_date",
 ];
 
 #[derive(Debug, Clone)]
@@ -26,6 +42,39 @@ pub(crate) struct RenderContext {
     pub title: String,
     pub folder: String,
     pub index: usize,
+    pub user_id: Option<String>,
+    pub id: Option<String>,
+    pub ext: Option<String>,
+    pub site: Option<String>,
+    pub service: Option<String>,
+    pub task_date: Option<String>,
+}
+
+#[cfg(test)]
+impl RenderContext {
+    pub fn new(
+        artist: impl Into<String>,
+        date: impl Into<String>,
+        tags: Vec<String>,
+        title: impl Into<String>,
+        folder: impl Into<String>,
+        index: usize,
+    ) -> Self {
+        Self {
+            artist: artist.into(),
+            date: date.into(),
+            tags,
+            title: title.into(),
+            folder: folder.into(),
+            index,
+            user_id: None,
+            id: None,
+            ext: None,
+            site: None,
+            service: None,
+            task_date: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +240,12 @@ pub(crate) fn validate_profiles_render(settings: &Value) -> Result<()> {
             title: "标题".to_string(),
             folder: "文件夹".to_string(),
             index: 1,
+            user_id: Some("1".to_string()),
+            id: Some("1".to_string()),
+            ext: Some("jpg".to_string()),
+            site: Some("site".to_string()),
+            service: Some("fanbox".to_string()),
+            task_date: Some("2026-01-01".to_string()),
         };
         render_profile(&profile, &context).with_context(|| {
             format!("profile {id} failed a sample render; it would fail at runtime")
@@ -387,8 +442,10 @@ pub(crate) fn render_profile(profile: &Value, context: &RenderContext) -> Result
         empty_value,
     );
     let artist = sanitize_token_value(&context.artist, empty_value);
+    let user = artist.clone();
     let title = sanitize_token_value(&context.title, empty_value);
     let folder = sanitize_token_value(&context.folder, empty_value);
+    let name = folder.clone();
     let rendered_tags = context
         .tags
         .iter()
@@ -401,16 +458,64 @@ pub(crate) fn render_profile(profile: &Value, context: &RenderContext) -> Result
         sanitize_token_value(&rendered_tags.join(tag_separator), empty_value)
     };
     let index = context.index.max(1).to_string();
+    let user_id = context
+        .user_id
+        .as_deref()
+        .map(|v| sanitize_token_value(v, empty_value))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| empty_value.to_string());
+    let id_val = context
+        .id
+        .as_deref()
+        .map(|v| sanitize_token_value(v, empty_value))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| index.clone());
+    let ext = context
+        .ext
+        .as_deref()
+        .map(|v| sanitize_token_value(v.trim_start_matches('.'), empty_value))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| empty_value.to_string());
+    let site = context
+        .site
+        .as_deref()
+        .map(|v| sanitize_token_value(v, empty_value))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| empty_value.to_string());
+    let service = context
+        .service
+        .as_deref()
+        .map(|v| sanitize_token_value(v, empty_value))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| empty_value.to_string());
+    let task_date = context
+        .task_date
+        .as_deref()
+        .map(|v| {
+            let (d, _, _) = formatted_date(
+                v,
+                profile["date_format"].as_str().unwrap_or("iso"),
+                empty_value,
+            );
+            d
+        })
+        .unwrap_or_else(|| date.clone());
 
-    let render_token = |name: &str| match name {
-        "artist" => artist.as_str(),
+    let render_token = |token_name: &str| match token_name {
+        "artist" | "user" => artist.as_str(),
+        "userID" | "user_id" => user_id.as_str(),
         "date" => date.as_str(),
         "year" => year.as_str(),
         "month" => month.as_str(),
         "tags" => tags.as_str(),
         "title" => title.as_str(),
-        "folder" => folder.as_str(),
+        "folder" | "name" => folder.as_str(),
         "index" => index.as_str(),
+        "id" => id_val.as_str(),
+        "ext" => ext.as_str(),
+        "site" => site.as_str(),
+        "service" => service.as_str(),
+        "task_date" => task_date.as_str(),
         _ => "",
     };
     let rendered = parts
@@ -425,6 +530,9 @@ pub(crate) fn render_profile(profile: &Value, context: &RenderContext) -> Result
         target_folder,
         tokens: json!({
             "artist": artist,
+            "user": user,
+            "userID": user_id,
+            "user_id": user_id,
             "date": date,
             "year": year,
             "month": month,
@@ -432,7 +540,13 @@ pub(crate) fn render_profile(profile: &Value, context: &RenderContext) -> Result
             "tag_values": rendered_tags,
             "title": title,
             "folder": folder,
+            "name": name,
             "index": index,
+            "id": id_val,
+            "ext": ext,
+            "site": site,
+            "service": service,
+            "task_date": task_date,
         }),
     })
 }
@@ -496,7 +610,11 @@ pub(crate) const MAX_RENDERED_TARGET_CHARS: usize = 512;
 
 /// Validate a rendered target as a portable artist-relative folder path.
 pub(crate) fn validate_rendered_target(value: &str) -> Result<String> {
-    let raw = value.replace('\\', "/").trim().to_string();
+    let raw = value
+        .replace('\\', "/")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
     if raw.is_empty() || raw.starts_with('/') || raw.starts_with("//") {
         bail!("rendered archive target must be an artist-relative folder");
     }
@@ -599,14 +717,14 @@ mod tests {
         assert_eq!(profile["collision_strategy"], "suffix");
         let rendered = render_profile(
             &profile,
-            &RenderContext {
-                artist: "Artist".into(),
-                date: "2026-03-04".into(),
-                tags: vec!["one".into(), "two".into()],
-                title: "Title".into(),
-                folder: "Folder".into(),
-                index: 1,
-            },
+            &RenderContext::new(
+                "Artist",
+                "2026-03-04",
+                vec!["one".into(), "two".into()],
+                "Title",
+                "Folder",
+                1,
+            ),
         )
         .unwrap();
         assert_eq!(rendered.target_folder, "2026/2026-03-04 one&two");
@@ -624,14 +742,14 @@ mod tests {
         });
         let rendered = render_profile(
             &profile,
-            &RenderContext {
-                artist: "A/rtist".into(),
-                date: "2024.03.04".into(),
-                tags: vec!["one".into(), "two/two".into()],
-                title: "..".into(),
-                folder: "source/name".into(),
-                index: 3,
-            },
+            &RenderContext::new(
+                "A/rtist",
+                "2024.03.04",
+                vec!["one".into(), "two/two".into()],
+                "..",
+                "source/name",
+                3,
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -650,14 +768,14 @@ mod tests {
                 "name": "Month",
                 "template": "{year}/{date} {tags}",
             }),
-            &RenderContext {
-                artist: "Artist".into(),
-                date: "2024-03".into(),
-                tags: vec!["one".into(), "two".into()],
-                title: "Title".into(),
-                folder: "Folder".into(),
-                index: 1,
-            },
+            &RenderContext::new(
+                "Artist",
+                "2024-03",
+                vec!["one".into(), "two".into()],
+                "Title",
+                "Folder",
+                1,
+            ),
         )
         .unwrap();
 
@@ -710,5 +828,59 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(profile["collision_strategy"], "merge");
+    }
+
+    #[test]
+    fn renders_user_id_ext_site_service_task_date_tokens() {
+        let profile = json!({
+            "id": "downloader_style",
+            "name": "Downloader",
+            "template": "{user}/{date} {title}/{userID}_{id}_{name}_{ext}_{site}_{service}_{task_date}",
+        });
+        let mut context = RenderContext::new(
+            "ArtistName",
+            "2025-03-31",
+            vec![],
+            "Post Title",
+            "source_dir",
+            5,
+        );
+        context.user_id = Some("123456".into());
+        context.id = Some("7890".into());
+        context.ext = Some(".png".into());
+        context.site = Some("kemono".into());
+        context.service = Some("fanbox".into());
+        context.task_date = Some("2025-03-31".into());
+
+        let rendered = render_profile(&profile, &context).unwrap();
+        assert_eq!(
+            rendered.target_folder,
+            "ArtistName/2025-03-31 Post Title/123456_7890_source_dir_png_kemono_fanbox_2025-03-31"
+        );
+        assert_eq!(rendered.tokens["user"], "ArtistName");
+        assert_eq!(rendered.tokens["userID"], "123456");
+        assert_eq!(rendered.tokens["id"], "7890");
+        assert_eq!(rendered.tokens["name"], "source_dir");
+        assert_eq!(rendered.tokens["ext"], "png");
+        assert_eq!(rendered.tokens["site"], "kemono");
+        assert_eq!(rendered.tokens["service"], "fanbox");
+        assert_eq!(rendered.tokens["task_date"], "2025-03-31");
+    }
+
+    #[test]
+    fn allows_and_trims_trailing_slashes_in_templates() {
+        let profile = json!({
+            "id": "trailing_slash",
+            "name": "Trailing Slash",
+            "template": "{user}/{date} {title}/",
+        });
+        let context = RenderContext::new("Artist", "2026-03-04", vec![], "My Work", "dir", 1);
+        let rendered = render_profile(&profile, &context).unwrap();
+        assert_eq!(rendered.target_folder, "Artist/2026-03-04 My Work");
+
+        assert!(validate_template("{user}/").is_ok());
+        assert!(validate_template("{user}/{date} {title}/").is_ok());
+        assert!(validate_template("/").is_err());
+        assert!(validate_template("///").is_err());
     }
 }

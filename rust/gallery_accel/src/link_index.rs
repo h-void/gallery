@@ -178,7 +178,7 @@ pub fn reindex_scanned_artist_links(
     let mut artist_errors = Vec::new();
 
     for artist_id in ids {
-        match reindex_artist_links_inner(conn, roots, artist_id) {
+        match reindex_artist_links_inner(conn, roots, artist_id, None) {
             Ok(result) => {
                 indexed_documents += result["indexed_documents"].as_i64().unwrap_or(0);
                 skipped_documents += result["skipped_documents"].as_i64().unwrap_or(0);
@@ -209,13 +209,107 @@ pub fn reindex_artist_links(
     artist_id: i64,
 ) -> Result<Value> {
     ensure_link_schema(conn)?;
-    reindex_artist_links_inner(conn, roots, artist_id)
+    reindex_artist_links_inner(conn, roots, artist_id, None)
+}
+
+/// Reindex only the given items, grouped by artist.
+///
+/// This is the incremental path used when a hash batch resolves text items: the
+/// caller knows exactly which items changed, so there is no reason to walk every
+/// text the artist owns. See the comment in `reindex_artist_links_inner` for the
+/// measurement and for why the full reindex after a complete scan still covers
+/// the rest.
+pub fn reindex_scanned_items_links(
+    conn: &Connection,
+    roots: &MediaRoots,
+    items_by_artist: &BTreeMap<i64, BTreeSet<i64>>,
+) -> Result<Value> {
+    ensure_link_schema(conn)?;
+    let mut indexed_documents = 0i64;
+    let mut skipped_documents = 0i64;
+    let mut links = 0i64;
+    let mut errors = 0i64;
+    let mut artist_errors = Vec::new();
+
+    for (artist_id, item_ids) in items_by_artist {
+        if *artist_id <= 0 || item_ids.is_empty() {
+            continue;
+        }
+        match reindex_artist_links_inner(conn, roots, *artist_id, Some(item_ids)) {
+            Ok(result) => {
+                indexed_documents += result["indexed_documents"].as_i64().unwrap_or(0);
+                skipped_documents += result["skipped_documents"].as_i64().unwrap_or(0);
+                links += result["links"].as_i64().unwrap_or(0);
+                errors += result["errors"].as_i64().unwrap_or(0);
+            }
+            Err(error) => {
+                errors += 1;
+                artist_errors.push(json!({"artist_id": *artist_id, "error": error.to_string()}));
+            }
+        }
+    }
+
+    Ok(json!({
+        "ok": artist_errors.is_empty(),
+        "artists": items_by_artist.len(),
+        "indexed_documents": indexed_documents,
+        "skipped_documents": skipped_documents,
+        "links": links,
+        "errors": errors,
+        "artist_errors": artist_errors,
+    }))
+}
+
+/// Refresh `file_path` / `file_name` / `folder_name` for documents whose source
+/// row moved, without stat'ing anything.
+///
+/// Deliberately narrow: it never touches `file_size` or `file_mtime`, because
+/// those are the values a full reindex compares against the filesystem, and
+/// writing them from `items` (which is only as fresh as the last scan) would
+/// hide a real content change.
+fn sync_renamed_documents(conn: &Connection, artist_id: i64) -> Result<i64> {
+    // `idx_artist_link_documents_path` is UNIQUE on (artist_id, file_path), so a
+    // rename that would collide with another document's path is left alone
+    // rather than failing the whole update.
+    let mut stmt = conn.prepare(
+        "SELECT d.item_id, i.file_path, i.file_name, COALESCE(i.folder_name, '')
+         FROM artist_link_documents d
+         JOIN items i ON i.id = d.item_id
+         WHERE d.artist_id = ?1
+           AND (
+               d.file_path <> i.file_path
+               OR d.file_name <> i.file_name
+               OR d.folder_name <> COALESCE(i.folder_name, '')
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM artist_link_documents other
+               WHERE other.artist_id = d.artist_id
+                 AND other.file_path = i.file_path
+                 AND other.item_id <> d.item_id
+           )",
+    )?;
+    let drifted: Vec<(i64, String, String, String)> = stmt
+        .query_map(params![artist_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let count = drifted.len() as i64;
+    for (item_id, file_path, file_name, folder_name) in drifted {
+        conn.execute(
+            "UPDATE artist_link_documents
+             SET file_path=?, file_name=?, folder_name=?
+             WHERE item_id=?",
+            params![file_path, file_name, folder_name, item_id],
+        )?;
+    }
+    Ok(count)
 }
 
 fn reindex_artist_links_inner(
     conn: &Connection,
     roots: &MediaRoots,
     artist_id: i64,
+    scope: Option<&BTreeSet<i64>>,
 ) -> Result<Value> {
     let items = list_source_items(conn, artist_id)?;
     let mut indexed_documents = 0i64;
@@ -225,6 +319,19 @@ fn reindex_artist_links_inner(
     let mut failures = Vec::new();
 
     for mut item in items {
+        // §9.2: a scoped run only touches the items the caller just changed.
+        // Everything else for this artist was already indexed and has not been
+        // modified since -- content changes and renames reach this code through
+        // the full reindex that runs after a *complete* scan, which is how
+        // changed files are discovered in the first place. Without the scope,
+        // indexing one new text re-stat'ed and re-queried every text the artist
+        // already had: measured linear in that count, 485ms of a 490ms call at
+        // N=2000, and the useful part is one document.
+        if let Some(scope) = scope {
+            if !scope.contains(&item.id) {
+                continue;
+            }
+        }
         let real_path = match roots.map_to_real(&item.file_path) {
             Ok(path) => path,
             Err(error) => {
@@ -297,6 +404,13 @@ fn reindex_artist_links_inner(
         links += extracted.len() as i64;
     }
 
+    if scope.is_some() {
+        // A scoped run still has to keep display metadata honest for the rows it
+        // skipped, otherwise renaming an already-indexed text would leave the
+        // stored path stale until the next full reindex. This is one query per
+        // artist, not one per skipped document.
+        sync_renamed_documents(conn, artist_id)?;
+    }
     prune_stale_documents(conn, artist_id)?;
     Ok(json!({
         "ok": true,
@@ -751,7 +865,9 @@ impl LineIndex {
     }
 
     fn line_at(&self, byte_index: usize) -> i64 {
-        self.newlines.partition_point(|&position| position < byte_index) as i64 + 1
+        self.newlines
+            .partition_point(|&position| position < byte_index) as i64
+            + 1
     }
 }
 
@@ -766,12 +882,9 @@ fn extract_text_links(text: &str) -> Vec<ExtractedLink> {
             &context_at(text, matched.start(), matched.end()),
             MAX_CONTEXT_CHARS,
         );
-        if let Some(link) = normalize_link(
-            raw,
-            String::new(),
-            lines.line_at(matched.start()),
-            context,
-        ) {
+        if let Some(link) =
+            normalize_link(raw, String::new(), lines.line_at(matched.start()), context)
+        {
             links.push(link);
         }
     }
@@ -1153,8 +1266,8 @@ fn decode_html_entities(value: &str) -> String {
 
 /// Load custom domain rules once per response instead of one query per URL.
 fn load_domain_rules(conn: &Connection) -> Result<Vec<(String, String, String)>> {
-    let mut stmt = conn
-        .prepare("SELECT domain, category, provider_name FROM artist_link_domain_rules")?;
+    let mut stmt =
+        conn.prepare("SELECT domain, category, provider_name FROM artist_link_domain_rules")?;
     let rows = stmt
         .query_map([], |row| {
             Ok((
@@ -1342,7 +1455,10 @@ mod tests {
             params![text_path.to_string_lossy(), metadata.len() as i64],
         )
         .unwrap();
-        let roots = MediaRoots::identical(vec![dir.path().to_string_lossy().to_string()], vec!["library".into()]);
+        let roots = MediaRoots::identical(
+            vec![dir.path().to_string_lossy().to_string()],
+            vec!["library".into()],
+        );
         let first = reindex_artist_links(&conn, &roots, 1).unwrap();
         assert_eq!(first["indexed_documents"], 1);
 
@@ -1368,12 +1484,20 @@ mod tests {
         let text_path = dir.path().join("links.txt");
         fs::write(&text_path, "https://example.com/aaaa").unwrap();
         let conn = fixture_conn();
-        let roots = MediaRoots::identical(vec![dir.path().to_string_lossy().to_string()], vec!["library".into()]);
+        let roots = MediaRoots::identical(
+            vec![dir.path().to_string_lossy().to_string()],
+            vec!["library".into()],
+        );
 
         // Fix initial mtime
-        let base_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let f = std::fs::OpenOptions::new().write(true).open(&text_path).unwrap();
-        f.set_times(std::fs::FileTimes::new().set_modified(base_time)).unwrap();
+        let base_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&text_path)
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(base_time))
+            .unwrap();
         drop(f);
         let meta = fs::metadata(&text_path).unwrap();
 
@@ -1395,24 +1519,38 @@ mod tests {
         // Scenario 1: Same length + 500ms
         let time_plus_500ms = base_time + std::time::Duration::from_millis(500);
         fs::write(&text_path, "https://example.com/bbbb").unwrap(); // same byte length (24 bytes)
-        let f = std::fs::OpenOptions::new().write(true).open(&text_path).unwrap();
-        f.set_times(std::fs::FileTimes::new().set_modified(time_plus_500ms)).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&text_path)
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(time_plus_500ms))
+            .unwrap();
         drop(f);
 
         let res2 = reindex_artist_links(&conn, &roots, 1).unwrap();
-        assert_eq!(res2["indexed_documents"], 1, "must reindex when mtime advanced by 500ms");
+        assert_eq!(
+            res2["indexed_documents"], 1,
+            "must reindex when mtime advanced by 500ms"
+        );
         let links2 = artist_links_response(&conn, 1).unwrap();
         assert_eq!(links2["links"][0]["url"], "https://example.com/bbbb");
 
         // Scenario 2: Same length + 1000ms
         let time_plus_1500ms = time_plus_500ms + std::time::Duration::from_millis(1000);
         fs::write(&text_path, "https://example.com/cccc").unwrap(); // same length
-        let f = std::fs::OpenOptions::new().write(true).open(&text_path).unwrap();
-        f.set_times(std::fs::FileTimes::new().set_modified(time_plus_1500ms)).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&text_path)
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(time_plus_1500ms))
+            .unwrap();
         drop(f);
 
         let res3 = reindex_artist_links(&conn, &roots, 1).unwrap();
-        assert_eq!(res3["indexed_documents"], 1, "must reindex when mtime advanced by 1s");
+        assert_eq!(
+            res3["indexed_documents"], 1,
+            "must reindex when mtime advanced by 1s"
+        );
         let links3 = artist_links_response(&conn, 1).unwrap();
         assert_eq!(links3["links"][0]["url"], "https://example.com/cccc");
 
@@ -1434,24 +1572,41 @@ mod tests {
         assert_eq!(links4["links"][0]["url"], "https://example.com/cccc");
 
         // Scenario 5: Path changed in items table but content and mtime unchanged -> updates metadata only
-        conn.execute("DROP TRIGGER assert_no_update_on_clean_docs_g1", []).unwrap();
+        conn.execute("DROP TRIGGER assert_no_update_on_clean_docs_g1", [])
+            .unwrap();
         conn.execute_batch(
             "CREATE TABLE test_doc_upd_counter (cnt INTEGER);
              INSERT INTO test_doc_upd_counter VALUES (0);
              CREATE TRIGGER count_doc_updates AFTER UPDATE ON artist_link_documents
              BEGIN
                  UPDATE test_doc_upd_counter SET cnt = cnt + 1;
-             END;"
-        ).unwrap();
+             END;",
+        )
+        .unwrap();
 
-        conn.execute("UPDATE items SET folder_name='new_folder' WHERE id=1", []).unwrap();
+        conn.execute("UPDATE items SET folder_name='new_folder' WHERE id=1", [])
+            .unwrap();
         let res5 = reindex_artist_links(&conn, &roots, 1).unwrap();
-        assert_eq!(res5["indexed_documents"], 0, "must not re-read or reindex document");
+        assert_eq!(
+            res5["indexed_documents"], 0,
+            "must not re-read or reindex document"
+        );
         assert_eq!(res5["skipped_documents"], 1);
-        let upd_cnt: i64 = conn.query_row("SELECT cnt FROM test_doc_upd_counter", [], |r| r.get(0)).unwrap();
-        assert_eq!(upd_cnt, 1, "metadata update must be executed once for folder rename");
+        let upd_cnt: i64 = conn
+            .query_row("SELECT cnt FROM test_doc_upd_counter", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            upd_cnt, 1,
+            "metadata update must be executed once for folder rename"
+        );
 
-        let doc_folder: String = conn.query_row("SELECT folder_name FROM artist_link_documents WHERE item_id=1", [], |r| r.get(0)).unwrap();
+        let doc_folder: String = conn
+            .query_row(
+                "SELECT folder_name FROM artist_link_documents WHERE item_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(doc_folder, "new_folder");
     }
 
@@ -1480,7 +1635,8 @@ mod tests {
 
         // Mount blip: the item is soft-marked missing, then a reindex runs.
         // The document and its occurrences must survive.
-        conn.execute("UPDATE items SET missing=1 WHERE id=1", []).unwrap();
+        conn.execute("UPDATE items SET missing=1 WHERE id=1", [])
+            .unwrap();
         let result = reindex_artist_links(&conn, &roots, 1).unwrap();
         let links_after: i64 = conn
             .query_row("SELECT COUNT(*) FROM artist_link_occurrences", [], |r| {
@@ -1667,5 +1823,117 @@ mod tests {
             assert!(!link["passcodes"][0].as_str().unwrap().is_empty());
             assert!(!link["sources"][0]["context"].as_str().unwrap().is_empty());
         }
+    }
+
+    /// §9.2: the incremental path must not walk every text the artist owns.
+    #[test]
+    fn scoped_reindex_only_touches_the_given_items() {
+        let dir = tempdir().unwrap();
+        let conn = fixture_conn();
+        let mut paths = Vec::new();
+        for id in 1..=3i64 {
+            let path = dir.path().join(format!("links{id}.txt"));
+            fs::write(&path, "https://files.example.test/base").unwrap();
+            let metadata = fs::metadata(&path).unwrap();
+            conn.execute(
+                "INSERT INTO items (id, artist_id, file_path, file_name, file_size, file_mtime, folder_name, missing, media_type)
+                 VALUES (?, 1, ?, ?, ?, 1.0, '', 0, 'text')",
+                params![id, path.to_string_lossy(), format!("links{id}.txt"), metadata.len() as i64],
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        let roots = MediaRoots::identical(
+            vec![dir.path().to_string_lossy().to_string()],
+            vec!["library".into()],
+        );
+
+        let full = reindex_artist_links(&conn, &roots, 1).unwrap();
+        assert_eq!(full["indexed_documents"], 3);
+
+        // Only the third file changed. A scoped run must touch exactly that one;
+        // the other two are neither stat'ed nor counted as skipped.
+        fs::write(
+            &paths[2],
+            "https://files.example.test/base\nhttps://pan.quark.cn/s/new",
+        )
+        .unwrap();
+        let mut scope: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+        scope.insert(1, [3i64].into_iter().collect());
+        let scoped = reindex_scanned_items_links(&conn, &roots, &scope).unwrap();
+        assert_eq!(
+            scoped["indexed_documents"], 1,
+            "only the changed item is indexed"
+        );
+        assert_eq!(
+            scoped["skipped_documents"], 0,
+            "the untouched items must not even be visited"
+        );
+
+        // Re-running the same scope with nothing changed visits only that item.
+        let again = reindex_scanned_items_links(&conn, &roots, &scope).unwrap();
+        assert_eq!(again["indexed_documents"], 0);
+        assert_eq!(again["skipped_documents"], 1);
+
+        let response = artist_links_response(&conn, 1).unwrap();
+        assert_eq!(response["summary"]["links"], 2);
+    }
+
+    /// §9.2: skipping an item must not leave its stored path stale, and must not
+    /// clobber the size/mtime a full reindex compares against.
+    #[test]
+    fn scoped_reindex_still_fixes_renamed_documents() {
+        let dir = tempdir().unwrap();
+        let conn = fixture_conn();
+        let mut paths = Vec::new();
+        for id in 1..=2i64 {
+            let path = dir.path().join(format!("old{id}.txt"));
+            fs::write(&path, "https://files.example.test/base").unwrap();
+            let metadata = fs::metadata(&path).unwrap();
+            conn.execute(
+                "INSERT INTO items (id, artist_id, file_path, file_name, file_size, file_mtime, folder_name, missing, media_type)
+                 VALUES (?, 1, ?, ?, ?, 1.0, '', 0, 'text')",
+                params![id, path.to_string_lossy(), format!("old{id}.txt"), metadata.len() as i64],
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        let roots = MediaRoots::identical(
+            vec![dir.path().to_string_lossy().to_string()],
+            vec!["library".into()],
+        );
+        let full = reindex_artist_links(&conn, &roots, 1).unwrap();
+        assert_eq!(full["indexed_documents"], 2);
+
+        // A scan renames the second file and updates the item row.
+        let renamed = dir.path().join("renamed.txt");
+        fs::rename(&paths[1], &renamed).unwrap();
+        conn.execute(
+            "UPDATE items SET file_path=?, file_name='renamed.txt' WHERE id=2",
+            params![renamed.to_string_lossy()],
+        )
+        .unwrap();
+
+        // Scope to item 1 only: item 2 is never visited, yet its stored path has
+        // to be corrected, or the UI would show the old name until a full sweep.
+        let mut scope: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+        scope.insert(1, [1i64].into_iter().collect());
+        let scoped = reindex_scanned_items_links(&conn, &roots, &scope).unwrap();
+        assert_eq!(scoped["indexed_documents"], 0);
+        assert_eq!(scoped["skipped_documents"], 1);
+
+        let (stored_name, stored_size, stored_mtime): (String, i64, f64) = conn
+            .query_row(
+                "SELECT file_name, file_size, file_mtime FROM artist_link_documents WHERE item_id=2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_name, "renamed.txt");
+        assert!(stored_size > 0, "size must not be clobbered: {stored_size}");
+        assert!(
+            stored_mtime > 0.0,
+            "mtime must not be clobbered: {stored_mtime}"
+        );
     }
 }

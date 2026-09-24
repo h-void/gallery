@@ -7,6 +7,7 @@ import {
 } from '../utils.js';
 import { toast } from '../logging.js';
 import { selectFolder } from './sidebar.js';
+import { ensureNetdiskDispatchReady } from './maintenance/netdisk.js';
 
 const artistLinksDialogOpeners = new WeakMap();
 let artistLinksDialogChromeBound = false;
@@ -173,6 +174,12 @@ function artistLinkSourceFolder(source) {
   return '';
 }
 
+function isCurrentFolderCloudLink(link) {
+  const folder = String(state.activeFolder || '');
+  return Boolean(folder && link.category === 'cloud_drive'
+    && (link.sources || []).some(source => artistLinkSourceFolder(source) === folder));
+}
+
 function artistLinkSourceMarkup(source) {
   const file = source.file_name || '来源文件';
   const path = String(source.file_path || '').replace(/\\/g, '/');
@@ -195,7 +202,7 @@ function artistLinkSourceMarkup(source) {
   `;
 }
 
-function artistLinkMarkup(link) {
+function artistLinkMarkup(link, index = 0) {
   const provider = artistLinkProviderKey(link);
   const passcodes = Array.isArray(link.passcodes) ? link.passcodes.filter(Boolean) : [];
   const copyWithCode = passcodes.length
@@ -213,6 +220,7 @@ function artistLinkMarkup(link) {
         ${passcodes.length ? `<code class="artist-link-passcode">提取码 ${escHtml(passcodes.join(' / '))}</code>` : ''}
         <button class="btn btn-ghost btn-sm" type="button" data-artist-link-copy="${escHtml(link.url)}">复制链接</button>
         ${copyWithCode}
+        <button class="btn btn-ghost btn-sm" type="button" data-artist-link-deliver="${index}">投递网盘</button>
       </div>
       <details class="artist-link-sources">
         <summary>来自 ${sourceCount} 个位置</summary>
@@ -298,11 +306,21 @@ export function renderArtistLinks() {
     return;
   }
   visible.sort((left, right) => {
+    const leftCurrent = isCurrentFolderCloudLink(left) ? 0 : 1;
+    const rightCurrent = isCurrentFolderCloudLink(right) ? 0 : 1;
     const leftCloud = left.category === 'cloud_drive' ? 0 : 1;
     const rightCloud = right.category === 'cloud_drive' ? 0 : 1;
-    return leftCloud - rightCloud || artistLinkProviderKey(left).localeCompare(artistLinkProviderKey(right));
+    return leftCurrent - rightCurrent || leftCloud - rightCloud
+      || artistLinkProviderKey(left).localeCompare(artistLinkProviderKey(right));
   });
-  list.innerHTML = visible.map(artistLinkMarkup).join('');
+  const currentFolderCount = visible.filter(isCurrentFolderCloudLink).length;
+  list.innerHTML = visible.map((link, index) => {
+    const heading = index === 0 && currentFolderCount
+      ? `<h3 class="artist-links-group-title">当前文件夹网盘 ${currentFolderCount}</h3>`
+      : index === currentFolderCount && currentFolderCount
+        ? '<h3 class="artist-links-group-title">其他链接</h3>' : '';
+    return heading + artistLinkMarkup(link, index);
+  }).join('');
   $$('[data-artist-link-copy]').forEach(button => {
     button.addEventListener('click', async () => {
       const ok = await copyText(button.dataset.artistLinkCopy || '');
@@ -313,6 +331,55 @@ export function renderArtistLinks() {
     button.addEventListener('click', async () => {
       const ok = await copyText(button.dataset.artistLinkCopyCode || '');
       toast(ok ? '链接和提取码已复制' : '复制失败', ok ? 'success' : 'error');
+    });
+  });
+  $$('[data-artist-link-deliver]').forEach(button => {
+    button.addEventListener('click', async () => {
+      if (button.disabled) return;
+      const idx = Number(button.dataset.artistLinkDeliver);
+      const link = visible[idx];
+      if (!link) return;
+      const passcodes = Array.isArray(link.passcodes) ? link.passcodes.filter(Boolean) : [];
+      button.disabled = true;
+      const originalText = button.textContent;
+      button.textContent = '投递中';
+      try {
+        if (!(await ensureNetdiskDispatchReady())) return null;
+        async function doDeliver(extra = {}) {
+          try {
+            const res = await API.postJson('/api/netdisk/jobs', {
+              link: link.url,
+              password: passcodes[0] || '',
+              ...extra,
+            });
+            if (res.auto_start) {
+              toast('已投递到 JDownloader，任务将自动开始', 'info');
+            } else {
+              toast('已投递到 JDownloader 收集器，请在网盘面板或链接收集器中确认开始', 'info');
+            }
+            return res;
+          } catch (err) {
+            if (err.status === 409 || err.message?.includes('409') || err.message?.includes('已有活跃投递任务') || err.message?.includes('进行中')) {
+              const retry = window.confirm('该链接已有投递任务正在进行中，是否重新投递？');
+              if (retry) {
+                return doDeliver({ force: true });
+              }
+              return null;
+            }
+            if (err.status === 400 || err.message?.includes('无法确定归属') || err.message?.includes('未在画库中找到')) {
+              await copyText(link.url);
+              toast('未在画库中找到该链接对应的作品记录，已复制链接至剪贴板', 'warn');
+              return null;
+            }
+            toast('投递失败：' + (err.message || err), 'error');
+            return null;
+          }
+        }
+        return await doDeliver();
+      } finally {
+        button.disabled = false;
+        button.textContent = originalText;
+      }
     });
   });
   $$('[data-artist-link-source-folder]').forEach(button => {
@@ -337,7 +404,10 @@ export function bindArtistLinks() {
   const openBtn = $('#artistLinksOpenBtn');
   const dialog = $('#artistLinksDialog');
   if (openBtn && dialog) {
-    openBtn.addEventListener('click', () => openArtistLinksDialog(dialog.id, openBtn));
+    openBtn.addEventListener('click', () => {
+      renderArtistLinks();
+      openArtistLinksDialog(dialog.id, openBtn);
+    });
     bindArtistLinksDialog(dialog);
   }
   const search = $('#artistLinksSearch');

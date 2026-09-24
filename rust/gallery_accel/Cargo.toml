@@ -1,6 +1,6 @@
 [package]
 name = "gallery_accel"
-version = "1.1.4"
+version = "1.1.5"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/h-void/gallery"
@@ -19,7 +19,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rusqlite = { version = "0.37", features = ["bundled", "collation", "backup", "hooks"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "time", "process", "io-util"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "time", "process", "io-util", "signal"] }
 tower-http = { version = "0.6", features = ["fs"] }
 futures-util = "0.3"
 http-body-util = "0.1"
@@ -44,3 +44,6 @@ tempfile = "3.25"
 
 [dev-dependencies]
 tower = "0.5"
+# `trace` is only used by tests that assert *which* statements a batch runs.
+# Kept out of [dependencies] so release builds do not carry the hook.
+rusqlite = { version = "0.37", features = ["trace"] }

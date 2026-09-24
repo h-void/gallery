@@ -27,10 +27,7 @@ use crate::character_ccip::character_model_path;
 const ONNX_VERSION: &str = "1.24.1";
 
 // CCIP character model (section 5.1 of the GPU runtime plan).
-const CCIP_REPO_ID: &str = "deepghs/ccip_onnx";
 const CCIP_REVISION: &str = "eb2acdd29af1703388d3d0c04221add322bc9110";
-const CCIP_VARIANT: &str = "ccip-caformer_b36-24";
-const CCIP_FILE: &str = "model_feat.onnx";
 const CCIP_MODEL_SIZE: u64 = 383_591_416;
 const CCIP_MODEL_SHA256: &str = "c1e7333a55c2ad9e03cd340c635e96c9c1d86f0836fa7eae65720e7c9c94ee51";
 
@@ -84,31 +81,16 @@ fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
-/// `auto | cuda | openvino | cpu` — same normalization as `character_ccip`.
+/// `auto | cuda | openvino | cpu` — unified in `model_config`.
 pub fn requested_provider() -> String {
-    let raw = std::env::var("CHARACTER_RECOGNITION_PROVIDER").unwrap_or_else(|_| "auto".into());
-    let lowered = raw.trim().to_ascii_lowercase();
-    match lowered.as_str() {
-        "" | "auto" => "auto".to_string(),
-        "cuda" | "nvidia" | "cudaexecutionprovider" => "cuda".to_string(),
-        // `gpu` is the historical alias for OpenVINO GPU (never CUDA).
-        "openvino" | "intel" | "gpu" | "openvinoexecutionprovider" => "openvino".to_string(),
-        "cpu" | "cpuexecutionprovider" => "cpu".to_string(),
-        other => other.to_string(),
-    }
+    crate::model_config::requested_provider()
 }
 
 /// New preferred fallback toggle; old `CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK`
 /// still accepted for backward compatibility when the new var is unset. With
 /// neither variable set the default allows CPU fallback.
 pub fn allow_cpu_fallback() -> bool {
-    if std::env::var("CHARACTER_ALLOW_CPU_FALLBACK").is_ok() {
-        env_bool("CHARACTER_ALLOW_CPU_FALLBACK", false)
-    } else if std::env::var("CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK").is_ok() {
-        env_bool("CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK", false)
-    } else {
-        true
-    }
+    crate::model_config::allow_cpu_fallback()
 }
 
 /// `1` by default. Master switch for auto-downloading the CCIP model and the
@@ -125,31 +107,22 @@ pub fn openvino_runtime_auto_download() -> bool {
 }
 
 fn model_repo_id() -> String {
-    std::env::var("CHARACTER_MODEL_REPO_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| CCIP_REPO_ID.to_string())
+    crate::model_config::character_model_repo_id()
 }
 
 fn model_variant() -> String {
-    std::env::var("CHARACTER_MODEL_VARIANT")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| CCIP_VARIANT.to_string())
+    crate::model_config::character_model_variant()
 }
 
 fn model_file() -> String {
-    std::env::var("CHARACTER_MODEL_FILE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| CCIP_FILE.to_string())
+    crate::model_config::character_model_file()
 }
 
 /// Auto-download only applies to the default pinned model. Custom
 /// `CHARACTER_MODEL_REPO_ID` / `_VARIANT` / `_FILE` values are marked
 /// `custom_model_unmanaged` and must be placed manually.
 fn is_default_model_config() -> bool {
-    model_repo_id() == CCIP_REPO_ID && model_variant() == CCIP_VARIANT && model_file() == CCIP_FILE
+    crate::model_config::is_default_model_config()
 }
 
 /// Base directory for downloaded ORT / CUDA runtime packages.
@@ -206,11 +179,6 @@ pub fn set_download_source(conn: &rusqlite::Connection, source: &str) -> Result<
         rusqlite::params!["ml_download_source", source],
     )?;
     Ok(())
-}
-
-/// Read the persisted download source (env override wins).
-pub fn read_download_source(conn: &rusqlite::Connection) -> String {
-    persisted_download_source(conn)
 }
 
 fn persisted_download_source(conn: &rusqlite::Connection) -> String {
@@ -1012,7 +980,9 @@ fn persisted_download_source_at(db_path: &Path, fallback: String) -> String {
     let Ok(conn) = rusqlite::Connection::open(db_path) else {
         return fallback;
     };
-    let _ = conn.busy_timeout(Duration::from_secs(30));
+    let _ = conn.busy_timeout(Duration::from_millis(
+        crate::db::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+    ));
     persisted_download_source(&conn)
 }
 
@@ -1230,16 +1200,6 @@ fn worker_loop(source: String) {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Start background preparation once at startup. Never blocks; returns whether
-/// a worker was actually launched.
-pub fn prepare_runtime(conn: &rusqlite::Connection) -> bool {
-    if PREPARE_STARTED.swap(true, Ordering::SeqCst) {
-        return false;
-    }
-    let source = persisted_download_source(conn);
-    start_preparation(source, None)
-}
-
 /// Startup variant: only captures the path and schedules the SQLite read in
 /// the worker, so a busy database cannot delay HTTP listener readiness.
 pub fn prepare_runtime_at(db_path: &Path) -> bool {
@@ -1247,11 +1207,6 @@ pub fn prepare_runtime_at(db_path: &Path) -> bool {
         return false;
     }
     start_preparation(env_download_source(), Some(db_path.to_path_buf()))
-}
-
-/// Alias matching the plan's `start_runtime_preparation` signature.
-pub fn start_runtime_preparation(conn: &rusqlite::Connection) -> bool {
-    prepare_runtime(conn)
 }
 
 /// Force-retry missing runtime downloads. Busy-guarded: only one preparation
@@ -1399,11 +1354,6 @@ pub fn ml_runtime_status(conn: &rusqlite::Connection) -> Value {
     })
 }
 
-/// Alias for the plan's `runtime_preparation_status`.
-pub fn runtime_preparation_status(conn: &rusqlite::Connection) -> Value {
-    ml_runtime_status(conn)
-}
-
 /// Resolve the provider planned from the requested mode and detected hardware.
 /// It is not the actual provider until a session has loaded successfully.
 fn select_provider(gpus: &[String], requested: &str, model_present: bool) -> (String, String) {
@@ -1496,11 +1446,6 @@ pub fn update_runtime_settings(conn: &rusqlite::Connection, body: &Value) -> Res
     Ok(runtime_settings(conn))
 }
 
-/// Returns the onnxruntime version targeted by the downloaded libs.
-pub fn onnx_version() -> &'static str {
-    ONNX_VERSION
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1529,14 +1474,27 @@ mod tests {
         }
     }
 
+    // `model_config` and `character_ccip` parse the same `CHARACTER_*`
+    // variables, and this module also owns `STATE_TEST_LOCK` for the runtime
+    // worker flag. Tests that touch the environment take `ENV_LOCK`; tests that
+    // flip `WORKER_RUNNING` keep `STATE_TEST_LOCK`. The two are never held
+    // together, so the ordering is not a deadlock risk.
+    fn env_lock() -> crate::test_support::EnvGuard<'static> {
+        crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn requested_provider_defaults_to_auto() {
+        let _env_lock = env_lock();
         set_provider("");
         assert_eq!(requested_provider(), "auto");
     }
 
     #[test]
     fn requested_provider_normalizes_variants() {
+        let _env_lock = env_lock();
         let cases = [
             ("cuda", "cuda"),
             ("CUDA", "cuda"),
@@ -1557,13 +1515,12 @@ mod tests {
 
     #[test]
     fn allow_cpu_fallback_reads_new_then_old_var() {
+        let _env_lock = env_lock();
         let new_key = "CHARACTER_ALLOW_CPU_FALLBACK";
         let old_key = "CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK";
-        let prev_new = std::env::var(new_key).ok();
-        let prev_old = std::env::var(old_key).ok();
+        let _new = crate::test_support::EnvVar::remove(new_key);
+        let _old = crate::test_support::EnvVar::remove(old_key);
 
-        std::env::remove_var(new_key);
-        std::env::remove_var(old_key);
         // Neither variable set -> default allows CPU fallback.
         assert!(allow_cpu_fallback());
 
@@ -1579,15 +1536,6 @@ mod tests {
 
         std::env::set_var(new_key, "1");
         assert!(allow_cpu_fallback());
-
-        match prev_new {
-            Some(v) => std::env::set_var(new_key, v),
-            None => std::env::remove_var(new_key),
-        }
-        match prev_old {
-            Some(v) => std::env::set_var(old_key, v),
-            None => std::env::remove_var(old_key),
-        }
     }
 
     #[test]
@@ -1680,18 +1628,19 @@ mod tests {
 
     #[test]
     fn cuda_runtime_dir_falls_back_to_model_cache() {
-        std::env::remove_var("CHARACTER_CUDA_RUNTIME_DIR");
+        let _env_lock = env_lock();
+        let _runtime_dir = crate::test_support::EnvVar::remove("CHARACTER_CUDA_RUNTIME_DIR");
         let dir = cuda_runtime_dir();
         assert!(dir.to_string_lossy().contains("ort/cuda-1.24.1"));
     }
 
     #[test]
     fn onnx_runtime_auto_download_default_true() {
-        std::env::remove_var("ONNXRUNTIME_AUTO_DOWNLOAD");
+        let _env_lock = env_lock();
+        let _auto = crate::test_support::EnvVar::remove("ONNXRUNTIME_AUTO_DOWNLOAD");
         assert!(onnxruntime_auto_download());
         std::env::set_var("ONNXRUNTIME_AUTO_DOWNLOAD", "0");
         assert!(!onnxruntime_auto_download());
-        std::env::remove_var("ONNXRUNTIME_AUTO_DOWNLOAD");
     }
 
     #[test]
@@ -1917,9 +1866,9 @@ mod tests {
 
     #[test]
     fn download_source_persists_and_validates() {
+        let _env_lock = env_lock();
         let conn = test_db();
-        let previous = std::env::var("GALLERY_DOWNLOAD_SOURCE").ok();
-        std::env::remove_var("GALLERY_DOWNLOAD_SOURCE");
+        let _source = crate::test_support::EnvVar::remove("GALLERY_DOWNLOAD_SOURCE");
         assert_eq!(persisted_download_source(&conn), "official");
         set_download_source(&conn, "china").unwrap();
         assert_eq!(persisted_download_source(&conn), "china");
@@ -1927,9 +1876,5 @@ mod tests {
         assert_eq!(persisted_download_source(&conn), "official");
         assert!(set_download_source(&conn, "https://evil.example").is_err());
         assert!(set_download_source(&conn, "files.pythonhosted.org").is_err());
-        match previous {
-            Some(value) => std::env::set_var("GALLERY_DOWNLOAD_SOURCE", value),
-            None => std::env::remove_var("GALLERY_DOWNLOAD_SOURCE"),
-        }
     }
 }

@@ -22,6 +22,10 @@ struct CharacterReferenceRow {
     file_mtime: Option<f64>,
     media_type: Option<String>,
     is_archive: Option<i64>,
+    /// A manually uploaded reference has its own stored image and no library
+    /// item, so the UI previews it through the id-based route instead of
+    /// `file_path`. The stored path itself stays server-side.
+    has_image: bool,
 }
 
 pub fn character_references_response(
@@ -45,7 +49,8 @@ fn list_character_references(
                cr.embedding_model_variant, cr.embedding_model_file,
                cr.embedding_updated_at, cr.item_id, cr.created_at,
                i.file_path, i.file_name, i.file_size, i.file_mtime,
-               i.media_type, i.is_archive
+               i.media_type, i.is_archive,
+               (cr.image_path IS NOT NULL) AS has_image
         FROM character_references cr
         JOIN characters c ON c.id = cr.character_id
         LEFT JOIN items i ON i.id = cr.item_id
@@ -74,6 +79,7 @@ fn list_character_references(
                 file_mtime: row.get("file_mtime")?,
                 media_type: row.get("media_type")?,
                 is_archive: row.get("is_archive")?,
+                has_image: row.get("has_image")?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()

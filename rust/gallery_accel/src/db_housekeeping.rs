@@ -50,20 +50,30 @@ pub fn run_housekeeping_batch_with_backup(
     backup: &dyn Fn(&Connection) -> Result<String>,
 ) -> Result<HousekeepingResult> {
     let batch_size = batch_size.clamp(1, 50_000);
-    let pending_missing_items: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM items i
-         WHERE i.missing=1
-           AND i.missing_at IS NOT NULL
-           AND i.missing_at <= ?
-           AND NOT EXISTS (
-               SELECT 1 FROM move_candidates mc
-               WHERE mc.item_id=i.id AND mc.status='pending'
-           )",
-        params![missing_item_cutoff],
-        |row| row.get(0),
-    )?;
+    // One bounded probe, because this runs on every hash tick. The predicate
+    // asks for expired missing items with no pending move candidate, and the
+    // old form counted all of them before deciding anything: a full `items`
+    // scan per tick, on a table that only grows. Nothing needs the number —
+    // the count fed the backup decision and nothing else — and `LIMIT 1` stops
+    // as soon as `idx_items_missing_at` finds a row, so an empty backlog costs
+    // a lookup and a non-empty one costs one row. `idx_move_candidates_item_status`
+    // covers the `NOT EXISTS` subquery, which the delete below repeats.
+    let anything_expired = {
+        let mut probe = conn.prepare_cached(
+            "SELECT 1 FROM items i
+             WHERE i.missing=1
+               AND i.missing_at IS NOT NULL
+               AND i.missing_at <= ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM move_candidates mc
+                   WHERE mc.item_id=i.id AND mc.status='pending'
+               )
+             LIMIT 1",
+        )?;
+        probe.exists(params![missing_item_cutoff])?
+    };
     let mut missing_items_backup = None;
-    if pending_missing_items > 0 {
+    if anything_expired {
         missing_items_backup = Some(
             backup(conn)
                 .context("backup before expired missing-item deletion failed; batch skipped")?,
@@ -263,23 +273,17 @@ mod tests {
             backup_calls.set(backup_calls.get() + 1);
             Ok("/tmp/backup".into())
         };
-        let result = run_housekeeping_batch_with_backup(
-            &conn,
-            500.0,
-            500.0,
-            500.0,
-            100,
-            &backup,
-        )
-        .unwrap();
+        let result =
+            run_housekeeping_batch_with_backup(&conn, 500.0, 500.0, 500.0, 100, &backup).unwrap();
         assert_eq!(result.missing_items_deleted, 1);
         assert_eq!(result.scan_seen_deleted, 2);
         assert_eq!(result.scan_candidates_deleted, 1);
-        assert_eq!(backup_calls.get(), 1, "deleting missing items must back up first");
         assert_eq!(
-            result.missing_items_backup.as_deref(),
-            Some("/tmp/backup")
+            backup_calls.get(),
+            1,
+            "deleting missing items must back up first"
         );
+        assert_eq!(result.missing_items_backup.as_deref(), Some("/tmp/backup"));
 
         let remaining_items: Vec<i64> = conn
             .prepare("SELECT id FROM items ORDER BY id")
@@ -362,13 +366,10 @@ mod tests {
             [],
         )
         .unwrap();
-        let backup = |_: &Connection| -> Result<String> {
-            Err(anyhow::anyhow!("disk full"))
-        };
+        let backup = |_: &Connection| -> Result<String> { Err(anyhow::anyhow!("disk full")) };
 
-        let error =
-            run_housekeeping_batch_with_backup(&conn, 500.0, 500.0, 500.0, 100, &backup)
-                .unwrap_err();
+        let error = run_housekeeping_batch_with_backup(&conn, 500.0, 500.0, 500.0, 100, &backup)
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("backup"),

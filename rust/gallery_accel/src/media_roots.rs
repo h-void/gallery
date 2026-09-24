@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
+use crate::fs_util::safe_canonicalize;
 use crate::path_display::default_label;
 
 /// Virtual media-root aliases (`/picturesN`), display labels, and parallel real authorized roots.
@@ -34,6 +35,12 @@ impl MediaRoots {
     }
 
     /// Authorized roots used for filesystem allow-checks (virtual + real).
+    ///
+    /// An install with nothing configured authorizes nothing. The old fallback
+    /// to `/pictures` was the development-mode read behaviour: it turned "the
+    /// user has not said which directories are media" into "this one hard-coded
+    /// path is", which is a write destination nobody chose. Fail closed and let
+    /// the caller report that no root is configured.
     pub fn allowed_roots(&self) -> Vec<String> {
         let mut allowed = Vec::new();
         for (i, root) in self.roots.iter().enumerate() {
@@ -47,9 +54,6 @@ impl MediaRoots {
                     allowed.push(real);
                 }
             }
-        }
-        if allowed.is_empty() {
-            allowed.push("/pictures".into());
         }
         allowed
     }
@@ -237,8 +241,65 @@ fn path_under_root(candidate: &str, root: &str) -> bool {
     cand == root || cand.starts_with(&(root + "/"))
 }
 
+/// The install's own persistent directory: the database, its backups, the logs,
+/// the recognition models and the transcode cache all live under it.
+///
+/// `DATA_DIR` is the single root of all of them, so excluding it excludes each
+/// one without a second list to keep in sync.
+fn persistent_data_root() -> String {
+    normalize_slashes(
+        std::env::var("DATA_DIR")
+            .unwrap_or_else(|_| "data".to_string())
+            .trim_end_matches(['/', '\\']),
+    )
+}
+
+/// Whether `path` names something inside the install's persistent directory.
+///
+/// Living under an authorized media root is not enough. On a normal fnOS
+/// install the data directory sits on the same volume as the pictures, so a
+/// download, an ingest or an archive that targeted it would write over the
+/// database, a backup or the log files. `PLAN_KEMONO_SUBSCRIPTION_2026-09-14.md`
+/// §7 excludes those directories explicitly, aliases included — which is why the
+/// comparison is repeated on the canonical paths rather than only on the
+/// strings.
+pub fn is_persistent_data_path(path: &Path) -> bool {
+    let root = persistent_data_root();
+    if root.is_empty() {
+        return false;
+    }
+    let logical = normalize_slashes(&path.to_string_lossy());
+    if path_under_root(&logical, &root) {
+        return true;
+    }
+
+    // An alias reaches the same directory under a name the strings do not
+    // share, so the deepest existing ancestor is compared for real.
+    let mut existing = path.to_path_buf();
+    while !existing.exists() {
+        if !existing.pop() {
+            return false;
+        }
+    }
+    let Ok(canonical) = safe_canonicalize(&existing) else {
+        return false;
+    };
+    let Ok(root) = safe_canonicalize(&root) else {
+        return false;
+    };
+    path_under_root(
+        &normalize_slashes(&canonical.to_string_lossy()),
+        &normalize_slashes(&root.to_string_lossy()),
+    )
+}
+
 /// True when `path` (logical or canonical) is under any authorized root.
 pub fn path_under_authorized_roots(path: &Path, roots: &MediaRoots) -> bool {
+    // The install's own data is never a media destination, whatever the roots
+    // say. Checked first so a misconfigured root cannot authorize it.
+    if is_persistent_data_path(path) {
+        return false;
+    }
     let allowed = roots.allowed_roots();
     let logical = normalize_slashes(&path.to_string_lossy());
     if !allowed.iter().any(|root| path_under_root(&logical, root)) {
@@ -251,13 +312,12 @@ pub fn path_under_authorized_roots(path: &Path, roots: &MediaRoots) -> bool {
             return false;
         }
     }
-    let Ok(canonical) = existing.canonicalize() else {
+    let Ok(canonical) = safe_canonicalize(&existing) else {
         return false;
     };
     let canonical = normalize_slashes(&canonical.to_string_lossy());
     allowed.iter().any(|root| {
-        PathBuf::from(root)
-            .canonicalize()
+        safe_canonicalize(root)
             .ok()
             .is_some_and(|root| path_under_root(&canonical, &root.to_string_lossy()))
     })
@@ -335,6 +395,88 @@ mod tests {
 
         assert!(!path_under_authorized_roots(
             &root.join("escape").join("missing.jpg"),
+            &roots
+        ));
+    }
+
+    /// An install with nothing configured authorizes nothing. The old fallback
+    /// made `/pictures` an authorized destination that nobody chose.
+    #[test]
+    fn an_install_with_no_roots_authorizes_nothing() {
+        let roots = MediaRoots::identical(vec![], vec![]);
+        assert!(roots.allowed_roots().is_empty());
+        assert!(!path_under_authorized_roots(
+            Path::new("/pictures/Artist/a.jpg"),
+            &roots
+        ));
+    }
+
+    /// The install's own data directory is never a media destination, even when
+    /// a configured root covers it — on a normal install the pictures and the
+    /// database share a volume.
+    #[test]
+    fn the_installs_own_data_directory_is_never_a_media_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let pictures = dir.path().join("pictures");
+        std::fs::create_dir_all(data.join("logs")).unwrap();
+        std::fs::create_dir_all(data.join("db-backups")).unwrap();
+        std::fs::create_dir_all(&pictures).unwrap();
+        let _env = crate::test_support::EnvVar::set("DATA_DIR", &data);
+
+        // The root covers everything under the temp directory, data included.
+        let roots = MediaRoots::identical(
+            vec![dir.path().to_string_lossy().to_string()],
+            vec!["Media".into()],
+        );
+
+        assert!(!path_under_authorized_roots(
+            &data.join("gallery.db"),
+            &roots
+        ));
+        assert!(!path_under_authorized_roots(
+            &data.join("logs").join("gallery.log"),
+            &roots
+        ));
+        assert!(!path_under_authorized_roots(
+            &data.join("db-backups").join("backup.db"),
+            &roots
+        ));
+        assert!(is_persistent_data_path(&data.join("gallery.db")));
+
+        // Real media next to it is still authorized.
+        assert!(path_under_authorized_roots(
+            &pictures.join("Artist").join("a.jpg"),
+            &roots
+        ));
+        assert!(!is_persistent_data_path(
+            &pictures.join("Artist").join("a.jpg")
+        ));
+    }
+
+    /// An alias reaches the same directory under a name the strings do not
+    /// share, so the data directory is recognised through it too.
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_of_the_data_directory_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let pictures = dir.path().join("pictures");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&pictures).unwrap();
+        symlink(&data, pictures.join("alias")).unwrap();
+        let _env = crate::test_support::EnvVar::set("DATA_DIR", &data);
+
+        let roots = MediaRoots::identical(
+            vec![dir.path().to_string_lossy().to_string()],
+            vec!["Media".into()],
+        );
+
+        assert!(is_persistent_data_path(&pictures.join("alias")));
+        assert!(!path_under_authorized_roots(
+            &pictures.join("alias").join("gallery.db"),
             &roots
         ));
     }

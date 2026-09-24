@@ -101,8 +101,9 @@ fn list_move_history(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     } else {
-        let mut stmt =
-            conn.prepare("SELECT * FROM move_history ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?")?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM move_history ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        )?;
         let rows = stmt
             .query_map((limit, offset), basic_history_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -169,8 +170,8 @@ mod tests {
             labels: vec![],
             real_paths: vec![],
         };
-        let result = move_history_response(&conn, &roots, Some("applied"), Some(2), Some(0))
-            .unwrap();
+        let result =
+            move_history_response(&conn, &roots, Some("applied"), Some(2), Some(0)).unwrap();
         let history = result["history"].as_array().unwrap();
         assert_eq!(history[0]["id"], 3);
         assert_eq!(history[1]["id"], 2);

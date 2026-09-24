@@ -9,7 +9,7 @@ import {
 import { toast } from '../../logging.js';
 
 const CHARACTER_IMPORT_POLL_MS = 1000;
-const CHARACTER_LIBRARY_VIEWS = ['import', 'characters', 'references'];
+const CHARACTER_LIBRARY_VIEWS = ['characters', 'references'];
 // Mobile shows one library zone at a time; the list scroll offset is kept so
 // returning from the reference view lands where the user left.
 let pendingCharacterListScroll = 0;
@@ -298,12 +298,12 @@ export function renderCharacterLibrary() {
   const tagList = $('#characterTagImportList');
   const characterList = $('#characterList');
   const referenceList = $('#characterReferenceList');
-  if (!summaryEl || !tagList || !characterList || !referenceList) return;
+  if (!summaryEl || !characterList || !referenceList) return;
 
   const library = state.characterLibrary;
   if (!library) {
     summaryEl.textContent = state.characterLibraryLoading ? '角色库读取中' : '角色特征库未加载';
-    tagList.innerHTML = '<div class="character-library-empty">暂无可导入的单角色标签</div>';
+    if (tagList) tagList.innerHTML = '<div class="character-library-empty">暂无可导入的单角色标签</div>';
     characterList.innerHTML = '<div class="character-library-empty">暂无已建角色</div>';
     referenceList.innerHTML = '<div class="character-library-empty">请先在「已建角色」列表中选择角色</div>';
     applyCharacterLibraryMobileView();
@@ -311,7 +311,7 @@ export function renderCharacterLibrary() {
   }
   if (library.error) {
     summaryEl.textContent = `角色库读取失败：${library.error}`;
-    tagList.innerHTML = `<div class="character-library-empty">${escHtml(library.error)}</div>`;
+    if (tagList) tagList.innerHTML = `<div class="character-library-empty">${escHtml(library.error)}</div>`;
     characterList.innerHTML = '<div class="character-library-empty">角色库不可用</div>';
     referenceList.innerHTML = '<div class="character-library-empty">角色库不可用</div>';
     applyCharacterLibraryMobileView();
@@ -408,10 +408,12 @@ export function renderCharacterLibrary() {
         </div>
       </div>
     `;
-  }).join('') : `<div class="character-library-empty">${query ? `未找到匹配的角色 "${escHtml(query)}"` : '暂无角色<button class="btn character-library-empty-action" type="button" data-character-library-goto="import">导入标签</button>'}</div>`;
+  }).join('') : `<div class="character-library-empty">${query ? `未找到匹配的角色 "${escHtml(query)}"` : '暂无角色<button class="btn character-library-empty-action" type="button" data-character-create-trigger>新建角色</button>'}</div>`;
   const referenceCards = references.length ? references.map(reference => {
     const pathText = reference.display_file_path || reference.file_path || reference.file_name || '未绑定文件';
-    const previewUrl = reference.file_path ? API.previewUrl(reference.file_path, characterReferencePreviewVersion(reference), 256) : '';
+    const previewUrl = reference.has_image
+      ? `/api/characters/${reference.character_id}/references/${reference.id}/image`
+      : (reference.file_path ? API.previewUrl(reference.file_path, characterReferencePreviewVersion(reference), 256) : '');
     const SOURCE_LABELS = {tag_single: '来自标签', manual: '手动添加'};
     const MEDIA_LABELS = {image: '图片', video: '视频', text: '文本'};
     const sourceLabel = SOURCE_LABELS[reference.source_type] || reference.source_type || '未知来源';
@@ -443,7 +445,9 @@ export function renderCharacterLibrary() {
     `;
   }).join('') : '<div class="character-library-empty">请选择角色后查看参考图</div>';
 
-  tagList.innerHTML = jobMarkup + tagButtons;
+  if (tagList) tagList.innerHTML = jobMarkup + tagButtons;
+  const jobContainer = $('#characterImportJobContainer');
+  if (jobContainer) jobContainer.innerHTML = jobMarkup;
   characterList.innerHTML = characterButtons;
   referenceList.innerHTML = referenceCards;
 
@@ -473,6 +477,16 @@ export function renderCharacterLibrary() {
   if (rebuildBtn) {
     rebuildBtn.disabled = rebuildDisabled;
     rebuildBtn.title = '重建角色识别用的参考索引';
+  }
+  const referenceUploadBtn = $('#characterReferenceUploadBtn');
+  if (referenceUploadBtn) {
+    // Uploading needs a character to attach the photo to, and one upload at a
+    // time: the embed is slow and the button is the only feedback there is.
+    referenceUploadBtn.disabled = !selectedCharacterId
+      || isActionBusy('character-reference-upload', '');
+    referenceUploadBtn.title = selectedCharacterId
+      ? '从本机选一张照片作为该角色的参考图'
+      : '先选择一个角色';
   }
   applyCharacterLibraryMobileView();
 }
@@ -579,6 +593,27 @@ export async function deleteCharacterReference(characterId, referenceId) {
   }
 }
 
+// Manual reference photo (参考图 → 添加照片). The picked File goes up as the raw
+// request body; the server sniffs the image type, so nothing here has to be
+// encoded or declared. Mirrors deleteCharacterReference: busy guard, toast,
+// then reload the library so the new card appears.
+export async function uploadCharacterReference(characterId, file) {
+  if (!characterId || !file) return;
+  if (isActionBusy('character-reference-upload', '')) return;
+  setActionBusy('character-reference-upload', '', true);
+  renderCharacterLibrary();
+  try {
+    await API.postFile(`/api/characters/${characterId}/references/upload`, file);
+    toast('参考图已添加', 'success');
+    await loadCharacterLibrary({characterId});
+  } catch (e) {
+    toast('添加参考图失败：' + (e.message || e), 'error');
+  } finally {
+    setActionBusy('character-reference-upload', '', false);
+    renderCharacterLibrary();
+  }
+}
+
 export async function deleteCharacter(characterId) {
   if (!characterId) return;
   if (isActionBusy('character-library-character-delete', characterId)) return;
@@ -613,5 +648,23 @@ export async function rebuildCharacterIndex() {
     toast('刷新角色参考失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('character-library-rebuild', '', false);
+  }
+}
+
+export async function createCharacter(name) {
+  const cleanName = String(name || '').trim();
+  if (!cleanName) {
+    toast('请输入角色名称', 'warning');
+    return null;
+  }
+  try {
+    const result = await API.postJson('/api/characters', { name: cleanName });
+    const characterId = result && (result.id || result.character_id);
+    toast(`已创建角色「${cleanName}」`);
+    await loadCharacterLibrary({ characterId });
+    return result;
+  } catch (err) {
+    toast(err && err.message ? err.message : '创建角色失败', 'error');
+    return null;
   }
 }

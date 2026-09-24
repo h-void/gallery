@@ -7,15 +7,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use tempfile::tempfile_in;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use tempfile::tempfile_in;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::content_hash::hash_file;
 use crate::db_housekeeping::cleanup_scan_seen;
 use crate::folder_archive::validate_relative_folder;
+use crate::fs_util::safe_canonicalize;
 use crate::media_roots::{normalize_slashes, path_under_authorized_roots, MediaRoots};
 use crate::media_type::{extract_date_from_folder, media_type_for_file};
 
@@ -45,13 +46,34 @@ const COLLECTION_WRAPPER_DIR_NAMES: &[&str] = &["合购", "涩图"];
 /// modifications: any actual sub-millisecond change (e.g. an in-place equal-length
 /// rewrite that bumps mtime by 0.5ms) must be detected and re-hashed. The prior
 /// `1.0` tolerance wrongly kept stale hashes for sub-second modifications.
-const MTIME_REUSE_EPSILON: f64 = 1e-6;
+pub(crate) const MTIME_REUSE_EPSILON: f64 = 1e-6;
 
 pub struct ScanControl {
     stop: AtomicBool,
     running: AtomicBool,
     active_ticket: AtomicU64,
     next_ticket: AtomicU64,
+    /// Set when the process is leaving.
+    ///
+    /// `stop` is the operator asking one run to end; this is the process
+    /// shutting down. The difference matters because fnOS stops the package
+    /// with SIGTERM and then SIGKILL a second later, so work that only reacts
+    /// to `stop` never writes its terminal state row — the next startup then
+    /// sees `status='scanning'` and `reconcile_interrupted_scan` has to correct
+    /// it. Workers read this between units of work and finish what they hold.
+    shutting_down: AtomicBool,
+}
+
+impl ScanControl {
+    /// Signal that the process is stopping. Idempotent.
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// True once shutdown began. Batch loops check this between units of work.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
 }
 
 impl Default for ScanControl {
@@ -61,6 +83,7 @@ impl Default for ScanControl {
             running: AtomicBool::new(false),
             active_ticket: AtomicU64::new(0),
             next_ticket: AtomicU64::new(1),
+            shutting_down: AtomicBool::new(false),
         }
     }
 }
@@ -88,12 +111,8 @@ impl ScanControl {
         self.stop.store(true, Ordering::SeqCst);
     }
 
-    pub fn clear_stop(&self) {
-        self.stop.store(false, Ordering::SeqCst);
-    }
-
     pub fn is_stop_requested(&self) -> bool {
-        self.stop.load(Ordering::SeqCst)
+        self.stop.load(Ordering::SeqCst) || self.is_shutting_down()
     }
 
     pub fn set_running(&self, running: bool) {
@@ -114,6 +133,9 @@ impl ScanControl {
     /// Claim the scan slot with an RAII guard that releases the slot on drop.
     /// Ticket validation ensures an older guard's drop cannot clear a newer claim.
     pub fn try_claim(self: &Arc<Self>) -> Option<ScanSlotGuard> {
+        if self.is_shutting_down() {
+            return None;
+        }
         let ticket = self.next_ticket.fetch_add(1, Ordering::SeqCst);
         match self
             .running
@@ -143,6 +165,9 @@ impl ScanControl {
 
     /// Atomically claim the scan slot. Clears stop only on success.
     pub fn try_start(&self) -> bool {
+        if self.is_shutting_down() {
+            return false;
+        }
         let ticket = self.next_ticket.fetch_add(1, Ordering::SeqCst);
         match self
             .running
@@ -209,6 +234,37 @@ pub fn ensure_scan_state(conn: &Connection) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Clear a scan that the process did not finish, at startup, before the
+/// listener binds.
+///
+/// `scan_state` is the only record of whether a scan is running, and it is
+/// written when the run starts and again when it reaches a terminal phase. A
+/// kill in between (fnOS stop/upgrade sends TERM and then KILL) leaves
+/// `status='scanning'` behind forever: the panel disables its scan button and
+/// the idle character-import tick answers `skipped: scan_active` on every pass,
+/// and nothing self-heals before the next scheduled scan — which may never come
+/// when `SCAN_INTERVAL=0`. This process cannot be the owner of that marker, so
+/// it is stale by definition.
+///
+/// Returns the number of rows reset (0 or 1), so startup can log it.
+pub fn reconcile_interrupted_scan(conn: &Connection) -> Result<usize> {
+    let has_table: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='scan_state'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_table == 0 {
+        return Ok(0);
+    }
+    conn.execute(
+        "UPDATE scan_state
+         SET status='idle', phase='interrupted', current_path='', scan_id='', updated_at=?
+         WHERE id=1 AND status='scanning'",
+        params![now()],
+    )
+    .map_err(Into::into)
 }
 
 pub fn get_scan_state(conn: &Connection) -> Result<Value> {
@@ -361,7 +417,10 @@ fn path_read_dir(path: &Path) -> std::io::Result<std::fs::ReadDir> {
         let injected = INJECTED_READDIR_ERROR.with(|cell| cell.borrow().clone());
         if let Some((target, kind)) = injected {
             if path_str.contains(&target) {
-                return Err(std::io::Error::new(kind, "injected read_dir error for test"));
+                return Err(std::io::Error::new(
+                    kind,
+                    "injected read_dir error for test",
+                ));
             }
         }
     }
@@ -375,7 +434,10 @@ fn path_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
         let injected = INJECTED_METADATA_ERROR.with(|cell| cell.borrow().clone());
         if let Some((target, kind)) = injected {
             if path_str.contains(&target) {
-                return Err(std::io::Error::new(kind, "injected metadata error for test"));
+                return Err(std::io::Error::new(
+                    kind,
+                    "injected metadata error for test",
+                ));
             }
         }
     }
@@ -393,7 +455,11 @@ fn count_media_files(directory: &Path, errors: &mut ScanErrors) -> usize {
         Ok(e) => e,
         Err(err) => {
             if err.kind() != std::io::ErrorKind::NotFound {
-                errors.push(format!("count_media_files error on {}: {}", directory.display(), err));
+                errors.push(format!(
+                    "count_media_files error on {}: {}",
+                    directory.display(),
+                    err
+                ));
             }
             return 0;
         }
@@ -403,7 +469,11 @@ fn count_media_files(directory: &Path, errors: &mut ScanErrors) -> usize {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
-                errors.push(format!("read_dir entry error in {}: {}", directory.display(), err));
+                errors.push(format!(
+                    "read_dir entry error in {}: {}",
+                    directory.display(),
+                    err
+                ));
                 continue;
             }
         };
@@ -414,7 +484,11 @@ fn count_media_files(directory: &Path, errors: &mut ScanErrors) -> usize {
         let is_file = match entry.file_type() {
             Ok(t) => t.is_file(),
             Err(err) => {
-                errors.push(format!("file_type error for {}: {}", entry.path().display(), err));
+                errors.push(format!(
+                    "file_type error for {}: {}",
+                    entry.path().display(),
+                    err
+                ));
                 false
             }
         };
@@ -430,7 +504,11 @@ fn has_subdirs(directory: &Path, errors: &mut ScanErrors) -> bool {
         Ok(e) => e,
         Err(err) => {
             if err.kind() != std::io::ErrorKind::NotFound {
-                errors.push(format!("has_subdirs error on {}: {}", directory.display(), err));
+                errors.push(format!(
+                    "has_subdirs error on {}: {}",
+                    directory.display(),
+                    err
+                ));
             }
             return false;
         }
@@ -439,7 +517,11 @@ fn has_subdirs(directory: &Path, errors: &mut ScanErrors) -> bool {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
-                errors.push(format!("read_dir entry error in {}: {}", directory.display(), err));
+                errors.push(format!(
+                    "read_dir entry error in {}: {}",
+                    directory.display(),
+                    err
+                ));
                 continue;
             }
         };
@@ -450,7 +532,11 @@ fn has_subdirs(directory: &Path, errors: &mut ScanErrors) -> bool {
         let is_dir = match entry.file_type() {
             Ok(t) => t.is_dir(),
             Err(err) => {
-                errors.push(format!("file_type error for {}: {}", entry.path().display(), err));
+                errors.push(format!(
+                    "file_type error for {}: {}",
+                    entry.path().display(),
+                    err
+                ));
                 false
             }
         };
@@ -471,7 +557,11 @@ pub fn discover_artist_dirs(root_path: &Path) -> DiscoveryResult {
             Ok(e) => e,
             Err(err) => {
                 if err.kind() != std::io::ErrorKind::NotFound {
-                    errors.push(format!("discovery read_dir error on {}: {}", current.display(), err));
+                    errors.push(format!(
+                        "discovery read_dir error on {}: {}",
+                        current.display(),
+                        err
+                    ));
                 }
                 return;
             }
@@ -479,17 +569,23 @@ pub fn discover_artist_dirs(root_path: &Path) -> DiscoveryResult {
         let mut dirs: Vec<std::fs::DirEntry> = Vec::new();
         for entry in entries {
             match entry {
-                Ok(e) => {
-                    match e.file_type() {
-                        Ok(t) if t.is_dir() => dirs.push(e),
-                        Ok(_) => {}
-                        Err(err) => {
-                            errors.push(format!("discovery file_type error for {}: {}", e.path().display(), err));
-                        }
+                Ok(e) => match e.file_type() {
+                    Ok(t) if t.is_dir() => dirs.push(e),
+                    Ok(_) => {}
+                    Err(err) => {
+                        errors.push(format!(
+                            "discovery file_type error for {}: {}",
+                            e.path().display(),
+                            err
+                        ));
                     }
-                }
+                },
                 Err(err) => {
-                    errors.push(format!("discovery read_dir entry error in {}: {}", current.display(), err));
+                    errors.push(format!(
+                        "discovery read_dir entry error in {}: {}",
+                        current.display(),
+                        err
+                    ));
                 }
             }
         }
@@ -522,7 +618,7 @@ pub fn discover_artist_dirs(root_path: &Path) -> DiscoveryResult {
 
 fn real_path_key(path: &str, roots: &MediaRoots) -> String {
     let mapped = map_media_path(path, roots);
-    let canonical = mapped.canonicalize().unwrap_or(mapped);
+    let canonical = safe_canonicalize(&mapped).unwrap_or(mapped);
     normalize_slashes(&canonical.to_string_lossy())
         .trim_end_matches('/')
         .to_string()
@@ -575,18 +671,18 @@ fn sample_dir_media_identities(dir: &Path, limit: usize) -> Vec<SampledMediaIden
 
 /// Resolve a scan directory under an artist path. Rejects absolute/traversal/symlink escape.
 ///
+/// Accepts an artist root path (e.g. `/pictures1/ArtistA`) and an optional
+/// relative folder within it (e.g. `2024/01` or `subdir`). Rejects traversal
+/// segments and paths that escape the artist directory.
+///
 /// Returns the canonical scan root. `folder=None` (or empty) scans the artist root.
 pub fn resolve_scan_scope(
     artist_path: &str,
     folder: Option<&str>,
     roots: &MediaRoots,
 ) -> Result<PathBuf> {
-    // A scoped scan is a filesystem boundary. Unlike full-library discovery,
-    // it must never fall back to a database path that did not map to a media root.
-    let artist_mapped = roots.map_to_real(artist_path)?;
-    let artist_root = authorized_artist_scan_root(&artist_mapped, artist_path, roots)?;
-
-    let folder = folder.map(str::trim).filter(|s| !s.is_empty());
+    let mapped = map_media_path(artist_path, roots);
+    let artist_root = authorized_artist_scan_root(&mapped, artist_path, roots)?;
     let Some(folder) = folder else {
         return Ok(artist_root);
     };
@@ -596,9 +692,8 @@ pub fn resolve_scan_scope(
     for part in rel.split('/') {
         target.push(part);
     }
-    let target = target
-        .canonicalize()
-        .with_context(|| format!("scan folder not found: {rel}"))?;
+    let target =
+        safe_canonicalize(&target).with_context(|| format!("scan folder not found: {rel}"))?;
     if !target.is_dir() {
         return Err(anyhow!("scan folder is not a directory"));
     }
@@ -617,8 +712,7 @@ fn authorized_artist_scan_root(
     artist_path: &str,
     roots: &MediaRoots,
 ) -> Result<PathBuf> {
-    let artist_root = mapped
-        .canonicalize()
+    let artist_root = safe_canonicalize(mapped)
         .with_context(|| format!("artist path not found or not accessible: {}", artist_path))?;
     if !artist_root.is_dir() {
         return Err(anyhow!("artist path is not a directory"));
@@ -663,7 +757,69 @@ pub fn run_scan(
     run_scan_claimed(conn, roots, control, artist_id, folder)
 }
 
-fn run_scan_inner(
+/// The artist row that owns `folder`, registering it when the folder exists
+/// under an authorized root but the library has not indexed it yet.
+///
+/// A subscription that was never bound to a library artist still delivers into
+/// a folder of its own — the one the user named when adding it. 下载后自动入库 has
+/// to hand those files to the library, and every item belongs to an artist, so
+/// that folder has to become one. This registers exactly the directory a full
+/// scan would register, under the same path string, so it only moves that
+/// discovery earlier. A path the library already knows is returned untouched,
+/// which is what keeps the two from drifting into duplicates.
+///
+/// `None` means the folder is missing or outside every authorized root: there is
+/// nothing to register, and the caller reports it rather than inventing one.
+pub fn ensure_artist_for_folder(
+    conn: &Connection,
+    roots: &MediaRoots,
+    folder: &str,
+    fallback_name: &str,
+) -> Result<Option<(i64, String)>> {
+    let mapped = roots.map_to_real(folder)?;
+    if !mapped.is_dir() || !path_under_authorized_roots(&mapped, roots) {
+        return Ok(None);
+    }
+    // The mapped path is the real one, which is the form `artists.path` holds
+    // (the scan writes whatever `map_to_real` produced for the root).
+    let path = normalize_slashes(&mapped.to_string_lossy())
+        .trim_end_matches('/')
+        .to_string();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM artists WHERE path = ?1",
+            params![&path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok(Some((id, path)));
+    }
+    let name = Path::new(&path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_name);
+    // A concurrent scan can register the same folder between the lookup above
+    // and here, so the insert is allowed to lose that race: the read below is
+    // the answer either way.
+    let _ = conn.execute(
+        "INSERT INTO artists (name, path) VALUES (?1, ?2)",
+        params![name, &path],
+    );
+    let id: i64 = conn.query_row(
+        "SELECT id FROM artists WHERE path = ?1",
+        params![&path],
+        |row| row.get(0),
+    )?;
+    Ok(Some((id, path)))
+}
+
+pub(crate) fn run_scan_inner(
     conn: &Connection,
     roots: &MediaRoots,
     control: &ScanControl,
@@ -766,9 +922,7 @@ fn run_scan_inner(
                     ("phase", json!("scan")),
                 ],
             )?;
-            let outcome = walk_artist(
-                conn, aid, &artist_s, &scan_root, &scan_id, control, &spool,
-            )?;
+            let outcome = walk_artist(conn, aid, &artist_s, &scan_root, &scan_id, control, &spool)?;
             new_candidates += outcome.new_candidates;
             updated_items += outcome.updated_items;
             scanned += 1;
@@ -799,7 +953,12 @@ fn run_scan_inner(
             scanned_artist_ids.push(aid);
         }
 
-        if full_library && !stopped && !control.is_stop_requested() && failed_artists == 0 && scan_errors.is_empty() {
+        if full_library
+            && !stopped
+            && !control.is_stop_requested()
+            && failed_artists == 0
+            && scan_errors.is_empty()
+        {
             // Only after every authorized root was discovered and scanned without error.
             let _ = mark_missing_artists_after_full_scan(
                 conn,
@@ -831,7 +990,12 @@ fn run_scan_inner(
             json!({"ok": true, "skipped": "scan_not_complete"})
         };
         let error_summary = if !scan_errors.is_empty() {
-            scan_errors.sample.join("; ").chars().take(500).collect::<String>()
+            scan_errors
+                .sample
+                .join("; ")
+                .chars()
+                .take(500)
+                .collect::<String>()
         } else if phase == "failed" {
             "all artist scans failed".to_string()
         } else if phase == "partial" {
@@ -975,9 +1139,9 @@ pub fn delete_scan_seen_chunked(
     loop {
         let deleted = match (scan_id, artist_id) {
             (Some(sid), Some(aid)) => {
-                let tx = conn
-                    .unchecked_transaction()
-                    .context("begin chunked delete transaction on scan_seen (scan_id, artist_id)")?;
+                let tx = conn.unchecked_transaction().context(
+                    "begin chunked delete transaction on scan_seen (scan_id, artist_id)",
+                )?;
                 let count = tx
                     .execute(
                         "DELETE FROM scan_seen WHERE id IN (
@@ -1208,9 +1372,10 @@ fn register_discovered_artist(
         params![artist_name, &path_norm],
     )?;
     let id = conn.last_insert_rowid();
-    index
-        .by_key
-        .insert(path_key, (id, artist_name.to_string(), path_norm.clone(), 0));
+    index.by_key.insert(
+        path_key,
+        (id, artist_name.to_string(), path_norm.clone(), 0),
+    );
     Ok((id, path_norm))
 }
 
@@ -1366,7 +1531,11 @@ fn apply_artist_path_relocation(
     )?;
     if updated != 1 {
         let current_path: Option<String> = tx
-            .query_row("SELECT path FROM artists WHERE id=?", params![artist_id], |r| r.get(0))
+            .query_row(
+                "SELECT path FROM artists WHERE id=?",
+                params![artist_id],
+                |r| r.get(0),
+            )
             .optional()?;
         match current_path {
             Some(ref p) if normalize_slashes(p).trim_end_matches('/') == new_norm => {
@@ -1387,7 +1556,9 @@ fn apply_artist_path_relocation(
                 ));
             }
             None => {
-                return Err(anyhow!("cannot relocate artist {artist_id}: artist not found"));
+                return Err(anyhow!(
+                    "cannot relocate artist {artist_id}: artist not found"
+                ));
             }
         }
     }
@@ -1524,8 +1695,11 @@ fn list_artists_for_scan(
         ));
     }
 
-    for ((root_name, &known), &discovered) in
-        roots.roots.iter().zip(&known_per_root).zip(&discovered_per_root)
+    for ((root_name, &known), &discovered) in roots
+        .roots
+        .iter()
+        .zip(&known_per_root)
+        .zip(&discovered_per_root)
     {
         if known > 0 && discovered == 0 {
             return Err(anyhow!(
@@ -1865,12 +2039,17 @@ fn process_discovered_batch(
                 {
                     let same = old_size == file.file_size
                         && (old_mtime - file.file_mtime).abs() < MTIME_REUSE_EPSILON;
-                    let cand_identity_changed = match (file.st_dev, file.st_ino, old_cand_dev, old_cand_ino) {
-                        (Some(d1), Some(i1), Some(d2), Some(i2)) => d1 != d2 || i1 != i2,
-                        _ => false,
-                    };
-                    let keep_hash = same && !cand_identity_changed && old_hash_status == "done" && !old_hash.is_empty();
-                    let next_status = if old_status == "previewed" || !same || cand_identity_changed {
+                    let cand_identity_changed =
+                        match (file.st_dev, file.st_ino, old_cand_dev, old_cand_ino) {
+                            (Some(d1), Some(i1), Some(d2), Some(i2)) => d1 != d2 || i1 != i2,
+                            _ => false,
+                        };
+                    let keep_hash = same
+                        && !cand_identity_changed
+                        && old_hash_status == "done"
+                        && !old_hash.is_empty();
+                    let next_status = if old_status == "previewed" || !same || cand_identity_changed
+                    {
                         "pending"
                     } else {
                         &old_status
@@ -1879,13 +2058,28 @@ fn process_discovered_batch(
                         stmt_supersede_move.execute(params![candidate_id])?;
                     }
                     stmt_update_cand.execute(params![
-                        scan_id, artist_id, file.fname, file.file_size, file.file_mtime, file.folder_name, file.date_str,
-                        file.is_archive, file.media_type,
-                        if keep_hash { old_hash.clone() } else { String::new() },
+                        scan_id,
+                        artist_id,
+                        file.fname,
+                        file.file_size,
+                        file.file_mtime,
+                        file.folder_name,
+                        file.date_str,
+                        file.is_archive,
+                        file.media_type,
+                        if keep_hash {
+                            old_hash.clone()
+                        } else {
+                            String::new()
+                        },
                         if keep_hash { "done" } else { "pending" },
-                        file.st_dev, file.st_ino, next_status, candidate_id,
+                        file.st_dev,
+                        file.st_ino,
+                        next_status,
+                        candidate_id,
                     ])?;
-                    *new_candidates += i64::from(old_status == "previewed" || !same || cand_identity_changed);
+                    *new_candidates +=
+                        i64::from(old_status == "previewed" || !same || cand_identity_changed);
                 } else {
                     stmt_insert_cand.execute(params![
                         scan_id,
@@ -1983,7 +2177,10 @@ fn walk_artist(
             Ok(m) => m,
             Err(err) => {
                 if walk_errors.len() < MAX_RECORDED_ERRORS_PER_ARTIST {
-                    walk_errors.push(format!("metadata error for {}: {err}", entry.path().display()));
+                    walk_errors.push(format!(
+                        "metadata error for {}: {err}",
+                        entry.path().display()
+                    ));
                 }
                 continue;
             }
@@ -2091,7 +2288,22 @@ fn walk_artist(
     })
 }
 
-const MAX_IN_MEMORY_PRESENCE: usize = 200;
+/// Paths a presence tracker holds in memory before spilling to its spool file.
+///
+/// The tracker has to remember every path it walks until the artist is done,
+/// because only then does it know whether the walk was clean. Spilling is the
+/// escape hatch for an artist whose file list genuinely does not fit in memory:
+/// a clean rescan discards the collected paths outright, so spilling a normal
+/// artist writes a temp file per artist purely to throw it away (measured at
+/// ~50-90KB per 2000-file artist, once per scan).
+///
+/// The default covers every artist in the reference library (488 artists, 755k
+/// items: median 820 files, largest 21,640) with headroom, so peak resident
+/// memory is a few MB while the disk spool still bounds a pathological artist.
+const DEFAULT_MAX_IN_MEMORY_PRESENCE_PATHS: usize = 50_000;
+/// Initial capacity of a tracker's in-memory buffer. Only an allocation hint;
+/// what bounds memory is [`PresenceSpoolConfig::max_in_memory_paths`].
+const PRESENCE_BUFFER_INITIAL_CAPACITY: usize = 256;
 const MAX_SPOOLED_PATH_BYTES: usize = 65536;
 /// Name prefix minted by [`PresenceTempFile`]; the trailing `_<pid>` suffix
 /// identifies the owning process for stale-file reclamation.
@@ -2137,9 +2349,15 @@ pub fn cleanup_stale_presence_spools(max_age: Duration) -> usize {
 
 #[cfg(windows)]
 fn is_process_running(pid_str: &str) -> bool {
-    let Ok(pid) = pid_str.parse::<u32>() else { return false; };
+    let Ok(pid) = pid_str.parse::<u32>() else {
+        return false;
+    };
     extern "system" {
-        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
+        fn OpenProcess(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            dwProcessId: u32,
+        ) -> *mut std::ffi::c_void;
         fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
         fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
         fn GetLastError() -> u32;
@@ -2160,7 +2378,9 @@ fn is_process_running(pid_str: &str) -> bool {
 
 #[cfg(unix)]
 fn is_process_running(pid_str: &str) -> bool {
-    let Ok(pid) = pid_str.parse::<i32>() else { return false; };
+    let Ok(pid) = pid_str.parse::<i32>() else {
+        return false;
+    };
     if Path::new("/proc").exists() {
         return Path::new(&format!("/proc/{pid}")).exists();
     }
@@ -2242,12 +2462,23 @@ fn max_presence_spool_bytes() -> u64 {
         .unwrap_or(64 * 1024 * 1024) // 64 MB default per artist
 }
 
+fn max_in_memory_presence_paths() -> usize {
+    std::env::var("GALLERY_MAX_IN_MEMORY_PRESENCE_PATHS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|paths| *paths > 0)
+        .unwrap_or(DEFAULT_MAX_IN_MEMORY_PRESENCE_PATHS)
+}
+
 /// Immutable spool settings resolved once, so a scan cannot observe a
 /// half-changed environment and tests never have to mutate process state.
 #[derive(Clone, Debug)]
 pub struct PresenceSpoolConfig {
     pub dir: PathBuf,
+    /// Total path bytes a single artist may spool to disk before the walk fails.
     pub max_bytes: u64,
+    /// Paths a single artist may hold in memory before spilling to disk.
+    pub max_in_memory_paths: usize,
 }
 
 impl PresenceSpoolConfig {
@@ -2255,6 +2486,7 @@ impl PresenceSpoolConfig {
         Self {
             dir: presence_spool_dir(),
             max_bytes: max_presence_spool_bytes(),
+            max_in_memory_paths: max_in_memory_presence_paths(),
         }
     }
 }
@@ -2267,10 +2499,16 @@ struct PresenceTempFile {
 impl PresenceTempFile {
     fn new(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| {
-            format!("failed to create presence spool directory {}", dir.display())
+            format!(
+                "failed to create presence spool directory {}",
+                dir.display()
+            )
         })?;
         let file = tempfile_in(dir).with_context(|| {
-            format!("failed to create anonymous presence temp file in {}", dir.display())
+            format!(
+                "failed to create anonymous presence temp file in {}",
+                dir.display()
+            )
         })?;
         Ok(Self { file })
     }
@@ -2290,7 +2528,7 @@ impl PresenceTracker {
         Self {
             artist_id,
             spool,
-            buffer: Vec::with_capacity(MAX_IN_MEMORY_PRESENCE),
+            buffer: Vec::with_capacity(PRESENCE_BUFFER_INITIAL_CAPACITY),
             spooled_file: None,
             spooled_count: 0,
             spooled_bytes: 0,
@@ -2299,7 +2537,7 @@ impl PresenceTracker {
 
     fn push(&mut self, path: String) -> Result<()> {
         self.buffer.push(path);
-        if self.buffer.len() >= MAX_IN_MEMORY_PRESENCE {
+        if self.buffer.len() >= self.spool.max_in_memory_paths {
             self.spool()?;
         }
         Ok(())
@@ -2357,10 +2595,9 @@ impl PresenceTracker {
         let res = (|| -> Result<()> {
             // 1. If paths were spooled to disk, stream in chunks of 200 via short transactions
             if self.spooled_count > 0 {
-                let temp = self
-                    .spooled_file
-                    .as_mut()
-                    .context("presence spool state invalid: spooled_count > 0 but no spooled file")?;
+                let temp = self.spooled_file.as_mut().context(
+                    "presence spool state invalid: spooled_count > 0 but no spooled file",
+                )?;
                 temp.file.flush()?;
                 temp.file.seek(SeekFrom::Start(0))?;
                 let mut reader = BufReader::new(&mut temp.file);
@@ -2564,6 +2801,64 @@ mod tests {
             real_paths: vec![media.to_string_lossy().replace('\\', "/")],
         };
         (dir, conn, roots)
+    }
+
+    fn artist_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM artists", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn ensure_artist_for_folder_registers_a_folder_once() {
+        let (dir, conn, roots) = fixture();
+        let media = roots.real_paths.first().unwrap().clone();
+        let known = format!("{media}/ArtistA");
+
+        // A path the library already knows is returned untouched.
+        let found = ensure_artist_for_folder(&conn, &roots, &known, "fallback")
+            .unwrap()
+            .expect("the known artist is returned");
+        assert_eq!(found.0, 1);
+        assert_eq!(found.1, known);
+        assert_eq!(artist_count(&conn), 1, "a known path is not duplicated");
+
+        // A folder the library has not indexed yet becomes one, named after the
+        // folder itself.
+        let created_dir = dir.path().join("pictures").join("GINSHANEE");
+        std::fs::create_dir_all(&created_dir).unwrap();
+        let created_path = created_dir.to_string_lossy().replace('\\', "/");
+        let created = ensure_artist_for_folder(&conn, &roots, &created_path, "fallback")
+            .unwrap()
+            .expect("a new folder under an authorized root is registered");
+        assert_eq!(created.1, created_path);
+        let name: String = conn
+            .query_row("SELECT name FROM artists WHERE id=?1", [created.0], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "GINSHANEE");
+        // Idempotent: the same folder resolves to the same artist.
+        assert_eq!(
+            ensure_artist_for_folder(&conn, &roots, &created_path, "fallback")
+                .unwrap()
+                .unwrap(),
+            created
+        );
+        assert_eq!(artist_count(&conn), 2);
+
+        // Nothing is invented for a folder that is not there, or is not under an
+        // authorized root.
+        assert!(
+            ensure_artist_for_folder(&conn, &roots, &format!("{media}/Missing"), "x")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ensure_artist_for_folder(&conn, &roots, "/elsewhere/Artist", "x")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(artist_count(&conn), 2);
     }
 
     #[test]
@@ -2819,9 +3114,9 @@ mod tests {
         let artist = dir.path().join("pictures").join("ArtistA");
         let ap = artist.to_string_lossy().replace('\\', "/");
         let root = resolve_scan_scope(&ap, None, &roots).unwrap();
-        assert_eq!(root, artist.canonicalize().unwrap());
+        assert_eq!(root, safe_canonicalize(&artist).unwrap());
         let sub = resolve_scan_scope(&ap, Some("sub"), &roots).unwrap();
-        assert_eq!(sub, artist.join("sub").canonicalize().unwrap());
+        assert_eq!(sub, safe_canonicalize(artist.join("sub")).unwrap());
     }
 
     #[test]
@@ -2856,9 +3151,9 @@ mod tests {
             real_paths: vec![media.to_string_lossy().replace('\\', "/")],
         };
         let resolved = resolve_scan_scope("/pictures1/ArtistA", None, &roots).unwrap();
-        assert_eq!(resolved, artist.canonicalize().unwrap());
+        assert_eq!(resolved, safe_canonicalize(&artist).unwrap());
         let sub = resolve_scan_scope("/pictures1/ArtistA", Some("sub"), &roots).unwrap();
-        assert_eq!(sub, artist.join("sub").canonicalize().unwrap());
+        assert_eq!(sub, safe_canonicalize(artist.join("sub")).unwrap());
     }
 
     #[test]
@@ -3354,7 +3649,7 @@ mod tests {
             real_paths: vec![real_s],
         };
         let scope = resolve_scan_scope("/pictures1/ArtistA", None, &roots).unwrap();
-        assert_eq!(scope, artist.canonicalize().unwrap());
+        assert_eq!(scope, safe_canonicalize(&artist).unwrap());
     }
 
     #[test]
@@ -3425,8 +3720,14 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(artist_missing, 0, "empty known root must not mark artists missing");
-        assert_eq!(item_missing, 0, "empty known root must not mark items missing");
+        assert_eq!(
+            artist_missing, 0,
+            "empty known root must not mark artists missing"
+        );
+        assert_eq!(
+            item_missing, 0,
+            "empty known root must not mark items missing"
+        );
 
         // Content returns: the same scan succeeds again.
         std::fs::create_dir_all(&artist).unwrap();
@@ -3726,7 +4027,12 @@ mod tests {
     /// Setup for the skip cases: seed the item, scan once so the row carries the
     /// real size/mtime/identity, then simulate a finished hash and leave a
     /// sentinel behind for the next scan to (not) overwrite.
-    fn stable_item_fixture() -> (tempfile::TempDir, Connection, MediaRoots, std::path::PathBuf) {
+    fn stable_item_fixture() -> (
+        tempfile::TempDir,
+        Connection,
+        MediaRoots,
+        std::path::PathBuf,
+    ) {
         let (dir, conn, roots) = fixture();
         let file = dir.path().join("pictures").join("ArtistA").join("one.jpg");
         seed_pending_item(&conn, &file);
@@ -3795,10 +4101,7 @@ mod tests {
             "an unchanged hashed item must not be rewritten: {second}"
         );
         let (folder, hash, status) = item_folder_and_hash(&conn);
-        assert_eq!(
-            folder, "",
-            "folder_name remains clean"
-        );
+        assert_eq!(folder, "", "folder_name remains clean");
         assert_eq!(
             (hash.as_str(), status.as_str()),
             ("hash-skip-test", "done"),
@@ -3814,11 +4117,8 @@ mod tests {
 
         // Derived metadata repair (S5): corrupting folder_name must trigger a repair
         // write while preserving the already computed content_hash.
-        conn.execute(
-            "UPDATE items SET folder_name='sentinel' WHERE id=10",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE items SET folder_name='sentinel' WHERE id=10", [])
+            .unwrap();
         let third = run_scan(&conn, &roots, &ScanControl::new(), Some(1), None).unwrap();
         assert_eq!(
             third["updated_items"], 1i64,
@@ -3842,7 +4142,10 @@ mod tests {
         std::fs::write(&file, b"jpg-and-more").unwrap();
 
         let out = run_scan(&conn, &roots, &ScanControl::new(), Some(1), None).unwrap();
-        assert_eq!(out["updated_items"], 1i64, "a changed file is rewritten: {out}");
+        assert_eq!(
+            out["updated_items"], 1i64,
+            "a changed file is rewritten: {out}"
+        );
 
         let (folder, hash, status) = item_folder_and_hash(&conn);
         assert_eq!(folder, "", "the rewrite clears the sentinel");
@@ -3902,7 +4205,11 @@ mod tests {
     #[test]
     fn stale_candidate_identity_invalidates_hash_and_requeues() {
         let (dir, conn, roots) = fixture();
-        let file = dir.path().join("pictures").join("ArtistA").join("new_cand.jpg");
+        let file = dir
+            .path()
+            .join("pictures")
+            .join("ArtistA")
+            .join("new_cand.jpg");
         std::fs::write(&file, b"content").unwrap();
         let file_s = normalize_slashes(&file.to_string_lossy());
 
@@ -3921,7 +4228,10 @@ mod tests {
 
         // Rescan: the file on disk has real ino != 111222
         let out2 = run_scan(&conn, &roots, &ScanControl::new(), Some(1), None).unwrap();
-        assert_eq!(out2["new_candidates"], 1, "identity change requeues candidate");
+        assert_eq!(
+            out2["new_candidates"], 1,
+            "identity change requeues candidate"
+        );
 
         let (hash, status, cand_status): (String, String, String) = conn
             .query_row(
@@ -3932,7 +4242,10 @@ mod tests {
             .unwrap();
         assert_eq!(hash, "", "inode change on candidate clears content_hash");
         assert_eq!(status, "pending", "inode change resets hash_status");
-        assert_eq!(cand_status, "pending", "inode change resets candidate status");
+        assert_eq!(
+            cand_status, "pending",
+            "inode change resets candidate status"
+        );
     }
 
     #[test]
@@ -3940,7 +4253,10 @@ mod tests {
         let control = Arc::new(ScanControl::new());
         let guard1 = control.try_claim().expect("guard1 claim succeeds");
         assert!(control.is_running());
-        assert!(control.try_claim().is_none(), "second claim while held must fail");
+        assert!(
+            control.try_claim().is_none(),
+            "second claim while held must fail"
+        );
 
         // Release guard1
         drop(guard1);
@@ -3952,7 +4268,10 @@ mod tests {
 
         // A stale release with ticket 1 (e.g. from an old guard or callback) must NOT clear guard2!
         control.release_ticket(1);
-        assert!(control.is_running(), "stale ticket release must not clear active slot");
+        assert!(
+            control.is_running(),
+            "stale ticket release must not clear active slot"
+        );
 
         // Dropping guard2 releases ticket 2
         drop(guard2);
@@ -3985,15 +4304,18 @@ mod tests {
         .unwrap();
 
         // Attempt relocation
-        let err = apply_artist_path_relocation(&conn, 1, "ArtistA", &old_path, &new_path, 3)
-            .unwrap_err();
+        let err =
+            apply_artist_path_relocation(&conn, 1, "ArtistA", &old_path, &new_path, 3).unwrap_err();
         assert!(err.to_string().contains("injected failure"));
 
         // Verify transaction rolled back completely:
         let current_path: String = conn
             .query_row("SELECT path FROM artists WHERE id=1", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(current_path, old_path, "artist path must not change when transaction fails");
+        assert_eq!(
+            current_path, old_path,
+            "artist path must not change when transaction fails"
+        );
 
         let items_path: String = conn
             .query_row(
@@ -4002,7 +4324,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(items_path.starts_with(&old_path), "items path must not be modified");
+        assert!(
+            items_path.starts_with(&old_path),
+            "items path must not be modified"
+        );
     }
 
     #[test]
@@ -4013,11 +4338,8 @@ mod tests {
             .unwrap();
 
         // Concurrently change artist path to something else
-        conn.execute(
-            "UPDATE artists SET path='/concurrent/other' WHERE id=1",
-            [],
-        )
-        .unwrap();
+        conn.execute("UPDATE artists SET path='/concurrent/other' WHERE id=1", [])
+            .unwrap();
 
         let err = apply_artist_path_relocation(&conn, 1, "ArtistA", &old_path, "/new/path", 3)
             .unwrap_err();
@@ -4027,7 +4349,11 @@ mod tests {
     #[test]
     fn walk_artist_captures_io_errors_without_dropping_cause() {
         let (dir, conn, _roots) = fixture();
-        let non_existent = dir.path().join("pictures").join("ArtistA").join("ghost_dir");
+        let non_existent = dir
+            .path()
+            .join("pictures")
+            .join("ArtistA")
+            .join("ghost_dir");
         let non_existent_s = normalize_slashes(&non_existent.to_string_lossy());
         let control = ScanControl::new();
 
@@ -4073,11 +4399,8 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO trigger_coll (name) VALUES ('AAA')",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO trigger_coll (name) VALUES ('AAA')", [])
+            .unwrap();
         conn.execute(
             "CREATE TRIGGER remove_b_after_insert AFTER INSERT ON artists
              WHEN NEW.name = 'ArtistB'
@@ -4095,7 +4418,10 @@ mod tests {
             &outcome
         };
         let phase = scan_val.get("phase").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(phase, "partial", "phase must be partial when one artist fails pre-scan");
+        assert_eq!(
+            phase, "partial",
+            "phase must be partial when one artist fails pre-scan"
+        );
         assert_eq!(scan_val["failed_artists"], 1);
         assert_eq!(scan_val["completed_artists"], 2);
 
@@ -4103,7 +4429,10 @@ mod tests {
         assert_eq!(state["status"], "idle");
         assert_eq!(state["phase"], "partial");
         assert!(
-            state["current_path"].as_str().unwrap().contains("pre-scan artist error"),
+            state["current_path"]
+                .as_str()
+                .unwrap()
+                .contains("pre-scan artist error"),
             "scan_state current_path must retain error reason: {}",
             state["current_path"]
         );
@@ -4153,12 +4482,18 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(hash, "sentinel_hash_123", "hash must be preserved when backfilling NULL inode");
+        assert_eq!(
+            hash, "sentinel_hash_123",
+            "hash must be preserved when backfilling NULL inode"
+        );
         assert_eq!(status, "done", "hash_status must remain done");
 
         #[cfg(unix)]
         {
-            assert!(dev.is_some() && ino.is_some(), "st_dev and st_ino must be backfilled on unix");
+            assert!(
+                dev.is_some() && ino.is_some(),
+                "st_dev and st_ino must be backfilled on unix"
+            );
         }
         #[cfg(not(unix))]
         {
@@ -4167,7 +4502,10 @@ mod tests {
 
         // Third scan: now that st_dev/st_ino are synced with disk, unchanged must be true
         let res3 = run_scan_claimed(&conn, &roots, &control, Some(1), None).unwrap();
-        assert_eq!(res3["updated_items"], 0, "third scan must be 0 writes (unchanged fast-path)");
+        assert_eq!(
+            res3["updated_items"], 0,
+            "third scan must be 0 writes (unchanged fast-path)"
+        );
     }
 
     #[test]
@@ -4192,7 +4530,9 @@ mod tests {
 
         // Verify active items match disk (2 files: one.jpg and sub/two.jpg)
         let active_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM items WHERE missing=0", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM items WHERE missing=0", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(active_count, 2);
 
@@ -4201,8 +4541,9 @@ mod tests {
             "CREATE TRIGGER test_no_scan_seen_insert BEFORE INSERT ON scan_seen
              BEGIN
                  SELECT RAISE(FAIL, 'unexpected scan_seen write on clean artist');
-             END;"
-        ).unwrap();
+             END;",
+        )
+        .unwrap();
 
         // 2. Second scan: identical directory, 0 changes -> must bypass scan_seen completely!
         let res2 = run_scan_claimed(&conn, &roots, &control, Some(1), None).unwrap();
@@ -4216,7 +4557,8 @@ mod tests {
         assert_eq!(seen_count, 0, "scan_seen must have 0 rows");
 
         // Drop the blocking trigger
-        conn.execute("DROP TRIGGER test_no_scan_seen_insert", []).unwrap();
+        conn.execute("DROP TRIGGER test_no_scan_seen_insert", [])
+            .unwrap();
 
         // Count inserts into scan_seen using a counter trigger
         conn.execute_batch(
@@ -4225,8 +4567,9 @@ mod tests {
              CREATE TRIGGER test_count_scan_seen_insert AFTER INSERT ON scan_seen
              BEGIN
                  UPDATE test_seen_counter SET cnt = cnt + 1;
-             END;"
-        ).unwrap();
+             END;",
+        )
+        .unwrap();
 
         // 3. Delete one file from disk (one.jpg)
         let artist_dir = dir.path().join("pictures").join("ArtistA");
@@ -4241,22 +4584,36 @@ mod tests {
         let inserted_seen: i64 = conn
             .query_row("SELECT cnt FROM test_seen_counter", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(inserted_seen, 1, "scan_seen must receive remaining file on reconcile");
+        assert_eq!(
+            inserted_seen, 1,
+            "scan_seen must receive remaining file on reconcile"
+        );
 
         // But after artist walk completes, scan_seen must be immediately deleted per-artist
         let remaining_seen: i64 = conn
             .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(remaining_seen, 0, "scan_seen must be cleaned up immediately per-artist");
+        assert_eq!(
+            remaining_seen, 0,
+            "scan_seen must be cleaned up immediately per-artist"
+        );
 
         // The deleted file must be marked missing=1
         let one_missing: i64 = conn
-            .query_row("SELECT missing FROM items WHERE file_name='one.jpg'", [], |r| r.get(0))
+            .query_row(
+                "SELECT missing FROM items WHERE file_name='one.jpg'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(one_missing, 1, "deleted file must be marked missing=1");
 
         let two_missing: i64 = conn
-            .query_row("SELECT missing FROM items WHERE file_name='two.jpg'", [], |r| r.get(0))
+            .query_row(
+                "SELECT missing FROM items WHERE file_name='two.jpg'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(two_missing, 0, "existing file must remain missing=0");
     }
@@ -4282,8 +4639,9 @@ mod tests {
              CREATE TRIGGER test_trg_artists_update AFTER UPDATE ON artists
              BEGIN
                  UPDATE test_artist_updates SET cnt = cnt + 1;
-             END;"
-        ).unwrap();
+             END;",
+        )
+        .unwrap();
 
         // Second scan: artist is still missing=0, so register_discovered_artist must NOT update artists
         run_scan_claimed(&conn, &roots, &control, Some(1), None).unwrap();
@@ -4291,7 +4649,10 @@ mod tests {
         let update_count: i64 = conn
             .query_row("SELECT cnt FROM test_artist_updates", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(update_count, 0, "artists table must not be updated when missing is already 0");
+        assert_eq!(
+            update_count, 0,
+            "artists table must not be updated when missing is already 0"
+        );
     }
 
     #[test]
@@ -4327,7 +4688,11 @@ mod tests {
             ",
         ).unwrap();
         let path = artist.to_string_lossy().replace('\\', "/");
-        conn.execute("INSERT INTO artists (id, name, path) VALUES (1, 'ArtistBig', ?)", params![path]).unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (1, 'ArtistBig', ?)",
+            params![path],
+        )
+        .unwrap();
         let roots = MediaRoots {
             roots: vec![media.to_string_lossy().replace('\\', "/")],
             labels: vec!["p1".into()],
@@ -4336,17 +4701,20 @@ mod tests {
         let control = ScanControl::new();
         let res = run_scan_claimed(&conn, &roots, &control, Some(1), None).unwrap();
         assert_eq!(res["phase"], "complete");
-        let cand_count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_candidates", [], |r| r.get(0)).unwrap();
+        let cand_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_candidates", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(cand_count, 250);
     }
 
     #[test]
-    fn presence_tracker_enforces_bounded_memory_budget_and_spools_to_temp_file() {
+    fn presence_tracking_reconciles_only_when_the_walk_is_dirty() {
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("pictures");
         let artist = media.join("ArtistSpool");
         std::fs::create_dir_all(&artist).unwrap();
-        // Create 450 files (exceeds MAX_IN_MEMORY_PRESENCE=200 multiple times)
+        // 450 files: the tracker holds every path until the artist is done,
+        // because only then does it know whether the walk was clean.
         for i in 0..450 {
             std::fs::write(artist.join(format!("spool_{:03}.jpg", i)), b"presence_test").unwrap();
         }
@@ -4374,7 +4742,11 @@ mod tests {
             ",
         ).unwrap();
         let path = artist.to_string_lossy().replace('\\', "/");
-        conn.execute("INSERT INTO artists (id, name, path) VALUES (1, 'ArtistSpool', ?)", params![path]).unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (1, 'ArtistSpool', ?)",
+            params![path],
+        )
+        .unwrap();
         let roots = MediaRoots {
             roots: vec![media.to_string_lossy().replace('\\', "/")],
             labels: vec!["p1".into()],
@@ -4385,7 +4757,9 @@ mod tests {
         // 1. First scan discovers candidates
         let res1 = run_scan_claimed(&conn, &roots, &control, Some(1), None).unwrap();
         assert_eq!(res1["phase"], "complete");
-        let cand_count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_candidates", [], |r| r.get(0)).unwrap();
+        let cand_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_candidates", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(cand_count, 450);
 
         // Convert to active done items
@@ -4408,25 +4782,30 @@ mod tests {
              END;"
         ).unwrap();
 
-        // Clean rescan on large directory (450 files > 200 memory budget)
+        // Clean rescan: every path is collected but none may reach persistent
+        // scan_seen, because nothing turned out to be missing.
         let res2 = run_scan_claimed(&conn, &roots, &control, Some(1), None).unwrap();
         assert_eq!(res2["phase"], "complete");
         assert_eq!(res2["updated_items"], 0);
         assert_eq!(res2["new_candidates"], 0);
 
-        let persistent_seen: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0)).unwrap();
+        let persistent_seen: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(persistent_seen, 0, "persistent scan_seen must have 0 rows");
 
         // 3. Now delete 1 file from the 450 files (leaving 449 files).
-        conn.execute("DROP TRIGGER test_no_persistent_scan_seen", []).unwrap();
+        conn.execute("DROP TRIGGER test_no_persistent_scan_seen", [])
+            .unwrap();
         conn.execute_batch(
             "CREATE TABLE test_seen_spool_counter (cnt INTEGER);
              INSERT INTO test_seen_spool_counter VALUES (0);
              CREATE TRIGGER test_count_seen_spool AFTER INSERT ON scan_seen
              BEGIN
                  UPDATE test_seen_spool_counter SET cnt = cnt + 1;
-             END;"
-        ).unwrap();
+             END;",
+        )
+        .unwrap();
 
         std::fs::remove_file(artist.join("spool_000.jpg")).unwrap();
 
@@ -4435,28 +4814,50 @@ mod tests {
         let res3 = run_scan_claimed(&conn, &roots, &control, Some(1), None).unwrap();
         assert_eq!(res3["phase"], "complete");
 
-        let total_inserted_seen: i64 = conn.query_row("SELECT cnt FROM test_seen_spool_counter", [], |r| r.get(0)).unwrap();
-        assert_eq!(total_inserted_seen, 449, "must flush all 449 remaining paths to scan_seen");
+        let total_inserted_seen: i64 = conn
+            .query_row("SELECT cnt FROM test_seen_spool_counter", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            total_inserted_seen, 449,
+            "must flush all 449 remaining paths to scan_seen"
+        );
 
         // Deleted file must be marked missing=1
-        let missing_count: i64 = conn.query_row("SELECT COUNT(*) FROM items WHERE missing=1", [], |r| r.get(0)).unwrap();
-        assert_eq!(missing_count, 1, "the single deleted file must be marked missing=1");
+        let missing_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items WHERE missing=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            missing_count, 1,
+            "the single deleted file must be marked missing=1"
+        );
 
-        let missing_name: String = conn.query_row("SELECT file_name FROM items WHERE missing=1", [], |r| r.get(0)).unwrap();
+        let missing_name: String = conn
+            .query_row("SELECT file_name FROM items WHERE missing=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(missing_name, "spool_000.jpg");
 
         // After artist scan completes, scan_seen must be cleared per-artist
-        let scan_seen_remaining: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0)).unwrap();
-        assert_eq!(scan_seen_remaining, 0, "scan_seen must be cleaned up per-artist");
+        let scan_seen_remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            scan_seen_remaining, 0,
+            "scan_seen must be cleaned up per-artist"
+        );
     }
 
     #[test]
-    fn failed_presence_flush_leaves_no_contamination_for_subsequent_reconciliation_on_same_connection() {
+    fn failed_presence_flush_leaves_no_contamination_for_subsequent_reconciliation_on_same_connection(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("pictures");
         let artist = media.join("ArtistContam");
         std::fs::create_dir_all(&artist).unwrap();
-        // Create 450 files (more than 2x MAX_IN_MEMORY_PRESENCE)
+        // 450 files, all collected before the walk decides anything
         for i in 0..450 {
             std::fs::write(artist.join(format!("file_{:03}.jpg", i)), b"content").unwrap();
         }
@@ -4464,7 +4865,9 @@ mod tests {
         let conn = crate::db::open_writable_db(&db_path).unwrap();
 
         // Check that temp_store is indeed MEMORY (2) as configured by production configure_connection
-        let temp_store: i64 = conn.query_row("PRAGMA temp_store", [], |r| r.get(0)).unwrap();
+        let temp_store: i64 = conn
+            .query_row("PRAGMA temp_store", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(temp_store, 2, "PRAGMA temp_store must be MEMORY (2)");
 
         conn.execute_batch(
@@ -4489,7 +4892,11 @@ mod tests {
             ",
         ).unwrap();
         let path = artist.to_string_lossy().replace('\\', "/");
-        conn.execute("INSERT INTO artists (id, name, path) VALUES (1, 'ArtistContam', ?)", params![path]).unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (1, 'ArtistContam', ?)",
+            params![path],
+        )
+        .unwrap();
         let roots = MediaRoots {
             roots: vec![media.to_string_lossy().replace('\\', "/")],
             labels: vec!["p1".into()],
@@ -4500,7 +4907,9 @@ mod tests {
         // 1. First scan discovers candidates
         let res1 = run_scan_claimed(&conn, &roots, &control, Some(1), None).unwrap();
         assert_eq!(res1["phase"], "complete");
-        let cand_count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_candidates", [], |r| r.get(0)).unwrap();
+        let cand_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_candidates", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(cand_count, 450);
 
         // Convert candidates to active done items
@@ -4523,12 +4932,16 @@ mod tests {
             "CREATE TRIGGER test_inject_presence_failure BEFORE INSERT ON scan_seen
              BEGIN
                  SELECT RAISE(ABORT, 'injected presence failure');
-             END;"
-        ).unwrap();
+             END;",
+        )
+        .unwrap();
 
         // 4. Run scan: must fail due to trigger
         let res2 = run_scan_claimed(&conn, &roots, &control, Some(1), None);
-        assert!(res2.is_err(), "scan must fail when presence flush triggers error");
+        assert!(
+            res2.is_err(),
+            "scan must fail when presence flush triggers error"
+        );
         let err_str = res2.unwrap_err().to_string();
         assert!(err_str.contains("injected presence failure"));
 
@@ -4536,7 +4949,8 @@ mod tests {
         std::fs::remove_file(artist.join("file_001.jpg")).unwrap();
 
         // 6. Remove the failure trigger
-        conn.execute("DROP TRIGGER test_inject_presence_failure", []).unwrap();
+        conn.execute("DROP TRIGGER test_inject_presence_failure", [])
+            .unwrap();
 
         // 7. Rescan on the EXACT SAME connection (as pooled connections are reused)
         let res3 = run_scan_claimed(&conn, &roots, &control, Some(1), None).unwrap();
@@ -4544,29 +4958,41 @@ mod tests {
 
         // 8. Verify H1: Both deleted files must be marked missing=1!
         // Under the old bug, file_001.jpg was marked missing=0 due to stale presence rows.
-        let missing_000: i64 = conn.query_row(
-            "SELECT missing FROM items WHERE file_name='file_000.jpg'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let missing_000: i64 = conn
+            .query_row(
+                "SELECT missing FROM items WHERE file_name='file_000.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(missing_000, 1, "file_000.jpg must be missing=1");
 
-        let missing_001: i64 = conn.query_row(
-            "SELECT missing FROM items WHERE file_name='file_001.jpg'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
-        assert_eq!(missing_001, 1, "file_001.jpg must be missing=1 (no contamination from failed run!)");
+        let missing_001: i64 = conn
+            .query_row(
+                "SELECT missing FROM items WHERE file_name='file_001.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            missing_001, 1,
+            "file_001.jpg must be missing=1 (no contamination from failed run!)"
+        );
 
-        let total_missing: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM items WHERE missing=1",
-            [],
-            |r| r.get(0),
-        ).unwrap();
-        assert_eq!(total_missing, 2, "exactly the two deleted files must be marked missing");
+        let total_missing: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items WHERE missing=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            total_missing, 2,
+            "exactly the two deleted files must be marked missing"
+        );
 
         // Scan seen must be empty
-        let scan_seen_count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0)).unwrap();
+        let scan_seen_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(scan_seen_count, 0, "scan_seen must be empty");
     }
 
@@ -4588,8 +5014,16 @@ mod tests {
             }
             assert_eq!(tracker.spooled_count, 200);
             assert!(tracker.buffer.is_empty());
-            tracker.flush_to_persistent_scan_seen(&conn, "scan1", 1).unwrap();
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen WHERE scan_id='scan1'", [], |r| r.get(0)).unwrap();
+            tracker
+                .flush_to_persistent_scan_seen(&conn, "scan1", 1)
+                .unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM scan_seen WHERE scan_id='scan1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
             assert_eq!(count, 200);
             conn.execute("DELETE FROM scan_seen", []).unwrap();
         }
@@ -4602,8 +5036,16 @@ mod tests {
             }
             assert_eq!(tracker.spooled_count, 200);
             assert_eq!(tracker.buffer.len(), 1);
-            tracker.flush_to_persistent_scan_seen(&conn, "scan1", 1).unwrap();
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen WHERE scan_id='scan1'", [], |r| r.get(0)).unwrap();
+            tracker
+                .flush_to_persistent_scan_seen(&conn, "scan1", 1)
+                .unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM scan_seen WHERE scan_id='scan1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
             assert_eq!(count, 201);
             conn.execute("DELETE FROM scan_seen", []).unwrap();
         }
@@ -4616,8 +5058,16 @@ mod tests {
             }
             assert_eq!(tracker.spooled_count, 400);
             assert_eq!(tracker.buffer.len(), 50);
-            tracker.flush_to_persistent_scan_seen(&conn, "scan1", 1).unwrap();
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen WHERE scan_id='scan1'", [], |r| r.get(0)).unwrap();
+            tracker
+                .flush_to_persistent_scan_seen(&conn, "scan1", 1)
+                .unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM scan_seen WHERE scan_id='scan1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
             assert_eq!(count, 450);
             conn.execute("DELETE FROM scan_seen", []).unwrap();
         }
@@ -4631,9 +5081,13 @@ mod tests {
             let file = &mut tracker.spooled_file.as_mut().unwrap().file;
             file.set_len(2).unwrap();
 
-            let err = tracker.flush_to_persistent_scan_seen(&conn, "scan1", 1).unwrap_err();
+            let err = tracker
+                .flush_to_persistent_scan_seen(&conn, "scan1", 1)
+                .unwrap_err();
             assert!(err.to_string().contains("presence spool read error"));
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0)).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 0, "scan_seen must be empty after failure");
         }
 
@@ -4648,9 +5102,16 @@ mod tests {
             let original_len = file.metadata().unwrap().len();
             file.set_len(original_len / 2).unwrap();
 
-            let err = tracker.flush_to_persistent_scan_seen(&conn, "scan1", 1).unwrap_err();
-            assert!(err.to_string().contains("presence spool read error") || err.to_string().contains("record count mismatch"));
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0)).unwrap();
+            let err = tracker
+                .flush_to_persistent_scan_seen(&conn, "scan1", 1)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("presence spool read error")
+                    || err.to_string().contains("record count mismatch")
+            );
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 0, "scan_seen must be empty after failure");
         }
 
@@ -4664,9 +5125,16 @@ mod tests {
             let original_len = file.metadata().unwrap().len();
             file.set_len(original_len - 5).unwrap();
 
-            let err = tracker.flush_to_persistent_scan_seen(&conn, "scan1", 1).unwrap_err();
-            assert!(err.to_string().contains("payload truncated") || err.to_string().contains("read error"));
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0)).unwrap();
+            let err = tracker
+                .flush_to_persistent_scan_seen(&conn, "scan1", 1)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("payload truncated")
+                    || err.to_string().contains("read error")
+            );
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 0, "scan_seen must be empty after failure");
         }
 
@@ -4681,9 +5149,13 @@ mod tests {
             file.write_all(&[0xFF, 0xFE, 0xFD]).unwrap(); // invalid UTF-8 bytes
             file.flush().unwrap();
 
-            let err = tracker.flush_to_persistent_scan_seen(&conn, "scan1", 1).unwrap_err();
+            let err = tracker
+                .flush_to_persistent_scan_seen(&conn, "scan1", 1)
+                .unwrap_err();
             assert!(err.to_string().contains("invalid UTF-8 path"));
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0)).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 0, "scan_seen must be empty after failure");
         }
 
@@ -4698,9 +5170,13 @@ mod tests {
             file.write_all(&(100_000u32).to_le_bytes()).unwrap();
             file.flush().unwrap();
 
-            let err = tracker.flush_to_persistent_scan_seen(&conn, "scan1", 1).unwrap_err();
+            let err = tracker
+                .flush_to_persistent_scan_seen(&conn, "scan1", 1)
+                .unwrap_err();
             assert!(err.to_string().contains("corrupted length"));
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0)).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 0, "scan_seen must be empty after failure");
         }
 
@@ -4715,9 +5191,13 @@ mod tests {
             file.write_all(&(0u32).to_le_bytes()).unwrap();
             file.flush().unwrap();
 
-            let err = tracker.flush_to_persistent_scan_seen(&conn, "scan1", 1).unwrap_err();
+            let err = tracker
+                .flush_to_persistent_scan_seen(&conn, "scan1", 1)
+                .unwrap_err();
             assert!(err.to_string().contains("corrupted length"));
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0)).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 0, "scan_seen must be empty after failure");
         }
 
@@ -4732,18 +5212,231 @@ mod tests {
             file.write_all(b"garbage_trailing_bytes").unwrap();
             file.flush().unwrap();
 
-            let err = tracker.flush_to_persistent_scan_seen(&conn, "scan1", 1).unwrap_err();
+            let err = tracker
+                .flush_to_persistent_scan_seen(&conn, "scan1", 1)
+                .unwrap_err();
             assert!(err.to_string().contains("trailing data"));
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0)).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM scan_seen", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 0, "scan_seen must be empty after failure");
         }
     }
 
+    /// Spool configuration for tracker-level tests. The in-memory budget is
+    /// pinned to the historical 200-path boundary so the spool/flush assertions
+    /// stay exact instead of depending on how many paths production holds
+    /// resident.
     fn test_spool(dir: &Path) -> PresenceSpoolConfig {
         PresenceSpoolConfig {
             dir: dir.to_path_buf(),
             max_bytes: 64 * 1024 * 1024,
+            max_in_memory_paths: 200,
         }
+    }
+
+    #[test]
+    fn presence_tracker_keeps_an_ordinary_artist_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = PresenceSpoolConfig {
+            dir: dir.path().to_path_buf(),
+            max_bytes: 64 * 1024 * 1024,
+            max_in_memory_paths: DEFAULT_MAX_IN_MEMORY_PRESENCE_PATHS,
+        };
+        let mut tracker = PresenceTracker::new(1, spool);
+        // A clean rescan discards everything it collected, so staying in memory
+        // is the whole point: only a genuinely oversized artist may spill.
+        for i in 0..20_000 {
+            tracker
+                .push(format!("/pictures/Artist/2024-01/{i:05}.jpg"))
+                .unwrap();
+        }
+        assert_eq!(
+            tracker.spooled_count, 0,
+            "an artist within the in-memory budget must not touch the spool file"
+        );
+        assert!(
+            tracker.spooled_file.is_none(),
+            "no spool file may be created for an in-memory artist"
+        );
+        assert_eq!(tracker.buffer.len(), 20_000);
+    }
+
+    /// The in-memory budget is a *path count*, and the byte budget is a second,
+    /// independent cap. Pin the exact boundary: the path that reaches the count
+    /// spills the buffer, one short of it does not, and the payload that spills
+    /// is a small fraction of the byte budget — which is what proves the count,
+    /// not the size, is what fired. Past the boundary the walk continues, so
+    /// the budget bounds memory without capping an artist's file count.
+    #[test]
+    fn presence_tracker_bounds_memory_by_path_count_not_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cap = DEFAULT_MAX_IN_MEMORY_PRESENCE_PATHS;
+        let byte_budget = 64 * 1024 * 1024;
+        let mut tracker = PresenceTracker::new(
+            1,
+            PresenceSpoolConfig {
+                dir: dir.path().to_path_buf(),
+                max_bytes: byte_budget,
+                max_in_memory_paths: cap,
+            },
+        );
+        let mut peak_resident = 0usize;
+
+        // One path short of the budget: everything stays resident, nothing spools.
+        for i in 0..cap - 1 {
+            tracker
+                .push(format!("/pictures/Artist/2024-01/{i:06}.jpg"))
+                .unwrap();
+            peak_resident = peak_resident.max(tracker.buffer.len());
+        }
+        assert_eq!(tracker.buffer.len(), cap - 1);
+        assert_eq!(tracker.spooled_count, 0);
+        assert!(
+            tracker.spooled_file.is_none(),
+            "one path short of the budget must not create a spool file"
+        );
+
+        // The path that reaches the budget spills every resident path.
+        tracker
+            .push("/pictures/Artist/2024-01/at-budget.jpg".to_string())
+            .unwrap();
+        peak_resident = peak_resident.max(tracker.buffer.len());
+        assert_eq!(
+            tracker.spooled_count, cap,
+            "the path that reaches the budget must spill the whole buffer"
+        );
+        assert!(
+            tracker.buffer.is_empty(),
+            "a spill drains the in-memory buffer"
+        );
+        assert_eq!(
+            peak_resident,
+            cap - 1,
+            "the spill happens inside push, so between calls the resident buffer sits \
+             one path below the budget; the cap-th path is only resident transiently"
+        );
+
+        // Past the budget the next path is resident again: the budget bounds
+        // memory rather than capping how many files an artist may have.
+        tracker
+            .push("/pictures/Artist/2024-01/past-budget.jpg".to_string())
+            .unwrap();
+        assert_eq!(
+            tracker.spooled_count, cap,
+            "the counter tracks spilled paths only"
+        );
+        assert_eq!(tracker.buffer.len(), 1);
+
+        // Short paths spill on the count, not on size.
+        assert!(
+            tracker.spooled_bytes < byte_budget / 8,
+            "{} spilled bytes must be far below the {} byte budget",
+            tracker.spooled_bytes,
+            byte_budget
+        );
+    }
+
+    /// A legitimate long path must survive the spool round trip intact.
+    /// `MAX_SPOOLED_PATH_BYTES` is the read-side guard, so the interesting case
+    /// is a real long path, not a corrupt length header.
+    #[test]
+    fn presence_tracker_round_trips_a_long_path_through_the_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE scan_seen (id INTEGER PRIMARY KEY, scan_id TEXT, artist_id INTEGER, file_path TEXT)",
+            [],
+        )
+        .unwrap();
+
+        // ~4,000 bytes: the Linux PATH_MAX ceiling, far under the 64 KiB guard.
+        let long_path = format!("/pictures/{}/deep.jpg", "a".repeat(4_000));
+        assert!(long_path.len() < MAX_SPOOLED_PATH_BYTES);
+
+        let mut tracker = PresenceTracker::new(1, test_spool(dir.path()));
+        for i in 0..200 {
+            tracker.push(format!("/path/to/file_{i}.jpg")).unwrap();
+        }
+        // The 200th resident path spills at the test threshold, so the long path
+        // is still buffered; the flush has to cover both halves.
+        tracker.push(long_path.clone()).unwrap();
+        assert_eq!(tracker.spooled_count, 200);
+        assert_eq!(tracker.buffer.len(), 1);
+
+        tracker
+            .flush_to_persistent_scan_seen(&conn, "scan1", 1)
+            .unwrap();
+
+        let stored: String = conn
+            .query_row(
+                "SELECT file_path FROM scan_seen WHERE file_path=?1",
+                [&long_path],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, long_path,
+            "the long path must round trip byte for byte"
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scan_seen WHERE scan_id='scan1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 201);
+    }
+
+    /// The byte budget guards the spool, not the resident buffer. It is only
+    /// consulted when a spill happens, so an artist whose paths are long reaches
+    /// the path count first and never trips the byte cap while resident.
+    /// Resident memory is therefore bounded by `max_in_memory_paths` times the
+    /// path length, and `max_bytes` does not bound it.
+    #[test]
+    fn presence_tracker_byte_budget_does_not_bound_resident_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cap = 1_000usize;
+        // Small enough that the resident long paths blow it many times over.
+        let byte_budget = 2 * 1024 * 1024;
+        let long = "a".repeat(4_000); // ~4 KB: the Linux PATH_MAX ceiling
+        let mut tracker = PresenceTracker::new(
+            1,
+            PresenceSpoolConfig {
+                dir: dir.path().to_path_buf(),
+                max_bytes: byte_budget,
+                max_in_memory_paths: cap,
+            },
+        );
+
+        for i in 0..cap - 1 {
+            tracker.push(format!("/pictures/{i}/{long}")).unwrap();
+        }
+        assert_eq!(tracker.spooled_count, 0);
+        assert!(
+            tracker.spooled_file.is_none(),
+            "nothing spills while the path count is under budget"
+        );
+        let resident_bytes: usize = tracker.buffer.iter().map(|p| p.len()).sum();
+        assert!(
+            resident_bytes as u64 > byte_budget,
+            "resident path bytes ({resident_bytes}) already exceed the spool byte \
+             budget ({byte_budget}) and the tracker does not object, because the \
+             budget is only consulted on a spill"
+        );
+
+        // The count is what finally forces a spill, and the spill is what finally
+        // consults the byte budget — which then refuses the overflow instead of
+        // growing the spool without limit.
+        let err = tracker.push(format!("/pictures/at-budget/{long}"));
+        let err = err.expect_err("the spill must consult the byte budget and refuse");
+        assert!(
+            err.to_string()
+                .contains("presence spool byte budget exceeded"),
+            "error should cite the byte budget: {err}"
+        );
     }
 
     #[test]
@@ -4756,11 +5449,13 @@ mod tests {
             PresenceSpoolConfig {
                 dir: dir.path().to_path_buf(),
                 max_bytes: 1024,
+                max_in_memory_paths: 200,
             },
         );
         let mut err = None;
         for i in 0..250 {
-            if let Err(e) = tracker.push(format!("/very/long/path/name/for/media/file_{:04}.jpg", i))
+            if let Err(e) =
+                tracker.push(format!("/very/long/path/name/for/media/file_{:04}.jpg", i))
             {
                 err = Some(e);
                 break;
@@ -4768,7 +5463,8 @@ mod tests {
         }
         let err = err.expect("pushing beyond byte budget must return Err");
         assert!(
-            err.to_string().contains("presence spool byte budget exceeded"),
+            err.to_string()
+                .contains("presence spool byte budget exceeded"),
             "error message should cite budget exceeded: {err}"
         );
     }
@@ -4789,15 +5485,21 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let spool_path = temp_dir.path().to_path_buf();
 
-        let foreign_stale = spool_path.join("gallery_pres_ab12_4242");
-        let foreign_fresh = spool_path.join("gallery_pres_cd34_4243");
+        // The foreign pids have to be ones no live process can hold. A plausible
+        // number like 4242 makes the test pass or fail depending on what the
+        // host happens to be running: `is_process_running` would see a live
+        // owner and correctly keep the spool, so the aged file would survive and
+        // the assertion would blame the cleanup. The sibling test above uses
+        // 99999999 for the same reason.
+        let foreign_stale = spool_path.join("gallery_pres_ab12_99999999");
+        let foreign_fresh = spool_path.join("gallery_pres_cd34_99999998");
         let own_file = spool_path.join(format!("gallery_pres_ef56_{}", std::process::id()));
         let unrelated_tmp = spool_path.join("unrelated_export.tmp");
         let unknown_prefix = spool_path.join("other_tool_4242");
         let legitimate = spool_path.join("config.json");
-        let subdir = spool_path.join("gallery_pres_gh78_4244");
+        let subdir = spool_path.join("gallery_pres_gh78_99999997");
         std::fs::create_dir(&subdir).unwrap();
-        let nested_stale = subdir.join("gallery_pres_ij90_4245");
+        let nested_stale = subdir.join("gallery_pres_ij90_99999996");
         for path in [
             &foreign_stale,
             &foreign_fresh,
@@ -4958,12 +5660,22 @@ mod tests {
         let mut m = 0i64;
         let mut u = 0i64;
         let mut nc = 0i64;
-        process_discovered_batch(&conn, &[discovered_file(1000.0)], "s1", 1, &mut m, &mut u, &mut nc)
-            .unwrap();
+        process_discovered_batch(
+            &conn,
+            &[discovered_file(1000.0)],
+            "s1",
+            1,
+            &mut m,
+            &mut u,
+            &mut nc,
+        )
+        .unwrap();
         let (h, st): (String, String) = conn
-            .query_row("SELECT content_hash, hash_status FROM items WHERE id=1", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT content_hash, hash_status FROM items WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(h, "deadbeef");
         assert_eq!(st, "done");
@@ -4978,34 +5690,67 @@ mod tests {
         let mut nc = 0i64;
 
         // 0.5ms (500 microseconds = 0.0005s) mtime bump must invalidate the cached hash.
-        process_discovered_batch(&conn, &[discovered_file(1000.0005)], "s2_sub_ms", 1, &mut m, &mut u, &mut nc)
-            .unwrap();
+        process_discovered_batch(
+            &conn,
+            &[discovered_file(1000.0005)],
+            "s2_sub_ms",
+            1,
+            &mut m,
+            &mut u,
+            &mut nc,
+        )
+        .unwrap();
         let (h_sub, st_sub): (String, String) = conn
-            .query_row("SELECT content_hash, hash_status FROM items WHERE id=1", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT content_hash, hash_status FROM items WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(h_sub, "", "0.5ms (500us) mtime change must invalidate cached hash");
+        assert_eq!(
+            h_sub, "",
+            "0.5ms (500us) mtime change must invalidate cached hash"
+        );
         assert_eq!(st_sub, "pending");
 
         // 500ms mtime bump must also invalidate the cached hash.
-        process_discovered_batch(&conn, &[discovered_file(1000.5)], "s2", 1, &mut m, &mut u, &mut nc)
-            .unwrap();
+        process_discovered_batch(
+            &conn,
+            &[discovered_file(1000.5)],
+            "s2",
+            1,
+            &mut m,
+            &mut u,
+            &mut nc,
+        )
+        .unwrap();
         let (h, st): (String, String) = conn
-            .query_row("SELECT content_hash, hash_status FROM items WHERE id=1", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT content_hash, hash_status FROM items WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(h, "", "500ms mtime change must invalidate cached hash");
         assert_eq!(st, "pending");
 
         // 1s mtime bump must also invalidate.
-        process_discovered_batch(&conn, &[discovered_file(1001.0)], "s3", 1, &mut m, &mut u, &mut nc)
-            .unwrap();
+        process_discovered_batch(
+            &conn,
+            &[discovered_file(1001.0)],
+            "s3",
+            1,
+            &mut m,
+            &mut u,
+            &mut nc,
+        )
+        .unwrap();
         let (h2, st2): (String, String) = conn
-            .query_row("SELECT content_hash, hash_status FROM items WHERE id=1", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT content_hash, hash_status FROM items WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(h2, "", "1s mtime change must invalidate cached hash");
         assert_eq!(st2, "pending");
@@ -5025,8 +5770,16 @@ mod tests {
         let mut u = 0i64;
         let mut nc = 0i64;
 
-        process_discovered_batch(&conn, &[discovered_file(1000.0)], "s1", 1, &mut m, &mut u, &mut nc)
-            .unwrap();
+        process_discovered_batch(
+            &conn,
+            &[discovered_file(1000.0)],
+            "s1",
+            1,
+            &mut m,
+            &mut u,
+            &mut nc,
+        )
+        .unwrap();
         let (h, st): (String, String) = conn
             .query_row(
                 "SELECT content_hash, hash_status FROM scan_candidates WHERE id=1",
@@ -5038,8 +5791,16 @@ mod tests {
         assert_eq!(st, "done");
 
         // 0.5ms (500us = 0.0005s) mtime bump must invalidate candidate hash
-        process_discovered_batch(&conn, &[discovered_file(1000.0005)], "s2_sub_ms", 1, &mut m, &mut u, &mut nc)
-            .unwrap();
+        process_discovered_batch(
+            &conn,
+            &[discovered_file(1000.0005)],
+            "s2_sub_ms",
+            1,
+            &mut m,
+            &mut u,
+            &mut nc,
+        )
+        .unwrap();
         let (h_sub, st_sub): (String, String) = conn
             .query_row(
                 "SELECT content_hash, hash_status FROM scan_candidates WHERE id=1",
@@ -5047,11 +5808,22 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(h_sub, "", "candidate hash must be invalidated after 0.5ms change");
+        assert_eq!(
+            h_sub, "",
+            "candidate hash must be invalidated after 0.5ms change"
+        );
         assert_eq!(st_sub, "pending");
 
-        process_discovered_batch(&conn, &[discovered_file(1000.5)], "s2", 1, &mut m, &mut u, &mut nc)
-            .unwrap();
+        process_discovered_batch(
+            &conn,
+            &[discovered_file(1000.5)],
+            "s2",
+            1,
+            &mut m,
+            &mut u,
+            &mut nc,
+        )
+        .unwrap();
         let (h2, st2): (String, String) = conn
             .query_row(
                 "SELECT content_hash, hash_status FROM scan_candidates WHERE id=1",
@@ -5059,7 +5831,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(h2, "", "candidate hash must be invalidated after 500ms change");
+        assert_eq!(
+            h2, "",
+            "candidate hash must be invalidated after 500ms change"
+        );
         assert_eq!(st2, "pending");
     }
 
@@ -5084,8 +5859,11 @@ mod tests {
         std::fs::write(new_dir.join("b.jpg"), &content_b).unwrap();
         let hash_a = crate::content_hash::hash_file(&new_dir.join("a.jpg"), 1024 * 1024).unwrap();
         let hash_b = crate::content_hash::hash_file(&new_dir.join("b.jpg"), 1024 * 1024).unwrap();
-        conn.execute("INSERT INTO artists (id, name, path) VALUES (2, 'Old', '/old/path')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (2, 'Old', '/old/path')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO items (id, artist_id, file_path, content_hash, hash_status) VALUES (20, 2, '/old/a.jpg', ?, 'done')",
             params![hash_a],
@@ -5147,8 +5925,11 @@ mod tests {
         #[cfg(not(unix))]
         std::fs::copy(new_dir.join("a.jpg"), new_dir.join("b.jpg")).unwrap();
         let hash = crate::content_hash::hash_file(&new_dir.join("a.jpg"), 1024 * 1024).unwrap();
-        conn.execute("INSERT INTO artists (id, name, path) VALUES (2, 'Old', '/old/path')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (2, 'Old', '/old/path')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO items (id, artist_id, file_path, content_hash, hash_status) VALUES (20, 2, '/old/a.jpg', ?, 'done')",
             params![hash],
@@ -5195,8 +5976,11 @@ mod tests {
         std::fs::write(new_dir.join("f2.jpg"), &content).unwrap();
         let hash = crate::content_hash::hash_file(&new_dir.join("f1.jpg"), 1024 * 1024).unwrap();
 
-        conn.execute("INSERT INTO artists (id, name, path) VALUES (3, 'OldHash', '/old/hash_path')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (3, 'OldHash', '/old/hash_path')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO items (id, artist_id, file_path, content_hash, hash_status) VALUES (30, 3, '/old/f1.jpg', ?, 'done')",
             params![hash],
@@ -5247,7 +6031,10 @@ mod tests {
     fn mark_missing_never_marks_an_existing_directory() {
         let (_dir, conn, _) = fixture();
         let roots = test_roots(&_dir);
-        let existing = format!("{}/existing_artist", _dir.path().to_string_lossy().replace('\\', "/"));
+        let existing = format!(
+            "{}/existing_artist",
+            _dir.path().to_string_lossy().replace('\\', "/")
+        );
         std::fs::create_dir_all(&existing).unwrap();
         conn.execute(
             "INSERT INTO artists (id, name, path, missing) VALUES (3, 'Live', ?, 0)",
@@ -5312,13 +6099,18 @@ mod tests {
         let i11_missing: i64 = conn
             .query_row("SELECT missing FROM items WHERE id=11", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(a_missing, 0, "artist update must roll back when item update fails");
+        assert_eq!(
+            a_missing, 0,
+            "artist update must roll back when item update fails"
+        );
         assert_eq!(i10_missing, 0, "item 10 must roll back");
         assert_eq!(i11_missing, 0, "item 11 must roll back");
 
         // Drop trigger and retry
-        conn.execute("DROP TRIGGER test_fail_item_missing", []).unwrap();
-        let stale = mark_missing_artists_after_full_scan(&conn, &roots, &scanned, &mut errors).unwrap();
+        conn.execute("DROP TRIGGER test_fail_item_missing", [])
+            .unwrap();
+        let stale =
+            mark_missing_artists_after_full_scan(&conn, &roots, &scanned, &mut errors).unwrap();
         assert_eq!(stale, 1);
         let a_missing2: i64 = conn
             .query_row("SELECT missing FROM artists WHERE id=2", [], |r| r.get(0))
@@ -5334,8 +6126,10 @@ mod tests {
         assert_eq!(i11_missing2, 1, "item 11 must be marked missing");
 
         // 2. Simulate an interrupted run: artist missing=1 but item 11 reset to 0.
-        conn.execute("UPDATE items SET missing=0 WHERE id=11", []).unwrap();
-        let stale2 = mark_missing_artists_after_full_scan(&conn, &roots, &scanned, &mut errors).unwrap();
+        conn.execute("UPDATE items SET missing=0 WHERE id=11", [])
+            .unwrap();
+        let stale2 =
+            mark_missing_artists_after_full_scan(&conn, &roots, &scanned, &mut errors).unwrap();
         assert_eq!(stale2, 1, "retry must reach the inconsistent artist");
         let i10_missing3: i64 = conn
             .query_row("SELECT missing FROM items WHERE id=10", [], |r| r.get(0))
@@ -5344,7 +6138,10 @@ mod tests {
             .query_row("SELECT missing FROM items WHERE id=11", [], |r| r.get(0))
             .unwrap();
         assert_eq!(i10_missing3, 1);
-        assert_eq!(i11_missing3, 1, "inconsistent item 11 must be reconciled on retry");
+        assert_eq!(
+            i11_missing3, 1,
+            "inconsistent item 11 must be reconciled on retry"
+        );
     }
 
     #[test]
@@ -5372,21 +6169,32 @@ mod tests {
 
         let scan = outcome.get("scan").unwrap_or(&outcome);
         let phase = scan.get("phase").and_then(Value::as_str).unwrap();
-        assert_eq!(phase, "partial", "discovery error must force phase to partial");
+        assert_eq!(
+            phase, "partial",
+            "discovery error must force phase to partial"
+        );
         assert!(
             outcome.get("archive").is_none(),
             "auto-archive must be blocked on partial scan"
         );
 
         let errors = scan.get("errors").and_then(Value::as_array).unwrap();
-        assert!(!errors.is_empty(), "discovery error must be reported in errors");
         assert!(
-            errors.iter().any(|e| e.as_str().unwrap().contains("discovery read_dir error")),
+            !errors.is_empty(),
+            "discovery error must be reported in errors"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.as_str().unwrap().contains("discovery read_dir error")),
             "expected discovery read_dir error, got {errors:?}"
         );
 
         let scanned = scan.get("scanned").and_then(Value::as_i64).unwrap_or(0);
-        assert!(scanned >= 1, "healthy artist should still be scanned: {scanned}");
+        assert!(
+            scanned >= 1,
+            "healthy artist should still be scanned: {scanned}"
+        );
     }
 
     #[test]
@@ -5425,7 +6233,10 @@ mod tests {
 
         // Inject metadata permission error specifically for InaccessibleArtist
         INJECTED_METADATA_ERROR.with(|cell| {
-            *cell.borrow_mut() = Some(("InaccessibleArtist".to_string(), std::io::ErrorKind::PermissionDenied));
+            *cell.borrow_mut() = Some((
+                "InaccessibleArtist".to_string(),
+                std::io::ErrorKind::PermissionDenied,
+            ));
         });
 
         let control = ScanControl::new();
@@ -5436,7 +6247,10 @@ mod tests {
 
         let scan = outcome.get("scan").unwrap_or(&outcome);
         let phase = scan.get("phase").and_then(Value::as_str).unwrap();
-        assert_eq!(phase, "partial", "reconciliation metadata error must yield partial phase");
+        assert_eq!(
+            phase, "partial",
+            "reconciliation metadata error must yield partial phase"
+        );
         assert!(
             outcome.get("archive").is_none(),
             "auto-archive must be blocked when missing reconciliation encounters inaccessible artists"
@@ -5448,8 +6262,14 @@ mod tests {
         let i20_missing: i64 = conn
             .query_row("SELECT missing FROM items WHERE id=20", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(a2_missing, 0, "inaccessible artist must never be marked missing");
-        assert_eq!(i20_missing, 0, "items of inaccessible artist must never be marked missing");
+        assert_eq!(
+            a2_missing, 0,
+            "inaccessible artist must never be marked missing"
+        );
+        assert_eq!(
+            i20_missing, 0,
+            "items of inaccessible artist must never be marked missing"
+        );
     }
 
     #[test]
@@ -5497,7 +6317,13 @@ mod tests {
 
         let cleaned = cleanup_stale_presence_spools_in(&spool_path, PRESENCE_SPOOL_MAX_AGE);
         assert_eq!(cleaned, 1, "only dead process spool file must be cleaned");
-        assert!(active_spool.exists(), "active process spool file must survive cleanup");
-        assert!(!dead_spool.exists(), "dead process spool file must be deleted");
+        assert!(
+            active_spool.exists(),
+            "active process spool file must survive cleanup"
+        );
+        assert!(
+            !dead_spool.exists(),
+            "dead process spool file must be deleted"
+        );
     }
 }

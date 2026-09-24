@@ -1,12 +1,15 @@
 {
   "appname": "gallery",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "display_name": "画廊",
   "desc": "纯 Rust 本地媒体库：浏览、标记、预览并维护 NAS 媒体。 Local media library (pure Rust runtime) for browsing, tagging, previewing, and maintaining NAS media.",
   "arch": "x86_64",
   "platform": "all",
   "source": "thirdparty",
-  "maintainer": "hczhr",
+  "maintainer": "h-void",
+  "maintainer_url": "https://github.com/h-void",
+  "distributor": "h-void",
+  "distributor_url": "https://github.com/h-void",
   "desktop_uidir": "ui",
   "desktop_applaunchname": "gallery.main",
   "service_port": 8899,
@@ -16,7 +19,7 @@
   "runtime_dependency": "",
   "ui": {
     "title": "画廊",
-    "icon": "images/gallery-icon-v1_1_4_{0}.png",
+    "icon": "images/gallery-icon-v1_1_5_{0}.png",
     "protocol": "http",
     "url": "/",
     "allUsers": true

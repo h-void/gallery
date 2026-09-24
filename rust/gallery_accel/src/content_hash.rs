@@ -3,8 +3,8 @@ use std::io::Read;
 use std::path::Path;
 
 use anyhow::Context;
-use serde_json::{json, Value};
 
+#[cfg(test)]
 const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Stream a file through BLAKE3 in 1 MiB chunks, mirroring
@@ -24,19 +24,6 @@ pub fn hash_file(path: &Path, chunk_size: usize) -> anyhow::Result<String> {
         hasher.update(&buf[..read]);
     }
     Ok(hasher.finalize().to_hex().to_string())
-}
-
-/// Compute the content hash of a file and report path, hash and size.
-pub fn content_hash_response(path: &str) -> anyhow::Result<Value> {
-    let path = Path::new(path);
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("stat file for hashing: {}", path.display()))?;
-    let content_hash = hash_file(path, DEFAULT_CHUNK_SIZE)?;
-    Ok(json!({
-        "path": path.to_string_lossy(),
-        "content_hash": content_hash,
-        "file_size": metadata.len(),
-    }))
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 
 import { $, $$, escHtml, formatSize, buttonIcon } from '../utils.js';
 import { state } from '../store.js';
-import { API } from '../api.js';
+import { API, scheduleFolderRenamesRefresh } from '../api.js';
 import { toast, logUiAction, collectUiLogContext } from '../logging.js';
 import { refreshCurrentView } from '../events.js';
 
@@ -96,6 +96,11 @@ export function openArchiveModal(itemId, opener = null) {
   const recycleCheckbox = $('#archiveRecycleSource');
   if (recycleCheckbox) recycleCheckbox.checked = true;
 
+  // One-shot option: it applies to the next extraction only, so a fresh dialog
+  // always starts with it unchecked.
+  const autoArchiveInput = $('#archiveAutoArchive');
+  if (autoArchiveInput) autoArchiveInput.checked = false;
+
   const statusMsg = $('#archiveStatusMsg');
   if (statusMsg) {
     statusMsg.textContent = '';
@@ -173,7 +178,7 @@ function renderArchiveInspection(data, currentPassword) {
   if (data.header_encrypted) {
     if (pwdRow) pwdRow.style.display = 'flex';
     if (summary) {
-      summary.innerHTML = `<div class="archive-meta-line"><b>${escHtml(data.archive_name)}</b> (${formatSize(data.archive_size)}) \\u00b7 压缩包已加密</div>`;
+      summary.innerHTML = `<div class="archive-meta-line"><b>${escHtml(data.archive_name)}</b> (${formatSize(data.archive_size)}) \u00b7 压缩包已加密</div>`;
     }
     if (tree) {
       tree.innerHTML = '<div class="archive-notice">文件名已加密，请输入密码后点击“解锁预览”。</div>';
@@ -200,7 +205,7 @@ function renderArchiveInspection(data, currentPassword) {
     summary.innerHTML = `
       <div class="archive-meta-line">
         <span class="archive-meta-badge">${escHtml(data.archive_name)}</span>
-        <span class="archive-meta-sub">${formatSize(data.archive_size)} \\u00b7 共 ${s.total_files || 0} 个文件${detailsStr} \\u00b7 解压后约 ${formatSize(s.total_uncompressed_bytes || 0)}</span>
+        <span class="archive-meta-sub">${formatSize(data.archive_size)} \u00b7 共 ${s.total_files || 0} 个文件${detailsStr} \u00b7 解压后约 ${formatSize(s.total_uncompressed_bytes || 0)}</span>
       </div>
     `;
   }
@@ -281,11 +286,16 @@ async function executeArchiveExtraction() {
   const targetModeRadio = $('input[name="archiveTargetMode"]:checked');
   const customFolderInput = $('#archiveCustomFolderName');
   const recycleCheckbox = $('#archiveRecycleSource');
+  const autoArchiveInput = $('#archiveAutoArchive');
 
   const password = pwdInput ? pwdInput.value : '';
   const targetMode = targetModeRadio ? targetModeRadio.value : 'current_folder';
   const customFolderName = targetMode === 'new_folder' && customFolderInput ? customFolderInput.value.trim() : null;
   const recycleSource = recycleCheckbox ? recycleCheckbox.checked : true;
+  const autoArchive = Boolean(autoArchiveInput && autoArchiveInput.checked);
+  // Capture the owning artist now: the view refresh below can swap or clear
+  // state.currentArtist, and the plan refresh must still hit the right artist.
+  const archiveArtistId = state.currentArtist?.id || null;
 
   if (extractBtn) {
     extractBtn.disabled = true;
@@ -308,6 +318,12 @@ async function executeArchiveExtraction() {
     toast(`已解压 ${res.extracted_count || 0} 项文件${res.recycled_source ? '，原压缩包已移入回收站' : ''}`);
     closeArchiveModal();
 
+    // Schedule before the view refresh: the scheduler debounces it anyway and
+    // a failing refresh must not drop the plan update.
+    if (autoArchive && archiveArtistId) {
+      scheduleFolderRenamesRefresh(archiveArtistId);
+    }
+
     // Trigger instant refresh of current view so newly extracted files appear
     await refreshCurrentView();
   } catch (err) {
@@ -317,6 +333,9 @@ async function executeArchiveExtraction() {
       statusMsg.className = 'archive-status-msg error';
     }
   } finally {
+    // The plan-generation checkbox is a one-shot option for this extraction,
+    // success or failure alike.
+    if (autoArchiveInput) autoArchiveInput.checked = false;
     if (extractBtn) {
       extractBtn.disabled = false;
       extractBtn.textContent = '立即解压';

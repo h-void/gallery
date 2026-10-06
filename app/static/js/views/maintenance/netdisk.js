@@ -182,6 +182,19 @@ function setButtonBusy(selector, disabled, key) {
   if (el) el.disabled = disabled || isActionBusy(key);
 }
 
+export function netdiskStateCode(label) {
+  switch (label) {
+    case '已连接': return 'ok';
+    case '设备离线': return 'offline';
+    case '凭据失效':
+    case '路径不可用': return 'warn';
+    case '未配置': return 'unconfigured';
+    case '连接中': return 'connecting';
+    case '已断开': return 'disconnected';
+    default: return 'unknown';
+  }
+}
+
 export function renderNetdiskStatus() {
   const el = $('#netdiskStatusText');
   if (!el) return;
@@ -198,7 +211,7 @@ export function renderNetdiskStatus() {
       : '无法读取 JDownloader 自动开始设置，已停止移入');
   }
   el.textContent = parts.join(' \u00b7 ');
-  el.dataset.netdiskState = label;
+  el.dataset.netdiskState = netdiskStateCode(label);
 }
 
 // Which commands make sense for a stored state. The backend refuses the rest
@@ -727,13 +740,8 @@ export async function submitNetdiskDispatch() {
       renderNetdiskPanel();
       return res;
     } catch (err) {
-      if (err.status === 409 || err.message?.includes('409') || err.message?.includes('已有活跃投递任务') || err.message?.includes('进行中')) {
-        const retry = window.confirm('该作品已有投递任务正在进行中，是否重新投递？');
-        if (retry) {
-          return doSubmit({ force: true });
-        }
-        return null;
-      }
+      const retryResult = confirmNetdiskForceRetry(err, () => doSubmit({ force: true }));
+      if (retryResult !== undefined) return retryResult;
       toast('投递失败：' + (err.message || err), 'error');
       return null;
     } finally {
@@ -743,4 +751,15 @@ export async function submitNetdiskDispatch() {
   }
 
   return doSubmit();
+}
+
+export function confirmNetdiskForceRetry(err, onRetry) {
+  if (err && (err.status === 409 || err.message?.includes('409') || err.message?.includes('已有活跃投递任务') || err.message?.includes('进行中'))) {
+    const retry = window.confirm('该作品已有投递任务正在进行中，是否重新投递？');
+    if (retry && typeof onRetry === 'function') {
+      return onRetry();
+    }
+    return null;
+  }
+  return undefined;
 }

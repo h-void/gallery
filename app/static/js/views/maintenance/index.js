@@ -7,7 +7,7 @@ import { $, $$ } from '../../utils.js';
 import { toast, logUiAction } from '../../logging.js';
 import { loadHealthSummary, loadHashStatus, loadFolderRenameAutoStatus, loadErrorArtistsSummary, loadMlRuntime, loadDimensionBackfillStatus, renderHealthSummary, renderHashStatus, renderFolderRenameAutoStatus, renderMlRuntime, renderOverviewActions, renderDimensionBackfillStatus } from './overview.js';
 import { renderMovePathSummary, renderMoveCandidates, renderMoveCandidateGroups, renderMoveHistory } from './paths.js';
-import { loadArtistFolderMove, loadArchiveWorkbench, renderArtistFolderMove, renderArchiveWorkbench } from './organize.js';
+import { loadArtistFolderMove, loadArchiveWorkbench, renderArtistFolderMove, renderArchiveWorkbench, archiveCurrentArtistId } from './organize.js';
 import { loadCharacterLibrary, characterImportJobBusy, renderCharacterLibrary } from './characters.js';
 import { loadDownloadsPanel, renderDownloadsPanel, stopDownloadSyncPolling, openDownloadAllWorks } from './downloads.js';
 import { loadNetdiskPanel, renderNetdiskPanel } from './netdisk.js';
@@ -194,10 +194,20 @@ function renderActiveMaintenanceView(view) {
   }
 }
 
+// The organize view is artist-scoped: its loaders read the current artist's
+// archive rules and plans. Reusing a request across an artist switch would keep
+// the previous artist's workbench on screen and never load the new artist, so
+// the request reuse key carries the artist scope for that view. The other views
+// load global data and keep a view-only key.
+function maintenanceRequestScope(view) {
+  return view === 'organize' ? String(archiveCurrentArtistId()) : '';
+}
+
 export async function refreshActiveMaintenanceView(options = {}) {
   const preservedScrollTop = options.preserveScroll ? movePanelScrollTop() : null;
   const view = options.view || state.maintenanceView || 'overview';
-  if (activeMaintenanceRequest && activeMaintenanceRequest.view === view) {
+  const scope = maintenanceRequestScope(view);
+  if (activeMaintenanceRequest && activeMaintenanceRequest.view === view && activeMaintenanceRequest.scope === scope) {
     return activeMaintenanceRequest.promise;
   }
   const seq = nextRequestSeq('maintenanceLoadSeq');
@@ -205,8 +215,8 @@ export async function refreshActiveMaintenanceView(options = {}) {
   const controller = new AbortController();
   activeMaintenanceController = controller;
   const signal = controller.signal;
-  const request = {view, controller, promise: null};
-  const loadOptions = {...options, signal};
+  const request = {view, scope, controller, promise: null};
+  const loadOptions = {...options, signal, render: false, maintenanceSeq: seq};
   activeMaintenanceRequest = request;
   request.promise = (async () => {
     try {
@@ -343,10 +353,12 @@ export function handleMaintenanceJump(jump) {
   if (jump === 'characters') {
     setMaintenanceView('characters');
     loadMoveWorkbench({view: 'characters'}).catch(() => {});
+    return;
   }
   if (jump === 'downloads') {
     setMaintenanceView('downloads');
     loadMoveWorkbench({view: 'downloads'}).catch(() => {});
+    return;
   }
 }
 

@@ -120,7 +120,7 @@ export function downloadFileName(item) {
 // Card and lightbox metadata: one node per tag name so fields and names are
 // separated by CSS spacing instead of the global middle-dot separator.
 export function renderTagNamesHtml(tags) {
-  if (!tags || tags.length === 0) return '<span class="meta-tag">未加标签</span>';
+  if (!tags || tags.length === 0) return '<span class="meta-tag meta-tag-empty">未加角色</span>';
   return tags.map(t => `<span class="meta-tag">${escHtml(t.name)}</span>`).join('');
 }
 

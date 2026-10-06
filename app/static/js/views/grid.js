@@ -32,6 +32,33 @@ let activeImageLoads = 0;
 const pendingImageLoads = [];
 let imageObserver = null;
 
+// Id -> item lookup memoized on the state.allItems array reference. The hot
+// paths below (thumbnail aspect backfill, marquee hit-testing) ran a linear
+// scan per call, which is O(n^2) across a full page of thumbnails or a single
+// pointermove storm. allItems is only ever replaced, never mutated in place,
+// so a map built from one array reference stays valid until that reference
+// changes; mutated item fields are shared through the same object references.
+let itemByIdMemo = {source: null, map: null};
+
+export function itemsByIdMap() {
+  const items = state.allItems;
+  if (itemByIdMemo.source !== items || !itemByIdMemo.map) {
+    itemByIdMemo = {
+      source: items,
+      map: new Map((items || []).map(item => [Number(item.id), item])),
+    };
+  }
+  return itemByIdMemo.map;
+}
+
+// Bumped whenever #grid children are (re)built so caches that captured DOM
+// geometry (the marquee card layout) know their snapshot is stale.
+let gridContentRevision = 0;
+
+function bumpGridContentRevision() {
+  gridContentRevision += 1;
+}
+
 export function syncSelectedCards(root = $('#grid')) {
   const scope = root || document;
   if (!scope.querySelectorAll) return;
@@ -39,7 +66,8 @@ export function syncSelectedCards(root = $('#grid')) {
     const cid = Number(card.dataset.id);
     const selected = state.selectedIds.has(cid);
     card.classList.toggle('selected', selected);
-    const chk = card.querySelector('.check');
+    const first = card.firstElementChild;
+    const chk = first && first.classList && first.classList.contains('check') ? first : card.querySelector('.check');
     if (chk) {
       chk.classList.toggle('visible', selected);
       chk.classList.toggle('checked', selected);
@@ -62,9 +90,13 @@ function isJustifiedTarget(duplicatesOnly) {
 }
 
 function justifiedOptions() {
+  const mobile = window.innerWidth <= 768;
   return {
-    mobile: window.innerWidth <= 768,
-    mobileColumns: state.mobileColumns,
+    mobile,
+    // The saved column preference is a mobile layout contract. Forwarding it
+    // on desktop let a stored 1-column choice render every desktop card as a
+    // full-width natural-aspect row instead of equal-height justified rows.
+    mobileColumns: mobile ? state.mobileColumns : undefined,
   };
 }
 
@@ -174,6 +206,7 @@ export function scheduleJustifiedRelayout() {
   justifiedResizeTimer = setTimeout(() => {
     const grid = $('#grid');
     if (!grid || !grid.classList.contains('justified') || !grid.childElementCount) return;
+    bumpGridContentRevision();
     const nodesById = collectGridCards(grid);
     applyJustifiedRows(grid, state.allItems, id => nodesById.get(id), 0, 'replace');
   }, 150);
@@ -182,6 +215,7 @@ export function scheduleJustifiedRelayout() {
 export function renderGrid() {
   const grid = $('#grid');
   if (!grid) return;
+  bumpGridContentRevision();
   const items = state.allItems;
   // Sync the tag-results container first: it sits outside #grid and must also
   // hide on the early returns below (e.g. leaving an artist clears the view).
@@ -199,9 +233,11 @@ export function renderGrid() {
   if (items.length === 0 && !tagResultsVisible) {
     releaseAllImageLoads();
     releaseAllVideoPreviews();
-   grid.innerHTML = state.duplicatesOnly
-      ? '<div class="empty library-empty-compact">当前范围没有重复文件</div>'
-      : '<div class="empty library-empty-compact">当前范围没有文件</div>';
+   grid.innerHTML = state.itemsLoadError
+      ? '<div class="empty library-empty-compact">加载失败，请重试</div>'
+      : state.duplicatesOnly
+        ? '<div class="empty library-empty-compact">当前范围没有重复文件</div>'
+        : '<div class="empty library-empty-compact">当前范围没有文件</div>';
     return;
   }
 
@@ -235,6 +271,7 @@ export function renderGrid() {
 
 export function appendItemsToGrid(items, startIndex) {
   if (!items.length) return;
+  bumpGridContentRevision();
   // ponytail: duplicate pages are small and rerendering keeps cross-page groups correct.
   if (state.duplicatesOnly) {
     renderGrid();
@@ -286,6 +323,7 @@ function clearJustifiedInlineSizes(node) {
 // keeps its live DOM (loaded images included); only new or changed cards are
 // rebuilt. Position stability is handled by the scroll anchor in this module.
 function reconcileGridCards(grid, items) {
+  bumpGridContentRevision();
   const previousById = collectGridCards(grid);
   if (grid.classList.contains('justified')) {
     justifyReplace(grid, items.map((item, idx) => cardEntry(item, idx)), previousById);
@@ -403,7 +441,7 @@ function buildItemCardHtml(item, idx) {
     const download = `<a class="btn btn-ghost btn-icon card-download" data-download href="${fileUrl}" download="${escHtml(downloadFileName(item))}" title="下载文件" aria-label="下载 ${escHtml(item.file_name)}">${buttonIcon('download')}</a>`;
     // Full file name stays reachable on every card (hover/AT tooltip) even
     // when the one-line title truncates.
-    const titleRow = `<div class="card-title-row"><div class="role" title="${escHtml(item.file_name)}">${escHtml(item.file_name)}</div></div>`;
+    const titleRow = `<div class="card-title-row"><div class="file-name" title="${escHtml(item.file_name)}">${escHtml(item.file_name)}</div></div>`;
     const cardActions = `<div class="card-actions">${favorite}${download}</div>`;
     const artistJump = isGlobalSearchActive() && item.artist_id
       ? `<button class="btn btn-ghost artist-jump" type="button" data-artist-jump="${item.artist_id}" title="转到 ${escHtml(item.artist_name || '画师')}">转到画师</button>`
@@ -479,7 +517,7 @@ function buildItemCardHtml(item, idx) {
     return `<div class="card${sel}" data-id="${item.id}" data-idx="${idx}" role="button" tabindex="0">
         <div class="check${checkVisible}${chk}" data-check="${item.id}"></div>
         ${cardActions}
-        <img class="thumb loading" data-src="${previewFileUrl}" decoding="async" fetchpriority="low" draggable="false">
+        <img class="thumb" data-src="${previewFileUrl}" decoding="async" fetchpriority="low" draggable="false">
         <div class="info">
           ${titleRow}
           ${cardMetaRow}
@@ -518,7 +556,7 @@ export function bindGridEvents() {
     const favoriteBtn = target.closest('[data-favorite]');
     if (favoriteBtn && grid.contains(favoriteBtn)) {
       e.stopPropagation();
-      const item = state.allItems.find(row => row.id === parseInt(favoriteBtn.dataset.favorite));
+      const item = itemsByIdMap().get(parseInt(favoriteBtn.dataset.favorite)) || null;
       toggleItemFavorite(item);
       return;
     }
@@ -557,7 +595,6 @@ export function bindGridEvents() {
     if (e.button === 0) state.suppressNextGridClick = false;
   });
   grid.addEventListener('keydown', e => {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
     const target = e.target instanceof Element ? e.target : null;
     if (!target) return;
     // Only proxy when the card itself is focused. A focused favorite button or
@@ -566,6 +603,19 @@ export function bindGridEvents() {
     if (cardInnerControlTarget(target)) return;
     const card = target.closest('.card');
     if (!card || !grid.contains(card)) return;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+      const cards = Array.from(grid.querySelectorAll('.card[data-id]'));
+      const idx = cards.indexOf(card);
+      if (idx !== -1) {
+        const nextIdx = e.key === 'ArrowRight' ? idx + 1 : idx - 1;
+        if (nextIdx >= 0 && nextIdx < cards.length) {
+          e.preventDefault();
+          cards[nextIdx].focus();
+        }
+      }
+      return;
+    }
+    if (e.key !== 'Enter' && e.key !== ' ') return;
     e.preventDefault();
     activateCard(card, e);
   });
@@ -704,7 +754,7 @@ function moveSelectionMarquee(e) {
     }));
   }
   e.preventDefault();
-  updateSelectionMarquee();
+  scheduleSelectionMarqueeUpdate();
 }
 
 function selectionIdsForMarquee(boxedIds, baseSelectedIds, modifier) {
@@ -744,6 +794,52 @@ function cardRectIntersectsMarquee(cardRect, box) {
     && cardRect.top <= box.bottom;
 }
 
+// Card geometry snapshot for marquee hit-testing. Each pointermove used to
+// rebuild an id -> item map and read every card's bounding box — two forced
+// layout passes per move on large grids. A drag only needs the boxes, and
+// they stay valid until the grid content, the container geometry, or its
+// scroll position changes; the snapshot fingerprint records all three.
+function marqueeCardLayout(selection) {
+  const grid = $('#grid');
+  const container = $('#gridContainer');
+  if (!grid || !container) return [];
+  const containerRect = container.getBoundingClientRect();
+  const cached = selection && selection.layoutCache;
+  if (
+    cached
+    && cached.revision === gridContentRevision
+    && cached.scrollTop === container.scrollTop
+    && cached.scrollLeft === container.scrollLeft
+    && cached.containerTop === containerRect.top
+    && cached.containerLeft === containerRect.left
+    && cached.containerWidth === containerRect.width
+    && cached.containerHeight === containerRect.height
+  ) {
+    return cached.cards;
+  }
+  const itemMap = itemsByIdMap();
+  const cards = [];
+  $$('#grid .card[data-id]').forEach(card => {
+    const id = Number(card.dataset.id);
+    const item = itemMap.get(id);
+    if (!item) return;
+    cards.push({id, item, rect: card.getBoundingClientRect()});
+  });
+  if (selection) {
+    selection.layoutCache = {
+      revision: gridContentRevision,
+      scrollTop: container.scrollTop,
+      scrollLeft: container.scrollLeft,
+      containerTop: containerRect.top,
+      containerLeft: containerRect.left,
+      containerWidth: containerRect.width,
+      containerHeight: containerRect.height,
+      cards,
+    };
+  }
+  return cards;
+}
+
 function updateSelectionMarquee() {
   if (!state.selectionMarquee || !state.selectionMarquee.active) return;
   const container = $('#gridContainer');
@@ -757,16 +853,28 @@ function updateSelectionMarquee() {
     overlay.style.height = `${box.height}px`;
   }
   const boxedIds = [];
-  $$('#grid .card[data-id]').forEach(card => {
-    const id = Number(card.dataset.id);
-    const item = (state.allItems || []).find(candidate => Number(candidate.id) === id);
+  marqueeCardLayout(state.selectionMarquee).forEach(card => {
+    const item = card.item;
     if (!item || !isTaggableItem(item)) return;
-    if (cardRectIntersectsMarquee(card.getBoundingClientRect(), box)) boxedIds.push(id);
+    if (cardRectIntersectsMarquee(card.rect, box)) boxedIds.push(card.id);
   });
   const nextIds = selectionIdsForMarquee(boxedIds, state.selectionMarquee.baseSelectedIds, state.selectionMarquee.modifier);
   state.selectionMarquee.boxedCount = boxedIds.length;
   state.selectionMarquee.boxedIds = boxedIds;
   applySelectionChange(nextIds, {reason: 'selection_box', boxed_count: boxedIds.length, modifier: state.selectionMarquee.modifier, schedule: false, log: false});
+}
+
+// Coalesce pointer-event bursts into one hit test per frame: every update
+// walks the cached card layout and re-applies the selection, so running it
+// per event starves the frame budget on grids with thousands of cards.
+function scheduleSelectionMarqueeUpdate() {
+  const selection = state.selectionMarquee;
+  if (!selection || selection.updateFrame) return;
+  selection.updateFrame = requestAnimationFrame(() => {
+    selection.updateFrame = 0;
+    if (state.selectionMarquee !== selection) return;
+    updateSelectionMarquee();
+  });
 }
 
 function finishSelectionMarquee(e) {
@@ -795,6 +903,10 @@ function cancelSelectionMarquee(e) {
 
 function cleanupSelectionMarquee(e) {
   const container = $('#gridContainer');
+  if (state.selectionMarquee && state.selectionMarquee.updateFrame) {
+    cancelAnimationFrame(state.selectionMarquee.updateFrame);
+    state.selectionMarquee.updateFrame = 0;
+  }
   if (state.selectionMarquee && state.selectionMarquee.overlay) {
     state.selectionMarquee.overlay.remove();
   }
@@ -839,7 +951,7 @@ export async function toggleItemFavorite(item) {
   try {
     const result = await API.putJson(`/api/items/${item.id}/favorite`, {favorite: !previous});
     item.favorite = Boolean(result.favorite);
-    const loaded = state.allItems.find(row => row.id === item.id);
+    const loaded = itemsByIdMap().get(item.id) || null;
     if (loaded) loaded.favorite = item.favorite;
     if (state.stats) {
       state.stats.favorites = Math.max(0, Number(state.stats.favorites || 0) + (item.favorite ? 1 : -1));
@@ -919,11 +1031,11 @@ export function observeImages() {
   });
 }
 
-function isImageNearLoadWindow(img) {
+function isImageNearLoadWindow(img, cachedViewport = null) {
   const container = $('#gridContainer');
   if (!container) return true;
   const margin = parseInt(IMAGE_OBSERVER_ROOT_MARGIN, 10) || 0;
-  const viewport = container.getBoundingClientRect();
+  const viewport = cachedViewport || container.getBoundingClientRect();
   const rect = img.getBoundingClientRect();
   return rect.bottom >= viewport.top - margin
     && rect.top <= viewport.bottom + margin
@@ -946,16 +1058,26 @@ function queueImageLoad(img) {
     return;
   }
   img.dataset.imageQueued = '1';
+  // The pulse placeholder marks queued-or-loading thumbs only. Attaching it in
+  // the card HTML left thousands of idle thumbnails running an infinite
+  // animation for the whole session — style recalc per frame on cards that may
+  // never be scrolled to — so the class now travels with the load queue.
+  img.classList.add('loading');
   if (!pendingImageLoads.includes(img)) pendingImageLoads.push(img);
   pumpImageLoadQueue();
 }
 
 function pumpImageLoadQueue() {
+  const container = $('#gridContainer');
+  const cachedViewport = container ? container.getBoundingClientRect() : null;
   while (activeImageLoads < MAX_IMAGE_LOADS && pendingImageLoads.length) {
     const img = pendingImageLoads.shift();
     delete img.dataset.imageQueued;
     if (!img.isConnected || !img.dataset.src || img.dataset.imageLoading === '1' || img.dataset.imageLoaded === '1') continue;
-    if (!isImageNearLoadWindow(img)) {
+    if (!isImageNearLoadWindow(img, cachedViewport)) {
+      // Leaving the queue without a load: drop the pulse placeholder so only
+      // queued-or-loading thumbs animate (it returns when the thumb re-queues).
+      img.classList.remove('loading');
       reobserveImage(img);
       continue;
     }
@@ -990,7 +1112,7 @@ export function updateItemAspectFromMedia(media) {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return false;
   const card = media.closest ? media.closest('.card[data-id]') : null;
   const id = Number(card && card.dataset && card.dataset.id);
-  const item = (state.allItems || []).find(row => Number(row.id) === id);
+  const item = itemsByIdMap().get(id);
   if (!item || (Number(item.width) > 0 && Number(item.height) > 0)) return false;
   item.width = width;
   item.height = height;
@@ -1039,6 +1161,7 @@ export function releaseAllImageLoads() {
     clearImageLoadTimer(img);
     img.onload = null;
     img.onerror = null;
+    img.classList.remove('loading');
     delete img.dataset.imageLoading;
     delete img.dataset.imageObserved;
     delete img.dataset.imageQueued;

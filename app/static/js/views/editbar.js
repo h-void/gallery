@@ -2,7 +2,7 @@
 // suggestions, date editing, and bulk delete. The bar is shown by the edit
 // mode toggle in events.js; P4 turns selection into a modeless state.
 
-import { API } from '../api.js';
+import { API, scheduleFolderRenamesRefresh } from '../api.js';
 import { state, nextRequestSeq, isCurrentRequestSeq, isActionBusy, setActionBusy } from '../store.js';
 import {
   $, $$, escHtml, searchableTextMatches, UI_FIELD_SEPARATOR, compareNameParts, compareCharacterNames,
@@ -11,7 +11,7 @@ import { toast, logUiAction, collectUiLogContext, collectSelectionLayoutLogConte
 import {
   isTaggableItem, captureGridScrollAnchor, restoreGridScrollAnchor, renderGrid, syncSelectedCards,
 } from './grid.js';
-import { loadItemsPreservingDepth, isCurrentFolderScopeActive } from './sidebar.js';
+import { loadItems, loadItemsPreservingDepth, isCurrentFolderScopeActive } from './sidebar.js';
 import { deleteMediaItem } from './lightbox.js';
 
 const CHARACTER_SUGGESTION_SELECTED_LIMIT = 3;
@@ -212,6 +212,13 @@ export function syncEditModeButton() {
 
 export function updateEditBar() {
   syncEditModeButton();
+  // Several browse paths clear state.selectedIds directly (search, filters,
+  // folder switch) without applySelectionChange; reset suggestion state here
+  // so a stale in-flight recognition cannot re-render over an empty selection.
+  if (state.selectedIds.size === 0
+      && (state.characterSuggestionLoading || (state.characterTagSuggestions || []).length)) {
+    resetCharacterTagSuggestions();
+  }
   const bar = $('#editBar');
   if (!bar) return;
   // Selection context (§4.1) is a state, not a mode: the bar floats in when
@@ -239,10 +246,22 @@ export function updateEditBar() {
       const isAllSelected = taggableCount > 0 && state.selectedIds.size >= taggableCount;
       selectAllBtn.textContent = isAllSelected ? '取消全选' : '全选';
     }
+    const archiveBtn = $('#editArchiveFolderBtn');
+    if (archiveBtn) {
+      archiveBtn.hidden = !folderScopeActive;
+    }
+    const bundleBtn = $('#editBundleItemsBtn');
+    if (bundleBtn) {
+      bundleBtn.hidden = !selectionActive;
+    }
   } else {
     bar.classList.remove('visible');
     bar.classList.remove('is-empty-selection');
     bar.classList.remove('has-folder-scope');
+    const archiveBtn = $('#editArchiveFolderBtn');
+    if (archiveBtn) archiveBtn.hidden = true;
+    const bundleBtn = $('#editBundleItemsBtn');
+    if (bundleBtn) bundleBtn.hidden = true;
   }
   if (!selectionActive) resetEditDeleteSelectedButton();
   renderEditTagPicker();
@@ -352,6 +371,7 @@ export async function applyItemDateBatch(manualDate) {
     renderEditDateControl();
     await loadItemsPreservingDepth();
     restoreGridScrollAnchor(gridScrollAnchor);
+    scheduleFolderRenamesRefresh(artistId);
     const workbench = $('#archiveWorkbenchPanel');
     if (workbench && workbench.open) {
       loadArchiveWorkbench({keepPreview: false, autoPreview: false}).catch(() => {});
@@ -480,6 +500,7 @@ export function editAvailableTags() {
   return mergeTagsByName([
     state.tags || [],
     state.editGlobalTagResults || [],
+    state.editCharacterResults || [],
   ]);
 }
 
@@ -498,11 +519,28 @@ async function loadGlobalEditTagResults(query = '') {
   try {
     const params = new URLSearchParams({limit: 100});
     if (clean) params.set('search', clean);
-    const data = await API.get('/api/tags/search?' + params.toString());
+    // The character library is a second source of role names: a character
+    // created there must be pickable here even before any tag carries its
+    // name. Entries merge by name with tags inside editAvailableTags().
+    const charParams = clean ? `?search=${encodeURIComponent(clean)}` : '';
+    const [tagData, charData] = await Promise.all([
+      API.get('/api/tags/search?' + params.toString()),
+      API.get('/api/characters' + charParams).catch(() => ({characters: []})),
+    ]);
     if (token !== editGlobalTagSearchToken) return;
-    state.editGlobalTagResults = (data.tags || []).map(tag => ({...tag, global: true}));
+    state.editGlobalTagResults = (tagData.tags || []).map(tag => ({...tag, global: true}));
+    state.editCharacterResults = (charData.characters || []).map(row => ({
+      id: `name:${tagNameKey(row.name)}`,
+      name: row.name,
+      item_count: 0,
+      virtual: true,
+      character_library: true,
+    }));
   } catch (e) {
-    if (token === editGlobalTagSearchToken) state.editGlobalTagResults = [];
+    if (token === editGlobalTagSearchToken) {
+      state.editGlobalTagResults = [];
+      state.editCharacterResults = [];
+    }
   } finally {
     if (token === editGlobalTagSearchToken) {
       state.editGlobalTagSearchLoading = false;
@@ -666,12 +704,26 @@ function characterSuggestionConfidence(result) {
 
 function aggregateCharacterTagSuggestions(results) {
   const byName = new Map();
+  // A name already carried by every sampled item is not a suggestion: showing
+  // it again reads as "the add did not take effect" after a re-render.
+  const coveredKeys = selectedItemExistingEditTagKeys();
+  const coveredItemCount = new Map();
+  (state.allItems || []).forEach(item => {
+    if (!state.selectedIds.has(item.id)) return;
+    (item.tags || []).forEach(tag => {
+      const key = tagNameKey(tag.name || tag.tag_name || '');
+      if (key) coveredItemCount.set(key, (coveredItemCount.get(key) || 0) + 1);
+    });
+  });
+  const selectedTotal = state.selectedIds.size;
+  const fullyCovered = key => selectedTotal > 0 && (coveredItemCount.get(key) || 0) >= selectedTotal;
   results.forEach(result => {
     const status = result?.status || '';
     if (status !== 'accepted' && status !== 'needs_review') return;
     const name = characterSuggestionName(result).trim();
     const key = tagNameKey(name);
     if (!key) return;
+    if (coveredKeys.has(key) && fullyCovered(key)) return;
     const confidence = characterSuggestionConfidence(result);
     const itemId = Number(result?.item_id);
     const existing = byName.get(key);
@@ -798,6 +850,10 @@ async function loadCharacterTagSuggestions() {
         const result = await recognizeCharacterSuggestionItem(item);
         if (!isCurrentCharacterSuggestionRequest(seq, pageKey)) return;
         results.push({...result, item_id: result.item_id || item.id});
+        if (result?.reason === 'no_references' || result?.reason === 'disabled') {
+          state.characterSuggestionCache.delete(characterSuggestionItemKey(item));
+          break;
+        }
       } catch (e) {
         if (!isCurrentCharacterSuggestionRequest(seq, pageKey)) return;
         failedCount += 1;
@@ -846,7 +902,11 @@ async function loadCharacterTagSuggestions() {
 function ensureCharacterTagSuggestions(options = {}) {
   if (state.selectedIds.size === 0) return;
   const pageKey = characterSuggestionPageKey();
-  if (pageKey === state.characterSuggestionPageKey && (state.characterSuggestionLoading || state.characterSuggestionStatus !== 'idle')) {
+  // 'unavailable' is retryable: a transient recognition failure must not
+  // block the same selection forever. Scheduling only fires on selection
+  // changes, so retries stay bounded to real user actions.
+  const settled = state.characterSuggestionStatus !== 'idle' && state.characterSuggestionStatus !== 'unavailable';
+  if (pageKey === state.characterSuggestionPageKey && (state.characterSuggestionLoading || settled)) {
     renderCharacterTagSuggestions();
     return;
   }
@@ -943,8 +1003,17 @@ export async function ensureEditTagContext() {
 }
 
 function pruneSelectedEditTags() {
-  const existing = new Set(editAvailableTags().map(tag => Number(tag.id)));
-  state.selectedEditTagIds = new Set([...state.selectedEditTagIds].filter(id => existing.has(Number(id))));
+  // Name-keyed rows (character-library entries, unsaved names) carry string
+  // ids whose Number() is NaN; only numeric ids belong in the id set, and a
+  // NaN kept here cross-matches every virtual row via Set.has(NaN).
+  const existing = new Set(
+    editAvailableTags().map(tag => numericTagId(tag.id)).filter(id => id != null)
+  );
+  state.selectedEditTagIds = new Set(
+    [...state.selectedEditTagIds]
+      .map(numericTagId)
+      .filter(id => id != null && existing.has(id))
+  );
   state.selectedEditTagNames = new Set(
     [...state.selectedEditTagNames].filter(name => tagNameKey(name))
   );
@@ -986,29 +1055,34 @@ export function renderEditTagPicker() {
   const tags = editTagOptions(query);
   const selectedNameKeys = selectedEditTagNameKeys();
   const existingNameKeys = selectedItemExistingEditTagKeys();
+  // Selection for a name-keyed row (id `name:*`) lives in its name key only;
+  // coercing that id with Number() yields NaN and would cross-match every
+  // virtual row through Set.has(NaN).
+  const selectedIdSet = new Set(
+    [...state.selectedEditTagIds].map(numericTagId).filter(id => id != null)
+  );
+  const isSelected = tag => {
+    const id = numericTagId(tag.id);
+    return (id != null && selectedIdSet.has(id)) || selectedNameKeys.has(tagNameKey(tag.name));
+  };
   const rows = [];
   const renderRow = tag => {
-    const selected = state.selectedEditTagIds.has(Number(tag.id)) || selectedNameKeys.has(tagNameKey(tag.name));
+    const selected = isSelected(tag);
     const globalAttr = tag.global ? ` data-global-tag-id="${tag.id}"` : '';
+    const meta = tag.character_library ? '角色库' : (tag.item_count || 0);
     return `
       <button class="btn tag-picker-option${selected ? ' selected' : ''}" type="button" data-tag-id="${tag.id}"${globalAttr} data-tag-name="${escHtml(tag.name)}" aria-pressed="${selected ? 'true' : 'false'}">
         <span>${escHtml(tag.name)}</span>
-        <em>${tag.item_count || 0}</em>
+        <em>${escHtml(String(meta))}</em>
       </button>
     `;
   };
-  const selectedTags = tags.filter(tag =>
-    state.selectedEditTagIds.has(Number(tag.id)) || selectedNameKeys.has(tagNameKey(tag.name))
-  );
+  const selectedTags = tags.filter(tag => isSelected(tag));
   const existingTags = tags.filter(tag =>
-    !state.selectedEditTagIds.has(Number(tag.id))
-    && !selectedNameKeys.has(tagNameKey(tag.name))
-    && existingNameKeys.has(tagNameKey(tag.name))
+    !isSelected(tag) && existingNameKeys.has(tagNameKey(tag.name))
   );
   const otherTags = tags.filter(tag =>
-    !state.selectedEditTagIds.has(Number(tag.id))
-    && !selectedNameKeys.has(tagNameKey(tag.name))
-    && !existingNameKeys.has(tagNameKey(tag.name))
+    !isSelected(tag) && !existingNameKeys.has(tagNameKey(tag.name))
   );
   const renderGroup = (label, groupTags, hint) => {
     if (!groupTags.length) return '';
@@ -1053,7 +1127,9 @@ function bindEditTagPickerPanel(panel) {
     }
     const tagBtn = target.closest('[data-tag-id]');
     if (tagBtn && panel.contains(tagBtn)) {
-      toggleEditTagSelection(Number(tagBtn.dataset.tagId), tagBtn.dataset.tagName || '');
+      // Raw id: name-keyed rows carry `name:*` strings that numericTagId
+      // maps to null so they select by name instead of a NaN id.
+      toggleEditTagSelection(tagBtn.dataset.tagId, tagBtn.dataset.tagName || '');
     }
   });
 }
@@ -1094,18 +1170,24 @@ function setSelectedEditTagName(name, selected) {
 }
 
 function removeSelectedEditTag(tagId, tagName = '') {
-  const id = Number(tagId);
-  const tag = editAvailableTags().find(t => Number(t.id) === id);
+  const id = numericTagId(tagId);
+  const tag = id != null ? editAvailableTags().find(t => numericTagId(t.id) === id) : null;
   const name = tagName || tag?.name || '';
-  state.selectedEditTagIds.delete(id);
+  if (id != null) state.selectedEditTagIds.delete(id);
   setSelectedEditTagName(name, false);
   state.characterSuggestionSelectedNames.delete(tagNameKey(name));
 }
 
 function selectEditTag(tagId, tagName = '') {
-  const tag = editAvailableTags().find(t => Number(t.id) === Number(tagId));
+  const id = numericTagId(tagId);
+  const tag = id != null ? editAvailableTags().find(t => numericTagId(t.id) === id) : null;
   const name = tagName || tag?.name || '';
-  state.selectedEditTagIds.add(Number(tagId));
+  // A bare id with no resolvable name becomes a phantom selection: prune drops
+  // it on the next context reload and the apply button then sees nothing.
+  if (!name) return;
+  // Name-keyed rows (character-library entries) select by name key alone;
+  // storing their string id as NaN would select every virtual row.
+  if (id != null) state.selectedEditTagIds.add(id);
   setSelectedEditTagName(name, true);
   logUiAction('edit_tag_select', {
     name,
@@ -1119,15 +1201,21 @@ function selectEditTag(tagId, tagName = '') {
 }
 
 function toggleEditTagSelection(tagId, tagName = '') {
-  const id = Number(tagId);
-  const tag = editAvailableTags().find(t => Number(t.id) === id);
+  const id = numericTagId(tagId);
+  const nameKey = tagNameKey(tagName);
+  const tag = id != null
+    ? editAvailableTags().find(t => numericTagId(t.id) === id)
+    : editAvailableTags().find(t => nameKey && tagNameKey(t.name) === nameKey) || null;
   const name = tagName || tag?.name || '';
-  const selected = state.selectedEditTagIds.has(id) || selectedEditTagNameKeys().has(tagNameKey(name));
+  const selected = (id != null && state.selectedEditTagIds.has(id))
+    || selectedEditTagNameKeys().has(tagNameKey(name));
   if (selected) {
     removeSelectedEditTag(id, name);
   } else {
-    state.selectedEditTagIds.add(id);
-    setSelectedEditTagName(name, true);
+    if (name) {
+      if (id != null) state.selectedEditTagIds.add(id);
+      setSelectedEditTagName(name, true);
+    }
   }
   logUiAction('edit_tag_select', {
     name,
@@ -1149,7 +1237,7 @@ export function selectFirstEditTagResult() {
   }
   const first = $('#editTagPickerPanel [data-tag-id]');
   if (first) {
-    selectEditTag(Number(first.dataset.tagId), first.dataset.tagName || '');
+    selectEditTag(first.dataset.tagId, first.dataset.tagName || '');
     return;
   }
   if (query) createOrSelectEditTag(query);
@@ -1205,7 +1293,7 @@ async function createOrSelectEditTag(name = '') {
     toast('角色已创建', 'success');
     return created;
   } catch (e) {
-    toast('创建角色失败', 'error');
+    toast(e && e.message ? e.message : '创建角色失败', 'error');
     return null;
   } finally {
     setActionBusy('edit-create-tag', busyId, false);
@@ -1229,9 +1317,14 @@ export function selectedEditTagIds() {
 
 export function selectedEditTagNames(extraTagIds = []) {
   const names = [...state.selectedEditTagNames];
-  const ids = new Set([...state.selectedEditTagIds, ...(extraTagIds || [])].map(id => Number(id)));
+  // Numeric ids only: a name-keyed row would coerce to NaN and then every
+  // virtual row's name would leak into the apply payload.
+  const ids = new Set(
+    [...state.selectedEditTagIds, ...(extraTagIds || [])].map(numericTagId).filter(id => id != null)
+  );
   editAvailableTags().forEach(tag => {
-    if (ids.has(Number(tag.id)) && tag.name) names.push(tag.name);
+    const id = numericTagId(tag.id);
+    if (id != null && ids.has(id) && tag.name) names.push(tag.name);
   });
   const byKey = new Map();
   names.forEach(name => {
@@ -1299,12 +1392,21 @@ export async function classifyItems(ids, tagIds, mode='add') {
       changed_item_ids: result?.changed_item_ids || [],
     });
     clearSelectedEditTags();
-    state.selectedIds.clear();
-    resetCharacterTagSuggestions();
-    updateEditBar();
-    toast('角色已更新', 'success');
+    applySelectionChange([], {reason: 'classify_items_cleared', schedule: false});
+    // Tag state changed on these items: recognition cached against the old
+    // state would re-surface names that were just applied.
+    resetCharacterTagSuggestions({clearCache: true});
+    const changedCount = Number(result?.changed_count ?? result?.updated ?? 0);
+    if (changedCount > 0) {
+      toast('角色已更新', 'success');
+    } else {
+      toast('角色未变化', 'warn');
+    }
 
     if (refreshArtistId) {
+      if (changedCount > 0) {
+        scheduleFolderRenamesRefresh(refreshArtistId);
+      }
       const [stats, tags] = await Promise.all([
         API.get(`/api/artists/${refreshArtistId}/stats`),
         API.get(`/api/tags?artist_id=${refreshArtistId}`),
@@ -1323,6 +1425,10 @@ export async function classifyItems(ids, tagIds, mode='add') {
     renderEditTagPicker();
     await loadItemsPreservingDepth();
     const restoreResult = restoreGridScrollAnchor(gridScrollAnchor);
+    const workbench = $('#archiveWorkbenchPanel');
+    if (workbench && workbench.open) {
+      loadArchiveWorkbench({keepPreview: false, autoPreview: false}).catch(() => {});
+    }
     logUiAction('edit_apply_layout', collectUiLogContext({
       target: 'items',
       mode,
@@ -1353,13 +1459,16 @@ export async function classifyItems(ids, tagIds, mode='add') {
   }
 }
 
-export async function classifyFolder(folder, tagIds, mode='add') {
+export async function classifyFolder(folder, tagIds, mode='add', explicitTagNames = null) {
   if (!state.currentArtist || !folder) return;
   if (isActionBusy('edit-classify-folder', folder)) return;
   setActionBusy('edit-classify-folder', folder, true);
   const refreshArtistId = state.currentArtist.id;
   const artistLoadSeq = Number(state.artistLoadSeq || 0);
   const tagNames = selectedEditTagNames(tagIds);
+  if (explicitTagNames && explicitTagNames.length) {
+    tagNames.splice(0, tagNames.length, ...explicitTagNames);
+  }
   if (!tagNames.length && !tagIds.length) {
     setActionBusy('edit-classify-folder', folder, false);
     return;
@@ -1386,8 +1495,18 @@ export async function classifyFolder(folder, tagIds, mode='add') {
       tag_names: result?.tag_names || tagNames,
     });
     clearSelectedEditTags();
+    resetCharacterTagSuggestions({clearCache: true});
     updateEditBar();
-    toast(`文件夹角色已更新：${result.updated} 张`, 'success');
+    const folderChanged = Number(result?.updated ?? 0);
+    if (folderChanged > 0) {
+      toast(`文件夹角色已更新：${result.updated} 张`, 'success');
+    } else {
+      toast('角色未变化', 'warn');
+    }
+
+    if (folderChanged > 0) {
+      scheduleFolderRenamesRefresh(refreshArtistId);
+    }
 
     const [stats, tags, folders] = await Promise.all([
       API.get(`/api/artists/${refreshArtistId}/stats`),
@@ -1406,6 +1525,10 @@ export async function classifyFolder(folder, tagIds, mode='add') {
       renderFolderTree();
       await loadItemsPreservingDepth();
       const restoreResult = restoreGridScrollAnchor(gridScrollAnchor);
+      const workbench = $('#archiveWorkbenchPanel');
+      if (workbench && workbench.open) {
+        loadArchiveWorkbench({keepPreview: false, autoPreview: false}).catch(() => {});
+      }
       logUiAction('edit_apply_layout', collectUiLogContext({
         target: 'folder',
         mode,
@@ -1429,6 +1552,116 @@ export async function classifyFolder(folder, tagIds, mode='add') {
     toast('更新文件夹角色失败：' + e.message, 'error');
   } finally {
     setActionBusy('edit-classify-folder', folder, false);
+  }
+}
+
+// A folder plan can only enter the confirm-and-execute flow when its status is
+// actionable; everything else needs work elsewhere first (tags, dates, retry
+// from the maintenance workbench) and gets its own message.
+const ARCHIVE_CONFIRMABLE_STATUSES = ['ready', 'confirmed', 'manual_review', 'draft'];
+
+function archivePlanHasMoveTarget(plan) {
+  return plan?.plan_kind === 'split_by_tag'
+    ? Number(plan.split_action_count || 0) > 0
+    : Boolean(plan?.target_folder);
+}
+
+function archivePlanTargetLabel(plan) {
+  if (plan?.plan_kind === 'split_by_tag') {
+    const targets = (Array.isArray(plan.target_folders) ? plan.target_folders : [])
+      .map(value => String(value || '')).filter(Boolean);
+    return targets.join('；') || `拆分到 ${Number(plan.split_action_count || 0)} 个位置`;
+  }
+  return String(plan?.target_folder || '');
+}
+
+function archivePlanNotReadyMessage(plan) {
+  const messages = {
+    needs_tags: '文件夹尚未就绪（缺少角色或有效日期）',
+    needs_date: '文件夹尚未就绪（缺少角色或有效日期）',
+    date_conflict: '文件夹尚未就绪（日期跨月冲突）',
+    inconsistent_tags: '文件夹尚未就绪（角色不一致）',
+    blocked: '文件夹尚未就绪（路径不安全）',
+    failed: '文件夹尚未就绪（上次整理失败）',
+    error: '文件夹尚未就绪（上次整理失败）',
+    executed: '该文件夹已整理',
+    reverted: '文件夹尚未就绪（整理已撤销）',
+  };
+  return messages[plan?.status] || '文件夹尚未就绪';
+}
+
+export async function archiveCurrentFolder() {
+  const folder = state.activeFolder;
+  const artist = state.currentArtist;
+  const artistIdAtStart = artist ? Number(artist.id) : null;
+  const artistLoadSeqAtStart = Number(state.artistLoadSeq || 0);
+  const artistRequestIsCurrent = () => Number(state.artistLoadSeq || 0) === artistLoadSeqAtStart
+    && Number(state.currentArtist?.id) === artistIdAtStart;
+  if (!artist || !folder || isActionBusy('edit-archive-folder', folder)) return;
+  setActionBusy('edit-archive-folder', folder, true);
+  try {
+    const plansResult = await API.get(`/api/folder-renames?artist_id=${encodeURIComponent(artist.id)}`);
+    if (!artistRequestIsCurrent()) return;
+    const plans = Array.isArray(plansResult?.plans) ? plansResult.plans : [];
+    const plan = plans.find(p => p.source_folder === folder);
+    if (!plan) {
+      toast('文件夹尚未就绪（未生成整理计划）', 'warn');
+      return;
+    }
+    if (!ARCHIVE_CONFIRMABLE_STATUSES.includes(plan.status)) {
+      toast(archivePlanNotReadyMessage(plan), 'warn');
+      return;
+    }
+    if (!archivePlanHasMoveTarget(plan)) {
+      toast(plan.plan_kind === 'split_by_tag' ? '文件夹尚未就绪（未生成拆分目标）' : '文件夹尚未就绪（未生成目标路径）', 'warn');
+      return;
+    }
+    // execute runs every confirmed plan of the artist, not just this folder's
+    // one, so the confirm must list the whole run: this plan (it becomes
+    // confirmed by the reconfirm below when needed) plus every other confirmed
+    // plan with a move target.
+    const otherRuns = plans.filter(p => p !== plan && p.status === 'confirmed' && archivePlanHasMoveTarget(p));
+    const runList = [plan, ...otherRuns];
+    const runLines = runList.map(p => `${p.source_folder} → ${archivePlanTargetLabel(p)}`);
+    const confirmMsg = `整理归档将执行该画师全部已确认计划，共移动 ${runList.length} 个文件夹：\n${runLines.join('\n')}\n确定继续？`;
+    if (!confirm(confirmMsg)) return;
+    if (!artistRequestIsCurrent()) return;
+    if (plan.status !== 'confirmed') {
+      await API.post(`/api/folder-renames/plans/${plan.id}/reconfirm`);
+      if (!artistRequestIsCurrent()) return;
+    }
+    const result = await API.postJson('/api/folder-renames/execute', {artist_id: artist.id, dry_run: false}, {timeoutMs: 600000});
+    if (!artistRequestIsCurrent()) return;
+    const rows = Array.isArray(result?.results) ? result.results : [];
+    const currentPlanResult = rows.find(row => Number(row.plan_id) === Number(plan.id));
+    const currentPlanExecuted = currentPlanResult?.status === 'executed';
+    const successful = rows.filter(row => row.status === 'executed').length;
+    const failed = rows.filter(row => row.status === 'error').length;
+    const skipped = Math.max(0, rows.length - successful - failed);
+    if (failed > 0 && successful > 0) {
+      toast(`部分整理失败：${successful} 个成功${skipped ? `、${skipped} 个跳过` : ''}、${failed} 个失败`, 'error');
+    } else if (failed > 0) {
+      toast(`整理失败：${failed} 个整理项${skipped ? `、${skipped} 个跳过` : ''}`, 'error');
+    } else {
+      toast(`整理完成：${successful} 个整理项`, successful ? 'success' : 'info');
+    }
+    if (currentPlanExecuted) state.activeFolder = null;
+    const [stats, folders] = await Promise.all([
+      API.get(`/api/artists/${artist.id}/stats`),
+      API.get(`/api/folders?artist_id=${artist.id}`),
+    ]);
+    if (!artistRequestIsCurrent()) return;
+    state.stats = stats;
+    state.folders = folders;
+    renderSidebar();
+    renderFolderTree();
+    updateEditBar();
+    syncBrowseUrl('replace');
+    loadItems();
+  } catch (e) {
+    toast('归档执行失败：' + (e.message || e), 'error');
+  } finally {
+    setActionBusy('edit-archive-folder', folder, false);
   }
 }
 
@@ -1486,6 +1719,63 @@ export async function removeSelectedTagsFromItems() {
   }
 }
 
+export async function bundleSelectedItems() {
+  const artist = state.currentArtist;
+  const artistIdAtStart = artist ? Number(artist.id) : null;
+  const artistLoadSeqAtStart = Number(state.artistLoadSeq || 0);
+  const artistRequestIsCurrent = () => Number(state.artistLoadSeq || 0) === artistLoadSeqAtStart
+    && Number(state.currentArtist?.id) === artistIdAtStart;
+  const selectedCount = state.selectedIds.size;
+  if (!artist || selectedCount === 0 || isActionBusy('edit-bundle-items')) return;
+  const folderName = window.prompt('输入目标文件夹名称（例如 2024-05 [展会]）：');
+  if (!folderName || !folderName.trim()) return;
+  const targetFolder = folderName.trim();
+  setActionBusy('edit-bundle-items', '', true);
+  try {
+    const res = await API.postJson('/api/items/bundle', {
+      artist_id: artist.id,
+      item_ids: [...state.selectedIds],
+      target_folder: targetFolder,
+    });
+    if (!artistRequestIsCurrent()) return;
+    // moved_count skips items the server could not move (missing or already
+    // gone), so report the real split instead of claiming the full selection.
+    const moved = Number(res?.moved_count ?? 0);
+    const unmoved = selectedCount - moved;
+    if (unmoved > 0) {
+      toast(`已移动 ${moved} 项，${unmoved} 项未移动`, 'error');
+    } else {
+      toast(`已将 ${moved} 项移至「${targetFolder}」`, 'success');
+    }
+    logUiAction('edit_bundle_items_result', {
+      target_folder: targetFolder,
+      requested_count: selectedCount,
+      moved_count: moved,
+      unmoved_count: unmoved,
+    });
+    applySelectionChange([], {reason: 'bundle_items', log: false});
+    const [stats, folders] = await Promise.all([
+      API.get(`/api/artists/${artist.id}/stats`),
+      API.get(`/api/folders?artist_id=${artist.id}`),
+    ]);
+    if (!artistRequestIsCurrent()) return;
+    state.stats = stats;
+    state.folders = folders;
+    renderSidebar();
+    renderFolderTree();
+    await loadItems();
+    const workbench = $('#archiveWorkbenchPanel');
+    if (workbench && workbench.open) {
+      loadArchiveWorkbench({keepPreview: false, autoPreview: false}).catch(() => {});
+    }
+  } catch (e) {
+    toast('打包失败：' + (e.message || e), 'error');
+  } finally {
+    setActionBusy('edit-bundle-items', '', false);
+  }
+}
+
 // Cross-module imports closing the editbar cycles; all call sites are inside
 // function bodies, never at module evaluation time.
 import { renderSidebar, renderFolderTree } from './sidebar.js';
+import { syncBrowseUrl } from '../router.js';

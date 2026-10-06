@@ -129,3 +129,31 @@ export const API = {
   artistProfileLinksUrl(artistId) { return `/api/artists/${encodeURIComponent(artistId)}/profile-links`; },
   artistProfileLinkUrl(artistId, linkId) { return `/api/artists/${encodeURIComponent(artistId)}/profile-links/${encodeURIComponent(linkId)}`; }
 };
+
+// Folder-rename plan refresh is expensive (auto-discover + target recompute for
+// a whole artist), and tag/date edits fire it from several places. Collapse a
+// burst of triggers into one refresh per artist: debounce the request and skip
+// firing while an earlier refresh for the same artist is still in flight (the
+// deferred run then happens after it settles, so no update is dropped).
+const FOLDER_RENAMES_REFRESH_DELAY_MS = 1200;
+const folderRenamesRefreshTimers = new Map();
+const folderRenamesRefreshInFlight = new Set();
+
+export function scheduleFolderRenamesRefresh(artistId, delayMs = FOLDER_RENAMES_REFRESH_DELAY_MS) {
+  const key = String(artistId || '');
+  if (!key) return;
+  const previous = folderRenamesRefreshTimers.get(key);
+  if (previous) clearTimeout(previous);
+  const timer = setTimeout(() => {
+    folderRenamesRefreshTimers.delete(key);
+    if (folderRenamesRefreshInFlight.has(key)) {
+      scheduleFolderRenamesRefresh(artistId, delayMs);
+      return;
+    }
+    folderRenamesRefreshInFlight.add(key);
+    API.post(`/api/folder-renames/refresh?artist_id=${encodeURIComponent(key)}`)
+      .catch(() => {})
+      .finally(() => folderRenamesRefreshInFlight.delete(key));
+  }, delayMs);
+  folderRenamesRefreshTimers.set(key, timer);
+}

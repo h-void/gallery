@@ -1,18 +1,20 @@
 // Lightbox: zoom/pan/pinch/double-tap, media loading with video fallback
 // chains, text/source rendering, and the single-item recycle-bin delete.
 
-import { API } from '../api.js';
+import { API, scheduleFolderRenamesRefresh } from '../api.js';
 import { state, isActionBusy, setActionBusy } from '../store.js';
 import {
   $, $$, escHtml, formatSize, copyText, downloadFileName, renderTagNamesHtml,
 } from '../utils.js';
 import { toast, logUiAction, collectUiLogContext, frontendErrorText } from '../logging.js';
-import { syncFavoriteButtons, isGifItem, fileVersionParam, renderGrid } from './grid.js';
+import { syncFavoriteButtons, toggleItemFavorite, isGifItem, fileVersionParam, renderGrid } from './grid.js';
+import { renderSidebar } from './sidebar.js';
 
 const LIGHTBOX_ZOOM_MIN = 0.5;
 const LIGHTBOX_ZOOM_MAX = 4;
 const LIGHTBOX_ZOOM_STEP = 0.15;
-const LIGHTBOX_DOUBLE_TAP_ZOOM = 2;
+export const LIGHTBOX_DOUBLE_CLICK_ZOOM = 2.5;
+export const LIGHTBOX_DOUBLE_TAP_ZOOM = LIGHTBOX_DOUBLE_CLICK_ZOOM;
 const LIGHTBOX_DOUBLE_TAP_DELAY_MS = 320;
 const LIGHTBOX_DOUBLE_TAP_DISTANCE_PX = 36;
 const LIGHTBOX_WHEEL_NAV_DELAY = 180;
@@ -20,20 +22,34 @@ const LIGHTBOX_VIDEO_FALLBACK_DELAY_MS = 12000;
 const VIDEO_TRANSCODE_POLL_INTERVAL_MS = 1000;
 const VIDEO_TRANSCODE_WAIT_TIMEOUT_MS = 120000;
 const LIGHTBOX_CLOSE_MS = 150;
+// Occluded or heavily throttled tabs can stop firing requestAnimationFrame
+// entirely; without a fallback the lightbox then sits at display:flex with
+// opacity 0 and pointer-events:auto — an invisible full-screen click shield.
+const LIGHTBOX_OPEN_FALLBACK_MS = 120;
 let lightboxCloseTimer = 0;
 let lightboxOpenRaf = 0;
+let lightboxOpenFallbackTimer = 0;
+
+function markLightboxOpen(lightbox) {
+  if (lightboxOpenRaf) {
+    cancelAnimationFrame(lightboxOpenRaf);
+    lightboxOpenRaf = 0;
+  }
+  if (lightboxOpenFallbackTimer) {
+    clearTimeout(lightboxOpenFallbackTimer);
+    lightboxOpenFallbackTimer = 0;
+  }
+  lightbox.classList.add('is-open');
+}
 
 function lightboxPreviewPlaceholderUrl(item) {
   if (!item || item.id === undefined || item.id === null) return '';
-  let placeholderUrl = '';
-  $$('#grid .card').forEach(card => {
-    if (placeholderUrl || card.dataset.id !== String(item.id)) return;
-    const thumb = card.querySelector('img.thumb');
-    if (!thumb || thumb.classList.contains('failed')) return;
-    if (thumb.dataset.imageLoaded !== '1' && !(thumb.complete && thumb.naturalWidth > 0)) return;
-    placeholderUrl = thumb.currentSrc || thumb.src || '';
-  });
-  return placeholderUrl;
+  const card = $(`#grid .card[data-id="${item.id}"]`);
+  if (!card) return '';
+  const thumb = card.querySelector('img.thumb');
+  if (!thumb || thumb.classList.contains('failed')) return '';
+  if (thumb.dataset.imageLoaded !== '1' && !(thumb.complete && thumb.naturalWidth > 0)) return '';
+  return thumb.currentSrc || thumb.src || '';
 }
 
 function clearLightboxVideoFallbackTimer(video) {
@@ -279,15 +295,22 @@ export function openLightbox(idx) {
   document.body.classList.add('lightbox-open');
   setLightboxBackgroundInert(true);
   // Trigger the §3.4 open animation on the next frame so the transition runs
-  // from the .98 / opacity:0 resting state to .is-open.
+  // from the .98 / opacity:0 resting state to .is-open. The timeout is the
+  // rAF-stalled fallback: whichever runs first wins, the second is a no-op.
   if (lightboxOpenRaf) {
     cancelAnimationFrame(lightboxOpenRaf);
     lightboxOpenRaf = 0;
   }
+  if (lightboxOpenFallbackTimer) {
+    clearTimeout(lightboxOpenFallbackTimer);
+    lightboxOpenFallbackTimer = 0;
+  }
   lightboxOpenRaf = requestAnimationFrame(() => {
-    lightbox.classList.add('is-open');
-    lightboxOpenRaf = 0;
+    markLightboxOpen(lightbox);
   });
+  lightboxOpenFallbackTimer = setTimeout(() => {
+    markLightboxOpen(lightbox);
+  }, LIGHTBOX_OPEN_FALLBACK_MS);
   document.addEventListener('keydown', onLightboxKey);
   // Move focus into the dialog for keyboard/screen-reader users.
   const closeBtn = $('#lightbox .close');
@@ -305,6 +328,53 @@ export function isLightboxItem(item) {
   return mediaType === 'image' || mediaType === 'video' || mediaType === 'source' || mediaType === 'text';
 }
 
+export function toggleLightboxCaption(force) {
+  const lightbox = $('#lightbox');
+  if (!lightbox) return;
+  const isHidden = lightbox.classList.contains('caption-hidden');
+  const nextHidden = typeof force === 'boolean' ? !force : !isHidden;
+  lightbox.classList.toggle('caption-hidden', nextHidden);
+  const toggleBtn = $('#lightboxInfoToggleBtn');
+  if (toggleBtn) {
+    toggleBtn.classList.toggle('active', !nextHidden);
+    toggleBtn.setAttribute('aria-pressed', String(!nextHidden));
+  }
+}
+
+const LIGHTBOX_PRELOAD_LIMIT = 4;
+const lightboxPreloadCache = new Map();
+
+export function clearLightboxPreloadCache() {
+  lightboxPreloadCache.clear();
+}
+
+export function preloadAdjacentLightboxMedia(items, currentIndex) {
+  if (!Array.isArray(items) || items.length <= 1) return;
+  const deltas = [1, -1];
+  for (const delta of deltas) {
+    const targetIdx = (currentIndex + delta + items.length) % items.length;
+    const targetItem = items[targetIdx];
+    if (!targetItem) continue;
+    const mediaType = targetItem.media_type || (targetItem.is_archive ? 'archive' : 'image');
+    if (mediaType === 'image' && !isGifItem(targetItem)) {
+      const url = API.fileUrl(targetItem.file_path, fileVersionParam(targetItem));
+      if (!lightboxPreloadCache.has(url)) {
+        const img = new Image();
+        img.decoding = 'async';
+        img.src = url;
+        if (typeof img.decode === 'function') {
+          img.decode().catch(() => {});
+        }
+        lightboxPreloadCache.set(url, img);
+        if (lightboxPreloadCache.size > LIGHTBOX_PRELOAD_LIMIT) {
+          const firstKey = lightboxPreloadCache.keys().next().value;
+          lightboxPreloadCache.delete(firstKey);
+        }
+      }
+    }
+  }
+}
+
 export function showLightboxImage(items) {
   const item = items[state.lightboxIndex];
   if (!item) return;
@@ -313,6 +383,12 @@ export function showLightboxImage(items) {
   const mediaType = item.media_type || 'image';
   const lightbox = $('#lightbox');
   lightbox.classList.toggle('text-mode', mediaType === 'text');
+  const toggleBtn = $('#lightboxInfoToggleBtn');
+  if (toggleBtn) {
+    const isHidden = lightbox.classList.contains('caption-hidden');
+    toggleBtn.classList.toggle('active', !isHidden);
+    toggleBtn.setAttribute('aria-pressed', String(!isHidden));
+  }
   const fileUrl = API.fileUrl(item.file_path, fileVersionParam(item));
   const displayFileUrl = fileUrl;
   const placeholderUrl = mediaType === 'image' && !isGifItem(item) ? lightboxPreviewPlaceholderUrl(item) : '';
@@ -467,7 +543,7 @@ export function showLightboxImage(items) {
   const copyPath = item.real_file_path || item.file_path;
   const lightboxMeta = [
     `<span class="lightbox-meta-tags">${renderTagNamesHtml(item.tags)}</span>`,
-    item.date ? `<span class="lightbox-meta-date">${escHtml(item.date)}</span>` : '',
+    item.date ? `<span class="lightbox-meta-date">${escHtml(item.date)}</span>` : '<span class="lightbox-meta-date"></span>',
     item.file_name ? `<span class="lightbox-meta-name">${escHtml(item.file_name)}</span>` : '',
   ];
   $('#lightboxPath').innerHTML = `
@@ -485,6 +561,8 @@ export function showLightboxImage(items) {
       toast(ok ? '真实路径已复制' : '复制路径失败', ok ? 'success' : 'error');
     });
   }
+  bindLightboxInPlaceEditing(item);
+  preloadAdjacentLightboxMedia(items, state.lightboxIndex);
 }
 
 export function applyLightboxZoom() {
@@ -671,23 +749,470 @@ export function moveLightbox(delta) {
   showLightboxImage(items);
 }
 
+export function closeLightboxInlineEditors() {
+  let closed = false;
+  const inputWrap = $('#lightboxTagInputWrap');
+  const addBtn = $('#lightboxTagAddBtn');
+  const tagInput = $('#lightboxTagInput');
+  if (inputWrap && inputWrap.style.display && inputWrap.style.display !== 'none') {
+    inputWrap.style.display = 'none';
+    if (tagInput) tagInput.value = '';
+    if (addBtn) {
+      addBtn.style.display = '';
+      if (typeof addBtn.focus === 'function') addBtn.focus();
+    }
+    closed = true;
+  }
+  const dateInput = $('#lightboxDateInput');
+  const dateBtn = $('#lightboxDateBtn');
+  if (dateInput && dateInput.style.display && dateInput.style.display !== 'none') {
+    if (dateInput.dataset?.initialValue !== undefined) {
+      dateInput.value = dateInput.dataset.initialValue;
+    }
+    dateInput.style.display = 'none';
+    if (dateBtn) {
+      dateBtn.style.display = '';
+      if (typeof dateBtn.focus === 'function') dateBtn.focus();
+    }
+    closed = true;
+  }
+  if (closed) {
+    const lightbox = $('#lightbox');
+    if (lightbox && typeof lightbox.focus === 'function') lightbox.focus();
+  }
+  return closed;
+}
+
+function isCurrentLightboxItem(item) {
+  if (!item) return false;
+  const items = lightboxItems();
+  const current = items[state.lightboxIndex];
+  return Boolean(current && Number(current.id) === Number(item.id));
+}
+
+export function handleLightboxEscape() {
+  if (closeLightboxInlineEditors()) return true;
+  if (state.lightboxZoom > 1) {
+    setLightboxZoom(1);
+    return true;
+  }
+  closeLightbox();
+  return true;
+}
+
 export function onLightboxKey(e) {
   if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target?.tagName) || e.target?.isContentEditable) {
     if (e.key === 'Escape') {
-      e.target.blur();
+      if (!closeLightboxInlineEditors()) e.target.blur();
     }
     return;
   }
   if (e.key === 'Escape') {
-    if (state.lightboxZoom > 1) {
-      setLightboxZoom(1);
+    handleLightboxEscape();
+    return;
+  }
+  if ((e.key === 't' || e.key === 'T') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (state.readOnlyMode) return;
+    e.preventDefault();
+    openLightboxTagInput();
+    return;
+  }
+  if ((e.key === 'i' || e.key === 'I') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    toggleLightboxCaption();
+    return;
+  }
+  if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    if (!document.fullscreenElement) {
+      $('#lightbox')?.requestFullscreen?.().catch(() => {});
     } else {
-      closeLightbox();
+      document.exitFullscreen?.().catch(() => {});
     }
     return;
   }
+  if (e.key === '0' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    setLightboxZoom(1);
+    return;
+  }
+  if (e.key === '1' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    setLightboxZoom(state.lightboxZoom > 1 ? 1 : LIGHTBOX_DOUBLE_CLICK_ZOOM);
+    return;
+  }
+  if ((e.key === '+' || e.key === '=') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    setLightboxZoom(state.lightboxZoom + 0.25);
+    return;
+  }
+  if ((e.key === '-' || e.key === '_') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    setLightboxZoom(state.lightboxZoom - 0.25);
+    return;
+  }
+  if ((e.key === 's' || e.key === 'S') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (state.readOnlyMode) return;
+    e.preventDefault();
+    const items = lightboxItems();
+    const item = items[state.lightboxIndex];
+    if (item) toggleItemFavorite(item);
+    return;
+  }
+  if ((e.key === ' ' || e.code === 'Space') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    const video = $('#lightboxVideo');
+    if (video && video.style.display !== 'none') {
+      e.preventDefault();
+      if (video.paused) {
+        video.play?.().catch(() => {});
+      } else {
+        video.pause?.();
+      }
+      return;
+    }
+  }
+  if (e.key === 'Home') {
+    e.preventDefault();
+    const items = lightboxItems();
+    if (items.length && state.lightboxIndex !== 0) {
+      state.lightboxIndex = 0;
+      resetLightboxTransform();
+      showLightboxImage(items);
+    }
+    return;
+  }
+  if (e.key === 'End') {
+    e.preventDefault();
+    const items = lightboxItems();
+    if (items.length && state.lightboxIndex !== items.length - 1) {
+      state.lightboxIndex = items.length - 1;
+      resetLightboxTransform();
+      showLightboxImage(items);
+    }
+    return;
+  }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (state.readOnlyMode) return;
+    const deleteBtn = $('#lightboxDeleteBtn');
+    if (deleteBtn && deleteBtn.style.display !== 'none') {
+      e.preventDefault();
+      onLightboxDelete(deleteBtn);
+      return;
+    }
+  }
   if (e.key === 'ArrowLeft') moveLightbox(-1);
   if (e.key === 'ArrowRight') moveLightbox(1);
+}
+
+function collectLightboxTagSuggestions() {
+  const suggestions = new Set();
+  if (Array.isArray(state.tags)) {
+    state.tags.forEach(t => { if (t && t.name) suggestions.add(t.name); });
+  }
+  if (Array.isArray(state.stats?.tags)) {
+    state.stats.tags.forEach(t => { if (t && t.name) suggestions.add(t.name); });
+  }
+  if (Array.isArray(state.allItems)) {
+    state.allItems.forEach(i => {
+      if (Array.isArray(i.tags)) {
+        i.tags.forEach(t => { if (t && t.name) suggestions.add(t.name); });
+      }
+    });
+  }
+  return [...suggestions].sort();
+}
+
+function refreshLightboxArtistTagContext(artistId) {
+  const targetArtistId = artistId || state.currentArtist?.id;
+  if (!targetArtistId) return;
+  scheduleFolderRenamesRefresh(targetArtistId);
+  Promise.all([
+    API.get(`/api/artists/${targetArtistId}/stats`),
+    API.get(`/api/tags?artist_id=${targetArtistId}`),
+  ]).then(([stats, tags]) => {
+    const tagList = Array.isArray(tags) ? tags : (Array.isArray(tags?.tags) ? tags.tags : null);
+    if (state.currentArtist && state.currentArtist.id === targetArtistId) {
+      if (stats && typeof stats === 'object') state.stats = stats;
+      if (tagList) state.tags = tagList;
+      renderSidebar();
+    } else if (!state.currentArtist && tagList) {
+      state.tags = tagList;
+    }
+    const datalist = $('#lightboxTagDatalist');
+    if (datalist) {
+      datalist.innerHTML = collectLightboxTagSuggestions().map(s => `<option value="${escHtml(s)}">`).join('');
+    }
+  }).catch(() => {});
+}
+
+export function openLightboxTagInput() {
+  if (state.readOnlyMode) return;
+  const addBtn = $('#lightboxTagAddBtn');
+  const inputWrap = $('#lightboxTagInputWrap');
+  const input = $('#lightboxTagInput');
+  if (!inputWrap || !input) return;
+  inputWrap.style.display = 'inline-flex';
+  if (addBtn) addBtn.style.display = 'none';
+  input.focus();
+  input.select();
+}
+
+function renderLightboxTags(item) {
+  const container = $('#lightboxInfo .lightbox-meta-tags');
+  if (!container) return;
+  const tags = Array.isArray(item.tags) ? item.tags : [];
+  const readOnly = Boolean(state.readOnlyMode);
+  let html = '';
+  if (tags.length === 0) {
+    html += '<span class="meta-tag meta-tag-empty">未加角色</span>';
+  } else {
+    html += tags.map(t => `
+      <span class="meta-tag meta-tag-editable" data-tag-name="${escHtml(t.name)}">
+        <span>${escHtml(t.name)}</span>
+        ${readOnly ? '' : `<button type="button" class="meta-tag-remove" data-remove-tag="${escHtml(t.name)}" title="移除角色" aria-label="移除角色 ${escHtml(t.name)}">×</button>`}
+      </span>
+    `).join('');
+  }
+  const suggestions = collectLightboxTagSuggestions();
+  const datalistOptions = suggestions.map(s => `<option value="${escHtml(s)}">`).join('');
+  if (!readOnly) {
+    html += `
+      <button type="button" class="btn btn-ghost btn-xs lightbox-btn-tag-add" id="lightboxTagAddBtn" title="添加角色 (快捷键 T)" aria-label="添加角色">+ 角色</button>
+      <span class="lightbox-tag-input-wrap" id="lightboxTagInputWrap" style="display:none">
+        <input type="text" class="input input-sm lightbox-tag-input" id="lightboxTagInput" placeholder="输入角色名按回车" maxlength="50" autocomplete="off" list="lightboxTagDatalist">
+        <datalist id="lightboxTagDatalist">${datalistOptions}</datalist>
+      </span>
+    `;
+  }
+  container.innerHTML = html;
+
+  container.querySelectorAll('.meta-tag-remove').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      e.stopPropagation();
+      const tagName = btn.dataset.removeTag;
+      if (!tagName || isActionBusy('lightbox-tag', String(item.id))) return;
+      setActionBusy('lightbox-tag', String(item.id), true);
+      try {
+        const res = await API.putJson('/api/items/tags-by-name', {
+          item_ids: [item.id],
+          tag_names: [tagName],
+          mode: 'remove',
+        });
+        const changedIds = new Set(Array.isArray(res?.changed_item_ids) ? res.changed_item_ids.map(Number) : [Number(item.id)]);
+        changedIds.add(Number(item.id));
+        if (Array.isArray(state.allItems)) {
+          state.allItems.forEach(row => {
+            if (row && changedIds.has(Number(row.id))) {
+              row.tags = (row.tags || []).filter(t => t.name !== tagName);
+            }
+          });
+        }
+        item.tags = (item.tags || []).filter(t => t.name !== tagName);
+        if (isCurrentLightboxItem(item)) {
+          renderLightboxTags(item);
+        }
+        renderGrid();
+        toast('已移除角色', 'success');
+        refreshLightboxArtistTagContext(item.artist_id);
+      } catch (err) {
+        toast('移除角色失败', 'error');
+      } finally {
+        setActionBusy('lightbox-tag', String(item.id), false);
+      }
+    });
+  });
+
+  const addBtn = $('#lightboxTagAddBtn');
+  const inputWrap = $('#lightboxTagInputWrap');
+  const input = $('#lightboxTagInput');
+
+  if (addBtn && inputWrap && input) {
+    addBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      openLightboxTagInput();
+    });
+
+    input.addEventListener('keydown', async e => {
+      e.stopPropagation();
+      if (e.key === 'Escape') {
+        closeLightboxInlineEditors();
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const raw = input.value.trim();
+        if (!raw) {
+          closeLightboxInlineEditors();
+          return;
+        }
+        const names = raw.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+        if (names.length === 0) return;
+        if (isActionBusy('lightbox-tag', String(item.id))) return;
+        setActionBusy('lightbox-tag', String(item.id), true);
+        try {
+          const res = await API.putJson('/api/items/tags-by-name', {
+            item_ids: [item.id],
+            tag_names: names,
+            mode: 'add',
+          });
+          const changedIds = new Set(Array.isArray(res?.changed_item_ids) ? res.changed_item_ids.map(Number) : [Number(item.id)]);
+          changedIds.add(Number(item.id));
+          const appendNames = target => {
+            if (!Array.isArray(target.tags)) target.tags = [];
+            names.forEach(name => {
+              if (!target.tags.some(t => t.name === name)) {
+                target.tags.push({name});
+              }
+            });
+          };
+          appendNames(item);
+          if (Array.isArray(state.allItems)) {
+            state.allItems.forEach(row => {
+              if (row && changedIds.has(Number(row.id))) appendNames(row);
+            });
+          }
+          toast('已添加角色', 'success');
+          if (isCurrentLightboxItem(item)) {
+            renderLightboxTags(item);
+            openLightboxTagInput();
+          }
+          renderGrid();
+          refreshLightboxArtistTagContext(item.artist_id);
+        } catch (err) {
+          toast('添加角色失败', 'error');
+        } finally {
+          setActionBusy('lightbox-tag', String(item.id), false);
+        }
+      }
+    });
+
+    input.addEventListener('blur', () => {
+      setTimeout(() => {
+        if (inputWrap.style.display !== 'none' && !input.value.trim()) {
+          inputWrap.style.display = 'none';
+          addBtn.style.display = '';
+        }
+      }, 200);
+    });
+  }
+}
+
+function renderLightboxDate(item) {
+  const container = $('#lightboxInfo .lightbox-meta-date');
+  if (!container) return;
+  const displayDate = item.display_date || item.date || '';
+  const rawDate = item.manual_date || (/^\d{4}-\d{2}-\d{2}$/.test(displayDate) ? displayDate : (item.date || ''));
+  let inputVal = '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+    inputVal = rawDate;
+  } else if (/^\d{4}-\d{2}$/.test(rawDate)) {
+    const candidateDay = item.detected_date || item.date || '';
+    inputVal = (candidateDay.startsWith(`${rawDate}-`) && /^\d{4}-\d{2}-\d{2}$/.test(candidateDay))
+      ? candidateDay
+      : `${rawDate}-01`;
+  }
+  const isMonthManual = /^\d{4}-\d{2}$/.test(String(item.manual_date || ''));
+  container.innerHTML = `
+    <button type="button" class="btn btn-ghost btn-xs lightbox-meta-date-btn" id="lightboxDateBtn" title="修改日期" aria-label="修改日期"${state.readOnlyMode ? ' disabled' : ''}>${escHtml(displayDate || '设置日期')}</button>
+    <input type="date" class="input input-sm lightbox-date-input" id="lightboxDateInput" data-initial-value="${escHtml(inputVal)}" style="display:none" value="${escHtml(inputVal)}" aria-label="设置有效日期">
+  `;
+
+  const dateBtn = $('#lightboxDateBtn');
+  const dateInput = $('#lightboxDateInput');
+  if (!dateBtn || !dateInput || state.readOnlyMode) return;
+
+  dateBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    dateBtn.style.display = 'none';
+    dateInput.style.display = 'inline-block';
+    dateInput.focus();
+    if (typeof dateInput.showPicker === 'function') {
+      try { dateInput.showPicker(); } catch (err) {}
+    }
+  });
+
+  const saveDate = async ({fromEnter = false} = {}) => {
+    const nextDate = dateInput.value.trim();
+    if (nextDate === inputVal && (!fromEnter || isMonthManual || nextDate === rawDate)) {
+      dateInput.style.display = 'none';
+      dateBtn.style.display = '';
+      return;
+    }
+    const artistId = item.artist_id || (state.currentArtist ? state.currentArtist.id : null);
+    if (!artistId) {
+      toast('无法确定当前画师', 'error');
+      dateInput.style.display = 'none';
+      dateBtn.style.display = '';
+      return;
+    }
+    if (isActionBusy('lightbox-date', String(item.id))) return;
+    setActionBusy('lightbox-date', String(item.id), true);
+    try {
+      const res = await API.putJson('/api/items/date', {
+        artist_id: artistId,
+        item_ids: [item.id],
+        manual_date: nextDate || null,
+      });
+      const updated = Array.isArray(res?.items)
+        ? res.items.find(row => Number(row?.item_id) === Number(item.id)) || res.items[0]
+        : null;
+      if (updated && typeof updated === 'object') {
+        item.date = updated.date ?? (nextDate || null);
+        item.manual_date = updated.manual_date ?? (nextDate || null);
+        item.display_date = updated.display_date ?? (nextDate || item.detected_date || item.date || '');
+        if (updated.detected_date !== undefined) item.detected_date = updated.detected_date;
+      } else {
+        const fallbackDate = nextDate || item.detected_date || null;
+        item.date = fallbackDate;
+        item.manual_date = nextDate || null;
+        item.display_date = fallbackDate || '';
+      }
+      toast(nextDate ? `已设置日期 ${nextDate}` : '已恢复检测日期', 'success');
+      if (isCurrentLightboxItem(item)) {
+        renderLightboxDate(item);
+      }
+      renderGrid();
+    } catch (err) {
+      toast('设置日期失败', 'error');
+      dateInput.style.display = 'none';
+      dateBtn.style.display = '';
+    } finally {
+      setActionBusy('lightbox-date', String(item.id), false);
+    }
+  };
+
+  dateInput.addEventListener('change', async e => {
+    e.stopPropagation();
+    await saveDate({fromEnter: false});
+  });
+
+  dateInput.addEventListener('keydown', async e => {
+    e.stopPropagation();
+    if (e.key === 'Escape') {
+      closeLightboxInlineEditors();
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      await saveDate({fromEnter: true});
+    }
+  });
+
+  dateInput.addEventListener('blur', () => {
+    setTimeout(() => {
+      if (dateInput.style.display !== 'none' && !isActionBusy('lightbox-date', String(item.id))) {
+        dateInput.value = inputVal;
+        dateInput.style.display = 'none';
+        dateBtn.style.display = '';
+      }
+    }, 200);
+  });
+}
+
+function bindLightboxInPlaceEditing(item) {
+  if (!item) return;
+  renderLightboxTags(item);
+  renderLightboxDate(item);
 }
 
 export function onLightboxWheel(e) {
@@ -761,6 +1286,10 @@ export function closeLightbox() {
     cancelAnimationFrame(lightboxOpenRaf);
     lightboxOpenRaf = 0;
   }
+  if (lightboxOpenFallbackTimer) {
+    clearTimeout(lightboxOpenFallbackTimer);
+    lightboxOpenFallbackTimer = 0;
+  }
   document.body.classList.remove('lightbox-open');
   setLightboxBackgroundInert(false);
   lightbox.classList.remove('is-open');
@@ -774,7 +1303,14 @@ export function closeLightbox() {
     lightboxCloseTimer = 0;
   }, reducedMotion ? 0 : LIGHTBOX_CLOSE_MS);
   lightbox.classList.remove('text-mode');
+  lightbox.classList.remove('caption-hidden');
+  const toggleBtn = $('#lightboxInfoToggleBtn');
+  if (toggleBtn) {
+    toggleBtn.classList.add('active');
+    toggleBtn.setAttribute('aria-pressed', 'true');
+  }
   state.lightboxLoadToken += 1;
+  clearLightboxPreloadCache();
   resetLightboxTransform();
   const img = $('#lightboxImg');
   img.onload = null;

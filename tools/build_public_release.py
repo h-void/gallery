@@ -140,9 +140,15 @@ def is_public_file(path: str | Path) -> bool:
         "rust/gallery_accel/Cargo.lock",
     }:
         return True
-    if path.startswith("rust/gallery_accel/src/") and path.endswith(".rs"):
+    if path.startswith("rust/gallery_accel/src/"):
         relative = path.removeprefix("rust/gallery_accel/src/")
-        return relative not in {"test_support.rs", "tests.rs"} and not relative.startswith("tests/")
+        if relative in {"test_support.rs", "tests.rs"} or relative.startswith("tests/"):
+            return False
+        # Non-Rust files under src/ can be production sources (the template
+        # pulled in through include_str! must ship or the public tree cannot
+        # compile), but the markdown recovery notes parked next to the sources
+        # they document stay internal.
+        return not relative.endswith(".md")
     return False
 
 

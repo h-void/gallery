@@ -436,10 +436,16 @@ def build_with_fnpack(staging_dir: Path, output_dir: Path, fnpack_binary: str, m
         artifact.unlink()
 
     # Must use official `fnpack build`; a zip renamed to .fpk is rejected by fnOS.
+    build_env = os.environ.copy()
+    temp_dir = (output_dir / "tmp").resolve()
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    build_env["TEMP"] = str(temp_dir)
+    build_env["TMP"] = str(temp_dir)
     subprocess.run(
         [fnpack_binary, "build"],
         check=True,
         cwd=staging_dir,
+        env=build_env,
     )
 
     if not artifact.exists():

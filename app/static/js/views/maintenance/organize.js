@@ -2,7 +2,7 @@
 // archive workbench (template editor, plan list, execute/undo).
 
 import { API } from '../../api.js';
-import { state, isActionBusy, setActionBusy } from '../../store.js';
+import { state, isActionBusy, setActionBusy, isCurrentRequestSeq } from '../../store.js';
 import { $, escHtml, formatBytes, formatSize, joinUiMeta, isAbortError, copyText, folderTreeHasPath } from '../../utils.js';
 import { toast } from '../../logging.js';
 import { loadArtists, selectArtist } from '../../router.js';
@@ -331,7 +331,7 @@ export async function executeArtistFolderMove() {
   }
 }
 
-function archiveCurrentArtistId() {
+export function archiveCurrentArtistId() {
   return state.currentArtist ? Number(state.currentArtist.id) : 0;
 }
 
@@ -480,11 +480,15 @@ export async function previewArchivePlans(options = {}) {
       signal: archivePreviewAbortController.signal,
     });
     if (currentSeq !== archivePreviewReqSeq) return;
+    // A preview is only valid for the artist it was requested for; switching
+    // artists mid-flight must not land artist A's targets on artist B's panel.
+    if (archiveCurrentArtistId() !== artistId) return;
     state.archivePreview = res;
     renderArchiveWorkbench();
   } catch (e) {
     if (isAbortError(e)) return;
     if (currentSeq !== archivePreviewReqSeq) return;
+    if (archiveCurrentArtistId() !== artistId) return;
     state.archivePreview = {error: e.message || String(e)};
     renderArchiveWorkbench();
     if (!options.silent) toast('预览目标失败：' + (e.message || e), 'error');
@@ -533,8 +537,8 @@ function archiveStatusLabel(status) {
     draft: '草稿',
     needs_date: '缺少有效日期',
     date_conflict: '跨月份冲突',
-    needs_tags: '待补标签',
-    inconsistent_tags: '标签不一致',
+    needs_tags: '待补角色',
+    inconsistent_tags: '角色不一致',
     manual_review: '需人工处理',
     aligned: '已符合规则',
     stale: '已过期',
@@ -550,13 +554,14 @@ function archiveStatusLabel(status) {
 
 function archiveStatusExplanation(plan) {
   const status = plan.status;
+  if (status === 'needs_tags') return '文件夹内媒体均未添加角色，请先添加角色后再整理';
   if (status === 'needs_date') return '文件夹内媒体缺少有效识别或手动日期，请在媒体卡片或批量修改中设置日期';
   if (status === 'date_conflict') return '文件夹内媒体的有效日期跨越了多个月份，请统一月份后再整理';
-  if (status === 'inconsistent_tags') return '文件会按各自的有效月份和标签分开整理，未打标签的文件保留原处';
+  if (status === 'inconsistent_tags') return '文件会按各自的有效月份和角色分开整理，未加角色的文件保留原处';
   if (status === 'aligned') return '目录已符合 Default 规则，无需整理';
   if (status === 'manual_review') return '此项需要核对，请查看执行记录';
   if (status === 'blocked') return '当前路径不能安全整理，未执行移动';
-  if (plan.plan_kind === 'split_by_tag' && status !== 'executed') return '将按每个文件的有效月份和标签分开整理；未打标签的文件保留原处';
+  if (plan.plan_kind === 'split_by_tag' && status !== 'executed') return '将按每个文件的有效月份和角色分开整理；未加角色的文件保留原处';
   return '';
 }
 
@@ -577,6 +582,13 @@ export async function refreshArchivePlans() {
   if (refreshFailed) toast('刷新整理项失败，当前列表可能不是最新', 'error');
 }
 
+// Every workbench load stamps itself. Its result may only reach the shared
+// state while it is still the newest load, for the artist it was requested for,
+// inside the maintenance request that started it. A late artist-A response must
+// not overwrite artist B's rules and plans, and a late failure must not wipe
+// them either.
+let archiveWorkbenchLoadSeq = 0;
+
 export async function loadArchiveWorkbench(options = {}) {
   // P6: no implicit artist selection any more — entering the organize view
   // with no artist picked shows 先选择画师 and keeps the move actions disabled
@@ -585,6 +597,10 @@ export async function loadArchiveWorkbench(options = {}) {
   const render = options.render !== false;
   const updateState = options.updateState !== false;
   const fetchOptions = options.signal ? {signal: options.signal} : {};
+  const loadSeq = ++archiveWorkbenchLoadSeq;
+  const isStale = () => loadSeq !== archiveWorkbenchLoadSeq
+    || archiveCurrentArtistId() !== artistId
+    || (options.maintenanceSeq != null && !isCurrentRequestSeq('maintenanceLoadSeq', options.maintenanceSeq));
   if (!artistId) {
     if (updateState) {
       state.archiveSettings = null;
@@ -602,6 +618,7 @@ export async function loadArchiveWorkbench(options = {}) {
     ]);
     const settings = archiveSettingsPayload(settingsResult);
     const plans = archivePlanRows(plansResult);
+    if (isStale()) return {settings, plans};
     if (updateState) {
       state.archiveSettings = settings;
       state.archivePlans = plans;
@@ -615,6 +632,7 @@ export async function loadArchiveWorkbench(options = {}) {
     return {settings, plans};
   } catch (e) {
     if (isAbortError(e)) throw e;
+    if (isStale()) return {plans: []};
     if (updateState) {
       state.archiveSettings = {error: e.message || String(e), profiles: []};
       state.archivePlans = [];
@@ -697,7 +715,7 @@ export function renderArchiveWorkbench() {
   const ready = plans.filter(plan => plan.status === 'ready').length;
   const executed = plans.filter(plan => plan.status === 'executed').length;
   const reverted = plans.filter(plan => plan.status === 'reverted').length;
-  const needsAttention = plans.filter(plan => ['needs_date', 'date_conflict', 'inconsistent_tags', 'manual_review', 'blocked'].includes(plan.status)).length;
+  const needsAttention = plans.filter(plan => ['needs_date', 'date_conflict', 'needs_tags', 'inconsistent_tags', 'manual_review', 'blocked'].includes(plan.status)).length;
   planSummary.textContent = joinUiMeta([
     `${plans.length} 个文件夹`,
     ready ? `${ready} 待确认` : '',
@@ -789,7 +807,6 @@ export function renderArchiveWorkbench() {
     const undoing = isActionBusy('archive-plan-undo', String(planId));
     const canUndo = !isSplit && plan.status === 'executed' && Number.isFinite(planId) && !undoing;
     const target = isSplit ? splitTargets.join('；') : String(plan.target_folder || '');
-    const targetLabel = isSplit ? `拆分到 ${splitTargets.length || Number(plan.split_action_count || 0)} 个位置` : '整理后名称';
     const explanation = archiveStatusExplanation(plan);
     const confirmLabel = plan.status === 'confirmed' ? '取消确认' : '确认';
     const confirmBtnMarkup = isAutoOrganize
@@ -801,15 +818,24 @@ export function renderArchiveWorkbench() {
           <code title="${escHtml(String(plan.source_folder || ''))}">${escHtml(String(plan.source_folder || '-'))}</code>
           <span class="archive-plan-status ${escHtml(String(plan.status || 'draft'))}">${escHtml(archiveStatusLabel(plan.status))}</span>
         </div>
-        <div class="archive-plan-target">
-          <span>${escHtml(targetLabel)}</span>
-          <code class="archive-target-preview" title="${escHtml(target)}">${escHtml(target || '（未生成目标路径）')}</code>
+        <div class="archive-plan-diff">
+          <div class="archive-diff-source" title="${escHtml(String(plan.source_folder || ''))}">
+            <span class="diff-tag">原路径</span>
+            <code>${escHtml(String(plan.source_folder || '-'))}</code>
+          </div>
+          <span class="archive-diff-arrow">➔</span>
+          <div class="archive-diff-target" title="${escHtml(target)}">
+            <span class="diff-tag">归档至</span>
+            <code>${escHtml(target || '（未生成目标路径）')}</code>
+          </div>
         </div>
         ${explanation ? `<div class="archive-plan-preview${plan.status === 'aligned' ? '' : ' blocked'}">${escHtml(explanation)}</div>` : ''}
         <div class="archive-plan-row-actions">
           <span>${plan.file_count ? `${plan.file_count} 项` : ''}</span>
           <div class="archive-plan-row-controls">
             <button class="btn btn-ghost" type="button" data-archive-plan-jump="${planId}" title="在画库中定位对应文件夹">在画库中定位</button>
+            ${plan.status === 'needs_tags' ? `<button class="btn btn-ghost" type="button" data-archive-plan-annotate="${planId}" title="为该文件夹设置角色">设置角色</button>` : ''}
+            ${plan.status === 'needs_date' ? `<button class="btn btn-ghost" type="button" data-archive-plan-annotate="${planId}" title="为该文件夹设置日期">设置日期</button>` : ''}
             ${confirmBtnMarkup}
             ${plan.status === 'executed' && !isSplit ? `<button class="btn btn-ops" type="button" data-archive-plan-undo="${planId}" ${canUndo ? '' : 'disabled'} ${undoing ? 'aria-busy="true"' : ''}>${undoing ? '撤销中' : '撤销整理'}</button>` : ''}
           </div>
@@ -1011,3 +1037,49 @@ export async function executeArchivePlans(dryRun) {
 // Late imports closing the organize <-> records cycle; undoArchivePlan refreshes
 // the operation log after a successful undo.
 import { loadOperationLog, renderOperationLog } from './records.js';
+
+
+export async function annotateArchivePlan(planId) {
+  const pid = Number(planId);
+  const plan = (state.archivePlans || []).find(p => Number(p.id) === pid);
+  if (!plan) return;
+  const aid = Number(plan.artist_id || archiveCurrentArtistId());
+  // Each gap gets its own fix: needs_tags lacks roles, needs_date lacks a valid
+  // date. The date gap cannot be closed by tagging, so it asks for a date and
+  // sends the manual_date the annotate endpoint already accepts.
+  if (plan.status === 'needs_date') {
+    const rawDate = window.prompt(`为「${plan.source_folder}」设置日期（YYYY-MM 或 YYYY-MM-DD）：`);
+    if (rawDate == null || !rawDate.trim()) return;
+    const manualDate = rawDate.trim();
+    if (!/^\d{4}-\d{2}(-\d{2})?$/.test(manualDate)) {
+      toast('日期格式：YYYY-MM 或 YYYY-MM-DD', 'error');
+      return;
+    }
+    try {
+      await API.postJson('/api/folders/annotate', {
+        artist_id: aid,
+        folder: plan.source_folder,
+        manual_date: manualDate,
+      });
+      toast(`已设置日期 ${manualDate}`, 'success');
+      await loadArchiveWorkbench({keepPreview: true});
+    } catch (e) {
+      toast('设置日期失败：' + (e.message || e), 'error');
+    }
+    return;
+  }
+  const tagName = window.prompt(`为「${plan.source_folder}」补充角色：`);
+  if (!tagName || !tagName.trim()) return;
+  try {
+    await API.postJson('/api/folders/annotate', {
+      artist_id: aid,
+      folder: plan.source_folder,
+      tag_names: [tagName.trim()],
+      mode: 'add',
+    });
+    toast('已设置角色并更新计划', 'success');
+    await loadArchiveWorkbench({keepPreview: true});
+  } catch (e) {
+    toast('设置角色失败：' + (e.message || e), 'error');
+  }
+}

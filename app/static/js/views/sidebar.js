@@ -5,14 +5,14 @@
 import { API } from '../api.js';
 import { state, nextRequestSeq, isCurrentRequestSeq } from '../store.js';
 import {
-  $, $$, escHtml, mergeTagsByNameCollator,
+  $, $$, escHtml, mergeTagsByNameCollator, buttonIcon,
 } from '../utils.js';
 import { toast, logUiAction, collectUiLogContext } from '../logging.js';
 import {
   BROWSE_KINDS, syncBrowseUrl, getSavedTagSort,
 } from '../router.js';
 import { renderGrid, appendItemsToGrid, releaseAllImageLoads, releaseAllVideoPreviewLoads } from './grid.js';
-import { updateEditBar, resetCharacterTagSuggestions, scheduleCharacterTagSuggestions } from './editbar.js';
+import { updateEditBar, resetCharacterTagSuggestions, scheduleCharacterTagSuggestions, applySelectionChange } from './editbar.js';
 
 // Three-state lifecycle of the duplicate-folder section across hydration and
 // runtime updates: 'unknown' before the first completed render, 'empty' after
@@ -27,7 +27,7 @@ let duplicateSectionLifecycle = 'unknown';
 export const SIDEBAR_SECTION_NAMES = {
   duplicates: '重复文件夹',
   filters: '排序与日期',
-  tags: '标签',
+  tags: '角色',
   folders: '文件夹',
 };
 
@@ -73,7 +73,6 @@ export function renderLibraryEmptyState() {
   panel.classList.toggle('needs-artist', needsArtistPick && showEmpty);
   document.body.classList.toggle('library-needs-artist', needsArtistPick && showEmpty);
   document.body.classList.toggle('library-empty-artists', noArtists && showEmpty);
-  document.body.classList.toggle('has-artist', Boolean(state.currentArtist));
 
   // The main empty panel already carries the artist-pick entry and guidance;
   // a second hint in the sidebar repeated the same instructions. Keep the
@@ -116,8 +115,8 @@ export function renderLibraryEmptyState() {
     // The page header already reads 「画廊」; drop the duplicate eyebrow here.
     $('#libraryEmptyKicker').hidden = true;
     $('#libraryEmptyTitle').textContent = '选择一位画师开始浏览';
-    $('#libraryEmptyText').textContent = `已有 ${state.artists.length} 位画师。从顶部搜索并选择画师，即可查看其标签、文件夹与媒体作品。`;
-    $('#libraryEmptyMeta').textContent = '支持全名、拼音与部分名搜索，也可全局查找标签或文件名。';
+    $('#libraryEmptyText').textContent = `已有 ${state.artists.length} 位画师。从顶部搜索并选择画师，即可查看其角色、文件夹与媒体作品。`;
+    $('#libraryEmptyMeta').textContent = '支持全名、拼音与部分名搜索，也可全局查找角色或文件名。';
     return;
   }
 
@@ -137,6 +136,16 @@ export function renderLibraryEmptyState() {
     $('#libraryEmptyMeta').textContent = scanState.total_estimate > 0
       ? `${scanState.scanned_count || 0} / ${scanState.total_estimate}`
       : '顶部导航栏会实时显示当前扫描进度。';
+    return;
+  }
+
+  // A failed artist load must not read as an empty gallery that invites a
+  // full scan; say the load failed instead.
+  if (state.artistsLoadError) {
+    $('#libraryEmptyKicker').hidden = true;
+    $('#libraryEmptyTitle').textContent = '画师列表加载失败';
+    $('#libraryEmptyText').textContent = '请刷新页面重试。';
+    $('#libraryEmptyMeta').textContent = '';
     return;
   }
 
@@ -249,9 +258,9 @@ function searchOptionsLabel() {
   const labels = {auto: '范围', artist: '画师', folder: '文件夹', global: '全局'};
   const scope = validSearchScope(state.searchScope);
   const tagsOnly = state.searchTarget === 'tags';
-  if (scope === 'auto' && tagsOnly) return '仅标签';
+  if (scope === 'auto' && tagsOnly) return '仅角色';
   if (scope === 'auto') return '范围';
-  return tagsOnly ? `${labels[scope]}/标签` : labels[scope];
+  return tagsOnly ? `${labels[scope]}/角色` : labels[scope];
 }
 
 // S6: the clear affordance exists only while a query is present. Typed input
@@ -263,13 +272,17 @@ export function syncClearSearch() {
   const input = $('#searchInput');
   const hasQuery = Boolean((input && input.value) || state.search);
   btn.hidden = !hasQuery;
+  const control = $('#searchControl');
+  if (control) {
+    control.classList.toggle('has-value', hasQuery);
+  }
 }
 
 export function syncSearchOptionsControl() {
   normalizeSearchScope();
   syncClearSearch();
   const input = $('#searchInput');
-  if (input) input.placeholder = state.searchTarget === 'tags' ? '搜索标签' : '搜索标签或文件名';
+  if (input) input.placeholder = state.searchTarget === 'tags' ? '搜索角色' : '搜索角色或文件名';
 
   const btn = $('#searchOptionsBtn');
   if (btn) {
@@ -397,7 +410,7 @@ export function setSidebarTagRatio(ratio, persist = false) {
   const divider = $('#sidebarTagDivider');
   if (divider) {
     divider.setAttribute('aria-valuenow', String(desired));
-    divider.setAttribute('aria-valuetext', `标签 ${desired}%`);
+    divider.setAttribute('aria-valuetext', `角色 ${desired}%`);
   }
   if (persist) {
     try { localStorage.setItem(SIDEBAR_TAG_RATIO_STORAGE_KEY, String(desired)); } catch (e) {}
@@ -699,7 +712,7 @@ function bindDuplicateListActions(container) {
 }
 
 export function renderSidebar() {
-  $('#tagFilterReset').disabled = !state.activeRole || String(state.activeRole).startsWith('__');
+  $('#tagFilterReset').disabled = !state.activeRole || (String(state.activeRole).startsWith('__') && state.activeRole !== BROWSE_KINDS.untagged);
   const s = state.stats;
   if (!s) {
     $('#sidebarList').innerHTML = '';
@@ -707,12 +720,19 @@ export function renderSidebar() {
   }
   const tags = Array.isArray(s.tags) ? s.tags : [];
   let html = '';
+  const untaggedCount = Number(s.untagged || 0);
+  const isUntaggedActive = state.activeRole === BROWSE_KINDS.untagged;
+  const untaggedClass = isUntaggedActive ? ' active' : '';
+  const untaggedEmptyClass = untaggedCount === 0 ? ' sidebar-item-empty' : '';
+  html += `<div class="sidebar-item sidebar-item-untagged${untaggedClass}${untaggedEmptyClass}" data-role="${BROWSE_KINDS.untagged}" role="button" tabindex="0">
+    <span>未加角色</span><span class="count">${untaggedCount}</span></div>`;
+
   sortSidebarTags(tags).forEach(r => {
     const active = state.activeRole === String(r.id) ? ' active' : '';
     html += `<div class="sidebar-item${active}" data-role="${r.id}" role="button" tabindex="0">
       <span>${escHtml(r.name)}</span><span class="count">${r.count}</span></div>`;
   });
-  $('#sidebarList').innerHTML = html || '<div class="sidebar-list-empty sidebar-empty-state">没有标签</div>';
+  $('#sidebarList').innerHTML = html || '<div class="sidebar-list-empty sidebar-empty-state">没有角色</div>';
 
   bindSidebarEvents();
 }
@@ -740,16 +760,15 @@ export function renderMediaFilter() {
   const active = Object.values(BROWSE_KINDS).includes(state.activeRole) ? state.activeRole : '';
   const filters = [
     ['', '全部媒体', s.total],
-    [BROWSE_KINDS.untagged, '未加标签', s.untagged || 0],
     [BROWSE_KINDS.favorites, '收藏', s.favorites || 0],
     [BROWSE_KINDS.archives, '压缩包', s.archives || 0],
     [BROWSE_KINDS.videos, '视频', s.videos || 0],
     [BROWSE_KINDS.sources, '源文件', s.sources || 0],
-  ].filter(([value, , count]) => !value || count > 0 || value === active || value === BROWSE_KINDS.favorites || value === BROWSE_KINDS.untagged);
+  ].filter(([value, , count]) => !value || count > 0 || value === active || value === BROWSE_KINDS.favorites);
   select.innerHTML = filters.map(([value, label, count]) =>
     `<option value="${value}">${label} ${count}</option>`
   ).join('');
-  select.value = active;
+  select.value = active && active !== BROWSE_KINDS.untagged ? active : '';
   select.disabled = false;
 }
 
@@ -770,8 +789,14 @@ function renderFolderNode(node, level) {
   const path = node.path || '';
   const name = path ? node.name : '全部';
   const active = state.activeFolder === path || (!state.activeFolder && !path);
+  // The tree root ("全部") is a scope, not a directory: only real folders
+  // carry actions.
+  const folderActions = path
+    ? `<button class="btn btn-ghost btn-icon folder-annotate" type="button" data-folder-annotate="${escHtml(path)}" title="设置角色" aria-label="为文件夹「${escHtml(name)}」设置角色">${buttonIcon('file')}</button>`
+      + `<button class="btn btn-ghost btn-icon folder-delete" type="button" data-folder-delete="${escHtml(path)}" title="移入回收站" aria-label="将文件夹「${escHtml(name)}」移入回收站">${buttonIcon('trash')}</button>`
+    : '';
   let html = `<div class="folder-item${path ? '' : ' folder-all'}${active ? ' active' : ''}" data-folder="${escHtml(path)}" role="button" tabindex="0" title="${escHtml(path || name)}" style="--level:${level}">
-    <span class="folder-name">${escHtml(name)}</span><span class="count">${node.item_count || 0}</span>
+    <span class="folder-name">${escHtml(name)}</span><span class="count">${node.item_count || 0}</span>${folderActions}
   </div>`;
   const children = Array.isArray(node.children) ? node.children : [];
   children.forEach(child => {
@@ -785,9 +810,8 @@ export function selectFolder(folder) {
   state.search = '';
   $('#searchInput').value = '';
   state.tagSearchResults = [];
-  state.selectedIds.clear();
+  applySelectionChange([], {reason: 'select_folder', schedule: false});
   syncSearchOptionsControl();
-  updateEditBar();
   renderFolderTree();
   updateDuplicateFilesButton();
   scrollToItemsTop();
@@ -796,17 +820,90 @@ export function selectFolder(folder) {
   closeFilterDrawerIfMobile();
 }
 
+function findFolderNode(node, path) {
+  if (!node || typeof node !== 'object') return null;
+  if (node.path === path) return node;
+  const children = Array.isArray(node.children) ? node.children : [];
+  for (const child of children) {
+    const found = findFolderNode(child, path);
+    if (found) return found;
+  }
+  return null;
+}
+
+// 删除文件夹：works and loose files move to the recycle bin together, so the
+// confirm copy states that plainly; nothing here deletes bytes outright.
+export async function deleteArtistFolder(folder) {
+  const artist = state.currentArtist;
+  if (!artist || !folder) return;
+  const node = findFolderNode(state.folders, folder);
+  const name = node && node.name ? node.name : folder;
+  if (!confirm(`确定将文件夹「${name}」移入回收站吗？文件夹内全部文件会一并移入回收站，可在回收站恢复。`)) return;
+  try {
+    const result = await API.postJson('/api/folders/delete', {artist_id: artist.id, folder});
+    const recycled = Number(result.recycled_items || 0) + Number(result.recycled_loose_files || 0);
+    const failed = Number(result.failed || 0);
+    if (failed > 0) {
+      toast(`部分文件未能移入回收站：成功 ${recycled}，失败 ${failed}`, 'error');
+    } else {
+      toast(`文件夹已移入回收站：${recycled} 个文件`, 'success');
+    }
+    if (state.activeFolder && (state.activeFolder === folder || state.activeFolder.startsWith(`${folder}/`))) {
+      state.activeFolder = null;
+    }
+    const [stats, folders] = await Promise.all([
+      API.get(`/api/artists/${artist.id}/stats`),
+      API.get(`/api/folders?artist_id=${artist.id}`),
+    ]);
+    state.stats = stats;
+    state.folders = folders;
+    renderSidebar();
+    renderFolderTree();
+    syncBrowseUrl('replace');
+    loadItems();
+  } catch (e) {
+    toast('删除文件夹失败：' + (e.message || e), 'error');
+  }
+}
+
+export async function annotateArtistFolder(folder) {
+  const artist = state.currentArtist;
+  if (!artist || !folder) return;
+  const tagName = prompt(`为文件夹「${folder}」批量添加角色：`);
+  if (!tagName || !tagName.trim()) return;
+  const { classifyFolder } = await import('./editbar.js');
+  await classifyFolder(folder, [], 'add', [tagName.trim()]);
+}
+
 function bindFolderEvents() {
   const tree = $('#folderTree');
   if (!tree || tree.dataset.folderBound === '1') return;
   tree.dataset.folderBound = '1';
   tree.addEventListener('click', e => {
-    const el = e.target instanceof Element ? e.target.closest('.folder-item') : null;
+    const target = e.target instanceof Element ? e.target : null;
+    const annotateBtn = target ? target.closest('[data-folder-annotate]') : null;
+    if (annotateBtn && tree.contains(annotateBtn)) {
+      e.stopPropagation();
+      annotateArtistFolder(annotateBtn.dataset.folderAnnotate || '');
+      return;
+    }
+    const deleteBtn = target ? target.closest('[data-folder-delete]') : null;
+    if (deleteBtn && tree.contains(deleteBtn)) {
+      e.stopPropagation();
+      deleteArtistFolder(deleteBtn.dataset.folderDelete || '');
+      return;
+    }
+    const el = target ? target.closest('.folder-item') : null;
     if (el && tree.contains(el)) selectFolder(el.dataset.folder || '');
   });
   tree.addEventListener('keydown', e => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
-    const el = e.target instanceof Element ? e.target.closest('.folder-item') : null;
+    const target = e.target instanceof Element ? e.target : null;
+    if (!target) return;
+    // A focused action button keeps its native Enter/Space click; the row's
+    // scope-selection handler must not also fire on those keys.
+    if (target.closest('[data-folder-delete]') || target.closest('[data-folder-annotate]')) return;
+    const el = target.closest('.folder-item');
     if (!el || !tree.contains(el)) return;
     e.preventDefault();
     selectFolder(el.dataset.folder || '');
@@ -854,8 +951,7 @@ function bindSidebarEvents() {
 
 export function selectBrowseRole(role) {
   state.activeRole = role || null;
-  state.selectedIds.clear();
-  updateEditBar();
+  applySelectionChange([], {reason: 'select_browse_role', schedule: false});
   renderSidebar();
   renderToolbar();
   scrollToItemsTop();
@@ -866,6 +962,7 @@ export function selectBrowseRole(role) {
 
 export function renderToolbar() {
   renderMediaFilter();
+  syncArchiveTriageToggle();
   updateDuplicateFilesButton();
 }
 
@@ -883,6 +980,7 @@ export async function loadItems(options = {}) {
     state.duplicatesOnly = false;
   }
   updateDuplicateFilesButton();
+  syncArchiveTriageToggle();
   if (!state.currentArtist && !globalSearch) {
     state.allItems = [];
     state.itemsOffset = 0;
@@ -902,6 +1000,7 @@ export async function loadItems(options = {}) {
   }
   state.loadingItems = true;
   state.loadingMoreItems = append;
+  state.itemsLoadError = false;
   if (!append) {
     state.itemsCursor = null;
     releaseAllImageLoads();
@@ -941,6 +1040,8 @@ export async function loadItems(options = {}) {
   if (state.search && state.searchTarget === 'tags') params.set('search_tags_only', 'true');
   if (!globalSearch && folderScoped) params.set('folder', state.activeFolder);
   if (!globalSearch && state.duplicatesOnly) params.set('duplicates_only', 'true');
+  if (!globalSearch && state.activeTriage === 'inbox') params.set('inbox', 'true');
+  if (!globalSearch && state.activeTriage === 'archived') params.set('inbox', 'false');
 
   // Tag results depend on the search context, not on which page of media is
   // being shown, and an append is the same context. Re-requesting them put a
@@ -1008,6 +1109,9 @@ export async function loadItems(options = {}) {
       state.itemsOffset = 0;
       state.hasMoreItems = false;
       state.tagSearchResults = [];
+      // A failed load must not render as "this scope has no files"; the grid
+      // empty-state branches on this flag to say the load failed instead.
+      state.itemsLoadError = true;
       renderGrid();
       toast('加载媒体失败', 'error');
     }
@@ -1131,7 +1235,7 @@ export function renderTagSearchResults() {
     if (signature !== tagResultsSignature || (visible && !container.firstElementChild)) {
       tagResultsSignature = signature;
       container.innerHTML = visible
-        ? `<div class="tag-result-title">标签结果</div>
+        ? `<div class="tag-result-title">角色结果</div>
         <div class="tag-result-list">
           ${state.tagSearchResults.map(tag => `
             <button class="tag-result-card" type="button" data-tag-jump="${tag.id}" data-artist-id="${tag.artist_id}" title="转到 ${escHtml(tag.artist_name || '')}">
@@ -1199,3 +1303,26 @@ import { captureGridScrollAnchor, restoreGridScrollAnchor } from './grid.js';
 import { releaseAllVideoPreviews } from './grid.js';
 import { classifyItems } from './editbar.js';
 import { scheduleDuplicatesViewRefresh } from '../events.js';
+
+
+export function syncArchiveTriageToggle() {
+  const container = $('#archiveTriageToggle');
+  if (!container) return;
+  const current = state.activeTriage || 'all';
+  // The triage filter only shapes artist-scoped listings; a global search
+  // outscopes it, so the switch is disabled and de-highlighted there instead of
+  // claiming a filter the query does not apply.
+  const disabled = isGlobalSearchActive();
+  container.classList.toggle('disabled', disabled);
+  container.querySelectorAll('button[data-triage]').forEach(btn => {
+    const active = !disabled && btn.dataset.triage === current;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    btn.disabled = disabled;
+    if (btn.dataset.triage === 'inbox' && state.stats && typeof state.stats.inbox === 'number') {
+      btn.textContent = state.stats.inbox > 0 ? `待整理 (${state.stats.inbox})` : '待整理';
+    } else if (btn.dataset.triage === 'inbox') {
+      btn.textContent = '待整理';
+    }
+  });
+}

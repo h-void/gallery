@@ -257,6 +257,12 @@ export function artistFromBrowsePath() {
   return artistRouteEntries().find(entry => artistRouteKey(entry.segment) === key)?.artist || null;
 }
 
+// The archive triage filter ('all' | 'inbox' | 'archived') rides the browse URL
+// like the other filters so a reload keeps the same scope.
+export function validBrowseTriage(value) {
+  return value === 'inbox' || value === 'archived' ? value : 'all';
+}
+
 export function browseUrlParams() {
   const params = new URLSearchParams();
   if (state.mode === 'moves') {
@@ -279,6 +285,7 @@ export function browseUrlParams() {
   if (state.itemDateTo) params.set('to', state.itemDateTo);
   if (state.view !== 'grid') params.set('view', state.view);
   if (state.duplicatesOnly && isDuplicateFilesScopeActive()) params.set('duplicates', '1');
+  if (state.activeTriage && state.activeTriage !== 'all') params.set('triage', state.activeTriage);
   if (state.returnToView) params.set('return_to', state.returnToView);
   return params;
 }
@@ -301,6 +308,7 @@ export function updateBrowseReturnButton() {
   if (from && state.mode !== 'moves') {
     btn.hidden = false;
     btn.textContent = from === 'downloads' ? '← 返回下载' : '← 返回维护';
+    btn.title = from === 'downloads' ? '返回下载' : '返回维护';
   } else {
     btn.hidden = true;
   }
@@ -382,6 +390,7 @@ export async function restoreBrowseUrl() {
   const folder = params.get('folder') || '';
   state.activeFolder = state.currentArtist && folderTreeHasPath(state.folders, folder) ? folder : null;
   state.duplicatesOnly = params.get('duplicates') === '1';
+  state.activeTriage = validBrowseTriage(params.get('triage'));
 
   $('#searchInput').value = state.search;
   syncSearchOptionsControl();
@@ -404,6 +413,7 @@ export async function restoreBrowseUrl() {
 export async function loadArtists() {
   try {
     const artists = await API.get('/api/artists');
+    state.artistsLoadError = false;
     state.artists = Array.isArray(artists)
       ? artists.filter(row => row && typeof row === 'object')
       : [];
@@ -424,6 +434,7 @@ export async function loadArtists() {
   } catch (e) {
     state.artists = [];
     state.duplicateFolders = [];
+    state.artistsLoadError = true;
     renderDuplicateFolders();
     toast('加载画师失败', 'error');
   }

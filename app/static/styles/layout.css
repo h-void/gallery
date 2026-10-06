@@ -71,12 +71,25 @@ header #scanBtn,header .scan-folder-btn,header #stopScanBtn{
   font-family:inherit;font-size:var(--header-control-font-size);line-height:1.2;
 }
 .search-options-btn.active{background:var(--accent-soft);border-color:transparent;color:var(--vermilion-deep)}
+.search-shortcut-hint{
+  position:absolute;right:68px;top:50%;transform:translateY(-50%);
+  font-family:inherit;font-size:10px;line-height:1;font-weight:600;
+  color:var(--text-3);background:var(--bg-canvas);border:1px solid var(--border-subtle);
+  border-radius:var(--radius-sm);padding:2px 5px;pointer-events:none;
+  display:none;user-select:none;
+}
+.search-control.has-value .search-shortcut-hint{
+  display:none !important;
+}
 /* One crease rule splits the search group from the scan/maintenance actions.
    It hangs off the search group so it survives #scanBtn hiding. */
 @media(min-width:1001px){
   .search-control::after{
     content:'';position:absolute;right:-6px;top:50%;transform:translateY(-50%);
     width:1px;height:20px;background:var(--border-subtle);
+  }
+  .search-control:not(:focus-within) .search-shortcut-hint{
+    display:inline-block;
   }
 }
 

@@ -79,6 +79,49 @@ pub fn items_page_query_response(
     search_tags_only: bool,
     favorite_only: Option<bool>,
 ) -> Result<Value> {
+    items_page_query_response_ext(
+        conn,
+        artist_id,
+        limit,
+        offset,
+        sort,
+        media_type,
+        folder,
+        date_from,
+        date_to,
+        image_only,
+        untagged,
+        tag_id,
+        duplicates_only,
+        tag_names,
+        search,
+        search_tags_only,
+        favorite_only,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn items_page_query_response_ext(
+    conn: &Connection,
+    artist_id: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    sort: Option<&str>,
+    media_type: Option<&str>,
+    folder: Option<&str>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+    image_only: Option<bool>,
+    untagged: Option<bool>,
+    tag_id: Option<i64>,
+    duplicates_only: Option<bool>,
+    tag_names: Option<&str>,
+    search: Option<&str>,
+    search_tags_only: bool,
+    favorite_only: Option<bool>,
+    inbox: Option<bool>,
+) -> Result<Value> {
     items_page_query_response_inner(
         conn,
         artist_id,
@@ -97,6 +140,7 @@ pub fn items_page_query_response(
         search,
         search_tags_only,
         favorite_only,
+        inbox,
         None,
         false,
     )
@@ -123,6 +167,51 @@ pub fn items_page_cursor_query_response(
     favorite_only: Option<bool>,
     cursor: Option<&str>,
 ) -> Result<Value> {
+    items_page_cursor_query_response_ext(
+        conn,
+        artist_id,
+        limit,
+        offset,
+        sort,
+        media_type,
+        folder,
+        date_from,
+        date_to,
+        image_only,
+        untagged,
+        tag_id,
+        duplicates_only,
+        tag_names,
+        search,
+        search_tags_only,
+        favorite_only,
+        None,
+        cursor,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn items_page_cursor_query_response_ext(
+    conn: &Connection,
+    artist_id: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    sort: Option<&str>,
+    media_type: Option<&str>,
+    folder: Option<&str>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+    image_only: Option<bool>,
+    untagged: Option<bool>,
+    tag_id: Option<i64>,
+    duplicates_only: Option<bool>,
+    tag_names: Option<&str>,
+    search: Option<&str>,
+    search_tags_only: bool,
+    favorite_only: Option<bool>,
+    inbox: Option<bool>,
+    cursor: Option<&str>,
+) -> Result<Value> {
     let parsed_cursor = cursor
         .map(|value| parse_item_cursor(value, sort))
         .transpose()?;
@@ -144,6 +233,7 @@ pub fn items_page_cursor_query_response(
         search,
         search_tags_only,
         favorite_only,
+        inbox,
         parsed_cursor.as_ref(),
         true,
     )
@@ -168,6 +258,7 @@ fn items_page_query_response_inner(
     search: Option<&str>,
     search_tags_only: bool,
     favorite_only: Option<bool>,
+    inbox: Option<bool>,
     cursor: Option<&ItemCursor>,
     cursor_mode: bool,
 ) -> Result<Value> {
@@ -192,6 +283,7 @@ fn items_page_query_response_inner(
         search,
         search_tags_only,
         favorite_only,
+        inbox,
         cursor,
     )?;
     let total = conn.query_row(
@@ -261,6 +353,7 @@ fn item_base_conditions(
     search: Option<&str>,
     search_tags_only: bool,
     favorite_only: Option<bool>,
+    inbox: Option<bool>,
 ) -> Result<(Vec<String>, Vec<SqlValue>)> {
     let mut conditions = vec![format!("{alias}.missing=0")];
     let mut params = Vec::new();
@@ -272,6 +365,18 @@ fn item_base_conditions(
         conditions.push(format!(
             "EXISTS (SELECT 1 FROM item_favorites f WHERE f.item_id={alias}.id)"
         ));
+    }
+
+    if let Some(inbox_val) = inbox {
+        if inbox_val {
+            conditions.push(format!(
+                "(NOT EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id={alias}.id)                  OR (COALESCE({alias}.manual_date, '') = '' AND COALESCE({alias}.detected_date, '') = '' AND (COALESCE({alias}.date, '') = '' OR {alias}.date LIKE '0000%'))                  OR COALESCE({alias}.folder_name, '') = '')"
+            ));
+        } else {
+            conditions.push(format!(
+                "(EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id={alias}.id)                  AND (COALESCE({alias}.manual_date, '') != '' OR COALESCE({alias}.detected_date, '') != '' OR (COALESCE({alias}.date, '') != '' AND {alias}.date NOT LIKE '0000%'))                  AND COALESCE({alias}.folder_name, '') != '')"
+            ));
+        }
     }
 
     if tag_id.is_some() || tag_names.is_some() || untagged.unwrap_or(false) || search_tags_only {
@@ -414,6 +519,7 @@ fn item_page_where(
     search: Option<&str>,
     search_tags_only: bool,
     favorite_only: Option<bool>,
+    inbox: Option<bool>,
     cursor: Option<&ItemCursor>,
 ) -> Result<(String, Vec<SqlValue>)> {
     let (mut conditions, mut params) = item_base_conditions(
@@ -431,6 +537,7 @@ fn item_page_where(
         search,
         search_tags_only,
         favorite_only,
+        inbox,
     )?;
     if duplicates_only.unwrap_or(false) {
         // Regenerate the same filters under the twin alias instead of a blind
@@ -451,6 +558,7 @@ fn item_page_where(
             search,
             search_tags_only,
             favorite_only,
+            inbox,
         )?;
         conditions.push("i.media_type IN ('image', 'video', 'source')".to_string());
         conditions.push("i.is_archive=0".to_string());

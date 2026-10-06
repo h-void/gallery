@@ -78,23 +78,30 @@
 .sidebar-item .count{flex:0 0 auto;font-size:var(--fs-small);color:var(--text-3);margin-left:auto;font-variant-numeric:tabular-nums}
 .sidebar-item.unclassified{box-shadow:inset 2px 0 0 var(--unclassified)}
 .sidebar-item.drag-over{background:var(--accent-soft);outline:2px dashed var(--vermilion)}
+.sidebar-item-untagged{margin-bottom:4px;border-bottom:1px solid var(--border-subtle)}
+.sidebar-item-untagged.sidebar-item-empty{opacity:0.65}
 .folder-item{
-  display:flex;align-items:center;gap:6px;padding:5px 12px 5px calc(12px + var(--level) * 12px);
+  display:flex;align-items:center;gap:4px;padding:2px 8px 2px calc(8px + var(--level) * 12px);
   cursor:pointer;font-size:var(--fs-small);border-radius:var(--radius);
   box-shadow:inset 2px 0 0 transparent;user-select:none;
-  min-height:32px;
+  min-height:24px;
 }
 .folder-item:hover{background:var(--bg-raised)}
 .folder-item.active{background:var(--accent-soft);box-shadow:inset 2px 0 0 var(--vermilion);color:var(--vermilion-deep);font-weight:600}
 .folder-item .folder-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.folder-item .count{flex:0 0 auto;font-size:var(--fs-small);color:var(--text-3);margin-left:auto;font-variant-numeric:tabular-nums}
+.folder-item .count{flex:0 0 auto;font-size:var(--fs-micro);color:var(--text-3);margin-left:auto;font-variant-numeric:tabular-nums}
+/* Row actions shrink with the row: .btn-icon's 34px box would otherwise make
+   every folder row ~44px tall and hide most of the tree behind scrolling. */
+.folder-item .folder-delete,.folder-item .folder-annotate{flex:0 0 auto;margin-left:2px;opacity:0;width:22px;min-width:22px;height:22px;min-height:22px;padding:0}
+.folder-item:hover .folder-delete,.folder-item:hover .folder-annotate,.folder-item .folder-delete:focus-visible,.folder-item .folder-annotate:focus-visible{opacity:1}
+@media (hover:none){.folder-item .folder-delete,.folder-item .folder-annotate{opacity:1}}
 .folder-item.folder-all {
   position: sticky;
   top: 0;
   z-index: 10;
   background: var(--bg-chrome);
   box-shadow: none;
-  padding: 8px 12px;
+  padding: 4px 8px;
   border-radius: 0;
   width: 100%;
   left: 0;
@@ -168,7 +175,7 @@
 }
 #grid.justified .card > .media-file-icon{height:var(--jh,180px);aspect-ratio:auto;min-height:0}
 #grid.justified .card .info{padding:8px 4px 0}
-#grid.justified .card .info .role{font-weight:500}
+#grid.justified .card .info .file-name{font-weight:500}
 /* Cards carry no corner marks: the earlier contact-sheet frame number and its
    vermilion binding tick were decorative only and are no longer rendered. */
 .card{
@@ -181,13 +188,26 @@
 .card:hover,.card:focus-visible{background:transparent}
 .card:focus-visible{outline:none;box-shadow:var(--focus-ring)}
 .card.selected{
-  background:var(--accent-faint);border-radius:var(--radius);
-  /* box-shadow ring instead of an outline: it follows the 10px corner radius
-     and never collides with the focus ring on the same element. */
+  background:transparent;
+  box-shadow:none;
+}
+.card.selected :is(.thumb,.gif-preview,.video-preview,.media-file-icon){
+  border-radius:var(--radius);
   box-shadow:0 0 0 2px var(--vermilion);
+}
+.card.selected:hover :is(.thumb,.gif-preview,.video-preview,.media-file-icon),
+.card.selected:focus-visible :is(.thumb,.gif-preview,.video-preview,.media-file-icon),
+.card.selected:has(:focus-visible) :is(.thumb,.gif-preview,.video-preview,.media-file-icon){
+  box-shadow:0 0 0 2px var(--vermilion), var(--shadow-card-lift);
+}
+.card.selected .info .file-name{
+  color:var(--text-1);font-weight:600;
 }
 /* Artwork lifts on intent: the media block floats 1px with a soft crease
    shadow; artwork itself stays untouched at rest. */
+.card :is(.thumb,.gif-preview,.video-preview,.media-file-icon){
+  transition:transform var(--motion),box-shadow var(--motion);
+}
 .card:hover :is(.thumb,.gif-preview,.video-preview,.media-file-icon),
 .card:focus-visible :is(.thumb,.gif-preview,.video-preview,.media-file-icon),
 .card:has(:focus-visible) :is(.thumb,.gif-preview,.video-preview,.media-file-icon){
@@ -196,7 +216,8 @@
 }
 .card .thumb{
   width:100%;aspect-ratio:4/3;object-fit:contain;display:block;
-  background:var(--bg-raised);min-height:120px;opacity:.35;transition:opacity .18s ease;
+  background:var(--bg-raised);min-height:120px;opacity:.35;
+  transition:opacity .18s ease, transform var(--motion), box-shadow var(--motion);
   border-radius:var(--radius);
 }
 .card:hover .thumb,.card:focus-visible .thumb{filter:brightness(1.06)}
@@ -215,11 +236,11 @@
 }
 .gif-card .gif-thumb.playing + .gif-placeholder{opacity:0;pointer-events:none}
 .card .info{
-  padding:4px 2px 0;font-size:var(--fs-small);color:var(--text-3);flex-shrink:0;
+  padding:6px 2px 2px;font-size:var(--fs-small);color:var(--text-3);flex-shrink:0;
   background:transparent;min-height:0;
 }
-.card .info .role{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-1);font-weight:400;font-size:var(--fs-body);line-height:1.35}
-.card .info .date{display:block;margin-top:1px;font-size:var(--fs-small);line-height:1.3;color:var(--text-2);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.85;transition:opacity var(--motion)}
+.card .info .file-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-1);font-weight:400;font-size:var(--fs-body);line-height:1.35}
+.card .info .date{display:block;margin-top:2px;font-size:var(--fs-small);line-height:1.3;color:var(--text-2);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.85;transition:opacity var(--motion)}
 .card:hover .info .date,.card:focus-visible .info .date,.card:has(:focus-visible) .info .date,.card.selected .info .date{opacity:1}
 #grid.justified .card .info .date{margin-top:3px}
 /* Card meta is label-free: fields are separated by spacing, never by a
@@ -227,8 +248,9 @@
 .card-meta .meta-tag + .meta-tag{margin-left:6px}
 .card-meta .recognized-date{margin-left:6px}
 .meta-tag{white-space:nowrap}
+.meta-tag.meta-tag-empty{color:var(--text-3);opacity:.68}
 .card-title-row{display:flex;align-items:center;gap:4px;min-width:0}
-.card-title-row .role{flex:1 1 auto}
+.card-title-row .file-name{flex:1 1 auto}
 .artist-jump{
   margin-top:5px;padding:3px 7px;border-radius:var(--radius);
   font-size:var(--fs-small);cursor:pointer;
@@ -237,15 +259,16 @@
   position:absolute;top:10px;right:10px;width:24px;height:24px;
   border-radius:50%;background:rgba(0,0,0,.45);border:1px solid var(--border-strong);
   display:none;align-items:center;justify-content:center;z-index:4;
+  box-shadow:0 2px 6px rgba(0,0,0,.28);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);
 }
 .card .check.visible{display:flex}
-.card .check.checked{background:var(--accent-solid);border-color:var(--accent-solid)}
-.card .check.checked::after{content:'\2713';color:#fff;font-size:var(--fs-small)}
+.card .check.checked{background:var(--accent-solid);border-color:var(--accent-solid);box-shadow:0 2px 8px rgba(184,51,42,.45)}
+.card .check.checked::after{content:'\2713';color:#fff;font-size:var(--fs-small);font-weight:700}
 .card-actions{
   position:absolute;top:8px;right:44px;z-index:5;display:flex;gap:4px;
   opacity:0;transition:opacity var(--motion);
 }
-.card:hover .card-actions,.card:focus-visible .card-actions,.card:has(:focus-visible) .card-actions,.card.selected .card-actions{opacity:1}
+.card:hover .card-actions,.card:focus-visible .card-actions,.card:has(:focus-visible) .card-actions{opacity:1}
 /* visibility:hidden (not only opacity) removes the hidden actions from the
    focus order and the accessibility tree: pointer-events alone still let Tab
    land on invisible favorite/download controls. */
@@ -260,12 +283,13 @@ body.edit-mode .card .card-actions{opacity:0;visibility:hidden;pointer-events:no
   display:flex;align-items:center;justify-content:center;
   border-radius:50%;background:rgba(31,26,20,.85);
   border:0;color:#fff;text-decoration:none;
-  font-size:var(--fs-title);line-height:1;transition:background var(--motion),opacity var(--motion);
+  font-size:var(--fs-title);line-height:1;transition:background var(--motion),opacity var(--motion),transform var(--motion);
+  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);
 }
 /* Near-opaque ink chips: translucent black over a light thumbnail left the
    ochre star below the 3:1 icon floor. */
 .card-download:hover,.card-download:focus,.card-favorite:hover,.card-favorite:focus,.card-favorite.active{
-    opacity:1;background:rgba(31,26,20,.95);outline:none;
+    opacity:1;background:rgba(31,26,20,.95);outline:none;transform:scale(1.08);
   }
 .card-favorite{color:var(--warn)}
 /* Tag-only search results: a stable chip block above #grid (a sibling in the
@@ -387,6 +411,8 @@ body.card-ratio-3x4{--grid-min-col:150px}
   height:auto;min-height:140px;max-width:640px;margin:24px auto;padding:20px;
   flex-direction:column;gap:10px;text-align:left;
   border-left:2px solid var(--vermilion);
+  box-shadow:inset 0 0 0 1px var(--border-subtle);
+  background:var(--bg-canvas);border-radius:0 var(--radius) var(--radius) 0;
 }
 .library-empty-compact::before{
   content:'';display:block;width:64px;height:48px;
@@ -394,6 +420,26 @@ body.card-ratio-3x4{--grid-min-col:150px}
   -webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 90' fill='none' stroke='%23000' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='5' y='5' width='110' height='80' rx='9'/%3E%3Ccircle cx='42' cy='32' r='9'/%3E%3Cpath d='M18 72l24-28 16 18 10-12 22 22'/%3E%3C/svg%3E") center/contain no-repeat;
   mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 90' fill='none' stroke='%23000' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='5' y='5' width='110' height='80' rx='9'/%3E%3Ccircle cx='42' cy='32' r='9'/%3E%3Cpath d='M18 72l24-28 16 18 10-12 22 22'/%3E%3C/svg%3E") center/contain no-repeat;
   opacity:.5;
+}
+.scroll-top-btn{
+  position:fixed;right:24px;bottom:32px;z-index:90;
+  width:40px;height:40px;min-width:40px;min-height:40px;padding:0;
+  border-radius:var(--radius-pill);
+  background:var(--bg-overlay);color:var(--text-1);
+  border:1px solid var(--border-subtle);box-shadow:var(--shadow-pop);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  display:inline-flex;align-items:center;justify-content:center;
+  cursor:pointer;opacity:0;transform:translateY(12px);pointer-events:none;
+  transition:opacity var(--motion),transform var(--motion),background var(--motion),border-color var(--motion),bottom var(--motion);
+}
+.scroll-top-btn.visible{
+  opacity:1;transform:translateY(0);pointer-events:auto;
+}
+.scroll-top-btn:hover{
+  background:var(--bg-raised);border-color:var(--border-strong);transform:translateY(-2px);
+}
+body.edit-bar-active .scroll-top-btn{
+  bottom:92px;
 }
 
 /* ---- List view (desktop): one media per row, 40px thumb ---- */
@@ -415,6 +461,8 @@ body.card-ratio-3x4{--grid-min-col:150px}
     padding:4px 14px;display:flex;flex-direction:column;justify-content:center;gap:2px;
   }
   .grid.list .card:hover .thumb{filter:none}
+  .grid.list .card.selected{background:var(--accent-faint);box-shadow:0 0 0 1px var(--vermilion)}
+  .grid.list .card.selected :is(.thumb,.gif-preview,.video-preview,.media-file-icon){box-shadow:none}
 }
 
 /* ---- Edit bar (§5.6): selection context floats above the gallery ---- */
@@ -428,6 +476,10 @@ body.card-ratio-3x4{--grid-min-col:150px}
   transition:opacity var(--motion),transform var(--motion),visibility var(--motion);
 }
 .edit-bar.visible{visibility:visible;opacity:1;pointer-events:auto;transform:translateY(0)}
+.edit-bar::before{
+  content:'';position:absolute;top:0;left:16px;right:16px;height:2px;
+  background:var(--vermilion);border-radius:var(--radius-pill);pointer-events:none;
+}
 .edit-bar-main{
   display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0;width:100%;
 }
@@ -440,6 +492,12 @@ body.card-ratio-3x4{--grid-min-col:150px}
 .edit-bar-group{
   display:flex;align-items:center;gap:8px;min-width:0;
   padding:2px 8px;
+}
+@media(min-width:769px){
+  .edit-bar-group + .edit-bar-group{
+    border-left:1px solid var(--border-subtle);
+    padding-left:12px;
+  }
 }
 .edit-bar-group[data-group="date"]{
   background:var(--bg-canvas);
@@ -458,6 +516,7 @@ body.card-ratio-3x4{--grid-min-col:150px}
 }
 .edit-bar.is-empty-selection .edit-bar-group[data-group="date"]{display:none !important}
 .edit-bar.is-empty-selection #editDeleteSelectedBtn{display:none !important}
+.edit-bar.is-empty-selection #editBundleItemsBtn{display:none !important}
 .edit-bar.is-empty-selection #editDeleteRoleBtn{display:none !important}
 body.mode-browse .toolbar{
   box-shadow:none;
@@ -467,7 +526,7 @@ body.mode-browse .toolbar{
   font-size:var(--fs-body);color:var(--vermilion-deep);font-weight:600;flex:0 0 auto;
   height:var(--control-height);min-height:var(--control-height);
   display:inline-flex;align-items:center;
-  padding:0 12px;border-radius:var(--radius);box-sizing:border-box;
+  padding:0 12px;border-radius:var(--radius-pill);box-sizing:border-box;
   background:var(--accent-soft);font-variant-numeric:tabular-nums;
 }
 .edit-bar button,.edit-bar input{
@@ -631,7 +690,18 @@ body.mode-browse .toolbar{
 /* applyLightboxZoom() 给 stage 图片写内联 transform，带 transform 的图片按树序
    参与定位层绘制，会盖住树序靠前的浮动控制钮（看得见但点不到）；这里把全部
    浮动控制钮显式抬到图片之上。 */
-.lightbox .close,.lightbox-download,.lightbox-favorite,.lightbox-delete,.lightbox .nav{z-index:1}
+.lightbox .close,.lightbox-download,.lightbox-favorite,.lightbox-delete,.lightbox-info-toggle,.lightbox .nav{z-index:1}
+.lightbox-info-toggle{
+  position:absolute;top:16px;left:16px;
+  width:44px;height:44px;min-width:44px;min-height:44px;
+  background:rgba(255,255,255,.08);border-color:rgba(255,246,232,.42);color:rgba(255,255,255,.85);
+  font-size:18px;border-radius:var(--radius-pill);
+}
+.lightbox-info-toggle:hover{color:#fff;background:rgba(255,255,255,.16)}
+.lightbox-info-toggle.active{background:var(--accent-soft);border-color:var(--vermilion);color:var(--vermilion)}
+.lightbox-info-toggle:focus-visible{outline:2px solid var(--vermilion);outline-offset:2px}
+.lightbox.caption-hidden .lightbox-caption{display:none}
+.lightbox.caption-hidden .lightbox-stage{max-height:calc(100dvh - 32px)}
 /* Contrast fix (supplement plan S4, background frozen): keep the light ghost
    chip and switch the glyph to the dark ink token — a white X sat on the
    cream disc at ~1.3:1. Hover keeps the shared ghost hover from base.css. */
@@ -701,8 +771,48 @@ body.mode-browse .toolbar{
   font-family:var(--font-display);font-size:var(--fs-body);letter-spacing:.01em;
 }
 .lightbox .info-bar .lightbox-meta-tags{
-  display:inline-flex;flex-wrap:wrap;gap:6px;min-width:0;max-width:100%;
+  display:inline-flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0;max-width:100%;
   white-space:normal;overflow:visible;
+}
+.meta-tag-editable{
+  display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:var(--radius-pill);
+  background:var(--bg-raised);border:1px solid var(--border-subtle);font-size:var(--fs-small);color:var(--text-1);
+}
+.meta-tag-remove{
+  display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;padding:0;
+  border:none;background:transparent;color:var(--text-3);cursor:pointer;border-radius:var(--radius-pill);
+  line-height:1;font-size:12px;
+}
+.meta-tag-remove:hover{
+  color:var(--vermilion);background:var(--accent-soft);
+}
+.lightbox-btn-tag-add{
+  font-size:var(--fs-small);border-radius:var(--radius-pill);padding:2px 8px;height:auto;min-height:22px;
+  color:var(--text-2);border:1px dashed var(--border-strong);
+}
+.lightbox-btn-tag-add:hover{
+  color:var(--text-1);border-color:var(--text-2);background:var(--bg-hover);
+}
+.lightbox-tag-input-wrap{
+  display:inline-flex;align-items:center;
+}
+.lightbox-tag-input{
+  width:130px;height:22px;padding:0 6px;font-size:var(--fs-small);border-radius:var(--radius);
+  background:var(--bg-canvas);border:1px solid var(--border-strong);color:var(--text-1);
+}
+.lightbox-meta-date{
+  display:inline-flex;align-items:center;gap:4px;
+}
+.lightbox-meta-date-btn{
+  font-size:var(--fs-small);border-radius:var(--radius);padding:2px 6px;height:auto;min-height:22px;
+  color:var(--text-2);background:transparent;border:1px solid transparent;
+}
+.lightbox-meta-date-btn:hover{
+  color:var(--text-1);background:var(--bg-hover);border-color:var(--border-subtle);
+}
+.lightbox-date-input{
+  height:22px;padding:0 4px;font-size:var(--fs-small);border-radius:var(--radius);
+  background:var(--bg-canvas);border:1px solid var(--border-strong);color:var(--text-1);
 }
 .lightbox .info-bar .lightbox-meta-status{color:var(--text-3)}
 .lightbox-path-wrap{width:100%;min-width:0}
@@ -873,11 +983,13 @@ body.mode-browse .toolbar{
 .maintenance-advanced-collapsible details[open] summary .ml-runtime-summary-status::before{content:'\25be'}
 .maintenance-advanced-collapsible details:not([open]) .maintenance-advanced-body{display:none}
 .ml-runtime-status{
-  display:grid;gap:6px;padding:10px 12px;border:1px solid var(--border-subtle);
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:6px 16px;
+  padding:10px 12px;border:1px solid var(--border-subtle);
   border-radius:var(--radius);background:var(--bg-canvas);font-size:var(--fs-small);
 }
 .ml-runtime-row{
   display:flex;align-items:baseline;justify-content:space-between;gap:12px;min-width:0;
+  padding:2px 0;
 }
 .ml-runtime-row span{color:var(--text-3);white-space:nowrap}
 .ml-runtime-row b{color:var(--text-1);font-weight:600;text-align:right;min-width:0;
@@ -996,10 +1108,10 @@ body.mode-browse .toolbar{
 .status-card b::before{
   content:'';width:6px;height:6px;border-radius:50%;flex:0 0 6px;background:var(--text-3);
 }
-.status-card.status-ok b::before{background:var(--status-ok)}
-.status-card.status-info b::before{background:var(--status-info)}
-.status-card.status-warn b::before{background:var(--status-warn)}
-.status-card.status-danger b::before{background:var(--status-danger)}
+.status-card.status-ok b::before{background:var(--status-ok);box-shadow:0 0 6px rgba(79,115,85,.45)}
+.status-card.status-info b::before{background:var(--status-info);box-shadow:0 0 6px rgba(45,107,148,.45)}
+.status-card.status-warn b::before{background:var(--status-warn);box-shadow:0 0 6px rgba(184,115,51,.45)}
+.status-card.status-danger b::before{background:var(--status-danger);box-shadow:0 0 6px rgba(192,75,58,.45)}
 .status-card.status-muted b::before{background:var(--text-3)}
 .health-grid b{color:var(--text-1);font-size:var(--fs-body);font-weight:600;letter-spacing:0}
 .health-grid span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-2);font-variant-numeric:tabular-nums}
@@ -1032,10 +1144,11 @@ body.mode-browse .toolbar{
   border-radius:var(--radius);
   background:transparent;
   color:var(--text-1);
-  transition:background var(--motion),border-color var(--motion);
+  transition:background var(--motion),border-color var(--motion),transform var(--motion),box-shadow var(--motion);
 }
 .maintenance-overview-card:hover,.maintenance-overview-card:focus-visible{
   background:var(--bg-overlay);border-color:var(--accent);
+  transform:translateY(-1px);box-shadow:var(--shadow-pop);
   outline:none;
 }
 .maintenance-overview-card-icon{
@@ -1043,7 +1156,10 @@ body.mode-browse .toolbar{
   display:inline-flex;align-items:center;justify-content:center;
   width:32px;height:32px;border-radius:var(--radius);
   background:var(--bg-overlay);color:var(--accent);
-  flex-shrink:0;
+  flex-shrink:0;transition:transform var(--motion),color var(--motion);
+}
+.maintenance-overview-card:hover .maintenance-overview-card-icon{
+  transform:scale(1.06);color:var(--vermilion-deep);
 }
 .maintenance-overview-card b{
   grid-column:2;grid-row:1;
@@ -1099,8 +1215,8 @@ body.mode-browse .toolbar{
 .paths-legend-item{display:inline-flex;align-items:center;gap:6px;min-width:0}
 .paths-legend-item b{font-weight:600;color:var(--text-1)}
 .paths-legend-dot{width:6px;height:6px;border-radius:50%;flex:0 0 6px}
-.paths-legend-dot.ok{background:var(--status-ok)}
-.paths-legend-dot.warn{background:var(--status-warn)}
+.paths-legend-dot.ok{background:var(--status-ok);box-shadow:0 0 6px rgba(79,115,85,.45)}
+.paths-legend-dot.warn{background:var(--status-warn);box-shadow:0 0 6px rgba(184,115,51,.45)}
 .hash-status{
     display:flex;align-items:center;justify-content:space-between;gap:12px;
     margin:0 16px 12px;padding:8px 4px;border:0;border-radius:0;
@@ -1110,6 +1226,7 @@ body.mode-browse .toolbar{
 .hash-status div{display:flex;align-items:center;gap:8px;min-width:0}
 .hash-status div::before{
   content:'';width:6px;height:6px;border-radius:50%;flex:0 0 6px;background:var(--status-info);
+  box-shadow:0 0 6px rgba(45,107,148,.45);
 }
 .maintenance-command-strip{box-shadow:none}
 .hash-label{color:var(--text-1);font-weight:600;white-space:nowrap}
@@ -1424,13 +1541,13 @@ body.mode-browse .toolbar{
   background:var(--bg-canvas);color:var(--text-1);font-size:var(--fs-small);
 }
 .artist-folder-move-form input,.artist-folder-move-form select,
-.archive-field input,.archive-field select,.archive-plan-create input,.archive-plan-target input{
+.archive-field input,.archive-field select,.archive-plan-create input{
   width:100%;min-width:0;height:var(--control-height);min-height:var(--control-height);box-sizing:border-box;
   border:1px solid var(--border-subtle);border-radius:var(--radius);background:var(--bg-canvas);color:var(--text-1);
   padding:0 10px;font:inherit;font-size:var(--fs-small);outline:none;
 }
 .artist-folder-move-form input:focus,.artist-folder-move-form select:focus,
-.archive-field input:focus,.archive-field select:focus,.archive-plan-create input:focus,.archive-plan-target input:focus{
+.archive-field input:focus,.archive-field select:focus,.archive-plan-create input:focus{
   border-color:var(--accent);box-shadow:var(--focus-ring);
 }
 .artist-folder-move-destination{display:flex;gap:6px;min-width:0}
@@ -1439,7 +1556,7 @@ body.mode-browse .toolbar{
 .artist-folder-move-destination button{flex:0 0 auto;height:var(--control-height);min-height:var(--control-height);padding:0 var(--control-padding-x);white-space:nowrap}
 .artist-folder-move-actions{display:flex;gap:8px;align-items:center}
 .artist-folder-move-actions button,.archive-rule-actions button,.archive-plan-actions button,
-.archive-plan-target button,.archive-plan-row-actions button{
+.archive-plan-row-actions button{
   height:var(--control-height);min-height:var(--control-height);padding:0 var(--control-padding-x);
   font-size:var(--fs-small);box-sizing:border-box;white-space:nowrap;
 }
@@ -1469,10 +1586,13 @@ body.mode-browse .toolbar{
   display:inline-flex;align-items:center;padding:4px 8px;border:1px solid var(--border-subtle);
   border-radius:var(--radius);background:var(--bg-raised);color:var(--text-2);
   font-size:var(--fs-small);font-family:var(--font-mono);letter-spacing:0;
-  cursor:pointer;user-select:none;transition:border-color var(--motion),color var(--motion);
+  cursor:pointer;user-select:none;transition:border-color var(--motion),color var(--motion),background var(--motion),transform var(--motion);
 }
 .archive-token-strip code:hover{
-  border-color:var(--accent);color:var(--text-1);
+  border-color:var(--accent);color:var(--text-1);background:var(--bg-overlay);
+}
+.archive-token-strip code:active{
+  transform:scale(0.95);
 }
 .archive-plan-head{
   display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;
@@ -1507,11 +1627,8 @@ body.mode-browse .toolbar{
 .archive-plan-status.executed{color:var(--text-3);background:var(--bg-raised)}
 .archive-plan-status.reverted{color:var(--moss);background:rgba(79,115,85,.14)}
 .archive-plan-status.inconsistent_tags{color:var(--ochre-deep);background:rgba(197,140,44,.16)}
-.archive-plan-status.needs_date,.archive-plan-status.date_conflict{color:var(--ochre-deep);background:rgba(197,140,44,.16)}
+.archive-plan-status.needs_date,.archive-plan-status.date_conflict,.archive-plan-status.needs_tags{color:var(--ochre-deep);background:rgba(197,140,44,.16)}
 .archive-plan-status.manual_review,.archive-plan-status.blocked,.archive-plan-status.error{color:var(--danger);background:rgba(154,42,42,.1)}
-.archive-plan-target{display:flex;align-items:center;gap:8px;color:var(--text-3);font-size:var(--fs-small);min-width:0}
-.archive-plan-target span{color:var(--text-3);font-weight:400;font-size:var(--fs-small);letter-spacing:0;flex-shrink:0}
-.archive-target-preview{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-2);font-size:var(--fs-small);font-weight:400;padding:4px 8px;border-radius:var(--radius);background:var(--bg-raised);font-family:var(--font-mono)}
 .archive-plan-preview{
   display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:var(--radius);
   font-size:var(--fs-small);line-height:1.4;color:var(--ok);background:rgba(79,115,85,.12);
@@ -2076,6 +2193,8 @@ body.mode-browse .toolbar{
 }
 .toast.success::before{background:var(--ok)}
 .toast.error::before{background:var(--danger)}
+.toast.warn::before{background:var(--warn)}
+.toast.info::before{background:var(--status-info)}
 .toast.toast-leaving{opacity:0;transform:translate(var(--toast-tx),8px);transition:opacity var(--motion),transform var(--motion)}
 @keyframes slideIn{from{transform:translate(var(--toast-tx),8px);opacity:0}to{transform:translate(var(--toast-tx),0);opacity:1}}
 /* A wrapped multi-row edit-bar is ~154px tall (the grid reserves that padding),
@@ -2114,6 +2233,7 @@ body.mode-browse .toolbar{
   .character-library-search input{height:44px;min-height:44px}
   header input,.search-control input,.item-filter-field input,.artist-links-controls input,
   .character-library-search input,.artist-folder-move-form input,.archive-field input,
+  .lightbox-tag-input,.lightbox-date-input,
   .download-subscription-mode select,
   .organize-artist-select{
     font-size:16px;
@@ -2207,7 +2327,7 @@ body.mode-browse .toolbar{
   #grid.justified{row-gap:12px}
   .grid,.grid.compact,.grid.list{grid-template-columns:repeat(var(--mobile-grid-columns,2),minmax(0,1fr));gap:8px}
   .card .info{font-size:var(--fs-small)}
-  .card .info .role{font-size:var(--fs-small)}
+  .card .info .file-name{font-size:var(--fs-small)}
   /* Always-visible card actions hug the card's top-right corner: mobile never
      shows the selection check (display:none below), and fixed 1fr slots can be
      as narrow as ~96px at 320px/3 columns, so the 44px desktop check offset
@@ -2247,11 +2367,15 @@ body.mode-browse .toolbar{
   .lightbox img,.lightbox video{max-width:100%;max-height:100%}
   .lightbox .nav{font-size:30px;padding:14px}
   /* Icon controls are 38px wide on mobile: step by control + gap so the boxes
-     never overlap at 390px or 320px, and keep one shared top edge. */
+     never overlap at 390px or 320px, and keep one shared top edge. Re-assert
+     absolute: the .btn tap-target rule earlier in this query demotes these
+     single-class selectors to relative, which drops them into flow. */
   .lightbox .close{top:12px;right:12px}
-  .lightbox-download{top:12px;right:calc(12px + var(--control-height) + 8px)}
-  .lightbox-favorite{top:12px;right:calc(12px + 2 * (var(--control-height) + 8px))}
-  .lightbox-delete{top:12px;right:calc(12px + 3 * (var(--control-height) + 8px))}
+  .lightbox-download{position:absolute;top:12px;right:calc(12px + var(--control-height) + 8px)}
+  .lightbox-favorite{position:absolute;top:12px;right:calc(12px + 2 * (var(--control-height) + 8px))}
+  .lightbox-delete{position:absolute;top:12px;right:calc(12px + 3 * (var(--control-height) + 8px))}
+  .lightbox-info-toggle{position:absolute;top:12px;left:12px;width:var(--control-height);height:var(--control-height);min-width:var(--control-height);min-height:var(--control-height)}
+  .lightbox.caption-hidden .lightbox-stage{max-height:calc(100dvh - 32px)}
   .lightbox-caption{padding:8px 12px calc(10px + env(safe-area-inset-bottom));gap:6px}
   .lightbox .info-bar{
     font-size:var(--fs-small);gap:5px 10px;align-items:flex-start;
@@ -2393,9 +2517,7 @@ body.mode-browse .toolbar{
   .archive-plan-create button{flex:1 1 100%;min-width:0}
   .archive-preview-summary{padding-left:12px;padding-right:12px}
   .archive-plan-list{padding:10px 12px 12px}
-  .archive-plan-target{grid-template-columns:1fr}
-  .archive-plan-target span{display:none}
-  .archive-plan-target button{width:100%}
+  .archive-plan-diff .diff-tag{display:none}
   .archive-plan-row-actions{align-items:flex-start;flex-direction:column}
   .archive-plan-row-controls{width:100%}
   .archive-plan-row-controls button{flex:1 1 96px;min-width:0}
@@ -2476,9 +2598,10 @@ body.mode-browse .toolbar{
   display:inline-flex;align-items:center;padding:4px 8px;border:1px solid var(--border-subtle);
   border-radius:var(--radius);background:var(--bg-raised);color:var(--text-2);
   font-size:var(--fs-small);font-family:var(--font-mono);letter-spacing:0;
-  cursor:pointer;user-select:none;transition:border-color var(--motion),color var(--motion);
+  cursor:pointer;user-select:none;transition:border-color var(--motion),color var(--motion),background var(--motion),transform var(--motion);
 }
-.download-token-strip code:hover{border-color:var(--accent);color:var(--text-1)}
+.download-token-strip code:hover{border-color:var(--accent);color:var(--text-1);background:var(--bg-overlay)}
+.download-token-strip code:active{transform:scale(0.95)}
 .archive-template-guide,.download-template-guide{display:grid;gap:6px;padding:0 0 10px;color:var(--text-3);font-size:var(--fs-small);line-height:1.5}
 .download-template-guide{padding:0 16px 14px}
 .archive-template-guide code,.download-template-guide code{font-family:var(--font-mono);color:var(--text-2);background:var(--bg-raised);padding:1px 4px;border-radius:var(--radius-sm)}
@@ -2546,24 +2669,45 @@ body.mode-browse .toolbar{
 .download-subscription-mode select:disabled{opacity:.45;cursor:not-allowed;color:var(--text-2)}
 .download-subscription-mode select:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 /* 订阅覆盖率日历：53 周 × 7 天，颜色用面板自己的朱砂系，深浅代表还缺多少。
-   每周列固定 10px + 3px 间距，月份标题按列数分配 flex 权重，因此与网格对齐。 */
-.download-calendar{display:flex;flex-direction:column;gap:4px;padding:6px 0 2px;max-width:100%}
+   月份标题行与周网格共用同一 53 列固定模板，标题恒对齐自己的列组；
+   窄卡不压缩周列：周网格保持固定尺寸，在自身区域内横向滚动。 */
+.download-calendar{display:flex;flex-direction:column;gap:4px;padding:6px 0 2px;max-width:100%;container-type:inline-size;min-width:0}
 /* Gutter + weeks sit in one grid: the weekday column and the week columns both
    occupy row 2 with identical row sizing, so the labels cannot drift out of
    line with the days. The month captions span row 1 over the weeks only. */
-/* overflow-y:hidden is deliberate: `overflow-x:auto` alone silently computes
-   overflow-y to auto as well, and the resulting vertical scrollbar sat on top of
-   the right-hand columns. The grid only ever scrolls sideways, and only when the
-   card is too narrow for 53 weeks. */
+/* The months row and the weeks grid share ONE fixed 53-column template
+   (repeat(53,10px) with 3px gaps — 686px natural width), so every caption sits
+   over its own column group by construction. A narrower card scrolls the weeks
+   grid sideways inside its own track (min-width:686px, overflow-x:auto) instead
+   of compressing the columns; rows stay 10px so the gutter keeps its rhythm. */
 .download-calendar-grid-wrap{
-  display:grid;grid-template-columns:auto max-content;
-  justify-content:start;width:max-content;max-width:100%;
+  display:grid;grid-template-columns:auto minmax(0,1fr);
+  width:100%;max-width:100%;
   grid-template-rows:auto auto;column-gap:6px;row-gap:4px;
-  overflow-x:auto;overflow-y:hidden;
-  scrollbar-width:thin;
+  overflow:hidden;min-width:0;
 }
-.download-calendar-months{grid-column:2;grid-row:1;display:flex;color:var(--text-3);font-size:var(--fs-small);line-height:1.2}
+.download-calendar-months{
+  grid-column:2;grid-row:1;display:grid;
+  grid-template-columns:repeat(53,10px);gap:3px;
+  min-width:0;width:max-content;color:var(--text-3);font-size:var(--fs-small);line-height:1.2;overflow:hidden;
+}
 .download-calendar-month{min-width:0;overflow:visible;white-space:nowrap}
+/* The tail month is a partial column group (1-3 weeks), usually narrower than
+   its caption; left-aligned the text would spill past the grid edge and get
+   cut. Shrink-wrapping the last caption to its text and pinning it to the
+   right edge keeps it whole — the spill falls into its own group's empty
+   space instead. (text-align does nothing here: a nowrap line box grows to
+   the text and aligning inside it moves nothing.) */
+.download-calendar-month:last-child{justify-self:end}
+/* When the calendar itself is narrow (container width, not viewport width) the
+   month slots become narrower than their captions and the labels run together;
+   showing every other — then every third — caption keeps them legible and over
+   their own column groups at full-year density. */
+@container (max-width:520px){.download-calendar-month:nth-child(even){visibility:hidden}}
+@container (max-width:280px){
+  .download-calendar-month{visibility:hidden}
+  .download-calendar-month:nth-child(3n+1){visibility:visible}
+}
 .download-calendar-weekdays{
   grid-column:1;grid-row:2;display:grid;grid-template-rows:repeat(7,10px);gap:3px;
   color:var(--text-3);font-size:var(--fs-micro);
@@ -2572,8 +2716,12 @@ body.mode-browse .toolbar{
   display:flex;align-items:center;justify-content:flex-end;
   height:10px;line-height:1;overflow:visible;
 }
-.download-calendar-grid{grid-column:2;grid-row:2;display:flex;gap:3px}
-.download-calendar-week{display:grid;grid-template-rows:repeat(7,10px);gap:3px;flex:0 0 10px}
+.download-calendar-grid{
+  grid-column:2;grid-row:2;display:grid;
+  grid-template-columns:repeat(53,10px);gap:3px;
+  width:max-content;min-width:686px;overflow-x:auto;overflow-y:hidden;padding-bottom:2px;
+}
+.download-calendar-week{display:grid;grid-template-rows:repeat(7,10px);gap:3px;min-width:10px;width:10px}
 /* Cells and legend swatches share one base. --bg-overlay keeps the empty grid
    visible against the card (--bg-raised), and the 1px inset rule gives the empty
    cells the same edge definition the filled ones get from their colour: without
@@ -2581,21 +2729,22 @@ body.mode-browse .toolbar{
    is what "the dots are different sizes" was. */
 .download-calendar-cell,
 .download-calendar-key i{
-  position:relative;display:block;width:10px;height:10px;
+  position:relative;display:block;height:10px;
   border-radius:var(--radius-sm);background:var(--bg-overlay);
   box-shadow:inset 0 0 0 1px var(--border-subtle);
 }
+.download-calendar-key i{width:10px}
 .download-calendar-cell::after,
 .download-calendar-key i::after{
   content:'';position:absolute;inset:0;border-radius:inherit;
   background:var(--accent);opacity:0;
 }
 /* The ramp stops at .42 rather than fading to a near-invisible wash. Every cell
-   is an identical 10px box (measured: 371 cells, all 10x10 at whole-pixel
-   offsets), but a low-alpha fill has low edge contrast and so READS as a
-   smaller dot than a saturated one — four uneven-looking dot sizes instead of a
-   colour ramp. Keeping the lightest level at .42 gives every filled day a crisp
-   edge, so only the colour varies. */
+   fills its column (all 10px rows; width follows the week column), but a
+   low-alpha fill has low edge contrast and so READS as a smaller dot than a
+   saturated one — four uneven-looking dot sizes instead of a colour ramp.
+   Keeping the lightest level at .42 gives every filled day a crisp edge, so
+   only the colour varies. */
 .download-calendar-cell[data-download-calendar-level="1"]::after,
 .download-calendar-key i[data-download-calendar-level="1"]::after{opacity:.42}
 .download-calendar-cell[data-download-calendar-level="2"]::after,
@@ -2732,11 +2881,12 @@ body.mode-browse .toolbar{
   .download-subscription-form{grid-template-columns:1fr}
   .download-subscription-item{flex-direction:column}
   /* Stacking the card left `align-items:flex-start` sizing the body to its
-     content, and the 53-week calendar cannot shrink below ~700px — so the whole
-     card grew past the viewport and everything to its right (including the
+     content, and the 53-week calendar is wide by nature — so the whole card
+     grew past the viewport and everything to its right (including the
      per-post buttons) was pushed off-screen. Pinning the body to the row width
-     and giving its single grid track a zero minimum hands the overflow back to
-     the calendar wrapper, which already scrolls sideways on purpose. */
+     and giving its single grid track a zero minimum lets the calendar wrapper
+     fit the row while the weeks grid scrolls inside it instead of pushing the
+     card wider than the viewport. */
   .download-subscription-main{width:100%;grid-template-columns:minmax(0,1fr)}
   .download-subscription-item-actions{width:100%;justify-content:flex-end}
   .download-subscription-path{white-space:normal;overflow-wrap:anywhere}
@@ -2761,10 +2911,9 @@ body.mode-browse .toolbar{
 .netdisk-number-field{flex:0 1 180px}
 .netdisk-actions{display:flex;gap:8px;flex-wrap:wrap;padding:8px 16px 12px}
 .netdisk-status{font-weight:600}
-.netdisk-status[data-netdisk-state="已连接"]{color:var(--ok)}
-.netdisk-status[data-netdisk-state="设备离线"],
-.netdisk-status[data-netdisk-state="凭据失效"],
-.netdisk-status[data-netdisk-state="路径不可用"]{color:var(--warn)}
+.netdisk-status[data-netdisk-state="ok"]{color:var(--ok)}
+.netdisk-status[data-netdisk-state="warn"],
+.netdisk-status[data-netdisk-state="offline"]{color:var(--warn)}
 .netdisk-job-head,
 .download-subscription-head{
   display:flex;align-items:center;justify-content:space-between;gap:8px;
@@ -2819,4 +2968,58 @@ body.mode-browse .toolbar{
      this reset the 280px stretches the label block and leaves a hole between
      the label text and the input. */
   .netdisk-dispatch-input-wrap{flex:0 0 auto}
+}
+
+/* Archive Triage & Workbench Diff Enhancements */
+.archive-triage-toggle {
+  display: inline-flex;
+  align-items: center;
+}
+.archive-plan-diff {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+  padding: 8px 10px;
+  background: var(--bg-raised);
+  border-radius: var(--radius);
+  font-size: var(--fs-small);
+  min-width: 0;
+  overflow: hidden;
+}
+.archive-diff-source,
+.archive-diff-target {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+.archive-diff-source code,
+.archive-diff-target code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+  background: var(--bg-canvas);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+}
+.archive-diff-target code {
+  color: var(--brand, var(--text-1));
+  font-weight: 500;
+}
+.diff-tag {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--border-subtle);
+  color: var(--text-3);
+}
+.archive-diff-arrow {
+  flex: 0 0 auto;
+  color: var(--text-3);
+  font-size: var(--fs-small);
 }

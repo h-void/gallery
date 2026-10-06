@@ -201,7 +201,7 @@ function characterLibrarySummaryText(library) {
   const scope = '全部画师';
   const parts = [
     `范围 ${scope}`,
-    `${totals.tags || (summary.tags || []).length || 0} 个单角色标签`,
+    `${totals.tags || (summary.tags || []).length || 0} 个可导入角色`,
     `${totals.characters || (summary.characters || []).length || 0} 个已建角色`,
     `${totals.references || 0} 张参考图`,
   ];
@@ -303,8 +303,10 @@ export function renderCharacterLibrary() {
   const library = state.characterLibrary;
   if (!library) {
     summaryEl.textContent = state.characterLibraryLoading ? '角色库读取中' : '角色特征库未加载';
-    if (tagList) tagList.innerHTML = '<div class="character-library-empty">暂无可导入的单角色标签</div>';
-    characterList.innerHTML = '<div class="character-library-empty">暂无已建角色</div>';
+    if (tagList) tagList.innerHTML = '<div class="character-library-empty">暂无可导入的角色</div>';
+    characterList.innerHTML = state.characterLibraryLoading
+      ? '<div class="character-library-empty">角色库读取中</div>'
+      : '<div class="character-library-empty">暂无已建角色</div>';
     referenceList.innerHTML = '<div class="character-library-empty">请先在「已建角色」列表中选择角色</div>';
     applyCharacterLibraryMobileView();
     return;
@@ -378,14 +380,14 @@ export function renderCharacterLibrary() {
       <div class="character-tag-row">
         <div class="character-tag-main">
           <b>${escHtml(tagName)}</b>
-          <span>${escHtml(joinUiMeta([`${singleTagCount} 张单标签图`, sourceLabel]))}</span>
+          <span>${escHtml(joinUiMeta([`${singleTagCount} 张单角色图`, sourceLabel]))}</span>
         </div>
         <div class="character-tag-actions">
           ${stateBadge}
         </div>
       </div>
     `;
-  }).join('') : `<div class="character-library-empty">${query ? `未找到匹配的标签 "${escHtml(query)}"` : '暂无可导入标签'}</div>`;
+  }).join('') : `<div class="character-library-empty">${query ? `未找到匹配的角色 "${escHtml(query)}"` : '暂无可导入角色'}</div>`;
 
   const characterButtons = characters.length ? characters.map(character => {
     const active = selectedCharacterId && Number(character.id) === Number(selectedCharacterId);
@@ -408,13 +410,13 @@ export function renderCharacterLibrary() {
         </div>
       </div>
     `;
-  }).join('') : `<div class="character-library-empty">${query ? `未找到匹配的角色 "${escHtml(query)}"` : '暂无角色<button class="btn character-library-empty-action" type="button" data-character-create-trigger>新建角色</button>'}</div>`;
+  }).join('') : `<div class="character-library-empty">${query ? `未找到匹配的角色 "${escHtml(query)}"` : '暂无角色'}<button class="btn character-library-empty-action" type="button" data-character-import-trigger>导入角色</button><button class="btn character-library-empty-action" type="button" data-character-create-trigger>新建角色</button></div>`;
   const referenceCards = references.length ? references.map(reference => {
-    const pathText = reference.display_file_path || reference.file_path || reference.file_name || '未绑定文件';
+    const pathText = reference.file_path || reference.file_name || '未绑定文件';
     const previewUrl = reference.has_image
       ? `/api/characters/${reference.character_id}/references/${reference.id}/image`
       : (reference.file_path ? API.previewUrl(reference.file_path, characterReferencePreviewVersion(reference), 256) : '');
-    const SOURCE_LABELS = {tag_single: '来自标签', manual: '手动添加'};
+    const SOURCE_LABELS = {tag_single: '来自单角色作品', manual: '手动添加'};
     const MEDIA_LABELS = {image: '图片', video: '视频', text: '文本'};
     const sourceLabel = SOURCE_LABELS[reference.source_type] || reference.source_type || '未知来源';
     const mediaLabel = MEDIA_LABELS[reference.media_type] || reference.media_type || '';
@@ -438,12 +440,12 @@ export function renderCharacterLibrary() {
             <button class="btn btn-danger character-reference-delete" type="button" data-character-reference-delete="${reference.id}" data-character-id="${reference.character_id}">${buttonIcon('trash')}删除</button>
           </div>
           <div class="character-reference-path">
-            <code title="${escHtml(reference.real_file_path || reference.file_path || '')}">${escHtml(pathText)}</code>
+            <code title="${escHtml(reference.file_path || '')}">${escHtml(pathText)}</code>
           </div>
         </div>
       </div>
     `;
-  }).join('') : '<div class="character-library-empty">请选择角色后查看参考图</div>';
+  }).join('') : `<div class="character-library-empty">${selectedCharacterId ? '该角色暂无参考图' : '请选择角色后查看参考图'}</div>`;
 
   if (tagList) tagList.innerHTML = jobMarkup + tagButtons;
   const jobContainer = $('#characterImportJobContainer');
@@ -462,6 +464,11 @@ export function renderCharacterLibrary() {
 
   const importScopeSelect = $('#characterImportScopeSelect');
   if (importScopeSelect) {
+    const artistOpt = importScopeSelect.querySelector ? importScopeSelect.querySelector('option[value="artist"]') : null;
+    if (artistOpt) artistOpt.disabled = !currentArtistId;
+    if (!currentArtistId && importScopeSelect.value !== 'all') {
+      importScopeSelect.value = 'all';
+    }
     importScopeSelect.disabled = importCurrentDisabled && importAllDisabled;
     importScopeSelect.title = currentArtistId ? `当前画师：${state.currentArtist.name}` : '先选择画师';
   }
@@ -471,7 +478,7 @@ export function renderCharacterLibrary() {
     importBtn.disabled = scope === 'artist' ? importCurrentDisabled : importAllDisabled;
     importBtn.title = scope === 'artist'
       ? (currentArtistId ? `导入当前画师 ${state.currentArtist.name}` : '先选择画师')
-      : '导入全库中符合条件的标签';
+      : '导入全库中符合条件的角色';
   }
   const rebuildBtn = $('#characterRebuildIndexBtn');
   if (rebuildBtn) {
@@ -532,12 +539,15 @@ async function finishCharacterImportJob(result) {
   if (!result || result.status === 'idle') return;
   if (result.job_id && state.characterImportFinishedJobId === result.job_id) return;
   if (result.job_id) state.characterImportFinishedJobId = result.job_id;
+  state.characterSuggestionCache?.clear();
   if (Number(result.added || result.added_references || 0) === 0 && Number(result.failed || 0) > 0) {
     toast(characterImportFailureText(result), 'error');
   } else if (result.status === 'cancelled') {
     toast('角色库导入已取消', 'error');
+  } else if (result.status === 'failed') {
+    toast(`部分导入失败：成功 ${result.added || result.added_references || 0}，失败 ${result.failed || 0}`, 'error');
   } else {
-    toast(`已导入 ${result.added || result.added_references || 0} 张参考图`, result.status === 'failed' ? 'error' : 'success');
+    toast(`已导入 ${result.added || result.added_references || 0} 张参考图`, 'success');
   }
   const importedCharacterId = characterIdFromImportResult(result);
   await loadCharacterLibrary({characterId: importedCharacterId || state.characterLibrarySelectedCharacterId});
@@ -558,7 +568,7 @@ export async function importCharacterLibraryReferences(payload) {
     }
     startCharacterImportPolling();
   } catch (e) {
-    toast('导入角色库失败：' + (e.message || e), 'error');
+    toast('导入角色失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('character-library-import', busyScope, false);
   }
@@ -584,6 +594,7 @@ export async function deleteCharacterReference(characterId, referenceId) {
   setActionBusy('character-library-delete', `${characterId}:${referenceId}`, true);
   try {
     await API.del(`/api/characters/${characterId}/references/${referenceId}`);
+    state.characterSuggestionCache?.clear();
     toast('参考图已删除', 'success');
     await loadCharacterLibrary({characterId});
   } catch (e) {
@@ -604,6 +615,7 @@ export async function uploadCharacterReference(characterId, file) {
   renderCharacterLibrary();
   try {
     await API.postFile(`/api/characters/${characterId}/references/upload`, file);
+    state.characterSuggestionCache?.clear();
     toast('参考图已添加', 'success');
     await loadCharacterLibrary({characterId});
   } catch (e) {
@@ -621,6 +633,7 @@ export async function deleteCharacter(characterId) {
   setActionBusy('character-library-character-delete', characterId, true);
   try {
     await API.del(`/api/characters/${characterId}`);
+    state.characterSuggestionCache?.clear();
     toast('角色已删除', 'success');
     const nextCharacterId = Number(state.characterLibrarySelectedCharacterId) === Number(characterId) ? null : state.characterLibrarySelectedCharacterId;
     await loadCharacterLibrary({characterId: nextCharacterId});
@@ -641,7 +654,11 @@ export async function rebuildCharacterIndex() {
   setActionBusy('character-library-rebuild', '', true);
   try {
     const result = await API.post('/api/admin/rebuild-character-index', undefined, {timeoutMs: 600000});
-    const text = result.ok ? `角色参考已刷新：${result.vector_count || 0} 条` : (result.reason || '刷新失败');
+    state.characterSuggestionCache?.clear();
+    // The Rust runtime reports reference_count; the legacy runtime reports
+    // vector_count. Whichever is present is the number of linked references.
+    const referenceTotal = Number(result.reference_count ?? result.vector_count ?? 0);
+    const text = result.ok ? `角色参考已刷新：${referenceTotal} 条` : (result.reason || '刷新失败');
     toast(text, result.ok ? 'success' : 'error');
     await loadCharacterLibrary({characterId: state.characterLibrarySelectedCharacterId});
   } catch (e) {

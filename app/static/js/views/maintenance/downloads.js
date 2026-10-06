@@ -10,7 +10,7 @@ import { toast, logUiAction } from '../../logging.js';
 import { applyMode } from '../../events.js';
 import { loadArtists, selectArtist } from '../../router.js';
 import { selectFolder } from '../sidebar.js';
-import { ensureNetdiskDispatchReady } from './netdisk.js';
+import { ensureNetdiskDispatchReady, confirmNetdiskForceRetry } from './netdisk.js';
 
 // Follow the sync round until it finishes. The backend runs it on a background
 // task, so the panel polls instead of holding one long request open.
@@ -709,7 +709,7 @@ function downloadCalendarHtml(coverage, subscriptionId) {
   if (!calendar.activeDays) return '';
   const openDay = downloadOpenDayKey(subscriptionId);
   const months = calendar.months
-    .map(month => `<span class="download-calendar-month" style="flex:${month.columns}">${escHtml(month.label)}</span>`)
+    .map(month => `<span class="download-calendar-month" style="grid-column:span ${month.columns}">${escHtml(month.label)}</span>`)
     .join('');
   const weeks = calendar.weeks.map(cells => `<div class="download-calendar-week">${cells.map(cell => {
     if (!cell) return '<span class="download-calendar-cell is-future"></span>';
@@ -921,10 +921,15 @@ export async function loadDownloadDayPosts(options = {}) {
   const open = state.downloadOpenDay;
   if (!open) return;
   const cursor = options.cursor ?? null;
+  // One in-flight read per open day: a slow response for a previous day must
+  // not overwrite the list of the day now on screen.
+  const request = {subscriptionId: open.subscriptionId, day: open.day};
+  state.downloadDayPostsRequest = request;
   try {
     const query = `/api/pawchive/subscriptions/${open.subscriptionId}/posts?day=${encodeURIComponent(open.day)}&limit=50`
       + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
     const result = await API.get(query);
+    if (state.downloadDayPostsRequest !== request) return;
     const posts = Array.isArray(result?.posts) ? result.posts : [];
     const previous = cursor ? (state.downloadDayPosts?.posts || []) : [];
     state.downloadDayPosts = {
@@ -936,6 +941,7 @@ export async function loadDownloadDayPosts(options = {}) {
     };
   } catch (error) {
     if (isAbortError(error)) return;
+    if (state.downloadDayPostsRequest !== request) return;
     state.downloadDayPosts = {
       ...(state.downloadDayPosts || {}),
       loading: false,
@@ -2103,6 +2109,8 @@ export function scheduleDownloadWorksSearch(value) {
   state.downloadAllSearchTimer = setTimeout(() => {
     state.downloadAllSearchTimer = null;
     setDownloadWorksFilter({search});
+    clearDownloadWorksSelection();
+    renderDownloadAllWorks();
     // The typed value is already in state; only the read is deferred.
     loadDownloadAllWorks().catch(() => {});
   }, DOWNLOAD_WORKS_SEARCH_DEBOUNCE_MS);
@@ -2212,26 +2220,31 @@ export async function jumpToDownloadWorkFolder(artistId, day, title = '') {
 export async function deliverPostToNetdisk(postId, options = {}) {
   const id = Number(postId);
   if (!Number.isFinite(id)) return null;
+  const busyKey = String(id);
+  if (!options.force && isActionBusy('netdisk-deliver', busyKey)) return null;
   if (!(await ensureNetdiskDispatchReady())) return null;
+  setActionBusy('netdisk-deliver', busyKey, true);
   try {
     const payload = { post_id: id, ...options };
     const res = await API.postJson('/api/netdisk/jobs', payload);
-    if (res.auto_start) {
+    if (res.auto_start && res.submitted === false && res.submit_error) {
+      toast('已登记网盘任务，但自动提交失败：' + res.submit_error, 'warn');
+    } else if (res.auto_start) {
       toast('已投递到 JDownloader，任务将自动开始', 'info');
     } else {
       toast('已投递到 JDownloader 收集器，请在网盘面板或链接收集器中确认开始', 'info');
     }
     return res;
   } catch (err) {
-    if (err.status === 409 || err.message?.includes('409') || err.message?.includes('已有活跃投递任务') || err.message?.includes('进行中')) {
-      const retry = window.confirm('该作品已有投递任务正在进行中，是否重新投递？');
-      if (retry) {
-        return deliverPostToNetdisk(id, { ...options, force: true });
-      }
-      return null;
-    }
+    const retryResult = confirmNetdiskForceRetry(err, () => {
+      setActionBusy('netdisk-deliver', busyKey, false);
+      return deliverPostToNetdisk(id, { ...options, force: true });
+    });
+    if (retryResult !== undefined) return retryResult;
     toast('投递网盘失败：' + (err.message || err), 'error');
     return null;
+  } finally {
+    setActionBusy('netdisk-deliver', busyKey, false);
   }
 }
 
@@ -2339,7 +2352,14 @@ export function renderDownloadAllWorks() {
 // and the backend's answer says when the filter held more than one request may
 // freeze — that is reported rather than passed over, because a snapshot holding a
 // silent prefix of the filter is a request the user cannot verify.
-export async function downloadWorksSelection(frozen) {
+function resolveNetdiskBatchDeliveredCount(job, fallbackTotal = 0) {
+  const submitted = Number(job?.submitted_count || 0);
+  if (submitted > 0) return submitted;
+  if (Array.isArray(job?.job_ids)) return job.job_ids.length;
+  return Number(fallbackTotal || 0);
+}
+
+export async function downloadWorksSelection(frozen, options = {}) {
   if (isActionBusy('downloadSelection')) return null;
   if (frozen === undefined) {
     toast('先选中要下载的作品', 'warn');
@@ -2378,27 +2398,37 @@ export async function downloadWorksSelection(frozen) {
     // Case 1: Pure external selection (no direct files)
     if (!direct && externalPosts.length > 0) {
       if (explicit && explicit.length === 1) {
-        return await deliverPostToNetdisk(explicit[0]);
+        const singleRes = await deliverPostToNetdisk(explicit[0]);
+        if (singleRes) {
+          clearDownloadWorksSelection();
+          await loadDownloadAllWorks();
+        }
+        return singleRes;
       }
       const ok = window.confirm(`已选择 ${externalPosts.length} 篇作品（均无直连文件），将投递至网盘下载器。是否继续？`);
       if (!ok) return null;
       if (!(await ensureNetdiskDispatchReady())) return null;
       const job = await API.postJson('/api/netdisk/jobs', { post_ids: externalPosts });
-      const submitted = Number(job?.submitted_count ?? (job?.job_ids?.length || externalPosts.length));
-      toast(`已投递网盘：${submitted} 篇作品`, 'info');
+      const delivered = resolveNetdiskBatchDeliveredCount(job, externalPosts.length);
+      const skippedCount = Array.isArray(job?.skipped) ? job.skipped.length : 0;
+      if (delivered === 0 && skippedCount > 0) {
+        toast(`所选 ${skippedCount} 篇作品已有进行中网盘任务，已跳过`, 'warn');
+      } else {
+        const skippedSuffix = skippedCount > 0 ? `（跳过 ${skippedCount} 篇）` : '';
+        toast(`已投递网盘：${delivered} 篇作品${skippedSuffix}`, 'info');
+      }
       clearDownloadWorksSelection();
       await loadDownloadAllWorks();
       return job;
     }
 
     // Case 2: Mixed selection (has direct files AND external posts)
-    if (direct > 0 && externalPosts.length > 0) {
+    if (!options.directOnly && direct > 0 && externalPosts.length > 0) {
       const total = explicit ? explicit.length : Number(preview?.posts || 0);
       const directPosts = preview?.plans ? preview.plans.filter(p => p.resources && p.resources.length > 0).length : (total - externalPosts.length);
       const confirmMsg = `已选择 ${total ? total + ' 篇' : ''}作品：${directPosts > 0 ? directPosts + ' 篇' : ''}将下载直连文件（共 ${direct} 个），${externalPosts.length} 篇将投递至网盘下载器。是否继续？`;
       const ok = window.confirm(confirmMsg);
       if (!ok) return null;
-      if (!(await ensureNetdiskDispatchReady())) return null;
 
       let attempt = null;
       try {
@@ -2412,15 +2442,17 @@ export async function downloadWorksSelection(frozen) {
       }
 
       let job = null;
-      try {
-        job = await API.postJson('/api/netdisk/jobs', { post_ids: externalPosts });
-      } catch (e) {
-        toast('投递网盘失败：' + (e.message || e), 'error');
+      if (await ensureNetdiskDispatchReady()) {
+        try {
+          job = await API.postJson('/api/netdisk/jobs', { post_ids: externalPosts });
+        } catch (e) {
+          toast('投递网盘失败：' + (e.message || e), 'error');
+        }
       }
 
       const parts = [];
       if (attempt) parts.push(`直连下载 ${Number(attempt.posts || 0)} 篇（${Number(attempt.resources || 0)} 个文件）`);
-      if (job) parts.push(`网盘投递 ${Number(job.submitted_count ?? (job.job_ids?.length || externalPosts.length))} 篇`);
+      if (job) parts.push(`网盘投递 ${resolveNetdiskBatchDeliveredCount(job, externalPosts.length)} 篇`);
       if (parts.length) {
         toast(`已发起：${parts.join('，')}`, 'info');
       }
@@ -2429,7 +2461,7 @@ export async function downloadWorksSelection(frozen) {
       return { attempt, job };
     }
 
-    // Case 3: Pure direct files
+    // Case 3: Pure direct files (or single-row direct download on a mixed post)
     const selection = await API.postJson('/api/pawchive/selections', {request_id: requestId, ...works});
     const attempt = await API.postJson('/api/pawchive/attempts', {
       selection_id: selection.selection_id,
@@ -2467,5 +2499,79 @@ export async function downloadWorksSelection(frozen) {
 export async function downloadWorksPost(postId) {
   const id = Number(postId);
   if (!Number.isFinite(id)) return null;
-  return downloadWorksSelection([id]);
+  return downloadWorksSelection([id], {directOnly: true});
 }
+
+export async function downloadWorksNetdiskSelection(frozen) {
+  if (isActionBusy('downloadSelection') || isActionBusy('downloadNetdiskSelection')) return null;
+  if (frozen === undefined) {
+    toast('先选中要投递的作品', 'warn');
+    return null;
+  }
+  const explicit = Array.isArray(frozen) ? frozen : null;
+  if (explicit && !explicit.length) {
+    toast('先选中要投递的作品', 'warn');
+    return null;
+  }
+  if (!explicit && !downloadWorksFilterActive()) {
+    toast('先选中要投递的作品，或先按画师、日期、状态筛选', 'warn');
+    return null;
+  }
+  const netdiskBtn = $('#downloadWorksNetdiskBtn');
+  const originalText = netdiskBtn ? netdiskBtn.textContent : '';
+  setActionBusy('downloadNetdiskSelection', '', true);
+  if (netdiskBtn) {
+    netdiskBtn.disabled = true;
+    netdiskBtn.textContent = '投递中';
+  }
+  const works = explicit
+    ? {post_ids: downloadIdList(explicit), file_ids: []}
+    : {post_ids: [], file_ids: [], filter: downloadWorksFilter(), subscription_id: downloadWorksSubscriptionId()};
+  try {
+    const preview = await API.postJson('/api/pawchive/selections/preview', {
+      request_id: '',
+      ...works,
+    });
+    const externalPosts = Array.isArray(preview?.external_posts) ? preview.external_posts : [];
+    if (!externalPosts.length) {
+      toast('所选作品没有可投递的网盘链接', 'warn');
+      return null;
+    }
+
+    if (explicit && explicit.length === 1 && externalPosts.length === 1) {
+      const singleRes = await deliverPostToNetdisk(externalPosts[0]);
+      if (singleRes) {
+        clearDownloadWorksSelection();
+        await loadDownloadAllWorks();
+      }
+      return singleRes;
+    }
+
+    const ok = window.confirm(`已选择 ${externalPosts.length} 篇含网盘链接的作品，将投递至网盘下载器。是否继续？`);
+    if (!ok) return null;
+    if (!(await ensureNetdiskDispatchReady())) return null;
+
+    const job = await API.postJson('/api/netdisk/jobs', { post_ids: externalPosts });
+    const delivered = resolveNetdiskBatchDeliveredCount(job, externalPosts.length);
+    const skippedCount = Array.isArray(job?.skipped) ? job.skipped.length : 0;
+    if (delivered === 0 && skippedCount > 0) {
+      toast(`所选 ${skippedCount} 篇作品已有进行中网盘任务，已跳过`, 'warn');
+    } else {
+      const skippedSuffix = skippedCount > 0 ? `（跳过 ${skippedCount} 篇）` : '';
+      toast(`已投递网盘：${delivered} 篇作品${skippedSuffix}`, 'info');
+    }
+    clearDownloadWorksSelection();
+    await loadDownloadAllWorks();
+    return job;
+  } catch (error) {
+    toast('投递网盘失败：' + (error.message || error), 'error');
+    return null;
+  } finally {
+    setActionBusy('downloadNetdiskSelection', '', false);
+    if (netdiskBtn) {
+      netdiskBtn.disabled = false;
+      netdiskBtn.textContent = originalText;
+    }
+  }
+}
+

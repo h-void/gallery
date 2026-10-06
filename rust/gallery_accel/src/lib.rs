@@ -123,7 +123,9 @@ pub use image_preview::{
 pub use item_dates::update_item_dates_response;
 pub use item_detail::item_detail_response;
 pub use items::items_page_cursor_query_response;
+pub use items::items_page_cursor_query_response_ext;
 pub use items::items_page_query_response;
+pub use items::items_page_query_response_ext;
 #[cfg(test)]
 pub use items::items_page_response;
 pub use items::set_item_favorite_response;
@@ -159,20 +161,19 @@ pub use operations::operation_history_response;
 pub use pawchive::{
     accept_legacy_scope, add_subscription_from_url, assess_post, assess_work_from_ledger,
     cancel_attempt, create_attempt, delete_subscription, demand_set, demand_set_for_work,
-    finish_pawchive_sync, get_pawchive_settings, get_subscription,
-    link_evidence_to_items, list_artist_posts_page, list_filtered_post_ids, list_pawchive_events,
-    list_post_attempts, list_post_candidates, list_subscription_posts, list_subscriptions,
-    pawchive_http_client, pawchive_redirect_policy, pawchive_round_due, pawchive_sync_status,
-    plan_manual_post, record_external_receipt, record_post_decision, record_selection,
-    record_selection_for_filter, required_resources, run_manual_attempt, run_pawchive_reconcile,
-    run_pawchive_sync, save_pawchive_settings, schedule_round_order, set_subscription_mode,
-    subscription_summary, toggle_subscription, try_begin_pawchive_sync, verify_post_files,
-    AttemptError, AttemptOutcome, CancelOutcome, DecisionOutcome, DemandSet, ExternalReceipt,
-    FilterSelectionOutcome, LegacyScopeOutcome, ManualPostPlan, PawchiveSettings,
-    PawchiveSyncStatus, PostAssessment, PostDecisionAction, PostListFilter, PostState,
-    ReceiptOutcome, RoundQueue, ScheduledPost, SelectionError, SelectionOutcome, StablePostPage,
-    StablePostRow, SubscriptionMode, SyncTrigger, LEDGER_REASON_UNKNOWN_WORK,
-    PAWCHIVE_FILTER_SELECTION_MAX_POSTS,
+    finish_pawchive_sync, get_pawchive_settings, get_subscription, link_evidence_to_items,
+    list_artist_posts_page, list_filtered_post_ids, list_pawchive_events, list_post_attempts,
+    list_post_candidates, list_subscription_posts, list_subscriptions, pawchive_http_client,
+    pawchive_redirect_policy, pawchive_round_due, pawchive_sync_status, plan_manual_post,
+    record_external_receipt, record_post_decision, record_selection, record_selection_for_filter,
+    required_resources, run_manual_attempt, run_pawchive_reconcile, run_pawchive_sync,
+    save_pawchive_settings, schedule_round_order, set_subscription_mode, subscription_summary,
+    toggle_subscription, try_begin_pawchive_sync, verify_post_files, AttemptError, AttemptOutcome,
+    CancelOutcome, DecisionOutcome, DemandSet, ExternalReceipt, FilterSelectionOutcome,
+    LegacyScopeOutcome, ManualPostPlan, PawchiveSettings, PawchiveSyncStatus, PostAssessment,
+    PostDecisionAction, PostListFilter, PostState, ReceiptOutcome, RoundQueue, ScheduledPost,
+    SelectionError, SelectionOutcome, StablePostPage, StablePostRow, SubscriptionMode, SyncTrigger,
+    LEDGER_REASON_UNKNOWN_WORK, PAWCHIVE_FILTER_SELECTION_MAX_POSTS,
 };
 pub use pawchive_groups::{
     apply_grouping, begin_group_move_intent, claim_publish_reservation, content_group_locations,
@@ -210,9 +211,8 @@ pub use recognition_status::{
     recognize_character_native_topk_with_roots, suggest_artists_native,
 };
 pub use recycle::{
-    capture_item_snapshot, clear_recycle_entries, ensure_recycle_schema,
-    purge_recycle_entry, reconcile_moving_recycle_entries,
-    recycle_entries_response, restore_recycle_entry,
+    capture_item_snapshot, clear_recycle_entries, ensure_recycle_schema, purge_recycle_entry,
+    reconcile_moving_recycle_entries, recycle_entries_response, restore_recycle_entry,
 };
 pub use scan::{
     get_scan_state, reconcile_interrupted_scan, resolve_scan_scope, run_full_library_scan,

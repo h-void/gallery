@@ -235,7 +235,11 @@ fn folder_item_ids(conn: &Connection, artist_id: i64, folder: &str) -> Result<Ve
             .to_string();
         format!("{base}/{folder}/")
     };
-    sql.push_str(" AND substr(replace(file_path,'\\\\','/'), 1, length(?)) = ? COLLATE BINARY");
+    // NOTE: the Rust string `'\\'` is the one-character SQL literal `'\'`
+    // (SQLite does not process backslash escapes). The previous `'\\\\'`
+    // reached SQLite as a *two*-backslash needle, so single-backslash Windows
+    // paths were never normalized and the prefix comparison missed every row.
+    sql.push_str(" AND substr(replace(file_path,'\\','/'), 1, length(?)) = ? COLLATE BINARY");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![artist_id, prefix, prefix], |r| r.get::<_, i64>(0))?;
     for row in rows {
@@ -296,6 +300,470 @@ pub fn update_folder_tags_by_name_response(
         obj.insert("tag_names".into(), json!(tag_names));
     }
     Ok(result)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct FolderAnnotatePayload {
+    pub artist_id: i64,
+    pub folder: String,
+    #[serde(default)]
+    pub tag_names: Vec<String>,
+    #[serde(default)]
+    pub tag_ids: Vec<i64>,
+    #[serde(default = "default_mode_add")]
+    pub mode: String,
+    pub manual_date: Option<String>,
+    pub keep_together: Option<bool>,
+}
+
+fn default_mode_add() -> String {
+    "add".into()
+}
+
+pub fn annotate_folder_response(
+    conn: &Connection,
+    roots: Option<&MediaRoots>,
+    payload: FolderAnnotatePayload,
+) -> Result<Value> {
+    let artist_id = payload.artist_id;
+    let folder = payload.folder.trim().trim_matches('/').replace('\\', "/");
+    if artist_id <= 0 {
+        return Err(anyhow!("artist_id must be positive"));
+    }
+    if folder.is_empty() {
+        return Err(anyhow!("folder must not be empty"));
+    }
+    let item_ids = folder_item_ids(conn, artist_id, &folder)?;
+    if item_ids.is_empty() {
+        return Err(anyhow!("folder has no items or does not exist"));
+    }
+
+    // 1. Update tags if provided
+    if !payload.tag_names.is_empty() {
+        update_folder_tags_by_name_response(
+            conn,
+            artist_id,
+            &folder,
+            &payload.tag_names,
+            &payload.mode,
+        )?;
+    } else if !payload.tag_ids.is_empty() {
+        update_folder_tags_response(conn, artist_id, &folder, &payload.tag_ids, &payload.mode)?;
+    }
+
+    // 2. Update manual date if provided
+    if let Some(ref date_str) = payload.manual_date {
+        let trimmed = date_str.trim();
+        let date_arg = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+        crate::item_dates::update_item_dates_response(conn, artist_id, &item_ids, date_arg)?;
+    }
+
+    // 3. Update keep_together if provided
+    if let Some(keep) = payload.keep_together {
+        crate::folder_archive::ensure_folder_schema(conn)?;
+        let existing_snapshot: Option<String> = conn
+            .query_row(
+                "SELECT format_snapshot FROM folder_rename_plans WHERE artist_id=? AND source_folder=?",
+                params![artist_id, folder],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let mut snapshot_obj = existing_snapshot
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        snapshot_obj.insert("keep_together".to_string(), json!(keep));
+        let new_snapshot_str = serde_json::to_string(&snapshot_obj)?;
+
+        let n = conn.execute(
+            "UPDATE folder_rename_plans
+             SET format_snapshot=?, plan_kind=CASE WHEN ?=1 THEN 'rename_folder' ELSE plan_kind END,
+                 updated_at=?
+             WHERE artist_id=? AND source_folder=? AND status NOT IN ('confirmed', 'executed')",
+            params![
+                new_snapshot_str,
+                if keep { 1 } else { 0 },
+                now(),
+                artist_id,
+                folder
+            ],
+        )?;
+        if n == 0 {
+            // Insert-or-update under the same lock rule as the UPDATE above:
+            // a confirmed or executed plan has already committed to its
+            // shape, so the upsert must not rewrite its snapshot either.
+            let _ = conn.execute(
+                "INSERT INTO folder_rename_plans
+                 (artist_id, source_folder, original_folder_name, original_title, format_snapshot, plan_kind, updated_at)
+                 VALUES (?, ?, ?, ?, ?, 'rename_folder', ?)
+                 ON CONFLICT(artist_id, source_folder) DO UPDATE SET
+                     format_snapshot=excluded.format_snapshot, updated_at=excluded.updated_at
+                 WHERE folder_rename_plans.status NOT IN ('confirmed', 'executed')",
+                params![artist_id, folder, folder, folder, new_snapshot_str, now()],
+            );
+        }
+    }
+
+    // 4. Discover and recompute plans
+    crate::folder_archive::auto_discover_artist_folder_plans(conn, artist_id)?;
+    crate::folder_archive::recompute_artist_plan_targets(conn, roots, artist_id)?;
+
+    // 5. Query updated plan
+    let plan = conn
+        .query_row(
+            "SELECT id, artist_id, source_folder, target_folder, status, parsed_date,
+                    selected_tag_ids, plan_kind, file_count, format_snapshot
+             FROM folder_rename_plans
+             WHERE artist_id=? AND source_folder=?",
+            params![artist_id, folder],
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "artist_id": row.get::<_, i64>(1)?,
+                    "source_folder": row.get::<_, String>(2)?,
+                    "target_folder": row.get::<_, String>(3)?,
+                    "status": row.get::<_, String>(4)?,
+                    "parsed_date": row.get::<_, String>(5)?,
+                    "selected_tag_ids": serde_json::from_str::<Value>(&row.get::<_, String>(6)?).unwrap_or(json!([])),
+                    "plan_kind": row.get::<_, String>(7)?,
+                    "file_count": row.get::<_, i64>(8)?,
+                    "format_snapshot": serde_json::from_str::<Value>(&row.get::<_, String>(9)?).unwrap_or(json!({})),
+                }))
+            },
+        )
+        .optional()?;
+
+    Ok(json!({
+        "ok": true,
+        "artist_id": artist_id,
+        "folder": folder,
+        "updated_items": item_ids.len(),
+        "plan": plan,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BundleItemsPayload {
+    pub artist_id: i64,
+    pub item_ids: Vec<i64>,
+    pub target_folder: String,
+}
+
+/// One file move applied by `bundle_items_response`, recorded the moment it
+/// happens so a later failure can put every file back where it started.
+struct BundleMove {
+    source: PathBuf,
+    dest: PathBuf,
+}
+
+fn rollback_bundle_moves(moves: &[BundleMove]) {
+    for applied in moves.iter().rev() {
+        if applied.dest == applied.source {
+            continue;
+        }
+        if let Err(error) = std::fs::rename(&applied.dest, &applied.source) {
+            // A cross-device move fails backwards the same way it failed
+            // forwards; copy back and drop the copy at the destination.
+            match std::fs::copy(&applied.dest, &applied.source) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&applied.dest);
+                }
+                Err(copy_error) => {
+                    log_warn!(
+                        "bundle rollback: cannot restore {}: {error}; copy: {copy_error}",
+                        applied.source.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn remove_created_bundle_dirs(created: &[PathBuf]) {
+    for path in created.iter().rev() {
+        if let Err(error) = std::fs::remove_dir(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log_warn!(
+                    "bundle: cannot remove newly created directory {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Create a bundle destination without following a pre-existing symlink.
+/// Every existing component is canonicalized before the next component is
+/// created, and only directories created by this call are eligible for cleanup.
+fn prepare_bundle_target_dir(artist_root: &Path, target_folder: &str) -> Result<PathBuf> {
+    let canonical_root = std::fs::canonicalize(artist_root)
+        .map_err(|error| anyhow!("cannot resolve artist directory: {error}"))?;
+    let mut current = artist_root.to_path_buf();
+    let mut created = Vec::new();
+    for component in Path::new(target_folder).components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(anyhow!("invalid target_folder path"));
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(_) => {
+                let canonical = match std::fs::canonicalize(&current) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        remove_created_bundle_dirs(&created);
+                        return Err(error.into());
+                    }
+                };
+                if !canonical.starts_with(&canonical_root) || !canonical.is_dir() {
+                    remove_created_bundle_dirs(&created);
+                    return Err(anyhow!("target folder must be within artist directory"));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(create_error) = std::fs::create_dir(&current) {
+                    remove_created_bundle_dirs(&created);
+                    return Err(create_error.into());
+                }
+                created.push(current.clone());
+                let canonical = match std::fs::canonicalize(&current) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        remove_created_bundle_dirs(&created);
+                        return Err(error.into());
+                    }
+                };
+                if !canonical.starts_with(&canonical_root) || !canonical.is_dir() {
+                    remove_created_bundle_dirs(&created);
+                    return Err(anyhow!("target folder must be within artist directory"));
+                }
+            }
+            Err(error) => {
+                remove_created_bundle_dirs(&created);
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(current)
+}
+
+pub fn bundle_items_response(
+    conn: &Connection,
+    roots: Option<&MediaRoots>,
+    payload: BundleItemsPayload,
+) -> Result<Value> {
+    let artist_id = payload.artist_id;
+    if artist_id <= 0 {
+        return Err(anyhow!("artist_id must be positive"));
+    }
+    if payload.item_ids.is_empty() {
+        return Err(anyhow!("item_ids must not be empty"));
+    }
+    if payload.item_ids.len() as i64 > crate::MAX_BATCH_ITEM_LIMIT {
+        return Err(anyhow!("too many item_ids"));
+    }
+    if payload.item_ids.iter().any(|id| *id <= 0) {
+        return Err(anyhow!("item_ids must be positive"));
+    }
+    let mut sorted_ids = payload.item_ids.clone();
+    sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+    if sorted_ids.len() != payload.item_ids.len() {
+        return Err(anyhow!("item_ids must not contain duplicates"));
+    }
+    // Reuse the shared folder validator: it rejects absolute paths, drive
+    // letters, `.` / `..` segments and empty segments. The strict comparison
+    // additionally refuses non-canonical spellings (`a//b`) outright instead of
+    // silently re-spelling them into a different folder than the caller named.
+    let trimmed = payload.target_folder.trim();
+    let target_folder = crate::folder_archive::validate_relative_folder(trimmed)
+        .map_err(|_| anyhow!("invalid target_folder path"))?;
+    if target_folder != trimmed.replace('\\', "/").trim_matches('/') {
+        return Err(anyhow!("invalid target_folder path"));
+    }
+
+    let artist_path: String = conn
+        .query_row(
+            "SELECT path FROM artists WHERE id=?",
+            params![artist_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| anyhow!("artist not found"))?;
+
+    let artist_real_root = if let Some(r) = roots {
+        r.map_to_real(&artist_path)
+            .unwrap_or_else(|_| PathBuf::from(&artist_path))
+    } else {
+        PathBuf::from(&artist_path)
+    };
+
+    let target_dir = prepare_bundle_target_dir(&artist_real_root, &target_folder);
+    let target_dir = match target_dir {
+        Ok(path) => path,
+        Err(error) => return Err(error),
+    };
+
+    let mut moved_count = 0usize;
+    let mut skipped = Vec::new();
+    let mut applied: Vec<BundleMove> = Vec::new();
+
+    // Files and their rows move together: one transaction holds every row
+    // update while each file move is recorded as it happens, and any failure
+    // puts every moved file back where it started. A half-moved batch would
+    // leave rows pointing at paths that no longer exist (next scan: mass
+    // missing plus duplicate entries in the target folder).
+    let outcome = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        for item_id in &payload.item_ids {
+            let item_opt: Option<(String, String)> = tx.query_row(
+                "SELECT file_path, file_name FROM items WHERE id=? AND artist_id=? AND COALESCE(missing, 0)=0",
+                params![item_id, artist_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional()?;
+
+            let Some((file_path, file_name)) = item_opt else {
+                continue;
+            };
+
+            // A stored file name must be a plain name: separators or dot
+            // segments could otherwise steer the destination outside
+            // target_dir no matter how the folder itself was validated.
+            if file_name.is_empty()
+                || file_name == "."
+                || file_name == ".."
+                || file_name.contains('/')
+                || file_name.contains('\\')
+            {
+                log_warn!("bundle: skipping item {item_id}: unsafe file_name {file_name:?}");
+                skipped.push(json!({"item_id": item_id, "reason": "unsafe_file_name"}));
+                continue;
+            }
+
+            let src_real = if let Some(r) = roots {
+                r.map_to_real(&file_path)
+                    .unwrap_or_else(|_| PathBuf::from(&file_path))
+            } else {
+                PathBuf::from(&file_path)
+            };
+
+            if !src_real.is_file() {
+                skipped.push(json!({"item_id": item_id, "reason": "source_missing"}));
+                continue;
+            }
+
+            // Avoid filename collision; never overwrite an existing file.
+            let (dest_file, final_file_name) = {
+                let direct = target_dir.join(&file_name);
+                if !direct.exists() || direct == src_real {
+                    (direct, file_name.clone())
+                } else {
+                    let stem = Path::new(&file_name)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("file");
+                    let ext = Path::new(&file_name)
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|e| format!(".{}", e))
+                        .unwrap_or_default();
+                    let mut chosen = None;
+                    for idx in 1..1000 {
+                        let candidate_name = format!("{} ({}){}", stem, idx, ext);
+                        let candidate = target_dir.join(&candidate_name);
+                        if !candidate.exists() {
+                            chosen = Some((candidate, candidate_name));
+                            break;
+                        }
+                    }
+                    match chosen {
+                        Some(pair) => pair,
+                        None => {
+                            // Every candidate name is taken: skip the item and
+                            // say so. Silently writing onto an existing file
+                            // would destroy data the caller never selected.
+                            skipped.push(
+                                json!({"item_id": item_id, "reason": "target_name_exhausted"}),
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            if dest_file != src_real {
+                if let Err(error) = std::fs::rename(&src_real, &dest_file) {
+                    if let Err(copy_error) = std::fs::copy(&src_real, &dest_file) {
+                        if let Err(cleanup_error) = std::fs::remove_file(&dest_file) {
+                            if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                                log_warn!(
+                                    "bundle: cannot remove incomplete target {}: {cleanup_error}",
+                                    dest_file.display()
+                                );
+                            }
+                        }
+                        return Err(anyhow!(
+                            "bundle move failed for item {item_id}: {error}; copy: {copy_error}"
+                        ));
+                    }
+                    if let Err(remove_error) = std::fs::remove_file(&src_real) {
+                        let cleanup = std::fs::remove_file(&dest_file).err();
+                        if let Some(cleanup_error) = cleanup {
+                            log_warn!(
+                                "bundle: copied {} but could not remove source {}: {}; also could not remove target {}: {}",
+                                src_real.display(),
+                                src_real.display(),
+                                remove_error,
+                                dest_file.display(),
+                                cleanup_error
+                            );
+                        }
+                        return Err(anyhow!(
+                            "bundle move failed for item {item_id}: copied target but could not remove source {}: {remove_error}",
+                            src_real.display()
+                        ));
+                    }
+                }
+                applied.push(BundleMove {
+                    source: src_real,
+                    dest: dest_file.clone(),
+                });
+            }
+
+            let new_file_path = format!(
+                "{}/{}/{}",
+                artist_path.trim_end_matches('/'),
+                target_folder,
+                final_file_name
+            );
+            tx.execute(
+                "UPDATE items SET file_path=?, file_name=?, folder_name=? WHERE id=? AND artist_id=?",
+                params![new_file_path, final_file_name, target_folder, item_id, artist_id],
+            )?;
+            moved_count += 1;
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+    if let Err(error) = outcome {
+        rollback_bundle_moves(&applied);
+        return Err(error);
+    }
+
+    crate::folder_archive::auto_discover_artist_folder_plans(conn, artist_id)?;
+    crate::folder_archive::recompute_artist_plan_targets(conn, roots, artist_id)?;
+
+    Ok(json!({
+        "ok": true,
+        "artist_id": artist_id,
+        "target_folder": target_folder,
+        "moved_count": moved_count,
+        "skipped": skipped,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2957,5 +3425,429 @@ mod tests {
         std::fs::write(&foreign, b"keep").unwrap();
         remove_reference_image_file(&foreign.to_string_lossy());
         assert!(foreign.is_file());
+    }
+
+    #[test]
+    fn annotate_folder_updates_tags_date_and_recomputes_plan() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY, artist_id INTEGER, name TEXT, sort_order INTEGER DEFAULT 0);
+             CREATE TABLE item_tags (item_id INTEGER, tag_id INTEGER);
+             CREATE TABLE items (
+                id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT, file_name TEXT,
+                folder_name TEXT, media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0,
+                missing INTEGER DEFAULT 0, manual_date TEXT, detected_date TEXT, date TEXT,
+                content_hash TEXT DEFAULT '', hash_status TEXT DEFAULT ''
+             );",
+        )
+        .unwrap();
+        crate::folder_archive::ensure_folder_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (1, 'Artist', '/media/artist')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, folder_name, detected_date, date)
+             VALUES (1, 1, '/media/artist/2024-05 pack/a.jpg', 'a.jpg', '2024-05 pack', '2024-05-01', '2024-05-01')",
+            [],
+        )
+        .unwrap();
+
+        let payload = FolderAnnotatePayload {
+            artist_id: 1,
+            folder: "2024-05 pack".into(),
+            tag_names: vec!["Frieren".into()],
+            tag_ids: vec![],
+            mode: "add".into(),
+            manual_date: Some("2024-05".into()),
+            keep_together: Some(true),
+        };
+
+        let result = annotate_folder_response(&conn, None, payload).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["updated_items"], 1);
+
+        let plan = &result["plan"];
+        assert_eq!(plan["source_folder"], "2024-05 pack");
+        assert_eq!(plan["plan_kind"], "rename_folder");
+        assert_eq!(plan["status"], "ready");
+    }
+
+    #[test]
+    fn bundle_target_keeps_preexisting_empty_directories() {
+        let dir = tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        let existing = artist.join("already");
+        std::fs::create_dir_all(&existing).unwrap();
+        let target = prepare_bundle_target_dir(&artist, "already").unwrap();
+        assert_eq!(target, existing);
+        assert!(
+            existing.is_dir(),
+            "pre-existing empty directory must remain"
+        );
+    }
+
+    #[test]
+    fn bundle_target_rejects_file_components_without_removing_existing_paths() {
+        let dir = tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        std::fs::create_dir_all(&artist).unwrap();
+        let blocker = artist.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let error = prepare_bundle_target_dir(&artist, "blocker/grandchild").unwrap_err();
+        assert!(error.to_string().contains("directory"));
+        assert!(
+            !artist.join("new").exists(),
+            "newly created parents must be rolled back"
+        );
+        assert!(blocker.is_file(), "pre-existing path must not be removed");
+    }
+
+    #[test]
+    fn bundle_items_moves_files_and_updates_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let artist_dir = dir.path().join("Artist");
+        std::fs::create_dir_all(&artist_dir).unwrap();
+        let file1 = artist_dir.join("loose1.jpg");
+        let file2 = artist_dir.join("loose2.jpg");
+        std::fs::write(&file1, b"pic1").unwrap();
+        std::fs::write(&file2, b"pic2").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY, artist_id INTEGER, name TEXT, sort_order INTEGER DEFAULT 0);
+             CREATE TABLE item_tags (item_id INTEGER, tag_id INTEGER);
+             CREATE TABLE items (
+                id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT, file_name TEXT,
+                folder_name TEXT, media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0,
+                missing INTEGER DEFAULT 0, manual_date TEXT DEFAULT '', detected_date TEXT DEFAULT '', date TEXT DEFAULT '',
+                content_hash TEXT DEFAULT '', hash_status TEXT DEFAULT ''
+             );",
+        )
+        .unwrap();
+        crate::folder_archive::ensure_folder_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (1, 'Artist', ?)",
+            params![artist_dir.to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, folder_name, detected_date, date)
+             VALUES (10, 1, ?, 'loose1.jpg', '', '2024-05-01', '2024-05-01'),
+                    (11, 1, ?, 'loose2.jpg', '', '2024-05-01', '2024-05-01')",
+            params![file1.to_string_lossy(), file2.to_string_lossy()],
+        )
+        .unwrap();
+
+        let payload = BundleItemsPayload {
+            artist_id: 1,
+            item_ids: vec![10, 11],
+            target_folder: "2024-05 [TestPack]".into(),
+        };
+
+        let result = bundle_items_response(&conn, None, payload).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["moved_count"], 2);
+
+        let target_dir = artist_dir.join("2024-05 [TestPack]");
+        assert!(target_dir.join("loose1.jpg").is_file());
+        assert!(target_dir.join("loose2.jpg").is_file());
+        assert!(!file1.exists());
+        assert!(!file2.exists());
+
+        let folder: String = conn
+            .query_row("SELECT folder_name FROM items WHERE id=10", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(folder, "2024-05 [TestPack]");
+    }
+
+    fn bundle_test_conn(artist_dir: &Path, items: &[(i64, &str)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY, artist_id INTEGER, name TEXT, sort_order INTEGER DEFAULT 0);
+             CREATE TABLE item_tags (item_id INTEGER, tag_id INTEGER);
+             CREATE TABLE items (
+                id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT, file_name TEXT,
+                folder_name TEXT, media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0,
+                missing INTEGER DEFAULT 0, manual_date TEXT DEFAULT '', detected_date TEXT DEFAULT '', date TEXT DEFAULT '',
+                content_hash TEXT DEFAULT '', hash_status TEXT DEFAULT ''
+             );",
+        )
+        .unwrap();
+        crate::folder_archive::ensure_folder_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (1, 'Artist', ?)",
+            params![artist_dir.to_string_lossy()],
+        )
+        .unwrap();
+        for (id, file_name) in items {
+            conn.execute(
+                "INSERT INTO items (id, artist_id, file_path, file_name, folder_name, detected_date, date)
+                 VALUES (?, 1, ?, ?, '', '2024-05-01', '2024-05-01')",
+                params![
+                    id,
+                    artist_dir.join(file_name).to_string_lossy(),
+                    file_name
+                ],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// SQLite treats string literals verbatim, so the path normalization has to
+    /// target a single backslash. With the old two-backslash needle Windows
+    /// paths were never normalized and folder tag writes matched no rows.
+    #[test]
+    fn folder_item_ids_normalizes_windows_backslash_paths() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE items (
+               id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT,
+               media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0,
+               missing INTEGER DEFAULT 0
+             );
+             INSERT INTO artists (id, path) VALUES (1, 'C:/root');
+             INSERT INTO items (id, artist_id, file_path) VALUES (1, 1, 'C:/root/sub/a.jpg');
+             INSERT INTO items (id, artist_id, file_path) VALUES (2, 1, 'C:\\root\\sub\\b.jpg');",
+        )
+        .unwrap();
+        let ids = folder_item_ids(&conn, 1, "sub").unwrap();
+        assert_eq!(ids, vec![1, 2], "single-backslash paths must normalize too");
+    }
+
+    #[test]
+    fn bundle_rejects_invalid_targets_and_batch_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let artist_dir = dir.path().join("Artist");
+        std::fs::create_dir_all(&artist_dir).unwrap();
+        std::fs::write(artist_dir.join("a.jpg"), b"pic").unwrap();
+        let conn = bundle_test_conn(&artist_dir, &[(10, "a.jpg")]);
+
+        for bad in [".", "a/./b", "a//b", "C:/x", "/abs", "..", ""] {
+            let err = bundle_items_response(
+                &conn,
+                None,
+                BundleItemsPayload {
+                    artist_id: 1,
+                    item_ids: vec![10],
+                    target_folder: bad.into(),
+                },
+            )
+            .expect_err("invalid target must be refused");
+            assert!(
+                err.to_string().contains("invalid target_folder path"),
+                "{bad}: {err}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&artist_dir).unwrap().count(),
+            1,
+            "a refused target must not create directories"
+        );
+
+        let cases: [(Vec<i64>, &str); 4] = [
+            (vec![], "item_ids must not be empty"),
+            (vec![0, -1], "item_ids must be positive"),
+            (vec![10, 10], "item_ids must not contain duplicates"),
+            (
+                (1..=crate::MAX_BATCH_ITEM_LIMIT + 1).collect(),
+                "too many item_ids",
+            ),
+        ];
+        for (item_ids, expected) in cases {
+            let err = bundle_items_response(
+                &conn,
+                None,
+                BundleItemsPayload {
+                    artist_id: 1,
+                    item_ids,
+                    target_folder: "pack".into(),
+                },
+            )
+            .expect_err("invalid batch must be refused");
+            assert!(err.to_string().contains(expected), "{expected}: {err}");
+        }
+    }
+
+    /// A failure halfway through the batch must leave the filesystem and the
+    /// rows in agreement: every file moved so far goes back where it started
+    /// and the row transaction rolls back with it.
+    #[test]
+    fn bundle_rolls_back_moved_files_when_a_later_row_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let artist_dir = dir.path().join("Artist");
+        std::fs::create_dir_all(&artist_dir).unwrap();
+        let file1 = artist_dir.join("loose1.jpg");
+        let file2 = artist_dir.join("loose2.jpg");
+        std::fs::write(&file1, b"pic1").unwrap();
+        std::fs::write(&file2, b"pic2").unwrap();
+        let conn = bundle_test_conn(&artist_dir, &[(10, "loose1.jpg"), (11, "loose2.jpg")]);
+        conn.execute_batch(
+            "CREATE TRIGGER fail_item11 BEFORE UPDATE ON items WHEN NEW.id = 11
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+        )
+        .unwrap();
+
+        let err = bundle_items_response(
+            &conn,
+            None,
+            BundleItemsPayload {
+                artist_id: 1,
+                item_ids: vec![10, 11],
+                target_folder: "pack".into(),
+            },
+        )
+        .expect_err("row failure must fail the batch");
+        assert!(err.to_string().contains("forced failure"), "{err}");
+
+        assert!(file1.is_file(), "first move must be rolled back");
+        assert!(file2.is_file(), "second move must be rolled back");
+        let target_dir = artist_dir.join("pack");
+        assert!(
+            !target_dir.join("loose1.jpg").exists() && !target_dir.join("loose2.jpg").exists(),
+            "no file may stay in the target after a rollback"
+        );
+        assert_eq!(&std::fs::read(&file1).unwrap()[..], b"pic1");
+        assert_eq!(&std::fs::read(&file2).unwrap()[..], b"pic2");
+        for id in [10, 11] {
+            let name: String = conn
+                .query_row("SELECT file_name FROM items WHERE id=?", params![id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert!(name.starts_with("loose"), "rows must be rolled back too");
+        }
+    }
+
+    /// When every collision candidate name is taken the item is skipped and
+    /// reported. Writing onto an existing file is never an option.
+    #[test]
+    fn bundle_skips_instead_of_overwriting_when_target_names_are_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let artist_dir = dir.path().join("Artist");
+        std::fs::create_dir_all(&artist_dir).unwrap();
+        let source = artist_dir.join("a.jpg");
+        std::fs::write(&source, b"new-content").unwrap();
+        let conn = bundle_test_conn(&artist_dir, &[(10, "a.jpg")]);
+
+        let target_dir = artist_dir.join("pack");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("a.jpg"), b"existing").unwrap();
+        for idx in 1..1000 {
+            std::fs::write(target_dir.join(format!("a ({idx}).jpg")), b"existing").unwrap();
+        }
+
+        let result = bundle_items_response(
+            &conn,
+            None,
+            BundleItemsPayload {
+                artist_id: 1,
+                item_ids: vec![10],
+                target_folder: "pack".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["moved_count"], 0);
+        assert_eq!(result["skipped"][0]["item_id"], 10);
+        assert_eq!(result["skipped"][0]["reason"], "target_name_exhausted");
+        assert!(source.is_file(), "the source file stays put");
+        assert_eq!(
+            &std::fs::read(target_dir.join("a.jpg")).unwrap()[..],
+            b"existing",
+            "an occupied name must never be overwritten"
+        );
+    }
+
+    /// Confirmed and executed plans have committed to their shape: the
+    /// keep_together lock may not rewrite their snapshot through the upsert
+    /// fallback either.
+    #[test]
+    fn annotate_keep_together_never_rewrites_locked_plans() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY, artist_id INTEGER, name TEXT, sort_order INTEGER DEFAULT 0);
+             CREATE TABLE item_tags (item_id INTEGER, tag_id INTEGER);
+             CREATE TABLE items (
+                id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT, file_name TEXT,
+                folder_name TEXT, media_type TEXT DEFAULT 'image', is_archive INTEGER DEFAULT 0,
+                missing INTEGER DEFAULT 0, manual_date TEXT, detected_date TEXT, date TEXT,
+                content_hash TEXT DEFAULT '', hash_status TEXT DEFAULT ''
+             );",
+        )
+        .unwrap();
+        crate::folder_archive::ensure_folder_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO artists (id, name, path) VALUES (1, 'Artist', '/media/artist')",
+            [],
+        )
+        .unwrap();
+        for (id, folder, status) in [
+            (1, "c1", "confirmed"),
+            (2, "e1", "executed"),
+            (3, "d1", "draft"),
+        ] {
+            conn.execute(
+                "INSERT INTO items (id, artist_id, file_path, file_name, folder_name, detected_date, date)
+                 VALUES (?, 1, ?, 'a.jpg', ?, '2024-05-01', '2024-05-01')",
+                params![id, format!("/media/artist/{folder}/a.jpg"), folder],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO folder_rename_plans (artist_id, source_folder, status, format_snapshot)
+                 VALUES (1, ?, ?, '{}')",
+                params![folder, status],
+            )
+            .unwrap();
+        }
+
+        for folder in ["c1", "e1", "d1"] {
+            annotate_folder_response(
+                &conn,
+                None,
+                FolderAnnotatePayload {
+                    artist_id: 1,
+                    folder: folder.into(),
+                    tag_names: vec![],
+                    tag_ids: vec![],
+                    mode: "add".into(),
+                    manual_date: None,
+                    keep_together: Some(true),
+                },
+            )
+            .unwrap();
+        }
+
+        for folder in ["c1", "e1"] {
+            let snapshot: String = conn
+                .query_row(
+                    "SELECT format_snapshot FROM folder_rename_plans WHERE source_folder=?",
+                    params![folder],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(snapshot, "{}", "{folder} must stay untouched");
+        }
+        let snapshot: String = conn
+            .query_row(
+                "SELECT format_snapshot FROM folder_rename_plans WHERE source_folder='d1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let parsed = serde_json::from_str::<Value>(&snapshot).unwrap();
+        assert_eq!(
+            parsed["keep_together"],
+            json!(true),
+            "the draft plan is locked"
+        );
     }
 }

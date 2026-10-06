@@ -114,6 +114,11 @@ pub(crate) struct ItemsQuery {
     pub(crate) duplicates_only: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_bool_lenient")]
     pub(crate) favorite_only: Option<bool>,
+    /// Archive-inbox triage filter: `true` = 待整理 (untagged, undated or
+    /// un-foldered items), `false` = 已归档 (fully organized items), absent =
+    /// 全部. Mirrors `app/api/items.py` `list_items(inbox=...)`.
+    #[serde(default, deserialize_with = "deserialize_bool_lenient")]
+    pub(crate) inbox: Option<bool>,
     /// Search filter, handled natively (raw substring on file_name/folder_name/
     /// file_path + pinyin on item tag names); mirrors `app/api/items.py`.
     pub(crate) search: Option<String>,

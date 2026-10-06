@@ -16,7 +16,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
-use serde::Deserialize;
 use gallery_accel::post_evidence_state;
 use gallery_accel::product_ui::{read_log_tail as read_bounded_log_tail, recent_log_errors};
 use gallery_accel::upstream::{proxy_error, Upstream};
@@ -31,60 +30,61 @@ use gallery_accel::{
     auto_resolve_move_candidates_with_roots, backfill_item_dimensions, bridge_move_is_isolated,
     bridge_task_view, cancel_attempt, cancel_character_import_job, character_model_signature,
     character_recognition_status, character_references_response, character_response,
-    character_summary_response, characters_response, cluster_scores_response,
-    confirm_all_artist_plans, confirm_artist_suggestion, content_group_locations,
-    content_group_members, content_groups_for_day, content_hash_allowed,
+    character_summary_response, characters_response, clear_recycle_entries,
+    cluster_scores_response, confirm_all_artist_plans, confirm_artist_suggestion,
+    content_group_locations, content_group_members, content_groups_for_day, content_hash_allowed,
     create_artist_profile_link, create_attempt, create_bridge_task, create_db_backup,
     create_new_item_response_with_roots, create_tag, default_bridge_identity,
     delete_artist_profile_link, delete_character_reference, delete_subscription, delete_tag,
     delete_to_recycle, demand_set, duplicate_artists_response, ensure_content_group_schema,
-    ensure_netdisk_staging_directory, env_media_roots,
-    execute_artist_folder_move, execute_folder_renames, finish_pawchive_sync,
-    folder_archive_failed_plans_count, folder_error_artists, folder_paths_response,
-    folder_rename_auto_response, folder_rename_auto_run, folder_rename_format_settings,
-    folders_response, generate_event_scripter_script, get_character_import_job,
-    get_pawchive_settings, get_scan_state, get_subscription, group_index_entries,
-    hash_status_response, health_summary, ignore_move_candidate_response, item_detail_response,
-    items_page_cursor_query_response, items_page_query_response, latest_bridge_session,
-    list_artist_posts_page, list_bridge_tasks, list_content_groups, list_filtered_post_ids,
-    list_folder_renames, list_media_root_directories, list_pawchive_events, list_post_attempts,
-    list_post_candidates, list_subscription_posts, list_subscriptions, list_work_group_links,
-    load_bridge_task, load_netdisk_settings, log_error, log_warn, mark_group_location_manual,
+    ensure_netdisk_staging_directory, env_media_roots, execute_artist_folder_move,
+    execute_folder_renames, finish_pawchive_sync, folder_archive_failed_plans_count,
+    folder_error_artists, folder_paths_response, folder_rename_auto_response,
+    folder_rename_auto_run, folder_rename_format_settings, folders_response,
+    generate_event_scripter_script, get_character_import_job, get_pawchive_settings,
+    get_scan_state, get_subscription, group_index_entries, hash_status_response, health_summary,
+    ignore_move_candidate_response, item_detail_response, items_page_cursor_query_response_ext,
+    items_page_query_response_ext, latest_bridge_session, list_artist_posts_page,
+    list_bridge_tasks, list_content_groups, list_filtered_post_ids, list_folder_renames,
+    list_media_root_directories, list_pawchive_events, list_post_attempts, list_post_candidates,
+    list_subscription_posts, list_subscriptions, list_work_group_links, load_bridge_task,
+    load_netdisk_settings, log_error, log_warn, mark_group_location_manual,
     mark_move_candidate_new_response, merge_move_candidate_group_with_roots,
     move_candidate_groups_response, move_candidates_response, move_history_response,
     netdisk_is_disconnected, open_writable_db, operation_history_response, operation_log_response,
     path_under_authorized_roots, pawchive_http_client, pawchive_sync_status, plan_manual_post,
     plan_naming_migration, preview_artist_folder_move, preview_day_pairing,
     preview_folder_rename_template, preview_jpeg_allowed, process_bridge_exchange,
-    propagate_hash_tags_response, queue_bridge_command, rebuild_character_index, recheck_plan,
-    recognize_character_native_topk_with_roots, reconfirm_plan, record_external_receipt,
-    record_post_decision, record_selection, recycle_entries_response, reindex_artist_links,
-    remember_bridge_token, resolve_existing_scan_candidate_response_with_roots,
-    resolve_netdisk_staging_directory, resolve_scan_scope, restore_recycle_entry,
-    clear_recycle_entries, purge_recycle_entry,
-    rotate_bridge_token, run_folder_rename_all_now, run_full_library_scan_claimed,
-    run_hash_batch_with_roots, run_manual_attempt, run_pawchive_reconcile, run_pawchive_sync,
-    run_scan_claimed, save_netdisk_settings, save_pawchive_settings, saved_bridge_token,
-    scan_candidates_response, serve_file_response, serve_text, serve_transcoded_hls,
-    serve_transcoded_hls_segment, serve_video_compatible, serve_video_hls, set_folder_rename_auto,
-    set_folder_rename_format_settings, set_item_favorite_response, set_netdisk_disconnected,
-    set_subscription_mode, start_character_import_job_with_roots, start_video_transcode,
-    submit_bridge_task, subscription_summary, suggest_artists_native, tag_search_response,
-    tags_response, toggle_subscription, try_begin_pawchive_sync, unconfirm_all_artist_plans,
-    unconfirm_plan, undo_folder_rename_plan, update_folder_tags_by_name_response,
-    update_folder_tags_response, update_item_dates_response, update_item_tags_by_name_response,
-    update_item_tags_response, update_tag, verify_bridge_token, verify_post_files,
-    video_frame_jpeg, video_transcode_status, AttemptError, BridgeConflict, BridgeExchangePayload,
-    BridgeInvalid, BridgeTask, CancelOutcome, DatePrecision, DbConfig, DbPool, DecisionOutcome,
-    ExternalReceipt, LegacyScopeOutcome, MediaRoots, NamingApplyError, NamingApplyRequest,
-    NetdiskSettings, PawchiveSettings, PostDecisionAction, PostListFilter, ReceiptOutcome,
-    ScanControl, SelectionError, StatsRefreshGate, SubscriptionMode, SyncTrigger,
-    WorkNamingContext, WorkerStatus, BRIDGE_TASK_SETTLED, BRIDGE_TASK_SUBMITTED,
-    DEFAULT_ITEM_PAGE_LIMIT, LEDGER_REASON_UNKNOWN_WORK, MAX_CLUSTER_SCORE_VECTORS,
-    MAX_ITEM_PAGE_LIMIT, NETDISK_BRIDGE_PAYLOAD_MAX_BYTES, NETDISK_PROTOCOL_VERSION,
+    propagate_hash_tags_response, purge_recycle_entry, queue_bridge_command,
+    rebuild_character_index, recheck_plan, recognize_character_native_topk_with_roots,
+    reconfirm_plan, record_external_receipt, record_post_decision, record_selection,
+    recycle_entries_response, reindex_artist_links, remember_bridge_token,
+    resolve_existing_scan_candidate_response_with_roots, resolve_netdisk_staging_directory,
+    resolve_scan_scope, restore_recycle_entry, rotate_bridge_token, run_folder_rename_all_now,
+    run_full_library_scan_claimed, run_hash_batch_with_roots, run_manual_attempt,
+    run_pawchive_reconcile, run_pawchive_sync, run_scan_claimed, save_netdisk_settings,
+    save_pawchive_settings, saved_bridge_token, scan_candidates_response, serve_file_response,
+    serve_text, serve_transcoded_hls, serve_transcoded_hls_segment, serve_video_compatible,
+    serve_video_hls, set_folder_rename_auto, set_folder_rename_format_settings,
+    set_item_favorite_response, set_netdisk_disconnected, set_subscription_mode,
+    start_character_import_job_with_roots, start_video_transcode, submit_bridge_task,
+    subscription_summary, suggest_artists_native, tag_search_response, tags_response,
+    toggle_subscription, try_begin_pawchive_sync, unconfirm_all_artist_plans, unconfirm_plan,
+    undo_folder_rename_plan, update_folder_tags_by_name_response, update_folder_tags_response,
+    update_item_dates_response, update_item_tags_by_name_response, update_item_tags_response,
+    update_tag, verify_bridge_token, verify_post_files, video_frame_jpeg, video_transcode_status,
+    AttemptError, BridgeConflict, BridgeExchangePayload, BridgeInvalid, BridgeTask, CancelOutcome,
+    DatePrecision, DbConfig, DbPool, DecisionOutcome, ExternalReceipt, LegacyScopeOutcome,
+    MediaRoots, NamingApplyError, NamingApplyRequest, NetdiskSettings, PawchiveSettings,
+    PostDecisionAction, PostListFilter, ReceiptOutcome, ScanControl, SelectionError,
+    StatsRefreshGate, SubscriptionMode, SyncTrigger, WorkNamingContext, WorkerStatus,
+    BRIDGE_TASK_SETTLED, BRIDGE_TASK_SUBMITTED, DEFAULT_ITEM_PAGE_LIMIT,
+    LEDGER_REASON_UNKNOWN_WORK, MAX_CLUSTER_SCORE_VECTORS, MAX_ITEM_PAGE_LIMIT,
+    NETDISK_BRIDGE_PAYLOAD_MAX_BYTES, NETDISK_PROTOCOL_VERSION,
     PAWCHIVE_FILTER_SELECTION_MAX_POSTS,
 };
 use rusqlite::OptionalExtension;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::services::{ServeDir, ServeFile};
@@ -294,6 +294,7 @@ pub fn router(state: AppState) -> Router {
             "/api/folders/tags-by-name",
             put(api_update_folder_tags_by_name),
         )
+        .route("/api/folders/annotate", post(api_annotate_folder))
         .route("/api/artists/{artist_id}/stats", get(api_artist_stats))
         .route("/api/items", get(api_items_page))
         .route(
@@ -306,6 +307,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/items/tags", put(api_update_item_tags))
         .route("/api/items/tags-by-name", put(api_update_item_tags_by_name))
+        .route("/api/items/bundle", post(api_bundle_items))
         .route("/api/items/date", put(api_update_item_dates))
         .route("/api/items/{item_id}/favorite", put(api_set_item_favorite))
         .route("/api/items/{item_id}", get(api_item_detail))
@@ -386,16 +388,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/file/stream", get(api_serve_file))
         .route("/api/file/text", get(api_file_text))
         .route("/api/file/delete", delete(api_file_delete))
-        .route("/api/recycle", get(api_recycle_entries).delete(api_recycle_clear))
+        .route(
+            "/api/recycle",
+            get(api_recycle_entries).delete(api_recycle_clear),
+        )
         .route("/api/recycle/clear", post(api_recycle_clear))
-        .route(
-            "/api/recycle/{entry_id}",
-            delete(api_recycle_purge),
-        )
-        .route(
-            "/api/recycle/{entry_id}/delete",
-            post(api_recycle_purge),
-        )
+        .route("/api/recycle/{entry_id}", delete(api_recycle_purge))
+        .route("/api/recycle/{entry_id}/delete", post(api_recycle_purge))
         .route("/api/recycle/{entry_id}/restore", post(api_recycle_restore))
         .route("/api/file/video-frame", get(api_video_frame))
         .route("/api/file/video-compatible", get(api_video_compatible))
@@ -1929,7 +1928,7 @@ async fn api_items_page(
         };
         let use_cursor = global_search && (query.cursor.is_some() || query.offset.is_none());
         let result = if use_cursor {
-            items_page_cursor_query_response(
+            items_page_cursor_query_response_ext(
                 &conn,
                 query.artist_id,
                 Some(limit),
@@ -1947,10 +1946,11 @@ async fn api_items_page(
                 query.search.as_deref(),
                 query.search_tags_only.unwrap_or(false),
                 query.favorite_only,
+                query.inbox,
                 query.cursor.as_deref(),
             )
         } else {
-            items_page_query_response(
+            items_page_query_response_ext(
                 &conn,
                 query.artist_id,
                 Some(limit),
@@ -1968,6 +1968,7 @@ async fn api_items_page(
                 query.search.as_deref(),
                 query.search_tags_only.unwrap_or(false),
                 query.favorite_only,
+                query.inbox,
             )
         };
         result.map_err(|error| {
@@ -4091,6 +4092,38 @@ async fn api_update_folder_tags_by_name(
         )
         .map(Json)
         .map_err(to_tag_write_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
+}
+
+async fn api_annotate_folder(
+    State(state): State<AppState>,
+    Json(body): Json<gallery_accel::product_ui::FolderAnnotatePayload>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        gallery_accel::product_ui::annotate_folder_response(&conn, Some(&roots), body)
+            .map(Json)
+            .map_err(to_tag_write_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
+}
+
+async fn api_bundle_items(
+    State(state): State<AppState>,
+    Json(body): Json<gallery_accel::product_ui::BundleItemsPayload>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        gallery_accel::product_ui::bundle_items_response(&conn, Some(&roots), body)
+            .map(Json)
+            .map_err(to_tag_write_http_error)
     })
     .await
     .map_err(blocking_http_error)?
@@ -6688,10 +6721,30 @@ fn to_http_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {
 
 fn to_tag_write_http_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {
     let message = error.to_string();
-    let status = match message.as_str() {
-        "artist not found" => StatusCode::NOT_FOUND,
-        "tag name must not be empty" | "Bad mode" => StatusCode::BAD_REQUEST,
-        _ => return to_http_error(error),
+    // User-input errors answer 400 with the message intact: a caller that sends
+    // an empty folder or an unparseable date must see what was wrong, not a
+    // generic 500 that reads like a server fault.
+    let status = if message == "artist not found" {
+        StatusCode::NOT_FOUND
+    } else if matches!(
+        message.as_str(),
+        "tag name must not be empty"
+            | "Bad mode"
+            | "artist_id must be positive"
+            | "folder must not be empty"
+            | "folder has no items or does not exist"
+            | "invalid target_folder path"
+            | "target folder must be within artist directory"
+            | "item_ids must not be empty"
+            | "item_ids must be positive"
+            | "item_ids must not contain duplicates"
+            | "too many item_ids"
+    ) || message.starts_with("invalid date: ")
+        || message.starts_with("target name exhausted")
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        return to_http_error(error);
     };
     (status, Json(json!({"error": message})))
 }
@@ -6867,16 +6920,22 @@ async fn api_archive_inspect(
     let conn = state.pool.get().map_err(to_http_error)?;
 
     let path_str = if let Some(id) = payload.item_id {
-        conn.query_row(
-            "SELECT file_path FROM items WHERE id = ?",
-            [id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| (StatusCode::NOT_FOUND, Json(json!({"error": "item not found"}))))?
+        conn.query_row("SELECT file_path FROM items WHERE id = ?", [id], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "item not found"})),
+            )
+        })?
     } else if let Some(p) = payload.file_path {
         p
     } else {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "item_id or file_path is required"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "item_id or file_path is required"})),
+        ));
     };
 
     let full_path = gallery_accel::media_serve::resolve_allowed_path(&path_str, &roots)
@@ -6909,16 +6968,22 @@ async fn api_archive_entry(
     let conn = state.pool.get().map_err(to_http_error)?;
 
     let path_str = if let Some(id) = query.item_id {
-        conn.query_row(
-            "SELECT file_path FROM items WHERE id = ?",
-            [id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|_| (StatusCode::NOT_FOUND, Json(json!({"error": "item not found"}))))?
+        conn.query_row("SELECT file_path FROM items WHERE id = ?", [id], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "item not found"})),
+            )
+        })?
     } else if let Some(p) = query.file_path {
         p
     } else {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "item_id or file_path is required"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "item_id or file_path is required"})),
+        ));
     };
 
     let full_path = gallery_accel::media_serve::resolve_allowed_path(&path_str, &roots)
@@ -6976,11 +7041,19 @@ async fn api_archive_extract(
             [id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
         )
-        .map_err(|_| (StatusCode::NOT_FOUND, Json(json!({"error": "item not found"}))))?
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "item not found"})),
+            )
+        })?
     } else if let Some(p) = payload.file_path {
         (p, None)
     } else {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "item_id or file_path is required"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "item_id or file_path is required"})),
+        ));
     };
 
     let full_path = gallery_accel::media_serve::resolve_allowed_path(&path_str, &roots)
@@ -6989,7 +7062,9 @@ async fn api_archive_extract(
 
     let pool = state.pool.clone();
     let roots_clone = roots.clone();
-    let target_mode = payload.target_mode.unwrap_or_else(|| "current_folder".to_string());
+    let target_mode = payload
+        .target_mode
+        .unwrap_or_else(|| "current_folder".to_string());
     let custom_name = payload.custom_folder_name;
     let recycle_source = payload.recycle_source.unwrap_or(false);
     let pwd = payload.password;
@@ -7026,12 +7101,18 @@ async fn api_archive_extract(
 fn to_archive_http_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {
     let msg = error.to_string();
     if msg.contains("密码错误") || msg.contains("Wrong password") {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "解压密码错误", "wrong_password": true})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "解压密码错误", "wrong_password": true})),
+        );
     }
     if msg.contains("not found") {
         return (StatusCode::NOT_FOUND, Json(json!({"error": msg})));
     }
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": msg})))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": msg})),
+    )
 }
 
 async fn api_ws_scan(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
@@ -10900,7 +10981,8 @@ mod tests {
             .unwrap();
         let res = app.clone().oneshot(inspect_req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body: Value = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let body: Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["archive_name"], "pack.zip");
         assert_eq!(body["stats"]["total_files"], 1);
         assert_eq!(body["stats"]["images"], 1);
@@ -10921,12 +11003,15 @@ mod tests {
             .method(Method::POST)
             .uri("/api/archives/extract")
             .header("content-type", "application/json")
-            .body(Body::from(json!({
-                "item_id": 101,
-                "target_mode": "new_folder",
-                "custom_folder_name": "extracted_set",
-                "recycle_source": false
-            }).to_string()))
+            .body(Body::from(
+                json!({
+                    "item_id": 101,
+                    "target_mode": "new_folder",
+                    "custom_folder_name": "extracted_set",
+                    "recycle_source": false
+                })
+                .to_string(),
+            ))
             .unwrap();
         let res = app.clone().oneshot(extract_req).await.unwrap();
         let status = res.status();
@@ -10992,7 +11077,8 @@ mod tests {
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body: Value = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let body: Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["ok"], true);
         assert!(!file1.exists());
 
@@ -11004,9 +11090,141 @@ mod tests {
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body: Value = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let body: Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["ok"], true);
         assert_eq!(body["cleared_count"], 1);
         assert!(!file2.exists());
+    }
+
+    fn items_inbox_test_app() -> (tempfile::TempDir, Router) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            dir.path().join("gallery.db"),
+            DbConfig {
+                read_only: false,
+                pool_size: 1,
+            },
+            Capabilities {
+                read_only: false,
+                writes: true,
+                media: true,
+                ml: true,
+            },
+        )
+        .unwrap();
+        state
+            .pool
+            .get()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO artists (id, name, path) VALUES (1, 'Artist', '/pictures/Artist');
+                 INSERT INTO items (id, artist_id, file_path, file_name, folder_name, media_type, missing, date, detected_date)
+                 VALUES (30, 1, '/pictures/Artist/2024-05/pic.jpg', 'pic.jpg', '2024-05', 'image', 0, '2024-05-01', '2024-05-01'),
+                        (31, 1, '/pictures/Artist/loose.jpg', 'loose.jpg', '', 'image', 0, '', '');
+                 INSERT INTO tags (id, artist_id, name, sort_order) VALUES (1, 1, 'tag1', 0);
+                 INSERT INTO item_tags (item_id, tag_id) VALUES (30, 1);",
+            )
+            .unwrap();
+        (dir, router(state))
+    }
+
+    /// The archive-inbox triage filter must survive the whole HTTP path: query
+    /// string -> `ItemsQuery` deserialization -> SQL WHERE. The core functions
+    /// were covered before, while every HTTP entry point silently dropped the
+    /// parameter, so 待整理/已归档 returned the unfiltered list.
+    #[tokio::test]
+    async fn items_page_inbox_filter_is_wired_through_query_parsing() {
+        let (_dir, app) = items_inbox_test_app();
+        for (query, mut expected) in [
+            ("artist_id=1&inbox=true", vec![31i64]),
+            ("artist_id=1&inbox=false", vec![30i64]),
+            ("artist_id=1&inbox=1", vec![31i64]),
+            ("artist_id=1", vec![30i64, 31i64]),
+        ] {
+            let (status, body) = json_response(
+                &app,
+                Request::builder()
+                    .uri(format!("/api/items?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            let mut ids: Vec<i64> = body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_i64().unwrap())
+                .collect();
+            ids.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(ids, expected, "inbox filter lost on: {query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bundle_and_annotate_reject_invalid_input_with_bad_request() {
+        let (_dir, app) = items_inbox_test_app();
+        let cases = [
+            (
+                "/api/items/bundle",
+                r#"{"artist_id":1,"item_ids":[],"target_folder":"x"}"#,
+            ),
+            (
+                "/api/items/bundle",
+                r#"{"artist_id":1,"item_ids":[30],"target_folder":""}"#,
+            ),
+            (
+                "/api/items/bundle",
+                r#"{"artist_id":1,"item_ids":[30],"target_folder":".."}"#,
+            ),
+            (
+                "/api/items/bundle",
+                r#"{"artist_id":1,"item_ids":[30],"target_folder":"."}"#,
+            ),
+            ("/api/folders/annotate", r#"{"artist_id":1,"folder":""}"#),
+            (
+                "/api/folders/annotate",
+                r#"{"artist_id":0,"folder":"x","manual_date":"2024-05"}"#,
+            ),
+        ];
+        for (uri, payload) in cases {
+            let (status, _) = json_response(
+                &app,
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {payload}");
+        }
+    }
+
+    #[test]
+    fn tag_write_errors_map_user_input_to_bad_request() {
+        for message in [
+            "artist_id must be positive",
+            "folder must not be empty",
+            "folder has no items or does not exist",
+            "invalid target_folder path",
+            "target folder must be within artist directory",
+            "item_ids must not be empty",
+            "item_ids must be positive",
+            "item_ids must not contain duplicates",
+            "too many item_ids",
+            "target name exhausted: x.jpg",
+            "invalid date: not-a-date",
+        ] {
+            let (status, _) = to_tag_write_http_error(anyhow::anyhow!(message.to_string()));
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{message}");
+        }
+        let (status, _) = to_tag_write_http_error(anyhow::anyhow!("artist not found"));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = to_tag_write_http_error(anyhow::anyhow!("disk on fire"));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

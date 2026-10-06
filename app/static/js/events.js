@@ -20,11 +20,13 @@ import {
   renderToolbar, loadItems, loadItemsPreservingDepth, updateDuplicateFilesButton,
   updateScanFolderButton, isDuplicateFilesScopeActive, scrollToItemsTop,
   onViewportLayoutChange, renderLibraryEmptyState, isMobileViewport, syncClearSearch,
+  syncArchiveTriageToggle,
 } from './views/sidebar.js';
-import { renderGrid, bindGridEvents, captureGridScrollAnchor, restoreGridScrollAnchor, isTaggableItem, scheduleJustifiedRelayout } from './views/grid.js';
+import { renderGrid, bindGridEvents, captureGridScrollAnchor, restoreGridScrollAnchor, isTaggableItem, scheduleJustifiedRelayout, itemsByIdMap } from './views/grid.js';
 import {
-  closeLightbox, moveLightbox, onLightboxWheel, startLightboxPan, moveLightboxPan,
-  stopLightboxPan, onLightboxDelete, bindLightboxVideoDiagnostics,
+  closeLightbox, closeLightboxInlineEditors, moveLightbox, onLightboxWheel, startLightboxPan, moveLightboxPan,
+  stopLightboxPan, onLightboxDelete, bindLightboxVideoDiagnostics, setLightboxZoom, toggleLightboxCaption,
+  handleLightboxEscape, LIGHTBOX_DOUBLE_CLICK_ZOOM,
 } from './views/lightbox.js';
 import {
   updateEditBar, applySelectionChange, ensureEditTagContext, selectOrCreateEditTagQuery,
@@ -32,7 +34,7 @@ import {
   applyItemDateBatch, editDateEnteredValue, syncEditDatePrecisionInputs,
   deleteSelectedMediaItems, removeSelectedTagsFromItems, selectAllCharacterSuggestions,
   selectCharacterSuggestionTag, closeEditTagPicker, renderEditTagPicker,
-  setEditMode, syncEditModeButton,
+  setEditMode, syncEditModeButton, archiveCurrentFolder, bundleSelectedItems,
 } from './views/editbar.js';
 import { bindArtistLinks, bindArtistProfileLinks, renderArtistLinks, renderArtistProfileLinks, closeArtistLinksDialog } from './views/links.js';
 import { bindArchiveModal, closeArchiveModal } from './views/archive_modal.js';
@@ -76,7 +78,7 @@ import {
   bindDownloadCandidate, verifyDownloadPost, stopDownloadPost, importDownloadPost,
   openDownloadPostFiles, retryDownloadFile, applyDownloadWorksFilter,
   scheduleDownloadWorksSearch, toggleDownloadWorksSelectAll, clearDownloadWorksSelection,
-  loadMoreDownloadWorks, downloadWorksSelection, downloadWorksPost,
+  loadMoreDownloadWorks, downloadWorksSelection, downloadWorksNetdiskSelection, downloadWorksPost,
   toggleDownloadWorkSelection, downloadWorksSelected,
   openDownloadWorksArtistCombo, closeDownloadWorksArtistCombo,
   pickDownloadWorksArtist, renderDownloadWorksArtistCombo,
@@ -521,6 +523,7 @@ export function bindEvents() {
       e.preventDefault();
       selectFirstArtistResult();
     } else if (e.key === 'Escape') {
+      e.stopPropagation();
       closeArtistDropdown();
     }
   });
@@ -536,6 +539,9 @@ export function bindEvents() {
   }, 300));
   $('#searchInput').addEventListener('keydown', e => {
     if (e.key === 'Escape') {
+      // The input owns this Escape; bubbling would reach the document-level
+      // overlay handler and silently clear the current selection.
+      e.stopPropagation();
       if (e.target.value) {
         e.preventDefault();
         clearBrowseSearch(e.target);
@@ -596,8 +602,39 @@ export function bindEvents() {
       loadItems();
     });
   }
+  const archiveTriageToggle = $('#archiveTriageToggle');
+  if (archiveTriageToggle) {
+    archiveTriageToggle.addEventListener('click', e => {
+      const btn = e.target instanceof Element ? e.target.closest('[data-triage]') : null;
+      if (!btn || !archiveTriageToggle.contains(btn)) return;
+      const triage = btn.dataset.triage || 'all';
+      if (state.activeTriage === triage) return;
+      state.activeTriage = triage;
+      syncArchiveTriageToggle();
+      state.selectedIds.clear();
+      updateEditBar();
+      scrollToItemsTop();
+      syncBrowseUrl('push');
+      loadItems();
+    });
+  }
   const gridContainer = $('#gridContainer');
-  if (gridContainer) gridContainer.addEventListener('scroll', maybeLoadMoreOnScroll, {passive: true});
+  const scrollTopBtn = $('#scrollTopBtn');
+  if (gridContainer) {
+    gridContainer.addEventListener('scroll', maybeLoadMoreOnScroll, {passive: true});
+    if (scrollTopBtn) {
+      gridContainer.addEventListener('scroll', () => {
+        const show = gridContainer.scrollTop > 360;
+        if (scrollTopBtn.hidden === show) {
+          scrollTopBtn.hidden = !show;
+          scrollTopBtn.classList.toggle('visible', show);
+        }
+      }, {passive: true});
+      scrollTopBtn.addEventListener('click', () => {
+        gridContainer.scrollTo({top: 0, behavior: 'smooth'});
+      });
+    }
+  }
   window.addEventListener('scroll', maybeLoadMoreOnScroll, {passive: true});
   $('#scanFolderBtn').addEventListener('click', async () => {
     if (!state.currentArtist || !isCurrentScanScopeActive() || isActionBusy('scan-context')) return;
@@ -769,6 +806,8 @@ export function bindEvents() {
     if (confirm && archivePlanList.contains(confirm)) return void toggleArchivePlanConfirmation(confirm.dataset.archivePlanConfirm);
     const jump = target.closest('[data-archive-plan-jump]');
     if (jump && archivePlanList.contains(jump)) return void jumpToArchivePlanFolder(jump.dataset.archivePlanJump);
+    const annotate = target.closest('[data-archive-plan-annotate]');
+    if (annotate && archivePlanList.contains(annotate)) return void annotateArchivePlan(annotate.dataset.archivePlanAnnotate);
   });
   const archivePlansFoldBtn = $('#archivePlansFoldBtn');
   if (archivePlansFoldBtn) archivePlansFoldBtn.addEventListener('click', toggleArchivePlansFold);
@@ -826,7 +865,10 @@ export function bindEvents() {
       openDownloadArtistCombo();
     });
     downloadArtistInput.addEventListener('keydown', e => {
-      if (e.key === 'Escape') closeDownloadArtistCombo();
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        closeDownloadArtistCombo();
+      }
     });
   }
   const downloadArtistListbox = $('#downloadSubscriptionArtistListbox');
@@ -1030,7 +1072,10 @@ export function bindEvents() {
         openDownloadWorksArtistCombo();
       });
       downloadWorksArtistInput.addEventListener('keydown', e => {
-        if (e.key === 'Escape') closeDownloadWorksArtistCombo();
+        if (e.key === 'Escape') {
+          e.stopPropagation();
+          closeDownloadWorksArtistCombo();
+        }
       });
     }
     const downloadWorksArtistListbox = $('#downloadWorksArtistListbox');
@@ -1086,6 +1131,10 @@ export function bindEvents() {
   const downloadWorksDownloadBtn = $('#downloadWorksDownloadBtn');
   if (downloadWorksDownloadBtn) {
     downloadWorksDownloadBtn.addEventListener('click', () => downloadWorksSelection(downloadWorksSelected()));
+  }
+  const downloadWorksNetdiskBtn = $('#downloadWorksNetdiskBtn');
+  if (downloadWorksNetdiskBtn) {
+    downloadWorksNetdiskBtn.addEventListener('click', () => downloadWorksNetdiskSelection(downloadWorksSelected()));
   }
   const recycleRefreshBtn = $('#recycleRefreshBtn');
   if (recycleRefreshBtn) recycleRefreshBtn.addEventListener('click', () => loadRecycleBin());
@@ -1153,8 +1202,13 @@ export function bindEvents() {
     const more = target ? target.closest('[data-recycle-load-more]') : null;
     if (more && recycleBinMore.contains(more)) loadRecycleBin({append: true});
   });
-  const characterImportBtn = $('#characterImportBtn');
-  if (characterImportBtn) characterImportBtn.addEventListener('click', () => {
+  // One import entry serves both the header button and the empty-list
+  // shortcut: same scope rules, same payload.
+  function startCharacterTagImport() {
+    const scopeSelect = $('#characterImportScopeSelect');
+    if (!state.currentArtist && scopeSelect && scopeSelect.value !== 'all') {
+      scopeSelect.value = 'all';
+    }
     const scope = $('#characterImportScopeSelect')?.value === 'all' ? 'all' : 'artist';
     if (scope === 'artist' && !state.currentArtist) {
       toast('请先在上方选择画师', 'error');
@@ -1166,7 +1220,9 @@ export function bindEvents() {
         ? {artist_id: state.currentArtist.id, limit_per_tag: 3}
         : {limit_per_tag: 3},
     });
-  });
+  }
+  const characterImportBtn = $('#characterImportBtn');
+  if (characterImportBtn) characterImportBtn.addEventListener('click', startCharacterTagImport);
   $('#characterRebuildIndexBtn').addEventListener('click', rebuildCharacterIndex);
 
   const characterCreateBtn = $('#characterCreateBtn');
@@ -1234,10 +1290,10 @@ export function bindEvents() {
   }
   const characterLibrarySearchInput = $('#characterLibrarySearchInput');
   if (characterLibrarySearchInput) {
-    characterLibrarySearchInput.addEventListener('input', e => {
+    characterLibrarySearchInput.addEventListener('input', debounce(e => {
       state.characterLibrarySearchQuery = e.target.value;
       renderCharacterLibrary();
-    });
+    }, 150));
     characterLibrarySearchInput.addEventListener('keydown', e => {
       if (e.key === 'Escape') {
         e.stopPropagation();
@@ -1294,9 +1350,9 @@ export function bindEvents() {
           applyMode('browse');
           const searchInput = $('#searchInput');
           if (searchInput) searchInput.value = query;
-          state.searchQuery = query;
+          state.search = query;
           syncClearSearch();
-          loadItems({reset: true});
+          loadItems();
         }
         return;
       }
@@ -1323,6 +1379,11 @@ export function bindEvents() {
       const createTrigger = target ? target.closest('[data-character-create-trigger]') : null;
       if (createTrigger && characterList.contains(createTrigger)) {
         openCharacterCreate();
+        return;
+      }
+      const importTrigger = target ? target.closest('[data-character-import-trigger]') : null;
+      if (importTrigger && characterList.contains(importTrigger)) {
+        startCharacterTagImport();
         return;
       }
     });
@@ -1512,7 +1573,7 @@ export function bindEvents() {
       tag_ids: tagIds,
       tag_names: tagNames,
     });
-    if (tagIds.length === 0 && tagNames.length === 0) { toast('请选择要操作的目标标签', 'error'); return; }
+    if (tagIds.length === 0 && tagNames.length === 0) { toast('请选择要操作的目标角色', 'error'); return; }
     if (state.selectedIds.size > 0) {
       const suggestionWarning = characterSuggestionCoverageWarning([...state.selectedIds], tagNames);
       if (suggestionWarning && !window.confirm(suggestionWarning)) return;
@@ -1536,6 +1597,16 @@ export function bindEvents() {
     }
   });
 
+  const editArchiveFolderBtn = $('#editArchiveFolderBtn');
+  if (editArchiveFolderBtn) {
+    editArchiveFolderBtn.addEventListener('click', () => archiveCurrentFolder());
+  }
+
+  const editBundleItemsBtn = $('#editBundleItemsBtn');
+  if (editBundleItemsBtn) {
+    editBundleItemsBtn.addEventListener('click', () => bundleSelectedItems());
+  }
+
   $('#editDeleteSelectedBtn').addEventListener('click', () => deleteSelectedMediaItems());
 
   $('#editTagSearch').addEventListener('focus', e => {
@@ -1551,6 +1622,7 @@ export function bindEvents() {
       e.preventDefault();
       selectFirstEditTagResult();
     } else if (e.key === 'Escape') {
+      e.stopPropagation();
       closeEditTagPicker();
     }
   });
@@ -1636,9 +1708,42 @@ export function bindEvents() {
     if ((e.key === 't' || e.key === 'T') && !e.ctrlKey && !e.metaKey && !e.altKey) {
       const activeEl = document.activeElement;
       const tag = activeEl ? activeEl.tagName : '';
-      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable) {
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable && $('#lightbox')?.style.display !== 'flex') {
         e.preventDefault();
         toggleTheme();
+      }
+    }
+    if ((e.key === 'k' || e.key === 'K') && (e.ctrlKey || e.metaKey) && !e.altKey) {
+      const activeEl = document.activeElement;
+      const tag = activeEl ? activeEl.tagName : '';
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable && $('#lightbox')?.style.display !== 'flex') {
+        e.preventDefault();
+        const searchInput = $('#searchInput');
+        if (searchInput) {
+          searchInput.focus();
+          searchInput.select?.();
+        }
+      }
+    }
+    if ((e.key === 'a' || e.key === 'A') && (e.ctrlKey || e.metaKey) && !e.altKey) {
+      const activeEl = document.activeElement;
+      const tag = activeEl ? activeEl.tagName : '';
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable && $('#lightbox')?.style.display !== 'flex') {
+        const selectAllBtn = $('#editSelectAllBtn');
+        if (selectAllBtn && typeof selectAllBtn.click === 'function' && (state.editMode || state.selectedIds.size > 0 || (state.allItems && state.allItems.length > 0))) {
+          e.preventDefault();
+          selectAllBtn.click();
+        }
+      }
+    }
+    if ((e.key === 'Delete' || e.key === 'Backspace') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      const activeEl = document.activeElement;
+      const tag = activeEl ? activeEl.tagName : '';
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable && !globalDeleteShortcutBlocked()) {
+        if (state.selectedIds.size > 0 && !state.readOnlyMode) {
+          e.preventDefault();
+          deleteSelectedMediaItems();
+        }
       }
     }
     // Focus trap for open filter drawer / lightbox dialogs.
@@ -1677,7 +1782,10 @@ export function bindEvents() {
   $('#lightbox').addEventListener('click', e => {
     const eventTarget = e.target;
     const closeButton = eventTarget instanceof Element ? eventTarget.closest('.close') : null;
-    if (eventTarget === $('#lightbox') || eventTarget === $('#lightboxStage') || (closeButton && $('#lightbox').contains(closeButton))) closeLightbox();
+    if (eventTarget === $('#lightbox') || eventTarget === $('#lightboxStage') || (closeButton && $('#lightbox').contains(closeButton))) {
+      if (!closeButton && closeLightboxInlineEditors()) return;
+      closeLightbox();
+    }
   });
   $('#lightbox').addEventListener('wheel', onLightboxWheel, {passive: false});
   const lightboxImg = $('#lightboxImg');
@@ -1685,12 +1793,17 @@ export function bindEvents() {
   lightboxImg.addEventListener('pointermove', moveLightboxPan);
   lightboxImg.addEventListener('pointerup', stopLightboxPan);
   lightboxImg.addEventListener('pointercancel', stopLightboxPan);
+  lightboxImg.addEventListener('dblclick', e => {
+    e.stopPropagation();
+    setLightboxZoom(state.lightboxZoom > 1 ? 1 : LIGHTBOX_DOUBLE_CLICK_ZOOM);
+  });
   $('#lightboxDownloadBtn').addEventListener('click', e => {
     e.stopPropagation();
   });
   $('#lightboxFavoriteBtn').addEventListener('click', e => {
     e.stopPropagation();
-    const item = state.allItems.find(row => row.id === parseInt(e.currentTarget.dataset.favorite));
+    const favId = parseInt(e.currentTarget.dataset.favorite);
+    const item = itemsByIdMap().get(favId) || (state.allItems || []).find(row => row.id === favId);
     toggleItemFavorite(item);
   });
   const deleteBtn = $('#lightboxDeleteBtn');
@@ -1698,6 +1811,13 @@ export function bindEvents() {
     deleteBtn.addEventListener('click', e => {
       e.stopPropagation();
       onLightboxDelete(deleteBtn);
+    });
+  }
+  const infoToggleBtn = $('#lightboxInfoToggleBtn');
+  if (infoToggleBtn) {
+    infoToggleBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      toggleLightboxCaption();
     });
   }
   $('#lightbox .prev').addEventListener('click', e => {
@@ -1713,6 +1833,22 @@ export function bindEvents() {
   bindArchiveModal();
 }
 
+// Delete/Backspace may only delete the grid selection when no overlay owns the
+// screen: with a modal, drawer or popup open, focus can sit on body or a button
+// and a delete confirm would pile on top of the overlay. Same overlay set as
+// closeTopmostOverlay below.
+export function globalDeleteShortcutBlocked() {
+  if ($('#lightbox')?.style.display === 'flex') return true;
+  if ($('#archiveDialog')?.open) return true;
+  if ([...$$('.artist-links-dialog')].some(dialog => dialog.open)) return true;
+  if (state.filterDrawerOpen) return true;
+  if ($('#editTagPicker')?.classList.contains('open')) return true;
+  if ($('#artistDropdown')?.classList.contains('open')) return true;
+  if (state.searchOptionsOpen) return true;
+  if (state.mobileHeaderToolsOpen) return true;
+  return false;
+}
+
 function closeTopmostOverlay() {
   const artistLinksDialog = $('.artist-links-dialog[open]');
   if (artistLinksDialog) {
@@ -1724,8 +1860,7 @@ function closeTopmostOverlay() {
     return true;
   }
   if ($('#lightbox').style.display === 'flex') {
-    closeLightbox();
-    return true;
+    return handleLightboxEscape();
   }
   if (state.filterDrawerOpen) {
     closeFilterDrawer();
@@ -1764,6 +1899,6 @@ import {
   openEditTagPicker, selectFirstEditTagResult, classifyItems, classifyFolder, currentEditArtistId,
 } from './views/editbar.js';
 import {
-  toggleArchivePlanConfirmation, undoArchivePlan, jumpToArchivePlanFolder,
+  toggleArchivePlanConfirmation, undoArchivePlan, jumpToArchivePlanFolder, annotateArchivePlan,
 } from './views/maintenance/organize.js';
 import { isActionBusy, setActionBusy } from './store.js';

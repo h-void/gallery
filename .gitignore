@@ -56,3 +56,8 @@ rust/**/target/
 # (`gallery.db`, `db-backups`, `retained-dirs`) the root rule keeps out, one
 # level down, and `data/` is anchored at the repository root.
 /rust/gallery_accel/data/
+
+# recovery artifacts (not source)
+recovered-448-history/
+tmp/
+

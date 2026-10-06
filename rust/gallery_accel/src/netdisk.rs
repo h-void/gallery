@@ -29,7 +29,7 @@ pub const KEY_NETDISK_DISCONNECTED: &str = "netdisk_disconnected";
 /// value, and a script that reports a different one is not trusted for the
 /// capabilities this version relies on.
 pub const NETDISK_PROTOCOL_VERSION: &str = "2";
-pub const NETDISK_SCRIPT_VERSION: &str = "2.3";
+pub const NETDISK_SCRIPT_VERSION: &str = "2.4";
 /// Allow several missed ten-second ticks before declaring the script offline.
 pub const NETDISK_HEARTBEAT_TIMEOUT_SECS: i64 = 60;
 
@@ -501,6 +501,12 @@ pub struct BridgeCapabilities {
     pub supports_download_path: bool,
     pub supports_snapshot: bool,
     pub max_page_size: u32,
+    /// The request budget the script reports for one exchange, in
+    /// milliseconds. 0 means "no hard timeout", not "bounded". Script 2.4
+    /// reports 5000 when JD's Java runtime backs the request, and 0 when it
+    /// cannot. Gallery records what the handshake said instead of assuming a
+    /// budget it never saw.
+    pub request_timeout_ms: u32,
     /// JD's own `LINKGRABBER_AUTO_START_ENABLED`, as the script read it.
     ///
     /// `None` is "the script could not read it", which is not the same as
@@ -2402,6 +2408,7 @@ mod tests {
                     supports_download_path: true,
                     supports_snapshot: true,
                     max_page_size: 100,
+                    request_timeout_ms: 5000,
                     // The fixture stands in for a JD whose global auto-start is
                     // off, which is what a move requires.
                     linkgrabber_auto_start_enabled: Some(false),
@@ -3691,6 +3698,13 @@ mod tests {
         assert!(
             trimmed.contains(r#"var GALLERY_URL = "http://host:1/api/netdisk/bridge/exchange";"#)
         );
+
+        // The request budget is wired into the body, not just documented: the
+        // bounded transport and its honest 0 fallback both live in the script.
+        assert!(script.contains("var GALLERY_REQUEST_BUDGET_MS = 5000;"));
+        assert!(script.contains("request_timeout_ms: requestBudget()"));
+        assert!(script.contains("function exchangePost(body)"));
+        assert!(script.contains("conn.setConnectTimeout(budget)"));
     }
 
     /// A token is attacker-influenced in the sense that it is generated and
@@ -3708,7 +3722,7 @@ mod tests {
         ));
         // Exactly the one call the script is supposed to make is left in the
         // body: the token did not introduce a second one.
-        assert_eq!(script.matches("postPage(GALLERY_URL").count(), 2);
+        assert_eq!(script.matches("postPage(GALLERY_URL").count(), 1);
     }
 
     /// The script body is a real file, not a string built in Rust, so this
@@ -3751,6 +3765,7 @@ mod tests {
             supports_download_path: true,
             supports_snapshot: true,
             max_page_size: 100,
+            request_timeout_ms: 5000,
             linkgrabber_auto_start_enabled: None,
         };
 

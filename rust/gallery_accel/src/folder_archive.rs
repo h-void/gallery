@@ -641,7 +641,7 @@ pub(crate) fn validate_relative_folder(folder: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-fn path_under_artist(path: &Path, artist: &Path) -> bool {
+pub(crate) fn path_under_artist(path: &Path, artist: &Path) -> bool {
     let path = safe_canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let artist = safe_canonicalize(artist).unwrap_or_else(|_| artist.to_path_buf());
     path.starts_with(&artist)
@@ -1318,6 +1318,29 @@ fn effective_date_key(raw: &str) -> Option<String> {
     }
 }
 
+/// First calendar-valid date at the head of a raw date string, for seeding a
+/// plan's `parsed_date` when the folder name itself carries no date.
+///
+/// Slices at most 10 bytes and never mid-character, keeps month precision
+/// (`2024-05` stays `2024-05`), and rejects impossible calendar dates instead
+/// of naming an archive folder `2024-13-99`. A `YYYYMMDD` head followed by
+/// more digits (a timestamp tail) still yields its leading 8 digits.
+fn date_head_from_raw(raw: &str) -> Option<String> {
+    let head = raw.get(..10).unwrap_or(raw);
+    if head.len() < 7 || !head.chars().all(|c| c.is_ascii_digit() || c == '-') {
+        return None;
+    }
+    if let Some(value) = crate::media_type::extract_date_value_from_folder(head) {
+        return Some(value.raw);
+    }
+    if head.len() >= 8 && head.bytes().all(|b| b.is_ascii_digit()) {
+        if let Some(value) = crate::media_type::extract_date_value_from_folder(&head[..8]) {
+            return Some(value.raw);
+        }
+    }
+    None
+}
+
 /// Distinct effective dates of the active items per source folder for one
 /// artist, built with a single pass over the artist's items.
 ///
@@ -1344,7 +1367,7 @@ impl ItemDatesByFolder {
         }
         let artist_path = artist_plan_path(conn, artist_id)?;
         let mut stmt = conn.prepare(
-            "SELECT file_path, folder_name, manual_date, detected_date, date FROM items
+            "SELECT file_path, folder_name, manual_date, COALESCE(detected_date, ''), COALESCE(date, '') FROM items
              WHERE artist_id=? AND COALESCE(missing, 0)=0",
         )?;
         let rows = stmt.query_map(params![artist_id], |row| {
@@ -1620,16 +1643,29 @@ fn source_folder_items(
     source_folder: &str,
 ) -> Result<Vec<DiscoveredFolderItem>> {
     let prefix = format!("{}/", folder_db_path(artist_path, source_folder));
-    let mut stmt = conn.prepare(
+    let has_item_tags: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='item_tags')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    let tags_subquery = if has_item_tags {
+        "(SELECT json_group_array(it.tag_id)
+          FROM (SELECT it.tag_id FROM item_tags it WHERE it.item_id=i.id ORDER BY it.tag_id) it)"
+    } else {
+        "'[]'"
+    };
+    let sql = format!(
         "SELECT i.id, i.file_path, i.file_name, i.folder_name, i.manual_date,
                 COALESCE(i.detected_date, ''), COALESCE(i.date, ''),
-                (SELECT json_group_array(it.tag_id)
-                 FROM (SELECT it.tag_id FROM item_tags it WHERE it.item_id=i.id ORDER BY it.tag_id) it)
+                {tags_subquery}
          FROM items i
          WHERE i.artist_id=? AND COALESCE(i.missing, 0)=0
            AND instr(REPLACE(i.file_path, '\\', '/'), ?)=1
-         ORDER BY i.id",
-    )?;
+         ORDER BY i.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![artist_id, prefix], |row| {
         let raw: Option<String> = row.get(7)?;
         Ok(DiscoveredFolderItem {
@@ -1967,14 +2003,60 @@ fn remove_empty_parents(paths: impl IntoIterator<Item = PathBuf>, artist_root: &
     }
 }
 
-/// Whether `path` is a directory that currently holds no entries.
+/// Harmless desktop or NAS metadata files/directories that can be safely removed
+/// when cleaning up otherwise-empty parent directories.
+fn is_harmless_junk_entry(entry_name: &str) -> bool {
+    let lower = entry_name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        ".ds_store"
+            | "thumbs.db"
+            | "desktop.ini"
+            | "ehthumbs.db"
+            | "ehthumbs_vista.db"
+            | "@eadir"
+            | "@synoresource"
+            | "@synoeastream"
+            | ".spotlight-v100"
+            | ".trashes"
+            | ".fseventsd"
+    ) || lower.starts_with("._")
+}
+
+/// Whether `path` is a directory that currently holds no entries, or only holds
+/// harmless OS metadata files (such as `.DS_Store`, `Thumbs.db`, `@eaDir`).
 ///
-/// An unreadable or absent path answers `false`: the caller uses this to decide
-/// what it may delete, and "I could not look" is not a reason to delete.
+/// If only harmless metadata entries are present, they are removed so the
+/// directory can be cleanly deleted by the caller. An unreadable or absent path
+/// answers `false`: the caller uses this to decide what it may delete, and
+/// "I could not look" is not a reason to delete.
 fn directory_is_empty(path: &Path) -> bool {
-    std::fs::read_dir(path)
-        .map(|mut entries| entries.next().is_none())
-        .unwrap_or(false)
+    let entries = match std::fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let mut junk_entries = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        if is_harmless_junk_entry(&name_str) {
+            junk_entries.push(entry.path());
+        } else {
+            return false;
+        }
+    }
+    for junk in junk_entries {
+        if junk.is_dir() {
+            let _ = std::fs::remove_dir_all(&junk);
+        } else {
+            let _ = std::fs::remove_file(&junk);
+        }
+    }
+    true
 }
 
 fn rollback_split_moves(moved: &[SplitFileMove], roots: &MediaRoots) -> Result<()> {
@@ -2146,8 +2228,19 @@ pub fn recompute_artist_plan_targets(
         .optional()?
         .unwrap_or_default();
     let (archive_profile, profile_source) = archive_profile_for_artist(conn, artist_id)?;
-    let format_snapshot =
-        archive_format::rule_snapshot(&archive_profile, &profile_source).to_string();
+    let tag_tables_ready: bool = conn
+        .query_row(
+            "SELECT COUNT(*)=2 FROM sqlite_master
+             WHERE type='table' AND name IN ('tags','item_tags')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    let requires_tags = tag_tables_ready
+        && archive_profile["template"]
+            .as_str()
+            .map(|t| t.contains("{tags}"))
+            .unwrap_or(true);
     let artist_root = roots.and_then(|roots| {
         roots
             .map_to_real(&artist_path)
@@ -2158,7 +2251,7 @@ pub fn recompute_artist_plan_targets(
     let merge_targets = archive_profile["collision_strategy"].as_str() == Some("merge");
     let mut seen_targets = HashSet::new();
     let mut stmt = conn.prepare(
-        "SELECT id, source_folder, original_title, selected_tag_ids, status, plan_kind, split_actions
+        "SELECT id, source_folder, original_title, selected_tag_ids, status, plan_kind, split_actions, format_snapshot, parsed_date
          FROM folder_rename_plans
          WHERE artist_id=? AND status NOT IN ('confirmed','executed','reverted')
          ORDER BY id",
@@ -2173,6 +2266,8 @@ pub fn recompute_artist_plan_targets(
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2188,8 +2283,23 @@ pub fn recompute_artist_plan_targets(
         _status,
         plan_kind,
         split_actions,
+        existing_snapshot,
+        parsed_date,
     ) in plans
     {
+        let row_format_snapshot = {
+            let mut snapshot_value =
+                archive_format::rule_snapshot(&archive_profile, &profile_source);
+            if let Ok(existing_val) = serde_json::from_str::<Value>(&existing_snapshot) {
+                if let Some(keep) = existing_val.get("keep_together") {
+                    if let Some(obj) = snapshot_value.as_object_mut() {
+                        obj.insert("keep_together".to_string(), keep.clone());
+                    }
+                }
+            }
+            snapshot_value.to_string()
+        };
+
         if plan_kind == "split_by_tag" {
             let complete = split_actions_complete(conn, artist_id, &source_folder, &split_actions)?;
             let new_status = if !complete {
@@ -2214,28 +2324,34 @@ pub fn recompute_artist_plan_targets(
                  SET target_folder='', status=?, confirmed_at=NULL, confirmation_source='',
                      format_snapshot=?, updated_at=?
                  WHERE id=? AND status NOT IN ('confirmed','executed','reverted')",
-                params![new_status, format_snapshot, now(), plan_id],
+                params![new_status, row_format_snapshot, now(), plan_id],
             )? as usize;
             continue;
         }
-        let dates = item_dates.get(&source_folder);
-        let mut target = if dates.is_empty() || dates.len() > 1 {
-            String::new()
-        } else {
-            let tags = plan_tag_names(conn, artist_id, &source_folder, &selected_json)?;
-            render_archive_target(
-                &archive_profile,
-                &artist_name,
-                &dates[0],
-                &tags,
-                &original_title,
-                &source_folder,
-                plan_id as usize,
-                Some(artist_id),
-                Some(plan_id),
-                None,
-            )?
-        };
+        let mut dates = item_dates.get(&source_folder);
+        if dates.is_empty() && !parsed_date.is_empty() {
+            if let Some(date_key) = effective_date_key(&parsed_date) {
+                dates.push(date_key);
+            }
+        }
+        let tags = plan_tag_names(conn, artist_id, &source_folder, &selected_json)?;
+        let mut target =
+            if (requires_tags && tags.is_empty()) || dates.is_empty() || dates.len() > 1 {
+                String::new()
+            } else {
+                render_archive_target(
+                    &archive_profile,
+                    &artist_name,
+                    &dates[0],
+                    &tags,
+                    &original_title,
+                    &source_folder,
+                    plan_id as usize,
+                    Some(artist_id),
+                    Some(plan_id),
+                    None,
+                )?
+            };
         if suffix_collisions && !target.is_empty() && target != source_folder {
             let requested_target = target.clone();
             let mut number = 2usize;
@@ -2252,7 +2368,7 @@ pub fn recompute_artist_plan_targets(
                 number += 1;
             }
         }
-        if merge_targets && !target.is_empty() && target != source_folder {
+        if tag_tables_ready && merge_targets && !target.is_empty() && target != source_folder {
             let items = source_folder_items(conn, artist_id, &artist_path, &source_folder)?;
             let (merge_actions, missing_date) = build_split_actions(
                 conn,
@@ -2286,14 +2402,22 @@ pub fn recompute_artist_plan_targets(
                  SET target_folder='', status=?, plan_kind='split_by_tag', split_actions=?,
                      confirmed_at=NULL, confirmation_source='', format_snapshot=?, updated_at=?
                  WHERE id=? AND status NOT IN ('confirmed','executed','reverted')",
-                params![new_status, merge_actions, format_snapshot, now(), plan_id,],
+                params![
+                    new_status,
+                    merge_actions,
+                    row_format_snapshot,
+                    now(),
+                    plan_id,
+                ],
             )? as usize;
             continue;
         }
         if !target.is_empty() {
             seen_targets.insert(target.to_ascii_lowercase());
         }
-        let new_status = if dates.is_empty() {
+        let new_status = if requires_tags && tags.is_empty() {
+            "needs_tags"
+        } else if dates.is_empty() {
             "needs_date"
         } else if dates.len() > 1 {
             "date_conflict"
@@ -2328,7 +2452,7 @@ pub fn recompute_artist_plan_targets(
              SET target_folder=?, status=?, confirmed_at=NULL, confirmation_source='',
                  format_snapshot=?, updated_at=?
              WHERE id=? AND status NOT IN ('confirmed','executed','reverted')",
-            params![target, new_status, format_snapshot, now(), plan_id],
+            params![target, new_status, row_format_snapshot, now(), plan_id],
         )?;
         changed += n as usize;
     }
@@ -2421,12 +2545,27 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
             continue;
         }
         let mut parsed_date = crate::media_type::extract_date_from_folder(&folder);
-        // Legacy dates may hold junk text; slicing must not split a multi-byte
-        // char, and only a leading ASCII date is safe to keep.
-        if parsed_date.is_empty() && !min_date.starts_with("0000") {
-            if let Some(head) = min_date.get(..10) {
-                if head.chars().all(|c| c.is_ascii_digit() || c == '-') {
-                    parsed_date = head.to_string();
+        // Legacy dates may hold junk text: keep only a leading, calendar-valid
+        // date (`date_head_from_raw` slices without splitting a multi-byte char
+        // and rejects impossible dates like `2024-13-99`).
+        if parsed_date.is_empty() {
+            if let Some(head) = date_head_from_raw(&min_date) {
+                parsed_date = head;
+            }
+        }
+        if parsed_date.is_empty() {
+            for it in &items {
+                let candidate = if let Some(m) = it.manual_date.as_deref().filter(|s| !s.is_empty())
+                {
+                    m
+                } else if !it.detected_date.is_empty() {
+                    &it.detected_date
+                } else {
+                    &it.legacy_date
+                };
+                if let Some(head) = date_head_from_raw(candidate) {
+                    parsed_date = head;
+                    break;
                 }
             }
         }
@@ -2436,58 +2575,9 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
             continue;
         }
 
-        let has_any_tags = items.iter().any(|item| !item.tags.is_empty());
-        if !has_any_tags {
-            // Folders with no tags must not appear in the pending organize list.
-            let _ = conn.execute(
-                "DELETE FROM folder_rename_plans WHERE artist_id=? AND source_folder=? AND status NOT IN ('confirmed', 'executed')",
-                params![artist_id, folder],
-            );
-            continue;
-        }
-
-        let mut groups = BTreeSet::new();
-        let mut union_set = BTreeSet::new();
-        for item in items.iter().filter(|item| !item.tags.is_empty()) {
-            let raw_date = effective_display_date(
-                &item.detected_date,
-                item.manual_date.as_deref(),
-                &item.legacy_date,
-            );
-            groups.insert((effective_date_key(&raw_date), item.tags.clone()));
-            for tag_id in &item.tags {
-                union_set.insert(*tag_id);
-            }
-        }
-        let split_needed = items.iter().any(|item| item.tags.is_empty()) || groups.len() > 1;
-        let plan_kind = if split_needed {
-            "split_by_tag"
-        } else {
-            "rename_folder"
-        };
-        let selected_tag_ids = union_set.into_iter().collect::<Vec<_>>();
-        let selected_tag_ids_json = serde_json::to_string(&selected_tag_ids)?;
-        let (split_actions, split_missing_date) = if split_needed {
-            build_split_actions(
-                conn,
-                artist_id,
-                &artist_name,
-                &archive_profile,
-                &folder,
-                &items,
-            )?
-        } else {
-            ("[]".to_string(), false)
-        };
-        let initial_status = if split_missing_date {
-            "needs_date"
-        } else {
-            "draft"
-        };
-
-        let existing: Option<(i64, String, String, String, i64, String)> = conn
+        let existing: Option<(i64, String, String, String, i64, String, String)> = conn
             .query_row(
-                "SELECT id, status, parsed_date, selected_tag_ids, file_count, target_folder
+                "SELECT id, status, parsed_date, selected_tag_ids, file_count, target_folder, format_snapshot
                  FROM folder_rename_plans
                  WHERE artist_id=? AND source_folder=?",
                 params![artist_id, folder],
@@ -2499,10 +2589,77 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
             .optional()?;
+
+        let is_locked_keep_together = existing
+            .as_ref()
+            .map(|(_, _, _, _, _, _, snapshot)| {
+                serde_json::from_str::<Value>(snapshot)
+                    .ok()
+                    .and_then(|v| v.get("keep_together").and_then(|k| k.as_bool()))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        let has_any_tags = items.iter().any(|item| !item.tags.is_empty());
+        let (plan_kind, selected_tag_ids_json, split_actions, initial_status) = if !has_any_tags {
+            (
+                "rename_folder",
+                "[]".to_string(),
+                "[]".to_string(),
+                "needs_tags",
+            )
+        } else {
+            let mut groups = BTreeSet::new();
+            let mut union_set = BTreeSet::new();
+            for item in items.iter().filter(|item| !item.tags.is_empty()) {
+                let raw_date = effective_display_date(
+                    &item.detected_date,
+                    item.manual_date.as_deref(),
+                    &item.legacy_date,
+                );
+                groups.insert((effective_date_key(&raw_date), item.tags.clone()));
+                for tag_id in &item.tags {
+                    union_set.insert(*tag_id);
+                }
+            }
+            let split_needed = !is_locked_keep_together
+                && (items.iter().any(|item| item.tags.is_empty()) || groups.len() > 1);
+            let plan_kind = if split_needed {
+                "split_by_tag"
+            } else {
+                "rename_folder"
+            };
+            let selected_tag_ids = union_set.into_iter().collect::<Vec<_>>();
+            let selected_tag_ids_json = serde_json::to_string(&selected_tag_ids)?;
+            let (split_actions, split_missing_date) = if split_needed {
+                build_split_actions(
+                    conn,
+                    artist_id,
+                    &artist_name,
+                    &archive_profile,
+                    &folder,
+                    &items,
+                )?
+            } else {
+                ("[]".to_string(), false)
+            };
+            let initial_status = if split_missing_date {
+                "needs_date"
+            } else {
+                "draft"
+            };
+            (
+                plan_kind,
+                selected_tag_ids_json,
+                split_actions,
+                initial_status,
+            )
+        };
 
         match existing {
             None => {
@@ -2510,7 +2667,7 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
                     "INSERT INTO folder_rename_plans
                      (artist_id, source_folder, original_folder_name, original_title, parsed_date,
                      selected_tag_ids, status, file_count, target_folder, execution_log, plan_kind,
-                      split_actions, confirmation_source, updated_at)
+                     split_actions, confirmation_source, updated_at)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '[]', ?, ?, '', ?)",
                     params![
                         artist_id,
@@ -2527,7 +2684,7 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
                     ],
                 );
             }
-            Some((plan_id, status, old_date, _old_tags, _old_count, _old_target)) => {
+            Some((plan_id, status, old_date, _old_tags, _old_count, _old_target, _)) => {
                 if status != "confirmed" && status != "executed" {
                     let final_date = if old_date.is_empty() {
                         parsed_date
@@ -3127,10 +3284,27 @@ pub fn execute_folder_renames_with_backup(
                 if item_dates_cache.is_none() {
                     item_dates_cache = Some(ItemDatesByFolder::build(conn, artist_id)?);
                 }
-                let dates = item_dates_cache
+                let mut dates = item_dates_cache
                     .as_ref()
                     .expect("item dates cache built above")
                     .get(&source_raw);
+                let (selected, format_snapshot, parsed_date): (String, String, String) = conn
+                    .query_row(
+                        "SELECT selected_tag_ids, format_snapshot, parsed_date
+                         FROM folder_rename_plans WHERE id=?",
+                        params![id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?;
+                // Same fallback as `recompute_artist_plan_targets`: a plan whose
+                // only date is the stored `parsed_date` (folder-name date) is
+                // executable here too. Without this mirror the plan rendered
+                // `ready` with a target and then bounced back to `needs_date`
+                // on every execution attempt.
+                if dates.is_empty() && !parsed_date.is_empty() {
+                    if let Some(date_key) = effective_date_key(&parsed_date) {
+                        dates.push(date_key);
+                    }
+                }
                 if dates.is_empty() {
                     demote_plan_with_log(conn, id, "needs_date", "", "needs_date", &source_raw)?;
                     executed.push(json!({
@@ -3154,11 +3328,6 @@ pub fn execute_folder_renames_with_backup(
                     }));
                     return Ok(false);
                 }
-                let (selected, format_snapshot): (String, String) = conn.query_row(
-                    "SELECT selected_tag_ids, format_snapshot FROM folder_rename_plans WHERE id=?",
-                    params![id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?;
                 let profile = serde_json::from_str::<Value>(&format_snapshot)
                     .ok()
                     .and_then(|snapshot| snapshot.get("profile").cloned());
@@ -3495,6 +3664,7 @@ pub fn execute_folder_renames_with_backup(
              "adopted_rename": adopted_rename}
         ));
         intent_guard.finish(crate::pawchive_groups::GROUP_MOVE_INTENT_APPLIED, "");
+        remove_empty_parents(Some(src), &artist_root);
         // The executed plan rewrote item paths; rebuild the grouping before
         // the next plan's recheck.
         item_dates_cache = None;
@@ -4420,14 +4590,15 @@ mod tests {
 
         auto_discover_artist_folder_plans(&conn, 1).unwrap();
 
-        let no_tags_count: i64 = conn
+        let (no_tags_count, no_tags_status): (i64, String) = conn
             .query_row(
-                "SELECT COUNT(*) FROM folder_rename_plans WHERE source_folder='no_tags'",
+                "SELECT COUNT(*), COALESCE(status, '') FROM folder_rename_plans WHERE source_folder='no_tags'",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(no_tags_count, 0);
+        assert_eq!(no_tags_count, 1);
+        assert_eq!(no_tags_status, "needs_tags");
 
         let inconsistent_plan: (String, String, String) = conn
             .query_row(
@@ -4454,6 +4625,145 @@ mod tests {
             serde_json::from_str::<Value>(&consistent_status.1).unwrap(),
             json!([1])
         );
+    }
+
+    #[test]
+    fn auto_discover_respects_keep_together_lock_and_avoids_split() {
+        let conn = create_plan_db();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT, file_name TEXT,
+                folder_name TEXT, missing INTEGER DEFAULT 0, manual_date TEXT,
+                detected_date TEXT, date TEXT
+             );
+             CREATE TABLE IF NOT EXISTS item_tags (item_id INTEGER, tag_id INTEGER);
+             INSERT INTO items VALUES (1, 1, '/one/mixed/a.jpg', 'a.jpg', 'mixed', 0, NULL, '2026-01-01', '2026-01-01'),
+                                      (2, 1, '/one/mixed/b.jpg', 'b.jpg', 'mixed', 0, NULL, '2026-01-01', '2026-01-01');
+             INSERT INTO item_tags VALUES (1, 1);
+             INSERT INTO folder_rename_plans (artist_id, source_folder, status, format_snapshot)
+             VALUES (1, 'mixed', 'draft', '{\"keep_together\":true}');"
+        ).unwrap();
+
+        auto_discover_artist_folder_plans(&conn, 1).unwrap();
+
+        let plan_kind: String = conn
+            .query_row(
+                "SELECT plan_kind FROM folder_rename_plans WHERE source_folder='mixed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(plan_kind, "rename_folder");
+    }
+
+    #[test]
+    fn auto_discover_date_fallback_accepts_month_precision_and_rejects_impossible_dates() {
+        let conn = create_plan_db();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT, file_name TEXT,
+                folder_name TEXT, missing INTEGER DEFAULT 0, manual_date TEXT,
+                detected_date TEXT, date TEXT
+             );
+             CREATE TABLE IF NOT EXISTS item_tags (item_id INTEGER, tag_id INTEGER);
+             -- Month-only manual dates are a real date (YYYY-MM) and must seed
+             -- the plan instead of leaving it dateless.
+             INSERT INTO items VALUES (1, 1, '/one/m1/a.jpg', 'a.jpg', 'm1', 0, '2024-05', '', '');
+             -- Impossible calendar dates must never name an archive folder.
+             INSERT INTO items VALUES (2, 1, '/one/j1/a.jpg', 'a.jpg', 'j1', 0, NULL, '2024-13-99', '');
+             -- A compact date with a timestamp tail still yields its date.
+             INSERT INTO items VALUES (3, 1, '/one/c1/a.jpg', 'a.jpg', 'c1', 0, NULL, '', '202405011230');"
+        ).unwrap();
+
+        auto_discover_artist_folder_plans(&conn, 1).unwrap();
+
+        for (folder, expected) in [("m1", "2024-05"), ("j1", ""), ("c1", "2024-05-01")] {
+            let parsed: String = conn
+                .query_row(
+                    "SELECT parsed_date FROM folder_rename_plans WHERE source_folder=?",
+                    params![folder],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(parsed, expected, "parsed_date for folder {folder}");
+        }
+    }
+
+    /// A plan whose only date is the folder-name date must be executable end to
+    /// end: recompute renders it `ready` with a target, and the execution
+    /// recheck has to apply the same `parsed_date` fallback instead of bouncing
+    /// the plan back to `needs_date` forever.
+    #[test]
+    fn execute_runs_plans_dated_only_from_the_folder_name() {
+        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        let src = artist.join("2024-05 pack");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.jpg"), b"x").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY, artist_id INTEGER, name TEXT);
+             CREATE TABLE item_tags (item_id INTEGER, tag_id INTEGER);
+             CREATE TABLE items (
+                id INTEGER PRIMARY KEY, artist_id INTEGER, file_path TEXT, file_name TEXT,
+                folder_name TEXT, missing INTEGER DEFAULT 0, manual_date TEXT,
+                detected_date TEXT, date TEXT
+             );
+             INSERT INTO artists VALUES (1, 'a', '');",
+        )
+        .unwrap();
+        ensure_folder_schema(&conn).unwrap();
+        let ap = artist.to_string_lossy().replace('\\', "/");
+        conn.execute("UPDATE artists SET path=? WHERE id=1", params![ap])
+            .unwrap();
+        conn.execute("INSERT INTO tags VALUES (1, 1, 'first')", [])
+            .unwrap();
+        // The folder name carries the date; the item itself has none.
+        let fp = src.join("a.jpg").to_string_lossy().replace('\\', "/");
+        conn.execute(
+            "INSERT INTO items (id, artist_id, file_path, file_name, folder_name, manual_date, detected_date, date)
+             VALUES (1, 1, ?, 'a.jpg', '2024-05 pack', NULL, '', '')",
+            params![fp],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO item_tags VALUES (1, 1)", [])
+            .unwrap();
+
+        auto_discover_artist_folder_plans(&conn, 1).unwrap();
+        let roots = test_roots(dir.path());
+        recompute_artist_plan_targets(&conn, Some(&roots), 1).unwrap();
+
+        let (parsed_date, status, target): (String, String, String) = conn
+            .query_row(
+                "SELECT parsed_date, status, target_folder FROM folder_rename_plans
+                 WHERE source_folder='2024-05 pack'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(parsed_date, "2024-05-01");
+        assert_eq!(status, "ready", "folder-name date must make the plan ready");
+        assert!(!target.is_empty());
+
+        conn.execute(
+            "UPDATE folder_rename_plans SET status='confirmed', confirmed_at=1, confirmation_source='manual'",
+            [],
+        )
+        .unwrap();
+        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
+        let out = execute_folder_renames(&conn, &roots, 1, false).unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(
+            out["results"][0]["status"], "executed",
+            "execution recheck must not demote a folder-name-dated plan to needs_date: {out}"
+        );
+        assert!(artist.join(&target).join("a.jpg").is_file());
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM folder_rename_plans", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "executed plan is consumed, not demoted");
     }
 
     #[test]
@@ -5835,6 +6145,31 @@ mod tests {
         remove_empty_parents(vec![childless.join("gone.jpg")], &artist);
         assert!(!childless.exists(), "the empty folder goes");
         assert!(artist.is_dir(), "the artist root stays");
+    }
+
+    #[test]
+    fn remove_empty_parents_cleans_directory_with_harmless_junk_files() {
+        let dir = tempdir().unwrap();
+        let artist = dir.path().join("artist");
+        let emptied = artist.join("2022").join("emptied");
+        let eadir = emptied.join("@eaDir");
+        std::fs::create_dir_all(&eadir).unwrap();
+        std::fs::write(eadir.join("thumb.jpg"), b"thumb").unwrap();
+        std::fs::write(emptied.join(".DS_Store"), b"mac").unwrap();
+        std::fs::write(emptied.join("Thumbs.db"), b"win").unwrap();
+        std::fs::write(emptied.join("desktop.ini"), b"ini").unwrap();
+
+        let moved = emptied.join("moved.jpg");
+        remove_empty_parents(vec![moved], &artist);
+        assert!(
+            !emptied.exists(),
+            "emptied folder containing only harmless junk files is removed"
+        );
+        assert!(
+            !artist.join("2022").exists(),
+            "parent folder that became empty is also removed"
+        );
+        assert!(artist.is_dir(), "artist root is never removed");
     }
 
     #[test]

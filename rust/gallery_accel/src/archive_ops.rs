@@ -81,6 +81,17 @@ fn resolve_7z_binary_path() -> Option<PathBuf> {
 
     #[cfg(windows)]
     {
+        for fixed in &[
+            r"C:\Program Files\7-Zip\7z.exe",
+            r"C:\Program Files (x86)\7-Zip\7z.exe",
+            r"C:\Program Files\PeaZip\res\bin\7z\7z.exe",
+            r"C:\Program Files (x86)\PeaZip\res\bin\7z\7z.exe",
+        ] {
+            let p = Path::new(fixed);
+            if p.is_file() {
+                return Some(p.to_path_buf());
+            }
+        }
         for base in &check_roots {
             for rel in &[
                 ".test-cache/tools/7zip-win/7z.exe",
@@ -91,15 +102,6 @@ fn resolve_7z_binary_path() -> Option<PathBuf> {
                 if p.is_file() {
                     return Some(p);
                 }
-            }
-        }
-        for fixed in &[
-            r"C:\Program Files\7-Zip\7z.exe",
-            r"C:\Program Files (x86)\7-Zip\7z.exe",
-        ] {
-            let p = Path::new(fixed);
-            if p.is_file() {
-                return Some(p.to_path_buf());
             }
         }
     }

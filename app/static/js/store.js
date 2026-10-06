@@ -76,6 +76,7 @@ function createStore(initial) {
 const browse = createStore({
   artists: [],
   artistsLoaded: false,
+  artistsLoadError: false,
   currentArtist: null,
   stats: null,
   mode: 'browse',
@@ -84,6 +85,7 @@ const browse = createStore({
   themeMode: 'light',
   activeRole: null,
   activeFolder: null,
+  activeTriage: 'all',
   search: '',
   searchScope: 'auto',
   searchTarget: 'all',
@@ -101,6 +103,7 @@ const browse = createStore({
   itemsCursor: null,
   hasMoreItems: false,
   loadingItems: false,
+  itemsLoadError: false,
   loadingMoreItems: false,
   itemLoadSeq: 0,
   artistLoadSeq: 0,
@@ -131,6 +134,7 @@ const selection = createStore({
   editTagContextLoading: false,
   editGlobalTagResults: [],
   editGlobalTagSearchLoading: false,
+  editCharacterResults: [],
   characterTagSuggestions: [],
   characterSuggestionSelectedNames: new Set(),
   characterSuggestionCache: new Map(),
@@ -260,6 +264,7 @@ const maintenance = createStore({
   // last read rather than a guess made from the click.
   downloadOpenDay: null,
   downloadDayPosts: null,
+  downloadDayPostsRequest: null,
   // Candidate lists the panel has asked for, keyed by post id. Cleared for a
   // post once its candidate is bound.
   downloadCandidates: {},

@@ -6,7 +6,7 @@ import { state, isActionBusy, setActionBusy } from '../../store.js';
 import { $, escHtml, joinUiMeta, formatSize, formatBytes, formatHealthTime, isAbortError } from '../../utils.js';
 import { toast, logUiAction } from '../../logging.js';
 import { setMaintenanceView, loadMoveWorkbench } from './index.js';
-import { loadArchiveWorkbench } from './organize.js';
+import { loadArchiveWorkbench, renderArchiveWorkbench } from './organize.js';
 import { applyMode } from '../../events.js';
 import { loadArtists, selectArtist } from '../../router.js';
 
@@ -88,6 +88,7 @@ async function pollDimensionBackfillStatus() {
         failed: Number(status.failed || 0),
         remaining: Number(status.remaining || 0),
         complete: Boolean(status.complete),
+        first_error: status.first_error || '',
       });
       if (status.error) toast('媒体尺寸补全失败', 'error');
       else if (status.complete) {
@@ -422,7 +423,14 @@ export async function jumpToErrorArtist(row) {
     applyMode('moves');
     setMaintenanceView('organize');
     await loadArchiveWorkbench({view: 'organize'});
-    const target = $(`[data-archive-plan-id="${String(planId)}"]`);
+    const panel = $('#archiveWorkbenchPanel');
+    if (panel) panel.open = true;
+    let target = $(`[data-archive-plan-id="${String(planId)}"]`);
+    if (!target && !state.archivePlansExpanded && (state.archivePlans || []).some(plan => Number(plan?.id) === planId)) {
+      state.archivePlansExpanded = true;
+      renderArchiveWorkbench();
+      target = $(`[data-archive-plan-id="${String(planId)}"]`);
+    }
     if (target) {
       target.classList.add('error-plan-highlight');
       target.scrollIntoView({block: 'center', behavior: 'smooth'});
@@ -533,6 +541,9 @@ export function renderDimensionBackfillStatus() {
   } else if (status.cursor_done && Number(status.remaining || 0) > 0) {
     result.textContent = `已补全 ${Number(status.updated || 0)} 项，${Number(status.remaining)} 项无法读取`;
     result.style.color = 'var(--status-danger)';
+  } else {
+    result.textContent = '';
+    result.style.color = '';
   }
 }
 

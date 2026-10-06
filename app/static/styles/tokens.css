@@ -20,6 +20,8 @@
   --bg-canvas:#F4ECDD;
   --bg-raised:#EDE3D0;
   --bg-overlay:#E5D9C2;
+  --bg-card:var(--paper-raised);
+  --bg-hover:rgba(84,62,38,.08);
   /* Ink text: 3 steps, hierarchy by size/weight/tone instead of borders. */
   /* --ink-1: fresh ink for body copy; --ink-3 faded ink for captions.
      All three steps keep >= 4.5:1 on the darkest paper (--paper-overlay). */
@@ -52,6 +54,7 @@
   --border-subtle:#D9C9AC;--border-strong:#C2AE8C;
   /* Type scale */
   --fs-display:24px;--fs-title:18px;--fs-section:15px;--fs-body:14px;--fs-small:13px;--fs-micro:11px;
+  --fw-medium:500;
   /* Display serif for folio titles (local stacks only, no webfonts). */
   --font-display:"Cormorant Garamond","EB Garamond","Source Serif Pro","Songti SC","SimSun",serif;
   --font-mono:ui-monospace,"Cascadia Code",Consolas,"SF Mono",Menlo,monospace;
@@ -101,6 +104,8 @@
   --bg-canvas:#1A1612;
   --bg-raised:#241F1A;
   --bg-overlay:#2D2620;
+  --bg-card:var(--paper-raised);
+  --bg-hover:rgba(255,255,255,.08);
   --ink-1:#EDE3D0;
   --ink-2:#B3A28C;
   --ink-3:#9E8E7A;

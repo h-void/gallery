@@ -37,6 +37,20 @@ pub fn artist_stats_response(conn: &Connection, artist_id: i64) -> Result<Value>
         [artist_id],
         |row| row.get::<_, i64>(0),
     )?;
+    let inbox = conn.query_row(
+        "
+        SELECT COUNT(*) FROM items
+        WHERE artist_id=? AND missing=0
+          AND (media_type IN ('image', 'video', 'source', 'archive', 'text') OR is_archive=1)
+          AND (
+              NOT EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id = items.id)
+              OR (COALESCE(manual_date, '') = '' AND COALESCE(detected_date, '') = '' AND (COALESCE(date, '') = '' OR date LIKE '0000%'))
+              OR COALESCE(folder_name, '') = ''
+          )
+        ",
+        [artist_id],
+        |row| row.get::<_, i64>(0),
+    )?;
     let favorites = conn.query_row(
         "SELECT COUNT(*) FROM item_favorites f JOIN items i ON i.id=f.item_id
          WHERE i.artist_id=? AND i.missing=0",
@@ -50,6 +64,7 @@ pub fn artist_stats_response(conn: &Connection, artist_id: i64) -> Result<Value>
         "videos": videos,
         "sources": sources,
         "untagged": untagged,
+        "inbox": inbox,
         "favorites": favorites,
         "tags": tags,
     }))

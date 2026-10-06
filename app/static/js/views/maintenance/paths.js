@@ -4,7 +4,7 @@
 import { API } from '../../api.js';
 import { state, isActionBusy, setActionBusy } from '../../store.js';
 import { $, $$, escHtml } from '../../utils.js';
-import { toast } from '../../logging.js';
+import { toast, logUiAction } from '../../logging.js';
 import { refreshActiveMaintenanceView } from './index.js';
 import { renderHashStatus } from './overview.js';
 import { loadArtists } from '../../router.js';
@@ -329,7 +329,7 @@ export async function runMoveAction(id, action) {
   if (!path) return;
   // 计划 P3 文案终稿：独立入库与忽略各带一句不冒充"稍后处理"的确认。
   const confirms = {
-    new: '将此路径单独入库，不继承旧记录的标签。不会复制或删除原文件。',
+    new: '将此路径单独入库，不继承旧记录的角色。不会复制或删除原文件。',
     ignore: '忽略这组新旧路径的匹配，不会把新路径作为独立文件入库。',
   };
   if (confirms[action] && !window.confirm(confirms[action])) return;
@@ -355,8 +355,13 @@ export async function runMoveAction(id, action) {
       toast('文件状态已变化，请刷新后核对', 'error');
     } else {
       // S5/P3: unknown refusals surface a readable message; the raw reason
-      // code and candidate id stay visible via moveReasonLabel/console.
-      console.warn('[move-candidate] unconfirmed', {id, action, result});
+      // code and candidate id stay visible via moveReasonLabel/ui-log.
+      logUiAction('move_candidate_unconfirmed', {
+        candidate_id: Number(id),
+        action: String(action),
+        reason: String(result?.reason || ''),
+        status: String(result?.status || ''),
+      });
       toast('未能确认，请查看详情', 'error');
     }
     await refreshActiveMaintenanceView({preserveScroll: true, view: 'paths'});

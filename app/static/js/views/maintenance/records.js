@@ -201,7 +201,7 @@ export async function purgeRecycleEntry(entryId) {
   setActionBusy('recycle-purge', String(id), true);
   renderRecycleBin();
   try {
-    const result = await API.delete(`/api/recycle/${id}`);
+    const result = await API.del(`/api/recycle/${id}`);
     toast(result.message || '已彻底删除', 'success');
     await loadRecycleBin();
   } catch (e) {
@@ -234,7 +234,7 @@ export async function clearRecycleBin() {
 }
 
 function operationLogKindLabel(operation) {
-  if (operation.reason === 'tagged_file') return '已标签文件归位';
+  if (operation.reason === 'tagged_file') return '已加角色文件归位';
   if (operation.kind === 'folder_rename_undo' || operation.reason === 'folder_rename_undo' || operation.reason === 'undo') return '撤销文件夹整理';
   if (operation.kind === 'folder_rename') return '文件夹整理';
   if (operation.kind === 'move') return '路径变更';
@@ -243,7 +243,7 @@ function operationLogKindLabel(operation) {
 
 function operationLogReasonLabel(reason) {
   const labels = {
-    tagged_file: '已标签文件归位',
+    tagged_file: '已加角色文件归位',
     folder_rename: '文件夹整理',
     folder_rename_undo: '已撤销文件夹整理',
     undo: '已撤销文件夹整理',

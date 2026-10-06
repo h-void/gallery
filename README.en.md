@@ -35,6 +35,8 @@
 ### 2. Artist Partitioning & Multi-Dimensional Tagging
 - Artist as top-level boundary (folders define artists); filter inside by folder tree and multi-tag combinations.
 - Batch tagging: single/marquee/whole-folder add or remove; tags sort by default/name/count with pinyin search for artists and tags.
+- Sidebar role list pins an "Untagged" todo entry, keeping folders and works without character tags one click away.
+- Archive status filter: All / Pending / Archived separates pending from organized content and syncs with the address bar.
 - Link indexing: auto-extract text/cloud links and passcodes; manage external profiles (Pixiv, Fanbox, Patreon, Twitter/X, Bilibili).
 
 ### 3. AI Character Recognition (CCIP & OpenVINO)
@@ -51,6 +53,8 @@
 - Editable Default template (initial {year}/{date} {tags}); preview before execution.
 - Safety: automatic SQLite online backup before any move; previews and revalidates source/target/authorization, never overwrites occupied targets.
 - Execution records: Current successful plans are deleted in the same transaction and cannot be undone.
+- Fill gaps in place: the sidebar folder panel adds character tags and manual dates directly; works missing a recognized date fall back to the posting date derived from the Twitter/X snowflake ID.
+- Archive the current folder and bundle into folders: the Edit Bar archives the current folder in place; multi-selected files can be bundled into a target path as one locked set with automatic rollback on failure, and folders missing characters or dates stay pending until completed.
 - Controlled auto-archive: Maintenance "Auto Organize" off by default; runs only after a successful full scan; single-artist/folder scans never trigger.
 
 ### 6. Storage Safety & Isolated State
@@ -62,6 +66,7 @@
 - Netdisk batch dispatch: bridge external links to JDownloader via Event Scripter with manual review and one-click delivery.
 - All Works panel with post link navigation, date folder jumps, and searchable artist filtering.
 - Collapsible variable reference tables for download naming templates and folder archive rules.
+- Subscription cards include a 53-week download coverage calendar; shading shows each week's gaps and narrow cards scroll sideways for the full year.
 
 > [!WARNING]
 > **Network Security Notice**: Gallery listens on port `8899` by default and **provides no built-in user authentication**. It is intended strictly for trusted local area networks (LAN). When exposing the service to public networks, configure authentication via fnOS or an upstream reverse proxy (such as Nginx or Caddy).

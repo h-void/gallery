@@ -141,8 +141,10 @@ fn f32_blob_to_vec(blob: &[u8]) -> Result<Vec<f32>> {
         return Err(anyhow!("invalid f32 blob length: {}", blob.len()));
     }
     Ok(blob
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&chunk| f32::from_le_bytes(chunk))
         .collect())
 }
 

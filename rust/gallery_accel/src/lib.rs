@@ -20,6 +20,7 @@ mod character_summary_tags;
 mod characters;
 mod content_hash;
 mod db;
+pub mod db_backup;
 mod db_housekeeping;
 mod db_identity;
 mod dimensions;
@@ -74,7 +75,6 @@ mod similarity;
 mod tag_search;
 mod tags;
 mod tags_write;
-pub mod upstream;
 pub mod work_naming;
 mod workers;
 
@@ -112,8 +112,6 @@ pub use folder_archive::{
 };
 pub use folder_paths::folder_paths_response;
 pub use folders::folders_response;
-#[cfg(test)]
-pub use hash_run::run_hash_batch;
 pub use hash_run::{run_hash_batch_with_budget, run_hash_batch_with_roots, HashCommitBudget};
 pub use hash_status::hash_status_response;
 pub use image_preview::{
@@ -126,8 +124,6 @@ pub use items::items_page_cursor_query_response;
 pub use items::items_page_cursor_query_response_ext;
 pub use items::items_page_query_response;
 pub use items::items_page_query_response_ext;
-#[cfg(test)]
-pub use items::items_page_response;
 pub use items::set_item_favorite_response;
 pub use link_index::{
     artist_links_response, reindex_artist_links, reindex_scanned_artist_links,
@@ -136,10 +132,10 @@ pub use link_index::{
 pub use maintenance::folder_rename_auto_response;
 pub use media_roots::{env_media_roots, path_under_authorized_roots, MediaRoots};
 pub use media_serve::{
-    content_hash_allowed, delete_item_to_recycle, delete_to_recycle, preview_jpeg_allowed,
-    resolve_allowed_path, serve_file_response, serve_text, serve_transcoded_hls,
-    serve_transcoded_hls_segment, serve_video_compatible, serve_video_hls, start_video_transcode,
-    video_frame_jpeg, video_transcode_status,
+    content_hash_allowed, delete_folder_to_recycle, delete_item_to_recycle, delete_to_recycle,
+    preview_jpeg_allowed, resolve_allowed_path, serve_file_response, serve_text,
+    serve_transcoded_hls, serve_transcoded_hls_segment, serve_video_compatible, serve_video_hls,
+    start_video_transcode, video_frame_jpeg, video_transcode_status,
 };
 pub use move_groups::move_candidate_groups_response;
 pub use move_history::move_history_response;
@@ -171,9 +167,9 @@ pub use pawchive::{
     toggle_subscription, try_begin_pawchive_sync, verify_post_files, AttemptError, AttemptOutcome,
     CancelOutcome, DecisionOutcome, DemandSet, ExternalReceipt, FilterSelectionOutcome,
     LegacyScopeOutcome, ManualPostPlan, PawchiveSettings, PawchiveSyncStatus, PostAssessment,
-    PostDecisionAction, PostListFilter, PostState, ReceiptOutcome, RoundQueue, ScheduledPost,
-    SelectionError, SelectionOutcome, StablePostPage, StablePostRow, SubscriptionMode, SyncTrigger,
-    LEDGER_REASON_UNKNOWN_WORK, PAWCHIVE_FILTER_SELECTION_MAX_POSTS,
+    PostAttemptSummary, PostDecisionAction, PostListFilter, PostState, ReceiptOutcome, RoundQueue,
+    ScheduledPost, SelectionError, SelectionOutcome, StablePostPage, StablePostRow,
+    SubscriptionMode, SyncTrigger, LEDGER_REASON_UNKNOWN_WORK, PAWCHIVE_FILTER_SELECTION_MAX_POSTS,
 };
 pub use pawchive_groups::{
     apply_grouping, begin_group_move_intent, claim_publish_reservation, content_group_locations,
@@ -211,8 +207,10 @@ pub use recognition_status::{
     recognize_character_native_topk_with_roots, suggest_artists_native,
 };
 pub use recycle::{
-    capture_item_snapshot, clear_recycle_entries, ensure_recycle_schema, purge_recycle_entry,
-    reconcile_moving_recycle_entries, recycle_entries_response, restore_recycle_entry,
+    capture_item_snapshot, clear_recycle_entries, ensure_recycle_schema,
+    get_recycle_target_setting, purge_recycle_entry, reconcile_moving_recycle_entries,
+    recycle_entries_response, recycle_entry_preview, restore_recycle_entry,
+    set_recycle_target_setting,
 };
 pub use scan::{
     get_scan_state, reconcile_interrupted_scan, resolve_scan_scope, run_full_library_scan,

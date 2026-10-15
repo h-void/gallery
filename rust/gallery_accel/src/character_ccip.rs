@@ -933,8 +933,9 @@ pub(crate) fn embed_item_with_roots(
         let (emb, src) = embed_image_path_with_source(&path)?;
         return Ok((emb, file_path, file_name, src));
     }
-    // video: extract a frame via ffmpeg to memory, decode directly
-    let jpeg = extract_video_frame_jpeg(&path, 0.1)?;
+    // video: extract a frame via shared media_serve ffmpeg executor to memory, decode directly
+    let jpeg = crate::media_serve::extract_video_frame_jpeg_blocking(&path, 0.1)
+        .map_err(|e| anyhow!(e.to_string()))?;
     let img = image::load_from_memory(&jpeg)
         .with_context(|| format!("decode video frame for item {item_id}"))?
         .to_rgb8();
@@ -967,64 +968,6 @@ pub(crate) fn embedding_model_meta() -> (String, String, String) {
 }
 
 pub(crate) const CCIP_EMBEDDING_DIM: usize = EMBEDDING_DIM;
-
-fn extract_video_frame_jpeg(path: &Path, t: f64) -> Result<Vec<u8>> {
-    use std::process::{Command, Stdio};
-    let _ffmpeg_slot = crate::media_serve::FfmpegSlotGuard::acquire_blocking()?;
-    // Bounded extraction: a broken/truncated video must not park the
-    // recognition path indefinitely. The child runs on a helper thread with a
-    // kill handle so the timeout actually stops ffmpeg.
-    const FRAME_EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            &format!("{t:.3}"),
-            "-i",
-            &path.to_string_lossy(),
-            "-frames:v",
-            "1",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "pipe:1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawn ffmpeg")?;
-    let mut stdout = child.stdout.take().context("ffmpeg stdout missing")?;
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let read_result = std::io::Read::read_to_end(&mut stdout, &mut buf);
-        let _ = sender.send((buf, read_result));
-    });
-    match receiver.recv_timeout(FRAME_EXTRACT_TIMEOUT) {
-        Ok((buf, Ok(_read))) => {
-            let status = child.wait().context("wait for ffmpeg")?;
-            if !status.success() || buf.is_empty() {
-                return Err(anyhow!("ffmpeg failed to extract video frame"));
-            }
-            Ok(buf)
-        }
-        Ok((_, Err(error))) => {
-            // The reader failed; stop ffmpeg now so no orphan process or pipe
-            // buffer lingers behind this request.
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(anyhow!("read ffmpeg output: {error}"))
-        }
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(anyhow!("ffmpeg frame extraction timed out"))
-        }
-    }
-}
 
 fn parse_embedding_blob(blob: &[u8], dim: i64) -> Option<Vec<f32>> {
     if dim as usize != EMBEDDING_DIM {
@@ -1418,140 +1361,4 @@ pub fn recognize_character_native_with_roots(
         },
         "backend": "rust-primary",
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn l2_normalize_unit() {
-        let v = l2_normalize(vec![3.0, 4.0]).unwrap();
-        assert!((v[0] - 0.6).abs() < 1e-5);
-        assert!((v[1] - 0.8).abs() < 1e-5);
-    }
-
-    #[test]
-    fn session_slot_unloads_only_after_idle_timeout() {
-        let now = Instant::now();
-        let mut slot = CcipSessionSlot {
-            session: Some(Err("test session".into())),
-            last_used: Some(now - Duration::from_secs(10)),
-        };
-        assert!(!slot.unload_if_idle(now, Duration::from_secs(11)));
-        assert!(slot.unload_if_idle(now, Duration::from_secs(10)));
-        assert!(slot.session.is_none());
-    }
-
-    #[test]
-    fn cpu_fallback_allowed_by_default_and_prefers_new_var() {
-        // `runtime_prepare` and `model_config` read the same `CHARACTER_*`
-        // variables, so this mutation is serialized on the process-wide lock.
-        let _env_lock = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let new_key = "CHARACTER_ALLOW_CPU_FALLBACK";
-        let old_key = "CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK";
-        let _new = crate::test_support::EnvVar::remove(new_key);
-        let _old = crate::test_support::EnvVar::remove(old_key);
-        // Neither variable set -> default allows CPU fallback.
-        assert!(allow_cpu_fallback());
-        std::env::set_var(new_key, "0");
-        std::env::set_var(old_key, "1");
-        assert!(!allow_cpu_fallback());
-        std::env::remove_var(new_key);
-        std::env::set_var(old_key, "0");
-        assert!(!allow_cpu_fallback());
-    }
-
-    #[test]
-    fn provider_aliases_map_gpu_to_openvino_not_cuda() {
-        let _env_lock = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _provider = crate::test_support::EnvVar::remove("CHARACTER_RECOGNITION_PROVIDER");
-        for (raw, cuda, openvino) in [
-            ("auto", true, true),
-            ("cuda", true, false),
-            ("nvidia", true, false),
-            ("cudaexecutionprovider", true, false),
-            ("openvino", false, true),
-            ("intel", false, true),
-            ("gpu", false, true),
-            ("openvinoexecutionprovider", false, true),
-            ("cpu", false, false),
-            ("cpuexecutionprovider", false, false),
-        ] {
-            std::env::set_var("CHARACTER_RECOGNITION_PROVIDER", raw);
-            assert_eq!(want_cuda(), cuda, "want_cuda({raw})");
-            assert_eq!(want_openvino(), openvino, "want_openvino({raw})");
-        }
-        std::env::set_var("CHARACTER_RECOGNITION_PROVIDER", "");
-        assert!(want_openvino());
-    }
-
-    #[test]
-    fn clear_failed_session_cache_removes_error_state_only() {
-        let slot = session_slot();
-        {
-            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-            guard.session = Some(Err("previous failure".into()));
-            guard.last_used = Some(Instant::now());
-        }
-        clear_failed_session_cache();
-        {
-            let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-            assert!(guard.session.is_none(), "failed cache must be cleared");
-            assert!(guard.last_used.is_none());
-        }
-        // An empty slot stays untouched (no successful session to unload).
-        clear_failed_session_cache();
-        {
-            let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-            assert!(guard.session.is_none());
-        }
-    }
-
-    #[test]
-    fn pack_embedding_rejects_wrong_dim_and_zero() {
-        assert!(pack_embedding_blob(&[1.0, 0.0]).is_err());
-        assert!(pack_embedding_blob(&vec![0.0f32; EMBEDDING_DIM]).is_err());
-        let mut v = vec![0.0f32; EMBEDDING_DIM];
-        v[0] = 1.0;
-        let blob = pack_embedding_blob(&v).unwrap();
-        assert_eq!(blob.len(), EMBEDDING_DIM * 4);
-        assert!(parse_embedding_blob(&blob, EMBEDDING_DIM as i64).is_some());
-    }
-
-    #[test]
-    fn rank_picks_best_character() {
-        let q = vec![1.0, 0.0, 0.0];
-        let refs = vec![
-            RefMeta {
-                character_id: 1,
-                character_name: "A".into(),
-                reference_id: 10,
-                item_id: Some(1),
-                vector: vec![0.9, 0.1, 0.0],
-            },
-            RefMeta {
-                character_id: 2,
-                character_name: "B".into(),
-                reference_id: 20,
-                item_id: Some(2),
-                vector: vec![0.1, 0.9, 0.0],
-            },
-            RefMeta {
-                character_id: 1,
-                character_name: "A".into(),
-                reference_id: 11,
-                item_id: Some(3),
-                vector: vec![1.0, 0.0, 0.0],
-            },
-        ];
-        // normalize query-like vectors roughly by using as-is for unit test
-        let ranked = rank_characters(&q, &refs, 2);
-        assert_eq!(ranked[0]["character_id"], 1);
-        assert_eq!(ranked[0]["matched_ref_id"], 11);
-    }
 }

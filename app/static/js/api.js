@@ -43,8 +43,8 @@ export const API = {
     const r = await fetchWithTimeout(path, {method:'POST', keepalive:true, ...options});
     return this.parseResponse(r);
   },
-  async put(path) {
-    const r = await fetchWithTimeout(path, {method:'PUT'});
+  async put(path, options = {}) {
+    const r = await fetchWithTimeout(path, {method:'PUT', ...options});
     return this.parseResponse(r);
   },
   async putJson(path, data, options = {}) {
@@ -80,8 +80,8 @@ export const API = {
     });
     return this.parseResponse(r);
   },
-  async del(path) {
-    const r = await fetchWithTimeout(path, {method:'DELETE'});
+  async del(path, options = {}) {
+    const r = await fetchWithTimeout(path, {method:'DELETE', ...options});
     return this.parseResponse(r);
   },
   fileUrl(filePath, version) {

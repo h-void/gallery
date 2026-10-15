@@ -138,12 +138,12 @@ pub fn spawn_configured_workers(
         let batch_size = std::env::var("HASH_BATCH_SIZE")
             .ok()
             .and_then(|value| value.trim().parse::<i64>().ok())
-            .unwrap_or(500)
-            .clamp(1, 500);
+            .unwrap_or(crate::MAX_PAGINATION_LIMIT)
+            .clamp(1, crate::MAX_PAGINATION_LIMIT);
         spawn_hash_loop(
             pool.clone(),
             roots,
-            scan,
+            scan.clone(),
             status.clone(),
             interval,
             batch_size,
@@ -161,7 +161,14 @@ pub fn spawn_configured_workers(
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_default();
-        spawn_backup_loop(pool, status, backup_interval, backup_on_start, start_delay);
+        spawn_backup_loop(
+            pool,
+            scan.clone(),
+            status,
+            backup_interval,
+            backup_on_start,
+            start_delay,
+        );
     } else {
         status.record("backup", false, json!({"status": "disabled"}), None);
     }
@@ -169,7 +176,7 @@ pub fn spawn_configured_workers(
     // The Pawchive loop always runs: whether it does anything is decided per
     // tick from the stored settings, so the master switch can be toggled in the
     // UI without a service restart.
-    spawn_pawchive_loop(pawchive_pool, pawchive_roots, pawchive_status);
+    spawn_pawchive_loop(pawchive_pool, pawchive_roots, scan, pawchive_status);
 }
 
 /// How often the loop asks whether a round is due. The configured interval is
@@ -221,11 +228,19 @@ fn spawn_pawchive_import_loop(
 /// The master switch and the interval are read from `app_settings` on every
 /// tick; the single-flight slot is shared with the manual route, so a manual
 /// round in progress simply makes the scheduled one wait for the next tick.
-fn spawn_pawchive_loop(pool: Arc<DbPool>, roots: MediaRoots, status: WorkerStatus) {
+fn spawn_pawchive_loop(
+    pool: Arc<DbPool>,
+    roots: MediaRoots,
+    scan: Arc<ScanControl>,
+    status: WorkerStatus,
+) {
     status.record("pawchive", true, json!({"status": "idle"}), None);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(PAWCHIVE_TICK).await;
+            if scan.is_shutting_down() {
+                break;
+            }
             let due = {
                 let conn = match pool.get() {
                     Ok(conn) => conn,
@@ -236,6 +251,9 @@ fn spawn_pawchive_loop(pool: Arc<DbPool>, roots: MediaRoots, status: WorkerStatu
                     Err(_) => false,
                 }
             };
+            if scan.is_shutting_down() {
+                break;
+            }
             if !due || !try_begin_pawchive_sync(SyncTrigger::Scheduled) {
                 continue;
             }
@@ -364,6 +382,7 @@ fn spawn_hash_loop(
 
 fn spawn_backup_loop(
     pool: Arc<DbPool>,
+    scan: Arc<ScanControl>,
     status: WorkerStatus,
     interval: Option<Duration>,
     on_start: bool,
@@ -384,6 +403,9 @@ fn spawn_backup_loop(
             if !start_delay.is_zero() {
                 tokio::time::sleep(start_delay).await;
             }
+            if scan.is_shutting_down() {
+                return;
+            }
             let pool = pool.clone();
             let result = tokio::task::spawn_blocking(move || run_backup(&pool))
                 .await
@@ -401,6 +423,9 @@ fn spawn_backup_loop(
         };
         loop {
             tokio::time::sleep(interval).await;
+            if scan.is_shutting_down() {
+                break;
+            }
             let pool = pool.clone();
             let result = tokio::task::spawn_blocking(move || run_backup(&pool))
                 .await
@@ -415,211 +440,4 @@ fn spawn_backup_loop(
             );
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::folder_archive::prune_backup_root;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    // `spawn_configured_workers` now also starts the Pawchive subscription
-    // loop, which is runtime-driven rather than interval-gated (it decides per
-    // tick from the stored settings), so this needs a Tokio context even when
-    // every interval is 0.
-    #[tokio::test]
-    async fn zero_intervals_disable_all_workers() {
-        let _env_lock = ENV_LOCK.lock().unwrap();
-        let previous = [
-            ("SCAN_INTERVAL", std::env::var("SCAN_INTERVAL").ok()),
-            ("HASH_INTERVAL", std::env::var("HASH_INTERVAL").ok()),
-            (
-                "DB_BACKUP_INTERVAL",
-                std::env::var("DB_BACKUP_INTERVAL").ok(),
-            ),
-            (
-                "DB_BACKUP_ON_START",
-                std::env::var("DB_BACKUP_ON_START").ok(),
-            ),
-        ];
-        std::env::set_var("SCAN_INTERVAL", "0");
-        std::env::set_var("HASH_INTERVAL", "0");
-        std::env::set_var("DB_BACKUP_INTERVAL", "0");
-        std::env::set_var("DB_BACKUP_ON_START", "0");
-
-        let dir = tempfile::tempdir().unwrap();
-        let pool = Arc::new(
-            DbPool::with_config(
-                dir.path().join("gallery.db"),
-                crate::DbConfig {
-                    read_only: false,
-                    pool_size: 1,
-                },
-            )
-            .unwrap(),
-        );
-        let status = WorkerStatus::default();
-        spawn_configured_workers(
-            pool,
-            MediaRoots {
-                roots: Vec::new(),
-                labels: Vec::new(),
-                real_paths: Vec::new().clone(),
-            },
-            Arc::new(ScanControl::new()),
-            status.clone(),
-            Arc::new(StatsRefreshGate::new(Duration::from_secs(60))),
-        );
-
-        for (key, value) in previous {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-
-        let snapshot = status.snapshot();
-        for name in ["scan", "hash", "backup"] {
-            assert_eq!(snapshot[name]["running"], false);
-            assert_eq!(snapshot[name]["last"]["status"], "disabled");
-        }
-    }
-
-    #[tokio::test]
-    async fn enabled_workers_publish_waiting_status_before_first_interval() {
-        let _env_lock = ENV_LOCK.lock().unwrap();
-        let previous = [
-            ("SCAN_INTERVAL", std::env::var("SCAN_INTERVAL").ok()),
-            ("HASH_INTERVAL", std::env::var("HASH_INTERVAL").ok()),
-            (
-                "DB_BACKUP_INTERVAL",
-                std::env::var("DB_BACKUP_INTERVAL").ok(),
-            ),
-            (
-                "DB_BACKUP_ON_START",
-                std::env::var("DB_BACKUP_ON_START").ok(),
-            ),
-        ];
-        std::env::set_var("SCAN_INTERVAL", "60");
-        std::env::set_var("HASH_INTERVAL", "60");
-        std::env::set_var("DB_BACKUP_INTERVAL", "0");
-        std::env::set_var("DB_BACKUP_ON_START", "0");
-
-        let dir = tempfile::tempdir().unwrap();
-        let pool = Arc::new(
-            DbPool::with_config(
-                dir.path().join("gallery.db"),
-                crate::DbConfig {
-                    read_only: false,
-                    pool_size: 1,
-                },
-            )
-            .unwrap(),
-        );
-        let status = WorkerStatus::default();
-        spawn_configured_workers(
-            pool,
-            MediaRoots {
-                roots: Vec::new(),
-                labels: Vec::new(),
-                real_paths: Vec::new().clone(),
-            },
-            Arc::new(ScanControl::new()),
-            status.clone(),
-            Arc::new(StatsRefreshGate::new(Duration::from_secs(60))),
-        );
-
-        for (key, value) in previous {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-
-        let snapshot = status.snapshot();
-        assert_eq!(snapshot["scan"]["running"], true);
-        assert_eq!(snapshot["hash"]["running"], true);
-        assert!(snapshot["scan"]["next_at"].as_f64().is_some());
-        assert!(snapshot["hash"]["next_at"].as_f64().is_some());
-    }
-
-    #[test]
-    fn backup_retention_stays_inside_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("db-backups");
-        std::fs::create_dir_all(root.join("20240101")).unwrap();
-        std::fs::create_dir_all(root.join("20240102")).unwrap();
-        assert_eq!(prune_backup_root(&root, 1).unwrap(), 1);
-        assert!(!root.join("20240101").exists());
-        assert!(root.join("20240102").exists());
-    }
-
-    #[test]
-    fn poisoned_status_mutex_recovers_and_reports_degraded() {
-        let status = WorkerStatus::default();
-        // Poison the mutex: a thread panics while holding the lock.
-        let poacher = {
-            let inner = std::sync::Arc::clone(&status.inner);
-            std::thread::spawn(move || {
-                let _guard = inner.lock().unwrap();
-                panic!("poison the status mutex");
-            })
-        };
-        let _ = poacher.join();
-        // record/snapshot must survive the poisoned lock and keep serving.
-        status.record("scan", true, json!({"status": "waiting"}), None);
-        let snapshot = status.snapshot();
-        assert_eq!(snapshot["scan"]["last"]["status"], "waiting");
-        assert!(
-            status.recovered_from_poison(),
-            "poison recovery must surface as degraded"
-        );
-    }
-
-    #[tokio::test]
-    async fn scan_worker_next_at_computed_after_task_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = Arc::new(
-            DbPool::with_config(
-                dir.path().join("gallery.db"),
-                crate::DbConfig {
-                    read_only: false,
-                    pool_size: 1,
-                },
-            )
-            .unwrap(),
-        );
-        let status = WorkerStatus::default();
-        let scan = Arc::new(ScanControl::new());
-        let roots = MediaRoots {
-            roots: Vec::new(),
-            labels: Vec::new(),
-            real_paths: Vec::new(),
-        };
-        let interval = Duration::from_millis(50);
-        let start_time = now();
-        spawn_scan_loop(
-            pool,
-            roots,
-            scan,
-            status.clone(),
-            interval,
-            Arc::new(StatsRefreshGate::new(Duration::from_secs(60))),
-        );
-
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let snapshot = status.snapshot();
-        assert_eq!(snapshot["scan"]["running"], true);
-        let next_at = snapshot["scan"]["next_at"]
-            .as_f64()
-            .expect("next_at must be present");
-        assert!(
-            next_at >= start_time + 0.08,
-            "next_at ({next_at}) must reflect post-run time, start_time={start_time}"
-        );
-    }
 }

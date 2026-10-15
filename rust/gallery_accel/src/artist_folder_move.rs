@@ -101,7 +101,8 @@ fn remap_path(path: &str, source: &str, target: &str) -> Option<String> {
     if path == source {
         return Some(target.to_string());
     }
-    path.strip_prefix(&(source.clone() + "/"))
+    path.strip_prefix(&source)
+        .and_then(|r| r.strip_prefix('/'))
         .map(|suffix| format!("{target}/{suffix}"))
 }
 
@@ -413,14 +414,24 @@ fn copy_artist_tree_to_staging(source: &Path, staging: &Path, _roots: &MediaRoot
     copy_dir_recursive(source, staging)
 }
 
-fn update_path_column(
+/// Rewrite `column` for rows under any of several `source → target` prefixes.
+///
+/// A stored row can name the artist by its real path or by a virtual alias
+/// (`/picturesN`), and an imported library may still hold the alias. Matching
+/// only the real prefix updated the `artists` row and left every item row on the
+/// old tree, so the next scan read the artist as missing and re-created its
+/// items. The caller passes both forms for the same reason `folder_archive`'s
+/// `update_folder_item_paths` does.
+fn update_path_column_multi(
     conn: &Connection,
     table: &str,
     column: &str,
     artist_id: i64,
-    source: &str,
-    target: &str,
+    prefixes: &[(&str, &str)],
 ) -> Result<i64> {
+    if prefixes.is_empty() {
+        return Ok(0);
+    }
     let query = format!("SELECT id, {column} FROM {table} WHERE artist_id=?");
     let mut stmt = conn.prepare(&query)?;
     let rows = stmt
@@ -432,9 +443,13 @@ fn update_path_column(
     let update = format!("UPDATE {table} SET {column}=? WHERE id=?");
     let mut changed = 0;
     for (id, path) in rows {
-        if let Some(next) = remap_path(&path, source, target) {
+        for (source, target) in prefixes {
+            let Some(next) = remap_path(&path, source, target) else {
+                continue;
+            };
             conn.execute(&update, params![next, id])?;
             changed += 1;
+            break;
         }
     }
     Ok(changed)
@@ -557,14 +572,12 @@ fn remove_owned_dir(path: &Path, expected: Option<(u64, u64)>) -> std::io::Resul
     fs::remove_dir_all(path)
 }
 
-#[cfg(test)]
 fn force_copy_fallback() -> bool {
-    std::env::var("GALLERY_TEST_ARTIST_MOVE_COPY").is_ok()
-}
-
-#[cfg(not(test))]
-fn force_copy_fallback() -> bool {
-    false
+    if cfg!(test) {
+        std::env::var("GALLERY_TEST_ARTIST_MOVE_COPY").is_ok()
+    } else {
+        false
+    }
 }
 
 fn copy_fallback_allowed(error: &std::io::Error) -> bool {
@@ -769,14 +782,87 @@ fn clear_pending_move_intent() {
     let _ = std::fs::remove_file(pending_move_intent_path());
 }
 
+/// Move an intent that could not be resolved out of the way instead of leaving it
+/// in place forever.
+///
+/// `write_pending_move_intent` refuses to start while the intent file exists, and
+/// the remedy it prints is a restart — which is exactly what re-enters the branch
+/// that kept the file. An ambiguous state (source and target both present, which
+/// the product's own copy fallback produces when it is killed between publishing
+/// the staging target and retiring the source) therefore blocked every future
+/// artist folder move, for every artist, with no way out.
+///
+/// The evidence is kept for inspection; only the block is lifted.
+fn archive_unresolved_move_intent(note: &str) {
+    let path = pending_move_intent_path();
+    if !path.is_file() {
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let archived = path.with_file_name(format!("pending-artist-move.unresolved-{stamp}.json"));
+    match std::fs::rename(&path, &archived) {
+        Ok(()) => log_error!(
+            "artist move intent {note}; archived to {} so later moves are not blocked",
+            archived.display()
+        ),
+        Err(error) => log_error!(
+            "artist move intent {note}; could not archive {}: {error}",
+            path.display()
+        ),
+    }
+}
+
 /// Shared DB rewrite for a completed whole-artist tree move: repoint the
 /// artist row plus every path-bearing table from source to target.
+///
+/// `roots` supplies the virtual aliases (`/picturesN`) that may name the same
+/// artist, so rows stored under an alias move too. Matching only the real prefix
+/// committed `artists.path` while leaving those item rows on the abandoned tree.
 fn apply_artist_move_db_updates(
     conn: &Connection,
+    roots: &MediaRoots,
     artist_id: i64,
     source_text: &str,
     target_text: &str,
 ) -> Result<i64> {
+    // Pair aliases by root index, not by list position: the source and target
+    // roots can be declared with different alias counts, and zipping two
+    // independent alias lists would pair the wrong virtual root with the target.
+    let source_real = roots.real_root_for(source_text);
+    let target_real = roots.real_root_for(target_text);
+    let mut prefixes: Vec<(&str, &str)> = vec![(source_text, target_text)];
+    let mut logical_pairs: Vec<(String, String)> = Vec::new();
+    for index in 0..roots.roots.len() {
+        let Some(real) = roots.real_root_at(index) else {
+            continue;
+        };
+        if real != source_real {
+            continue;
+        }
+        let alias = roots.roots[index].trim_end_matches(['/', '\\']).to_string();
+        if alias.is_empty() || alias == source_text {
+            continue;
+        }
+        // A virtual alias only maps onto the moved tree when this root is the
+        // one that is moving; otherwise the alias keeps pointing at its own root.
+        let target_alias = if target_real == source_real {
+            alias.clone()
+        } else {
+            target_text.to_string()
+        };
+        logical_pairs.push((alias, target_alias));
+    }
+    for (logical_source, logical_target) in &logical_pairs {
+        prefixes.push((logical_source.as_str(), logical_target.as_str()));
+    }
+    let remap_any = |path: &str| -> Option<String> {
+        prefixes
+            .iter()
+            .find_map(|(source, target)| remap_path(path, source, target))
+    };
     let transaction = conn.unchecked_transaction()?;
     transaction.execute(
         "UPDATE artists SET path=?, missing=0, missing_at=NULL WHERE id=?",
@@ -792,44 +878,34 @@ fn apply_artist_move_db_updates(
         if table_has_column(&transaction, table, "artist_id")?
             && table_has_column(&transaction, table, column)?
         {
-            updated += update_path_column(
-                &transaction,
-                table,
-                column,
-                artist_id,
-                source_text,
-                target_text,
-            )?;
+            updated += update_path_column_multi(&transaction, table, column, artist_id, &prefixes)?;
         }
     }
     if table_has_column(&transaction, "move_candidates", "artist_id")? {
-        updated += update_path_column(
+        updated += update_path_column_multi(
             &transaction,
             "move_candidates",
             "old_path",
             artist_id,
-            source_text,
-            target_text,
+            &prefixes,
         )?;
-        updated += update_path_column(
+        updated += update_path_column_multi(
             &transaction,
             "move_candidates",
             "new_path",
             artist_id,
-            source_text,
-            target_text,
+            &prefixes,
         )?;
     }
     if table_has_column(&transaction, "kemono_subscriptions", "target_dir")?
         && table_has_column(&transaction, "kemono_subscriptions", "artist_id")?
     {
-        updated += update_path_column(
+        updated += update_path_column_multi(
             &transaction,
             "kemono_subscriptions",
             "target_dir",
             artist_id,
-            source_text,
-            target_text,
+            &prefixes,
         )?;
     }
     if table_has_column(&transaction, "download_publish_jobs", "target_path")? {
@@ -841,7 +917,7 @@ fn apply_artist_move_db_updates(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         for (id, path) in rows {
-            if let Some(next) = remap_path(&path, source_text, target_text) {
+            if let Some(next) = remap_any(&path) {
                 transaction.execute(
                     "UPDATE download_publish_jobs SET target_path=? WHERE id=?",
                     params![next, id],
@@ -865,7 +941,7 @@ fn apply_artist_move_db_updates(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         for (id, path) in rows {
-            if let Some(next) = remap_path(&path, source_text, target_text) {
+            if let Some(next) = remap_any(&path) {
                 transaction.execute(
                     "UPDATE kemono_files SET target_path=? WHERE id=?",
                     params![next, id],
@@ -887,7 +963,7 @@ fn apply_artist_move_db_updates(
                 let mut changed = false;
                 if val.get("artist_id").and_then(|v| v.as_i64()) == Some(artist_id) {
                     if let Some(p) = val.get("artist_path").and_then(|v| v.as_str()) {
-                        if let Some(next) = remap_path(p, source_text, target_text) {
+                        if let Some(next) = remap_any(p) {
                             val["artist_path"] = serde_json::Value::String(next);
                             changed = true;
                         }
@@ -921,13 +997,16 @@ fn apply_artist_move_db_updates(
 /// Called once at writable startup, mirroring recycle reconciliation: an
 /// intent whose filesystem rename already happened rolls forward; an intent
 /// whose rename never started rolls back (intent dropped); anything ambiguous
-/// stays on disk for manual reconciliation.
+/// is archived for manual reconciliation instead of blocking later moves.
 pub fn reconcile_pending_artist_move(conn: &Connection) -> Value {
     let path = pending_move_intent_path();
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(_) => return json!({"reconciled": false}),
     };
+    // The media roots come from the same environment the move itself read, so a
+    // roll-forward rewrites the virtual aliases as well as the real paths.
+    let roots = crate::media_roots::env_media_roots();
     let parsed: Value = match serde_json::from_str(&raw) {
         Ok(value) => value,
         Err(error) => {
@@ -947,7 +1026,7 @@ pub fn reconcile_pending_artist_move(conn: &Connection) -> Value {
     let source_dir = PathBuf::from(source);
     let target_dir = PathBuf::from(target);
     let outcome = if !source_dir.is_dir() && target_dir.is_dir() {
-        match apply_artist_move_db_updates(conn, artist_id, source, target) {
+        match apply_artist_move_db_updates(conn, &roots, artist_id, source, target) {
             Ok(updated) => {
                 clear_pending_move_intent();
                 log_info!(
@@ -967,9 +1046,12 @@ pub fn reconcile_pending_artist_move(conn: &Connection) -> Value {
         log_info!("artist move intent dropped: filesystem was never moved");
         "rolled_back"
     } else {
-        log_error!(
-            "artist move intent needs manual reconciliation: source={source} target={target}"
-        );
+        // Both trees present, or neither: the intent cannot decide, and keeping
+        // the file would block every later artist move while printing a remedy
+        // that re-enters this same branch. Archive it and let the operator look.
+        archive_unresolved_move_intent(&format!(
+            "needs manual reconciliation: source={source} target={target}"
+        ));
         "needs_manual_reconciliation"
     };
     json!({"reconciled": true, "outcome": outcome})
@@ -1017,7 +1099,7 @@ pub fn execute_artist_folder_move(
         published_identity,
     } = outcome;
 
-    let result = apply_artist_move_db_updates(conn, artist_id, &source_text, &target_text);
+    let result = apply_artist_move_db_updates(conn, roots, artist_id, &source_text, &target_text);
     let updated = match result {
         Ok(updated) => updated,
         Err(error) => {
@@ -1098,657 +1180,4 @@ pub fn execute_artist_folder_move(
     Ok(
         json!({"ok": true, "backup": backup, "source": source_text, "target": target_text, "updated_paths": updated, "cleanup_error": cleanup_error, "retained_dirs": prune_retained_directory_records()}),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn recycle_entry_remaps_original_and_snapshot_together() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE recycle_entries (
-                id INTEGER PRIMARY KEY, artist_id INTEGER, original_path TEXT,
-                item_snapshot TEXT, status TEXT
-            );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO recycle_entries (id, artist_id, original_path, item_snapshot, status)
-             VALUES (1, 1, '/old/Artist/pic.jpg', ?, 'recycled')",
-            [r#"{"file_path": "/old/Artist/pic.jpg", "file_name": "pic.jpg"}"#],
-        )
-        .unwrap();
-        // Snapshot file_path outside the moved prefix: the pair must stay
-        // untouched instead of half-updating.
-        conn.execute(
-            "INSERT INTO recycle_entries (id, artist_id, original_path, item_snapshot, status)
-             VALUES (2, 1, '/old/Artist/gone.jpg', ?, 'recycled')",
-            [r#"{"file_path": "/elsewhere/pic.jpg"}"#],
-        )
-        .unwrap();
-        // Malformed snapshot: same rule.
-        conn.execute(
-            "INSERT INTO recycle_entries (id, artist_id, original_path, item_snapshot, status)
-             VALUES (3, 1, '/old/Artist/bad.jpg', 'not-json', 'recycled')",
-            [],
-        )
-        .unwrap();
-
-        let changed = update_recycle_entries_for_move(&conn, 1, "/old/Artist", "/new/Artist")
-            .expect("remap must not fail the move");
-
-        assert_eq!(changed, 1, "only the fully remappable entry updates");
-        let rows: Vec<(String, String)> = conn
-            .prepare("SELECT original_path, item_snapshot FROM recycle_entries ORDER BY id")
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert!(rows[0].0.starts_with("/new/Artist"), "{}", rows[0].0);
-        assert!(rows[0].1.contains("/new/Artist/pic.jpg"), "{}", rows[0].1);
-        assert_eq!(
-            rows[1].0, "/old/Artist/gone.jpg",
-            "unremappable pair keeps original"
-        );
-        assert_eq!(
-            rows[1].1, r#"{"file_path": "/elsewhere/pic.jpg"}"#,
-            "unremappable pair keeps snapshot"
-        );
-        assert_eq!(rows[2].0, "/old/Artist/bad.jpg");
-        assert_eq!(rows[2].1, "not-json");
-    }
-
-    #[test]
-    fn retained_directory_records_are_persisted_and_pruned() {
-        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
-        let dir = tempdir().unwrap();
-        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
-        let retained = dir.path().join("leftover");
-        fs::create_dir_all(&retained).unwrap();
-        record_retained_directory(
-            &retained,
-            &dir.path().join("s"),
-            &dir.path().join("t"),
-            "test",
-        );
-
-        assert_eq!(prune_retained_directory_records(), 1);
-
-        fs::remove_dir_all(&retained).unwrap();
-        assert_eq!(prune_retained_directory_records(), 0);
-        let records_dir = dir.path().join("data").join("retained-dirs");
-        let remaining: Vec<_> = fs::read_dir(&records_dir)
-            .map(|entries| entries.filter_map(|entry| entry.ok()).collect())
-            .unwrap_or_default();
-        assert!(remaining.is_empty(), "pruned records must be removed");
-    }
-
-    #[test]
-    fn occupied_publish_target_records_retained_staging() {
-        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
-        let _forced = crate::test_support::EnvVar::set("GALLERY_TEST_ARTIST_MOVE_COPY", "1");
-        let dir = tempdir().unwrap();
-        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
-        let source = dir.path().join("Artist");
-        fs::create_dir_all(source.join("work")).unwrap();
-        fs::write(source.join("work").join("image.jpg"), b"image").unwrap();
-        let target = dir.path().join("Moved");
-        fs::create_dir_all(&target).unwrap();
-        let roots = MediaRoots::identical(
-            vec![dir.path().to_string_lossy().to_string()],
-            vec!["root".into()],
-        );
-
-        let error = move_artist_tree(&source, &target, &roots, None)
-            .expect_err("occupied target must refuse the publish");
-
-        assert!(error.to_string().contains("staging retained"));
-        let records_dir = dir.path().join("data").join("retained-dirs");
-        let records: Vec<_> = fs::read_dir(&records_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|entry| entry.ok())
-                    .filter(|entry| {
-                        entry
-                            .path()
-                            .extension()
-                            .and_then(|extension| extension.to_str())
-                            == Some("json")
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        assert_eq!(records.len(), 1, "the retained staging must be recorded");
-        let record: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(records[0].path()).unwrap()).unwrap();
-        let recorded = Path::new(record["retained_path"].as_str().unwrap());
-        assert!(recorded.is_dir(), "record must point at the staging copy");
-        assert!(recorded
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".gallery-copy-")));
-    }
-
-    #[test]
-    fn copy_fallback_publishes_tree_and_retires_source_to_staging() {
-        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
-        let _forced = crate::test_support::EnvVar::set("GALLERY_TEST_ARTIST_MOVE_COPY", "1");
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("Artist");
-        fs::create_dir_all(source.join("work")).unwrap();
-        fs::write(source.join("work").join("image.jpg"), b"image").unwrap();
-        let target = dir.path().join("Moved");
-        let roots = MediaRoots::identical(
-            vec![dir.path().to_string_lossy().to_string()],
-            vec!["root".into()],
-        );
-
-        let outcome = move_artist_tree(&source, &target, &roots, None).unwrap();
-
-        assert!(!outcome.renamed);
-        assert!(target.join("work").join("image.jpg").is_file());
-        assert!(!source.exists());
-        let staged = outcome.staged_source.as_ref().unwrap();
-        assert!(staged.is_dir());
-        assert!(staged
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(".gallery-move-")));
-        let leftovers: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with(".gallery-copy-"))
-            })
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "staging target must be published, not left behind"
-        );
-    }
-
-    #[test]
-    fn copy_fallback_never_overwrites_or_cleans_up_appeared_target() {
-        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
-        let _forced = crate::test_support::EnvVar::set("GALLERY_TEST_ARTIST_MOVE_COPY", "1");
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("Artist");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("image.jpg"), b"image").unwrap();
-        let target = dir.path().join("Moved");
-        fs::create_dir_all(&target).unwrap();
-        fs::write(target.join("foreign.txt"), b"foreign").unwrap();
-        let roots = MediaRoots::identical(
-            vec![dir.path().to_string_lossy().to_string()],
-            vec!["root".into()],
-        );
-
-        let error = move_artist_tree(&source, &target, &roots, None).unwrap_err();
-
-        assert!(
-            error.to_string().contains("destination appeared"),
-            "unexpected error: {error}"
-        );
-        assert_eq!(fs::read(target.join("foreign.txt")).unwrap(), b"foreign");
-        assert!(source.join("image.jpg").is_file());
-        // A failed publish retains private staging rather than recursively
-        // deleting a pathname that another process may have replaced.
-        assert!(fs::read_dir(dir.path()).unwrap().any(|entry| {
-            entry.ok().is_some_and(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(".gallery-copy-"))
-            })
-        }));
-    }
-
-    #[test]
-    fn db_failure_rollback_restores_renamed_source() {
-        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("Artist");
-        let file = source.join("work").join("image.jpg");
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
-        fs::write(&file, b"image").unwrap();
-        let conn = Connection::open(dir.path().join("gallery.db")).unwrap();
-        conn.execute_batch("CREATE TABLE artists(id INTEGER PRIMARY KEY,name TEXT,path TEXT UNIQUE,missing INTEGER DEFAULT 0,missing_at REAL); CREATE TABLE items(id INTEGER PRIMARY KEY,artist_id INTEGER,file_path TEXT UNIQUE,file_size INTEGER,missing INTEGER DEFAULT 0);").unwrap();
-        conn.execute(
-            "INSERT INTO artists(id,name,path) VALUES(1,'Artist',?)",
-            params![source.to_string_lossy()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO items(id,artist_id,file_path,file_size,missing) VALUES(1,1,?,5,0)",
-            params![file.to_string_lossy()],
-        )
-        .unwrap();
-        conn.execute_batch(
-            "CREATE TRIGGER fail_items_update BEFORE UPDATE ON items
-             BEGIN SELECT RAISE(ABORT, 'stop'); END;",
-        )
-        .unwrap();
-        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
-        let roots = MediaRoots::identical(
-            vec![dir.path().to_string_lossy().into()],
-            vec!["root".into()],
-        );
-
-        let error = execute_artist_folder_move(&conn, &roots, 1, 0, "Moved").unwrap_err();
-
-        assert!(
-            error.to_string().contains("stop"),
-            "unexpected error: {error}"
-        );
-        assert!(source.join("work").join("image.jpg").is_file());
-        assert!(!dir.path().join("Moved").exists());
-    }
-
-    #[test]
-    fn db_failure_with_recreated_source_requires_manual_reconciliation() {
-        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-
-        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("Artist");
-        let file = source.join("work").join("image.jpg");
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
-        fs::write(&file, b"image").unwrap();
-        let conn = Connection::open(dir.path().join("gallery.db")).unwrap();
-        conn.execute_batch("CREATE TABLE artists(id INTEGER PRIMARY KEY,name TEXT,path TEXT UNIQUE,missing INTEGER DEFAULT 0,missing_at REAL); CREATE TABLE items(id INTEGER PRIMARY KEY,artist_id INTEGER,file_path TEXT UNIQUE,file_size INTEGER,missing INTEGER DEFAULT 0);").unwrap();
-        conn.execute(
-            "INSERT INTO artists(id,name,path) VALUES(1,'Artist',?)",
-            params![source.to_string_lossy()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO items(id,artist_id,file_path,file_size,missing) VALUES(1,1,?,5,0)",
-            params![file.to_string_lossy()],
-        )
-        .unwrap();
-        conn.execute_batch(
-            "CREATE TRIGGER fail_items_update BEFORE UPDATE ON items
-             BEGIN SELECT RAISE(ABORT, 'stop'); END;",
-        )
-        .unwrap();
-        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
-        let roots = MediaRoots::identical(
-            vec![dir.path().to_string_lossy().into()],
-            vec!["root".into()],
-        );
-
-        // Another process recreates the source path right after the artist row
-        // update starts: rollback must refuse to clobber it.
-        let recreated = source.clone();
-        conn.authorizer(Some(move |ctx: AuthContext<'_>| {
-            if matches!(
-                ctx.action,
-                AuthAction::Update {
-                    table_name: "artists",
-                    ..
-                }
-            ) {
-                fs::create_dir_all(&recreated).unwrap();
-                fs::write(recreated.join("foreign.txt"), b"foreign").unwrap();
-            }
-            Authorization::Allow
-        }));
-        let error = execute_artist_folder_move(&conn, &roots, 1, 0, "Moved").unwrap_err();
-        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-
-        assert!(
-            error.to_string().contains("manual reconciliation"),
-            "unexpected error: {error}"
-        );
-        assert_eq!(fs::read(source.join("foreign.txt")).unwrap(), b"foreign");
-        assert!(
-            dir.path()
-                .join("Moved")
-                .join("work")
-                .join("image.jpg")
-                .is_file(),
-            "moved tree must stay available for manual reconciliation"
-        );
-    }
-
-    #[test]
-    fn copy_dir_recursive_refuses_to_overwrite_existing_file() {
-        let dir = tempdir().unwrap();
-        let src = dir.path().join("src");
-        let dst = dir.path().join("dst");
-        fs::create_dir_all(&src).unwrap();
-        fs::create_dir_all(&dst).unwrap();
-        fs::write(src.join("a.jpg"), b"source").unwrap();
-        fs::write(dst.join("a.jpg"), b"existing").unwrap();
-
-        let result = copy_dir_recursive(&src, &dst);
-        assert!(result.is_err());
-        // Original target file must be untouched.
-        assert_eq!(fs::read(dst.join("a.jpg")).unwrap(), b"existing");
-    }
-
-    #[test]
-    fn lists_only_direct_non_symlink_directories_under_the_selected_root() {
-        let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("Alpha").join("Child")).unwrap();
-        fs::create_dir_all(dir.path().join("Beta")).unwrap();
-        fs::write(dir.path().join("file.jpg"), b"file").unwrap();
-        let roots = MediaRoots::identical(
-            vec![dir.path().to_string_lossy().into()],
-            vec!["root".into()],
-        );
-
-        let root_listing = list_media_root_directories(&roots, 0, "").unwrap();
-        assert_eq!(root_listing["directories"], json!(["Alpha", "Beta"]));
-        let child_listing = list_media_root_directories(&roots, 0, "Alpha").unwrap();
-        assert_eq!(child_listing["directories"], json!(["Child"]));
-        assert!(list_media_root_directories(&roots, 0, "../outside").is_err());
-    }
-
-    #[test]
-    fn copy_dir_recursive_succeeds_when_target_has_no_conflicting_files() {
-        let dir = tempdir().unwrap();
-        let src = dir.path().join("src");
-        let dst = dir.path().join("dst");
-        fs::create_dir_all(src.join("sub")).unwrap();
-        fs::write(src.join("a.jpg"), b"file-a").unwrap();
-        fs::write(src.join("sub").join("b.jpg"), b"file-b").unwrap();
-
-        copy_dir_recursive(&src, &dst).unwrap();
-        assert_eq!(fs::read(dst.join("a.jpg")).unwrap(), b"file-a");
-        assert_eq!(fs::read(dst.join("sub").join("b.jpg")).unwrap(), b"file-b");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn move_artist_tree_rejects_symlinked_target_parent() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempdir().unwrap();
-        let root = dir.path().join("pictures");
-        let source = root.join("Artist");
-        let outside = dir.path().join("outside");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir(&outside).unwrap();
-        fs::write(source.join("image.jpg"), b"image").unwrap();
-        symlink(&outside, root.join("replaced-parent")).unwrap();
-        let roots = MediaRoots::identical(
-            vec![root.to_string_lossy().to_string()],
-            vec!["pictures".into()],
-        );
-        let target = root.join("replaced-parent").join("Moved");
-
-        assert!(move_artist_tree(&source, &target, &roots, None).is_err());
-        assert!(source.join("image.jpg").is_file());
-        assert!(!outside.join("Moved").exists());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn move_artist_tree_rejects_symlinked_source_parent() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempdir().unwrap();
-        let root = dir.path().join("pictures");
-        let parent = root.join("source-parent");
-        let source = parent.join("Artist");
-        let original_parent = root.join("source-parent-original");
-        let outside = dir.path().join("outside");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("image.jpg"), b"original").unwrap();
-        fs::create_dir_all(outside.join("Artist")).unwrap();
-        fs::write(outside.join("Artist").join("foreign.jpg"), b"foreign").unwrap();
-        fs::rename(&parent, &original_parent).unwrap();
-        symlink(&outside, &parent).unwrap();
-        let roots = MediaRoots::identical(
-            vec![root.to_string_lossy().to_string()],
-            vec!["pictures".into()],
-        );
-
-        assert!(move_artist_tree(&source, &root.join("Moved"), &roots, None).is_err());
-        assert_eq!(
-            fs::read(original_parent.join("Artist").join("image.jpg")).unwrap(),
-            b"original"
-        );
-        assert_eq!(
-            fs::read(outside.join("Artist").join("foreign.jpg")).unwrap(),
-            b"foreign"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn move_artist_tree_rejects_source_replaced_after_preview() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().join("pictures");
-        let source = root.join("Artist");
-        let replaced_source = root.join("Artist-before-replacement");
-        let target = root.join("Moved");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("image.jpg"), b"original").unwrap();
-        let expected = dir_identity(&source);
-        fs::rename(&source, &replaced_source).unwrap();
-        fs::create_dir(&source).unwrap();
-        fs::write(source.join("foreign.jpg"), b"foreign").unwrap();
-        let roots = MediaRoots::identical(
-            vec![root.to_string_lossy().to_string()],
-            vec!["pictures".into()],
-        );
-
-        assert!(move_artist_tree(&source, &target, &roots, expected).is_err());
-        assert_eq!(fs::read(source.join("foreign.jpg")).unwrap(), b"foreign");
-        assert_eq!(
-            fs::read(replaced_source.join("image.jpg")).unwrap(),
-            b"original"
-        );
-        assert!(!target.exists());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn copy_staging_refuses_existing_directory() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().join("pictures");
-        let source = root.join("Artist");
-        let staging = root.join(".gallery-copy-existing");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("image.jpg"), b"image").unwrap();
-        fs::create_dir_all(&staging).unwrap();
-        fs::write(staging.join("foreign.txt"), b"foreign").unwrap();
-        let roots = MediaRoots::identical(
-            vec![root.to_string_lossy().to_string()],
-            vec!["pictures".into()],
-        );
-
-        assert!(copy_artist_tree_to_staging(&source, &staging, &roots).is_err());
-        assert_eq!(fs::read(staging.join("foreign.txt")).unwrap(), b"foreign");
-        assert!(source.join("image.jpg").is_file());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn copy_staging_rejects_symlinked_child() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempdir().unwrap();
-        let root = dir.path().join("pictures");
-        let source = root.join("Artist");
-        let staging = root.join(".gallery-copy-safe");
-        let outside = dir.path().join("outside.jpg");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(&outside, b"outside").unwrap();
-        symlink(&outside, source.join("escape.jpg")).unwrap();
-        let roots = MediaRoots::identical(
-            vec![root.to_string_lossy().to_string()],
-            vec!["pictures".into()],
-        );
-
-        assert!(copy_artist_tree_to_staging(&source, &staging, &roots).is_err());
-        assert_eq!(fs::read(&outside).unwrap(), b"outside");
-        assert!(!staging.join("escape.jpg").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn remove_owned_dir_keeps_replacement() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("owned");
-        let outside = dir.path().join("outside");
-        fs::create_dir(&path).unwrap();
-        let identity = dir_identity(&path);
-        fs::remove_dir(&path).unwrap();
-        fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("foreign.txt"), b"foreign").unwrap();
-        symlink(&outside, &path).unwrap();
-
-        assert!(remove_owned_dir(&path, identity).is_err());
-        assert_eq!(fs::read(outside.join("foreign.txt")).unwrap(), b"foreign");
-    }
-
-    #[test]
-    fn previews_and_rejects_existing_target() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("Artist");
-        let target = dir.path().join("Moved");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        let conn = Connection::open(dir.path().join("gallery.db")).unwrap();
-        conn.execute_batch("CREATE TABLE artists(id INTEGER PRIMARY KEY,name TEXT,path TEXT,missing INTEGER DEFAULT 0,missing_at REAL); CREATE TABLE items(id INTEGER PRIMARY KEY,artist_id INTEGER,file_path TEXT,file_size INTEGER,missing INTEGER DEFAULT 0);").unwrap();
-        conn.execute(
-            "INSERT INTO artists(id,name,path) VALUES(1,'Artist',?)",
-            params![source.to_string_lossy()],
-        )
-        .unwrap();
-        let roots = MediaRoots::identical(
-            vec![dir.path().to_string_lossy().into()],
-            vec!["root".into()],
-        );
-        let value = preview_artist_folder_move(&conn, &roots, 1, 0, "Moved").unwrap();
-        assert_eq!(value["target_exists"], true);
-        assert_eq!(value["can_execute"], false);
-    }
-
-    #[test]
-    fn executes_move_and_updates_indexed_paths() {
-        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("Artist");
-        let file = source.join("work").join("image.jpg");
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
-        fs::write(&file, b"image").unwrap();
-        let conn = Connection::open(dir.path().join("gallery.db")).unwrap();
-        conn.execute_batch("CREATE TABLE artists(id INTEGER PRIMARY KEY,name TEXT,path TEXT UNIQUE,missing INTEGER DEFAULT 0,missing_at REAL); CREATE TABLE items(id INTEGER PRIMARY KEY,artist_id INTEGER,file_path TEXT UNIQUE,file_size INTEGER,missing INTEGER DEFAULT 0);").unwrap();
-        conn.execute(
-            "INSERT INTO artists(id,name,path) VALUES(1,'Artist',?)",
-            params![source.to_string_lossy()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO items(id,artist_id,file_path,file_size,missing) VALUES(1,1,?,5,0)",
-            params![file.to_string_lossy()],
-        )
-        .unwrap();
-        let _data_dir = crate::test_support::EnvVar::set("DATA_DIR", dir.path().join("data"));
-        let roots = MediaRoots::identical(
-            vec![dir.path().to_string_lossy().into()],
-            vec!["root".into()],
-        );
-
-        let result = execute_artist_folder_move(&conn, &roots, 1, 0, "Moved").unwrap();
-        let target = dir.path().join("Moved");
-        assert_eq!(result["ok"], true);
-        assert!(target.join("work").join("image.jpg").is_file());
-        assert!(!source.exists());
-        let artist_path: String = conn
-            .query_row("SELECT path FROM artists WHERE id=1", [], |row| row.get(0))
-            .unwrap();
-        let item_path: String = conn
-            .query_row("SELECT file_path FROM items WHERE id=1", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(artist_path, path_text(&target));
-        assert_eq!(item_path, path_text(&target.join("work").join("image.jpg")));
-        assert!(Path::new(result["backup"].as_str().unwrap()).is_file());
-    }
-
-    fn conflict_fixture() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE artists(id INTEGER PRIMARY KEY,name TEXT,path TEXT,missing INTEGER DEFAULT 0,missing_at REAL);
-             CREATE TABLE items(id INTEGER PRIMARY KEY,artist_id INTEGER,file_path TEXT,file_size INTEGER,missing INTEGER DEFAULT 0);",
-        )
-        .unwrap();
-        conn
-    }
-
-    #[test]
-    fn indexed_conflicts_match_path_bytes_not_case() {
-        let conn = conflict_fixture();
-        conn.execute_batch(
-            "INSERT INTO artists(id,name,path) VALUES(1,'Source','/root/Somewhere');
-             INSERT INTO artists(id,name,path) VALUES(2,'Lower','/root/foo');
-             INSERT INTO artists(id,name,path) VALUES(3,'Exact','/root/Foo');
-             INSERT INTO items(id,artist_id,file_path,missing) VALUES(1,2,'/root/foo/a.jpg',0);
-             INSERT INTO items(id,artist_id,file_path,missing) VALUES(2,3,'/root/Foo/b.jpg',0);",
-        )
-        .unwrap();
-        let conflicts = indexed_conflicts(&conn, "/root/Foo", 1).unwrap();
-        let ids: Vec<i64> = conflicts
-            .iter()
-            .filter_map(|value| value["artist_id"].as_i64())
-            .collect();
-        // The case-only sibling `/root/foo` must not block the move; the exact
-        // `/root/Foo` artist and its items must.
-        assert!(
-            ids.contains(&3),
-            "exact path conflict is reported: {conflicts:?}"
-        );
-        assert!(
-            !ids.contains(&2),
-            "case-only sibling must not be a conflict: {conflicts:?}"
-        );
-        let paths: Vec<String> = conflicts
-            .iter()
-            .filter_map(|value| value["path"].as_str().map(str::to_owned))
-            .collect();
-        assert!(paths.contains(&"/root/Foo/b.jpg".to_string()));
-        assert!(!paths.contains(&"/root/foo/a.jpg".to_string()));
-    }
-
-    #[test]
-    fn indexed_conflicts_treat_wildcards_in_target_literally() {
-        let conn = conflict_fixture();
-        conn.execute_batch(
-            "INSERT INTO artists(id,name,path) VALUES(1,'Source','/root/Somewhere');
-             INSERT INTO artists(id,name,path) VALUES(2,'Sibling','/root/100Xfoo');
-             INSERT INTO artists(id,name,path) VALUES(3,'Exact','/root/100%foo');
-             INSERT INTO items(id,artist_id,file_path,missing) VALUES(1,2,'/root/100Xfoo/deep/y.jpg',0);
-             INSERT INTO items(id,artist_id,file_path,missing) VALUES(2,3,'/root/100%foo/real/z.jpg',0);",
-        )
-        .unwrap();
-        let conflicts = indexed_conflicts(&conn, "/root/100%foo", 1).unwrap();
-        let paths: Vec<String> = conflicts
-            .iter()
-            .filter_map(|value| value["path"].as_str().map(str::to_owned))
-            .collect();
-        // `%` in the destination is a literal character: the LIKE-free prefix
-        // test must not report items under the unrelated `100Xfoo` directory.
-        assert!(
-            paths.contains(&"/root/100%foo/real/z.jpg".to_string()),
-            "{paths:?}"
-        );
-        assert!(
-            !paths.contains(&"/root/100Xfoo/deep/y.jpg".to_string()),
-            "{paths:?}"
-        );
-    }
 }

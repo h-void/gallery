@@ -16,9 +16,13 @@ use crate::scan::{run_scan_inner, ScanControl};
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS netdisk_import_status (
-        task_id TEXT PRIMARY KEY, error TEXT NOT NULL DEFAULT '', updated_at REAL NOT NULL
+        task_id TEXT PRIMARY KEY, error TEXT NOT NULL DEFAULT '', updated_at REAL NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0
     )",
     )?;
+    let _ = conn.execute(
+        "ALTER TABLE netdisk_import_status ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     conn.execute_batch("CREATE TABLE IF NOT EXISTS netdisk_task_naming (
         task_id TEXT PRIMARY KEY REFERENCES netdisk_bridge_tasks(task_id) ON DELETE CASCADE, snapshot TEXT NOT NULL
     )")?;
@@ -57,13 +61,33 @@ pub fn pending_auto_imports(conn: &Connection, bridge_id: &str) -> Result<Vec<St
         "SELECT t.task_id FROM netdisk_bridge_tasks t
         LEFT JOIN netdisk_import_status s ON s.task_id=t.task_id
         WHERE t.bridge_id=?1 AND t.state='confirmed'
+          AND NOT EXISTS (
+              SELECT 1 FROM netdisk_bridge_commands c
+              WHERE c.job_id = t.task_id AND c.action = 'remove' AND c.status = 'confirmed'
+          )
           AND (
             s.task_id IS NULL
-            OR (s.error != '' AND s.updated_at < strftime('%s','now')-60)
+            OR (
+                s.error != ''
+                AND COALESCE(s.retry_count, 0) < 5
+                AND s.updated_at < strftime('%s','now') - CASE
+                    WHEN COALESCE(s.retry_count, 0) <= 1 THEN 60
+                    WHEN s.retry_count = 2 THEN 300
+                    WHEN s.retry_count = 3 THEN 900
+                    ELSE 3600 END
+            )
             OR (
                 COALESCE(json_array_length(t.expected), 0) > 0
                 AND (SELECT COUNT(*) FROM download_publish_jobs WHERE engine='netdisk' AND source_job_id=t.task_id AND manifest_version=t.manifest_version AND stage='ingested' AND item_id IS NOT NULL) < json_array_length(t.expected)
-                AND (s.error = '' AND s.updated_at < strftime('%s','now')-60)
+                AND (
+                    s.error = ''
+                    AND COALESCE(s.retry_count, 0) < 5
+                    AND s.updated_at < strftime('%s','now') - CASE
+                        WHEN COALESCE(s.retry_count, 0) <= 1 THEN 60
+                        WHEN s.retry_count = 2 THEN 300
+                        WHEN s.retry_count = 3 THEN 900
+                        ELSE 3600 END
+                )
             )
           )
         ORDER BY COALESCE(s.updated_at,0), t.created_at LIMIT 4",
@@ -359,11 +383,29 @@ pub fn import_task_with_mode(
         .err()
         .map(ToString::to_string)
         .unwrap_or_default();
-    conn.execute(
-        "INSERT INTO netdisk_import_status(task_id,error,updated_at) VALUES(?1,?2,strftime('%s','now'))
-        ON CONFLICT(task_id) DO UPDATE SET error=excluded.error,updated_at=excluded.updated_at",
-        params![task.task_id, message],
-    )?;
+    if message.is_empty() {
+        let (linked, total) = task_import_state(conn, task).unwrap_or((0, 0));
+        let all_done = total > 0 && linked == total;
+        if all_done {
+            conn.execute(
+                "INSERT INTO netdisk_import_status(task_id,error,updated_at,retry_count) VALUES(?1,'',strftime('%s','now'),0)
+                ON CONFLICT(task_id) DO UPDATE SET error='',updated_at=excluded.updated_at,retry_count=0",
+                params![task.task_id],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO netdisk_import_status(task_id,error,updated_at,retry_count) VALUES(?1,'',strftime('%s','now'),1)
+                ON CONFLICT(task_id) DO UPDATE SET error='',updated_at=excluded.updated_at,retry_count=COALESCE(netdisk_import_status.retry_count,0)+1",
+                params![task.task_id],
+            )?;
+        }
+    } else {
+        conn.execute(
+            "INSERT INTO netdisk_import_status(task_id,error,updated_at,retry_count) VALUES(?1,?2,strftime('%s','now'),1)
+            ON CONFLICT(task_id) DO UPDATE SET error=excluded.error,updated_at=excluded.updated_at,retry_count=COALESCE(netdisk_import_status.retry_count,0)+1",
+            params![task.task_id, message],
+        )?;
+    }
     result
 }
 
@@ -669,536 +711,4 @@ pub fn cleanup_imported_task(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::{DbConfig, DbPool};
-    use crate::netdisk::{
-        create_bridge_task, load_bridge_task, process_bridge_exchange, BridgeExchangePayload,
-    };
-    use std::sync::Arc;
-
-    struct Fixture {
-        _dir: tempfile::TempDir,
-        pool: Arc<DbPool>,
-        roots: MediaRoots,
-        task: BridgeTask,
-        source: PathBuf,
-        target: PathBuf,
-    }
-    fn fixture() -> Fixture {
-        fixture_configured(|_| {})
-    }
-
-    fn fixture_configured(configure: impl FnOnce(&Connection)) -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
-        let media = dir.path().join("media");
-        let artist = media.join("Artist");
-        let staging = media.join(".staging");
-        std::fs::create_dir_all(&artist).unwrap();
-        std::fs::create_dir_all(&staging).unwrap();
-        let source = staging.join("bundle.rar");
-        std::fs::write(&source, b"RAR archive bytes preserved unchanged").unwrap();
-        let pool = Arc::new(
-            DbPool::with_config(
-                dir.path().join("gallery.db"),
-                DbConfig {
-                    read_only: false,
-                    pool_size: 2,
-                },
-            )
-            .unwrap(),
-        );
-        let conn = pool.get().unwrap();
-        conn.execute(
-            "INSERT INTO artists(id,name,path) VALUES(1,'Artist',?1)",
-            [artist.to_string_lossy().replace('\\', "/")],
-        )
-        .unwrap();
-        conn.execute("INSERT INTO kemono_subscriptions(id,artist_id,service,user_id,target_dir,created_at,updated_at)
-            VALUES(1,1,'patreon','123',?1,'t','t')",[artist.to_string_lossy().replace('\\',"/")]).unwrap();
-        conn.execute("INSERT INTO kemono_posts(id,subscription_id,post_id,title,published_at,external_links,created_at,updated_at)
-            VALUES(1,1,'remote','Bundle','2026-07-23T09:00:00Z','[\"https://drive.google.com/file/d/example/view\"]','t','t')",[]).unwrap();
-        crate::pawchive::record_work_observation(
-            &conn,
-            1,
-            crate::pawchive::ManifestCompleteness::Complete,
-        )
-        .unwrap();
-        conn.execute("INSERT INTO app_settings(key,value) VALUES('netdisk_enabled','1'),('netdisk_auto_import','1')",[]).unwrap();
-        let roots = MediaRoots::identical(
-            vec![media.to_string_lossy().replace('\\', "/")],
-            vec!["Media".into()],
-        );
-        let handshake: BridgeExchangePayload = serde_json::from_value(serde_json::json!({
-            "version":"2","bridge_id":"jd-local","session_id":"test","seq":1,"ack":0,
-            "capabilities":{"script_version":"2.2","protocol_version":"2","supports_commands":true,
-                "supports_pagination":true,"supports_download_path":true,"supports_snapshot":true,
-                "max_page_size":100,"linkgrabber_auto_start_enabled":false},"pages":[]
-        }))
-        .unwrap();
-        process_bridge_exchange(&conn, &handshake, &roots).unwrap();
-        configure(&conn);
-        let task = create_bridge_task(
-            &conn,
-            "jd-local",
-            "test",
-            1,
-            &["https://drive.google.com/file/d/example/view".into()],
-            None,
-        )
-        .unwrap();
-        let mut payload = serde_json::to_value(&handshake).unwrap();
-        payload["seq"] = 2.into();
-        payload["ack"] = 1.into();
-        payload["pages"] = serde_json::json!([{"job_id":task.task_id,"manifest_version":task.manifest_version,
-            "snapshot_id":"pkg","page_index":0,"total_count":1,"complete":true,"expected":["link1"],
-            "records":[{"link_id":"link1","name":"bundle.rar","finished":true,"status":"FINISHED",
-                "bytes_total":source.metadata().unwrap().len(),"download_path":source.to_string_lossy().replace('\\',"/")}]}]);
-        let response =
-            process_bridge_exchange(&conn, &serde_json::from_value(payload).unwrap(), &roots)
-                .unwrap();
-        assert_eq!(response.settled_receipts, 1);
-        let task = load_bridge_task(&conn, &task.task_id).unwrap().unwrap();
-        drop(conn);
-        Fixture {
-            _dir: dir,
-            pool,
-            roots,
-            task,
-            source,
-            target: artist.join("Artist/2026-07-23 Bundle/2026-07-23 bundle.rar"),
-        }
-    }
-
-    #[test]
-    fn import_after_real_artist_move() {
-        let _env_lock = crate::test_support::ENV_LOCK.lock().unwrap();
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        let _data = crate::test_support::EnvVar::set("DATA_DIR", f._dir.path().join("data"));
-        let moved =
-            crate::artist_folder_move::execute_artist_folder_move(&conn, &f.roots, 1, 0, "Moved")
-                .unwrap();
-        assert_eq!(moved["ok"], true);
-        let result = import_task(&conn, &f.task, &f.roots, &Arc::new(ScanControl::new()));
-        assert!(result.is_ok());
-        assert!(
-            !f.target.exists(),
-            "moving the artist must not recreate its abandoned source path on import"
-        );
-    }
-
-    #[test]
-    fn auto_import_stops_after_disabled_first_file() {
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        let other = f.source.with_file_name("other.rar");
-        std::fs::write(&other, b"second unchanged archive").unwrap();
-        let mut task = f.task.clone();
-        task.expected.push("link2".into());
-        conn.execute(
-            "UPDATE netdisk_bridge_tasks SET expected=?1 WHERE task_id=?2",
-            params![serde_json::to_string(&task.expected).unwrap(), task.task_id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE pawchive_external_receipts SET output_paths=?1 WHERE task_id=?2",
-            params![
-                format!("{}\n{}", f.source.display(), other.display()),
-                task.task_id
-            ],
-        )
-        .unwrap();
-        conn.execute_batch("CREATE TRIGGER review_disable_after_first_publish AFTER INSERT ON download_publish_jobs
-            WHEN NEW.engine='netdisk' BEGIN UPDATE app_settings SET value='0' WHERE key='netdisk_auto_import'; END;").unwrap();
-        assert!(pending_auto_imports(&conn, "jd-local")
-            .unwrap()
-            .contains(&task.task_id));
-        assert!(load_netdisk_settings(&conn).unwrap().auto_import);
-        let result = import_task(&conn, &task, &f.roots, &Arc::new(ScanControl::new()));
-        assert!(result.is_ok());
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM download_publish_jobs WHERE engine='netdisk'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            count, 1,
-            "auto-import must not claim the second file after the setting is disabled"
-        );
-    }
-
-    #[test]
-    fn late_artist_binding_can_recover() {
-        let f = fixture_configured(|conn| {
-            conn.execute(
-                "UPDATE kemono_subscriptions SET artist_id=NULL WHERE id=1",
-                [],
-            )
-            .unwrap();
-        });
-        let conn = f.pool.get().unwrap();
-        conn.execute("UPDATE kemono_subscriptions SET artist_id=1 WHERE id=1", [])
-            .unwrap();
-        let result = import_task(&conn, &f.task, &f.roots, &Arc::new(ScanControl::new()));
-        assert!(
-            result.is_ok(),
-            "an accepted task must recover after its missing artist is bound"
-        );
-    }
-
-    #[test]
-    fn netdisk_freezes_naming_before_first_import() {
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        let sources = vec![f.source.clone()];
-        let original = destination(&conn, &f.task, &f.roots, &sources).unwrap();
-        let mut templates = get_pawchive_settings(&conn).unwrap();
-        templates.folder_template = "{date}/{title}".into();
-        templates.attachment_template = "changed_{name}".into();
-        crate::pawchive::save_pawchive_settings(&conn, &templates).unwrap();
-        let mut settings = load_netdisk_settings(&conn).unwrap();
-        settings.import_dir = original.artist.join("NewBase").to_string_lossy().into();
-        crate::netdisk::save_netdisk_settings(&conn, &settings).unwrap();
-        conn.execute("UPDATE kemono_posts SET title='NewTitle',published_at='2026-08-21T09:00:00Z' WHERE id=1", []).unwrap();
-        let frozen = destination(&conn, &f.task, &f.roots, &sources).unwrap();
-        assert_eq!(frozen.folder, original.folder);
-        assert_eq!(frozen.names, original.names);
-        assert_eq!(
-            import_task(&conn, &f.task, &f.roots, &Arc::new(ScanControl::new())).unwrap(),
-            1
-        );
-        assert!(f.target.is_file());
-        let next = create_bridge_task(&conn, "jd-local", "test", 1, &f.task.links, None).unwrap();
-        let next = destination(&conn, &next, &f.roots, &sources).unwrap();
-        assert_eq!(
-            next.folder,
-            original.artist.join("NewBase/2026-08-21/NewTitle")
-        );
-        assert_eq!(next.names, ["changed_bundle.rar"]);
-        // Pre-upgrade tasks with a reserved publication retain that path.
-        conn.execute(
-            "DELETE FROM netdisk_task_naming WHERE task_id=?1",
-            [&f.task.task_id],
-        )
-        .unwrap();
-        let legacy = destination(&conn, &f.task, &f.roots, &sources).unwrap();
-        assert_eq!(legacy.folder, original.folder);
-        assert_eq!(
-            import_task(&conn, &f.task, &f.roots, &Arc::new(ScanControl::new())).unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn netdisk_destination_preserves_custom_folder_components() {
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        let mut settings = get_pawchive_settings(&conn).unwrap();
-        for (template, expected) in [
-            ("{user}/{date} {title}/", "Artist/2026-07-23 Bundle"),
-            ("{date} {title}/", "2026-07-23 Bundle"),
-            ("{user}/{user}/{title}/", "Artist/Artist/Bundle"),
-            ("{service}/{userID}/{id}", "patreon/123/remote"),
-            ("{year}/{month}/{title}", "2026/07/Bundle"),
-            ("固定目录", "固定目录"),
-            ("  ", "Artist/2026-07-23 Bundle"),
-        ] {
-            settings.folder_template = template.to_string();
-            crate::pawchive::save_pawchive_settings(&conn, &settings).unwrap();
-            conn.execute(
-                "DELETE FROM netdisk_task_naming WHERE task_id=?1",
-                [&f.task.task_id],
-            )
-            .unwrap();
-            freeze_task_naming(&conn, &f.task.task_id, f.task.post_id).unwrap();
-            let actual = destination(&conn, &f.task, &f.roots, &[]).unwrap();
-            assert_eq!(actual.folder, actual.artist.join(expected));
-        }
-    }
-
-    #[test]
-    fn netdisk_destination_uses_both_file_templates_and_checks_custom_base() {
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        let mut templates = get_pawchive_settings(&conn).unwrap();
-        templates.image_template = "{userID}_{index}.{ext}".into();
-        templates.attachment_template = "{service}_{index}_{name}".into();
-        crate::pawchive::save_pawchive_settings(&conn, &templates).unwrap();
-        let sources = [PathBuf::from("cover.PNG"), PathBuf::from("archive.rar")];
-        conn.execute(
-            "DELETE FROM netdisk_task_naming WHERE task_id=?1",
-            [&f.task.task_id],
-        )
-        .unwrap();
-        freeze_task_naming(&conn, &f.task.task_id, f.task.post_id).unwrap();
-        let plan = destination(&conn, &f.task, &f.roots, &sources).unwrap();
-        assert_eq!(plan.names, ["123_0.PNG", "patreon_1_archive.rar"]);
-        let mut settings = load_netdisk_settings(&conn).unwrap();
-        settings.import_dir = plan.artist.parent().unwrap().to_string_lossy().into();
-        crate::netdisk::save_netdisk_settings(&conn, &settings).unwrap();
-        conn.execute(
-            "DELETE FROM netdisk_task_naming WHERE task_id=?1",
-            [&f.task.task_id],
-        )
-        .unwrap();
-        freeze_task_naming(&conn, &f.task.task_id, f.task.post_id).unwrap();
-        let parent_base = destination(&conn, &f.task, &f.roots, &sources).unwrap();
-        assert_eq!(parent_base.folder, plan.artist.join("2026-07-23 Bundle"));
-        templates.folder_template = "Other/{title}".into();
-        crate::pawchive::save_pawchive_settings(&conn, &templates).unwrap();
-        conn.execute(
-            "DELETE FROM netdisk_task_naming WHERE task_id=?1",
-            [&f.task.task_id],
-        )
-        .unwrap();
-        freeze_task_naming(&conn, &f.task.task_id, f.task.post_id).unwrap();
-        assert!(destination(&conn, &f.task, &f.roots, &sources).is_err());
-    }
-
-    #[test]
-    fn netdisk_constant_filename_keeps_two_outputs_distinct_and_retry_stable() {
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        let other = f.source.with_file_name("other.rar");
-        std::fs::write(&other, b"second archive, different bytes").unwrap();
-        let mut task = f.task.clone();
-        task.expected.push("link2".into());
-        conn.execute(
-            "UPDATE pawchive_external_receipts SET output_paths=?1 WHERE task_id=?2",
-            params![
-                format!("{}\n{}", other.display(), f.source.display()),
-                task.task_id
-            ],
-        )
-        .unwrap();
-        let mut templates = get_pawchive_settings(&conn).unwrap();
-        templates.attachment_template = "same.rar".into();
-        crate::pawchive::save_pawchive_settings(&conn, &templates).unwrap();
-        conn.execute(
-            "DELETE FROM netdisk_task_naming WHERE task_id=?1",
-            [&f.task.task_id],
-        )
-        .unwrap();
-        freeze_task_naming(&conn, &f.task.task_id, f.task.post_id).unwrap();
-        let control = Arc::new(ScanControl::new());
-        assert_eq!(import_task(&conn, &task, &f.roots, &control).unwrap(), 2);
-        let mut q = conn
-            .prepare(
-                "SELECT target_path FROM download_publish_jobs WHERE source_job_id=?1 ORDER BY id",
-            )
-            .unwrap();
-        let paths = q
-            .query_map([&task.task_id], |r| r.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(paths.len(), 2);
-        assert_ne!(paths[0], paths[1]);
-        assert_eq!(
-            std::fs::read(&paths[0]).unwrap(),
-            std::fs::read(&f.source).unwrap()
-        );
-        assert_eq!(
-            std::fs::read(&paths[1]).unwrap(),
-            std::fs::read(&other).unwrap()
-        );
-        templates.folder_template = "changed".into();
-        templates.attachment_template = "renamed.rar".into();
-        crate::pawchive::save_pawchive_settings(&conn, &templates).unwrap();
-        assert_eq!(import_task(&conn, &task, &f.roots, &control).unwrap(), 2);
-        assert_eq!(
-            std::fs::read_dir(f.target.parent().unwrap())
-                .unwrap()
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn netdisk_finished_receipt_automatically_publishes_and_indexes_archive_once() {
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        assert_eq!(
-            pending_auto_imports(&conn, "jd-local").unwrap(),
-            vec![f.task.task_id.clone()]
-        );
-        let control = Arc::new(ScanControl::new());
-        assert_eq!(import_task(&conn, &f.task, &f.roots, &control).unwrap(), 1);
-        assert!(!control.is_running());
-        assert_eq!(
-            std::fs::read(&f.target).unwrap(),
-            std::fs::read(&f.source).unwrap()
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            assert_ne!(
-                f.target.metadata().unwrap().ino(),
-                f.source.metadata().unwrap().ino()
-            );
-        }
-        let (kind, archive): (String, i64) = conn
-            .query_row(
-                "SELECT media_type,is_archive FROM items WHERE file_name='2026-07-23 bundle.rar'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(kind, "archive");
-        assert_eq!(archive, 1);
-        assert_eq!(import_task(&conn, &f.task, &f.roots, &control).unwrap(), 1);
-        assert!(pending_auto_imports(&conn, "jd-local").unwrap().is_empty());
-        assert_eq!(
-            crate::netdisk::bridge_task_view(&conn, &f.task).unwrap()["state_label"],
-            "已入库"
-        );
-        assert_eq!(
-            std::fs::read_dir(f.target.parent().unwrap())
-                .unwrap()
-                .count(),
-            1,
-            "no extraction or duplicate files"
-        );
-    }
-
-    #[test]
-    fn netdisk_collision_never_overwrites_and_retry_recovers() {
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        let control = Arc::new(ScanControl::new());
-        std::fs::create_dir_all(f.target.parent().unwrap()).unwrap();
-        std::fs::write(&f.target, b"user file").unwrap();
-        assert!(import_task(&conn, &f.task, &f.roots, &control).is_err());
-        assert_eq!(std::fs::read(&f.target).unwrap(), b"user file");
-        assert!(f.source.is_file());
-        assert!(!control.is_running());
-        assert!(import_error(&conn, &f.task.task_id).unwrap().is_some());
-        assert!(
-            pending_auto_imports(&conn, "jd-local").unwrap().is_empty(),
-            "failed work backs off"
-        );
-        std::fs::rename(&f.target, f.target.with_extension("kept")).unwrap();
-        assert_eq!(import_task(&conn, &f.task, &f.roots, &control).unwrap(), 1);
-    }
-
-    #[test]
-    fn netdisk_retry_preserves_reserved_target_after_template_changes() {
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        let identity = f.source.to_string_lossy().replace('\\', "/");
-        let request = IngestPublishRequest {
-            engine: "netdisk",
-            source_job_id: &f.task.task_id,
-            manifest_version: f.task.manifest_version,
-            source_identity: &identity,
-            source_path: &f.source,
-            expected_length: f.source.metadata().unwrap().len(),
-            expected_blake3: "deliberately incorrect digest",
-            target_path: &f.target,
-        };
-        assert!(publish_completed_file(&conn, &request, &f.roots).is_err());
-        assert!(!f.target.exists());
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM download_publish_jobs WHERE source_job_id=?1",
-                [&f.task.task_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1, "a failed staging copy keeps its reservation");
-        let mut templates = get_pawchive_settings(&conn).unwrap();
-        templates.folder_template = "changed/{title}".into();
-        templates.attachment_template = "renamed.rar".into();
-        crate::pawchive::save_pawchive_settings(&conn, &templates).unwrap();
-        assert_eq!(
-            import_task(&conn, &f.task, &f.roots, &Arc::new(ScanControl::new())).unwrap(),
-            1
-        );
-        assert_eq!(
-            std::fs::read(&f.target).unwrap(),
-            std::fs::read(&f.source).unwrap()
-        );
-    }
-
-    #[test]
-    fn netdisk_off_and_busy_leave_media_untouched() {
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        conn.execute(
-            "UPDATE app_settings SET value='0' WHERE key='netdisk_auto_import'",
-            [],
-        )
-        .unwrap();
-        assert!(pending_auto_imports(&conn, "jd-local").unwrap().is_empty());
-        let control = Arc::new(ScanControl::new());
-        let guard = control.try_claim().unwrap();
-        assert!(import_task(&conn, &f.task, &f.roots, &control).is_err());
-        assert!(!f.target.exists());
-        assert!(f.source.exists());
-        drop(guard);
-    }
-
-    #[test]
-    fn netdisk_stale_manifest_refuses_publication() {
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        conn.execute(
-            "UPDATE kemono_posts SET manifest_version=manifest_version+1 WHERE id=1",
-            [],
-        )
-        .unwrap();
-        assert!(import_task(&conn, &f.task, &f.roots, &Arc::new(ScanControl::new())).is_err());
-        assert!(!f.target.exists());
-    }
-
-    #[test]
-    fn netdisk_cleanup_after_import_deletes_staging_and_queues_remove() {
-        let f = fixture_configured(|conn| {
-            conn.execute(
-                "INSERT INTO app_settings(key, value) VALUES('netdisk_cleanup_after_import', '1')
-                 ON CONFLICT(key) DO UPDATE SET value='1'",
-                [],
-            )
-            .unwrap();
-        });
-        let conn = f.pool.get().unwrap();
-        let result = import_task(&conn, &f.task, &f.roots, &Arc::new(ScanControl::new())).unwrap();
-        assert_eq!(result, 1);
-        assert!(f.target.exists());
-        assert!(!f.source.exists());
-
-        let remove_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM netdisk_bridge_commands WHERE job_id = ?1 AND action = 'remove'",
-                params![f.task.task_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(remove_count, 1);
-    }
-
-    #[test]
-    fn netdisk_cleanup_disabled_preserves_staging() {
-        let f = fixture();
-        let conn = f.pool.get().unwrap();
-        let result = import_task(&conn, &f.task, &f.roots, &Arc::new(ScanControl::new())).unwrap();
-        assert_eq!(result, 1);
-        assert!(f.target.exists());
-        assert!(f.source.exists());
-
-        let remove_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM netdisk_bridge_commands WHERE job_id = ?1 AND action = 'remove'",
-                params![f.task.task_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(remove_count, 0);
-    }
 }

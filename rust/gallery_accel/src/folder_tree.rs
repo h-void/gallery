@@ -112,9 +112,11 @@ fn relative_folder_path(artist_path: &str, file_path: &str) -> String {
     if file_dir == artist {
         return String::new();
     }
-    let prefix = format!("{artist}/");
-    if file_dir.starts_with(&prefix) {
-        return normalize_folder(&file_dir[prefix.len()..]);
+    if let Some(rest) = file_dir
+        .strip_prefix(&artist)
+        .and_then(|r| r.strip_prefix('/'))
+    {
+        return normalize_folder(rest);
     }
     normalize_folder(file_dir.rsplit('/').next().unwrap_or(file_dir.as_str()))
 }

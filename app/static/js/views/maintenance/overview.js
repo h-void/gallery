@@ -5,6 +5,7 @@ import { API } from '../../api.js';
 import { state, isActionBusy, setActionBusy } from '../../store.js';
 import { $, escHtml, joinUiMeta, formatSize, formatBytes, formatHealthTime, isAbortError } from '../../utils.js';
 import { toast, logUiAction } from '../../logging.js';
+import { t } from '../../i18n.js';
 import { setMaintenanceView, loadMoveWorkbench } from './index.js';
 import { loadArchiveWorkbench, renderArchiveWorkbench } from './organize.js';
 import { applyMode } from '../../events.js';
@@ -92,7 +93,7 @@ async function pollDimensionBackfillStatus() {
       });
       if (status.error) toast('媒体尺寸补全失败', 'error');
       else if (status.complete) {
-        toast(Number(status.updated || 0) ? `已补全 ${Number(status.updated)} 项` : '媒体尺寸已完整', 'success');
+        toast(Number(status.updated || 0) ? `${t('已补全 {Number} 项', {Number: Number(status.updated)})}` : '媒体尺寸已完整', 'success');
         try { await loadItemsPreservingDepth(); } catch (e) {
           logUiAction('item_dimensions_backfill_reload_failed', {error: e.message || String(e)});
         }
@@ -235,7 +236,7 @@ export function renderMlRuntime() {
     ['实际 Provider', actualProvider],
     ['ORT core', ortCore],
     ['CPU 回退', fallbackText],
-    ['CCIP 模型', `${modelState}${status.custom_model_unmanaged ? '（自定义模型，不自动下载）' : ''}`],
+    ['CCIP 模型', status.custom_model_unmanaged ? t('{state}（自定义模型，不自动下载）', {state: modelState}) : modelState],
     ['CUDA 运行时', cudaState],
   ];
   if (sessionText) rows.push(['推理会话', sessionText]);
@@ -273,7 +274,7 @@ export async function saveMlDownloadSource() {
     toast('下载源已保存', 'success');
     await loadMlRuntime();
   } catch (error) {
-    toast(`保存下载源失败：${error.message || String(error)}`, 'error');
+    toast(`${t('保存下载源失败：{error}', {error: error.message || String(error)})}`, 'error');
     renderMlRuntime();
   } finally {
     state.mlRuntimeSaving = false;
@@ -295,7 +296,7 @@ export async function retryMlRuntime() {
     }
     await loadMlRuntime();
   } catch (error) {
-    toast(`重试失败：${error.message || String(error)}`, 'error');
+    toast(`${t('重试失败：{error}', {error: error.message || String(error)})}`, 'error');
     renderMlRuntime();
   }
 }
@@ -336,7 +337,7 @@ export function renderErrorArtistsDialog() {
   const empty = $('#errorArtistsEmpty');
   if (!list || !more || !empty) return;
   list.innerHTML = state.errorArtists.map(row => `<button class="error-artist-row" type="button" data-error-artist-id="${Number(row.artist_id)}" data-error-latest-plan-id="${Number(row.latest_plan_id)}" title="${escHtml(row.reason || row.message || '需要人工处理')}">
-    <span class="error-artist-name">${escHtml(row.artist_name || row.artist_id)}</span><strong>${Number(row.error_count || 0)}</strong><span class="error-artist-reason">${escHtml(row.message || row.reason || '需要人工处理')}</span>
+    <span class="error-artist-name" data-i18n-skip>${escHtml(row.artist_name || row.artist_id)}</span><strong>${Number(row.error_count || 0)}</strong><span class="error-artist-reason">${escHtml(row.message || row.reason || '需要人工处理')}</span>
   </button>`).join('');
   empty.hidden = state.errorArtistsLoading || state.errorArtists.length > 0;
   more.hidden = !state.errorArtistsHasMore || state.errorArtistsLoading;
@@ -501,9 +502,9 @@ export async function runFolderRenameAllNow() {
       retried_count: Number(result.retried_count || 0),
     });
     if (failed) {
-      toast(`全库整理完成：成功 ${executed} 项，失败 ${failed} 项`, 'error');
+      toast(`${t('全库整理完成：成功 {executed} 项，失败 {failed} 项', {executed: executed, failed: failed})}`, 'error');
     } else {
-      toast(executed ? `全库整理完成：${executed} 项` : '当前没有可执行的整理项', executed ? 'success' : 'info');
+      toast(executed ? `${t('全库整理完成：{executed} 项', {executed: executed})}` : '当前没有可执行的整理项', executed ? 'success' : 'info');
     }
   } catch (e) {
     logUiAction('archive_run_all_result', {status: 'error', error: e.message || String(e)});
@@ -525,21 +526,21 @@ export function renderDimensionBackfillStatus() {
   btn.disabled = busy || running;
   btn.textContent = running || busy ? '补全中' : '补全媒体尺寸';
   if (status.error) {
-    result.textContent = `补全失败：${status.error}`;
+    result.textContent = `${t('补全失败：{status}', {status: status.error})}`;
     result.style.color = 'var(--status-danger)';
   } else if (running) {
     const processed = Number(status.processed || 0);
     const updated = Number(status.updated || 0);
     const remaining = Number(status.remaining || 0);
-    result.textContent = `已处理 ${processed} 项，已补全 ${updated} 项${remaining ? `，剩余 ${remaining} 项` : ''}`;
+    result.textContent = (remaining ? t('已处理 {processed} 项，已补全 {updated} 项，剩余 {remaining} 项', {processed, updated, remaining}) : t('已处理 {processed} 项，已补全 {updated} 项', {processed, updated}));
     result.style.color = '';
   } else if (status.complete) {
     result.textContent = Number(status.updated || 0)
-      ? `已补全 ${Number(status.updated)} 项`
+      ? `${t('已补全 {Number} 项', {Number: Number(status.updated)})}`
       : '媒体尺寸已完整';
     result.style.color = 'var(--status-ok)';
   } else if (status.cursor_done && Number(status.remaining || 0) > 0) {
-    result.textContent = `已补全 ${Number(status.updated || 0)} 项，${Number(status.remaining)} 项无法读取`;
+    result.textContent = `${t('已补全 {Number} 项，{Number2} 项无法读取', {Number: Number(status.updated || 0), Number2: Number(status.remaining)})}`;
     result.style.color = 'var(--status-danger)';
   } else {
     result.textContent = '';
@@ -582,8 +583,8 @@ export function renderOverviewActions() {
   const waiting = Number(state.moveWaitingHashCount || 0)
     + Number(state.hashStatus?.scan_candidates?.remaining || 0);
   const hints = [];
-  if (pending > 0) hints.push(`${pending} 项待确认`);
-  if (waiting > 0) hints.push(`${waiting} 项正在自动入库`);
+  if (pending > 0) hints.push(`${t('{pending} 项待确认', {pending: pending})}`);
+  if (waiting > 0) hints.push(`${t('{waiting} 项正在自动入库', {waiting: waiting})}`);
   if (hints.length > 0) {
     pathsHint.textContent = hints.join('，');
     pathsHint.classList.toggle('is-attention', pending > 0);
@@ -602,16 +603,16 @@ function healthNumber(value) {
 }
 
 function formatHealthScanStatus(scan) {
-  if (!isHealthObject(scan) || (!scan.status && !scan.phase)) return '扫描状态就绪';
+  if (!isHealthObject(scan) || (!scan.status && !scan.phase)) return t('扫描状态就绪');
   const isError = scan.status === 'error' || scan.phase === 'error' || scan.phase === 'failed';
   if (isError) {
     const errorMsg = scan.current_path ? String(scan.current_path).replace(/^error:\s*/i, '').trim() : '';
-    return errorMsg ? `扫描失败 \u00b7 ${errorMsg}` : '扫描失败';
+    return errorMsg ? `${t('扫描失败 \u00b7 {errorMsg}', {errorMsg: errorMsg})}` : t('扫描失败');
   }
   const isPartial = scan.phase === 'partial';
   if (isPartial) {
     const errorMsg = scan.current_path ? String(scan.current_path).replace(/^error:\s*/i, '').trim() : '';
-    return errorMsg ? `扫描部分完成 \u00b7 ${errorMsg}` : '扫描部分完成';
+    return errorMsg ? `${t('扫描部分完成 \u00b7 {errorMsg}', {errorMsg: errorMsg})}` : t('扫描部分完成');
   }
   const statusLabels = {
     idle: '空闲',
@@ -629,48 +630,48 @@ function formatHealthScanStatus(scan) {
     partial: '部分完成',
     failed: '失败',
   };
-  const status = statusLabels[scan.status] || '未知状态';
-  const phase = phaseLabels[scan.phase] || '';
+  const status = statusLabels[scan.status] ? t(statusLabels[scan.status]) : t('未知状态');
+  const phase = phaseLabels[scan.phase] ? t(phaseLabels[scan.phase]) : '';
   const scanned = healthNumber(scan.scanned_count);
   const total = healthNumber(scan.total_estimate);
   const showCount = total != null && total > 0 && scanned != null
     && (scan.status === 'scanning' || scan.phase === 'complete');
   const count = showCount ? `${scanned}/${total}` : '';
-  const missing = scan.phase === 'complete' && showCount && scanned < total ? `未扫描 ${total - scanned}` : '';
+  const missing = scan.phase === 'complete' && showCount && scanned < total ? `${t('未扫描 {total}', {total: total - scanned})}` : '';
   return joinUiMeta([status, phase, count, missing]);
 }
 
 function formatHealthHashStatus(hash) {
   if (!isHealthObject(hash) || !isHealthObject(hash.items) || !isHealthObject(hash.scan_candidates)) {
-    return '查重状态就绪';
+    return t('查重状态就绪');
   }
   const itemRemaining = healthNumber(hash.items.remaining);
   const candidateRemaining = healthNumber(hash.scan_candidates.remaining);
   const itemErrors = healthNumber(hash.items.error);
   const candidateErrors = healthNumber(hash.scan_candidates.error);
   if ([itemRemaining, candidateRemaining, itemErrors, candidateErrors].some(value => value == null)) {
-    return '查重就绪';
+    return t('查重就绪');
   }
   const remaining = itemRemaining + candidateRemaining;
   const errors = itemErrors + candidateErrors;
-  if (remaining === 0 && errors === 0) return joinUiMeta(['已完成查重', '无重复错误']);
-  const parts = [remaining ? `剩余 ${remaining} 项待比对` : '查重完成'];
-  parts.push(errors ? `${errors} 项异常` : '无错误');
+  if (remaining === 0 && errors === 0) return t('已完成查重 \u00b7 无重复错误');
+  const parts = [remaining ? `${t('剩余 {remaining} 项待比对', {remaining: remaining})}` : t('查重完成')];
+  parts.push(errors ? `${t('{errors} 项异常', {errors: errors})}` : t('无错误'));
   return joinUiMeta(parts);
 }
 
 function formatHealthSchedule(schedule, nextKey) {
-  if (!isHealthObject(schedule)) return '等待排期';
-  if (schedule.error || schedule.last_error) return '排期读取失败';
-  if (schedule.enabled === false) return '自动排期未开启';
-  if (schedule.enabled !== true) return '等待排期';
+  if (!isHealthObject(schedule)) return t('等待排期');
+  if (schedule.error || schedule.last_error) return t('排期读取失败');
+  if (schedule.enabled === false) return t('自动排期未开启');
+  if (schedule.enabled !== true) return t('等待排期');
   const nextAt = schedule[nextKey];
   const interval = healthNumber(schedule.interval);
   const intervalHours = interval ? Math.round(interval / 3600 * 10) / 10 : 0;
-  if (!nextAt) return intervalHours ? joinUiMeta([`每 ${intervalHours} 小时`, '等待排期']) : '等待排期';
-  const prefix = schedule.overdue ? '已到执行时间' : `下次预计 ${formatHealthTime(nextAt)}`;
-  const suffix = schedule.deferred_by_manual ? '手动后顺延' : '';
-  return intervalHours ? joinUiMeta([prefix, `每 ${intervalHours} 小时`, suffix]) : joinUiMeta([prefix, suffix]);
+  if (!nextAt) return intervalHours ? joinUiMeta([`${t('每 {intervalHours} 小时', {intervalHours: intervalHours})}`, t('等待排期')]) : t('等待排期');
+  const prefix = schedule.overdue ? t('已到执行时间') : `${t('下次预计 {formatHealthTime}', {formatHealthTime: formatHealthTime(nextAt)})}`;
+  const suffix = schedule.deferred_by_manual ? t('手动后顺延') : '';
+  return intervalHours ? joinUiMeta([prefix, `${t('每 {intervalHours} 小时', {intervalHours: intervalHours})}`, suffix]) : joinUiMeta([prefix, suffix]);
 }
 
 export function renderHealthSummary() {
@@ -678,11 +679,11 @@ export function renderHealthSummary() {
   if (!grid) return;
   const health = state.healthSummary;
   if (!health) {
-    grid.innerHTML = '<div class="maintenance-card status-card status-muted move-empty small">系统健康状态读取中</div>';
+    grid.innerHTML = `<div class="maintenance-card status-card status-muted move-empty small">${t('系统健康状态读取中')}</div>`;
     return;
   }
   if (health.error) {
-    grid.innerHTML = `<div class="maintenance-card status-card status-danger"><b>状态检查失败</b><span>${escHtml(health.error)}</span></div>`;
+    grid.innerHTML = `<div class="maintenance-card status-card status-danger"><b>${t('状态检查失败')}</b><span>${escHtml(health.error)}</span></div>`;
     return;
   }
   // Status summary plus secondary detail: the first lines stay visible, the
@@ -755,65 +756,65 @@ export function renderHealthSummary() {
   const archiveFailedPlans = folderArchiveKnown ? healthNumber(folderArchive.failed_plans) : null;
   const archiveStatus = !folderArchiveKnown || archiveFailedPlans == null ? 'status-muted' : (archiveFailedPlans > 0 ? 'status-danger' : 'status-ok');
   const overallStatus = health.degraded === true ? 'status-danger' : 'status-ok';
-  const overallText = health.degraded === true ? `需要处理${degradedReasons.length ? ` \u00b7 ${degradedReasons.join('、')}` : ''}` : '系统运行正常';
+  const overallText = health.degraded === true ? (degradedReasons.length ? t('需要处理 \u00b7 {reasons}', {reasons: degradedReasons.join('、')}) : t('需要处理')) : t('系统运行正常');
   const databaseText = !databaseKnown
-    ? ['数据库状态未上报']
+    ? [t('数据库状态未上报')]
     : [
-        health.database_error ? '数据库读取失败' : (health.schema_error ? '数据库结构检查失败' : (database.exists === true ? '数据库正常' : '数据库文件不存在')),
+        health.database_error ? t('数据库读取失败') : (health.schema_error ? t('数据库结构检查失败') : (database.exists === true ? t('数据库正常') : t('数据库文件不存在'))),
         database.size_bytes != null ? formatBytes(database.size_bytes) : '',
       ];
   const databaseStorageText = databaseKnown ? [
-    database.page_size_bytes != null ? `页大小 ${formatBytes(database.page_size_bytes)}` : '页大小未上报',
-    database.page_count != null ? `共 ${database.page_count} 页` : '页数未上报',
-    database.free_pages != null ? `空闲页 ${database.free_pages}` : '空闲页未上报',
-    database.reclaimable_bytes != null ? `数据库内空闲 ${formatBytes(database.reclaimable_bytes)}` : '空闲容量未上报',
-    database.reclaimable_bytes != null ? '后续写入会复用，当前不会自动缩小数据库文件。' : '',
-    database.wal_size_bytes != null ? `WAL ${formatBytes(database.wal_size_bytes)}` : 'WAL 大小未上报',
-    database.storage_error ? '存储诊断不完整' : '',
+    database.page_size_bytes != null ? `${t('页大小 {formatBytes}', {formatBytes: formatBytes(database.page_size_bytes)})}` : t('页大小未上报'),
+    database.page_count != null ? `${t('共 {database} 页', {database: database.page_count})}` : t('页数未上报'),
+    database.free_pages != null ? `${t('空闲页 {database}', {database: database.free_pages})}` : t('空闲页未上报'),
+    database.reclaimable_bytes != null ? `${t('数据库内空闲 {formatBytes}', {formatBytes: formatBytes(database.reclaimable_bytes)})}` : t('空闲容量未上报'),
+    database.reclaimable_bytes != null ? t('后续写入会复用，当前不会自动缩小数据库文件。') : '',
+    database.wal_size_bytes != null ? `WAL ${formatBytes(database.wal_size_bytes)}` : t('WAL 大小未上报'),
+    database.storage_error ? t('存储诊断不完整') : '',
   ] : [];
   databaseText.push(...databaseStorageText);
   const backupText = !backupsKnown
-    ? ['备份状态未上报']
+    ? [t('备份状态未上报')]
     : backups.error
-      ? ['备份读取失败']
+      ? [t('备份读取失败')]
     : backupCount == null
-      ? ['备份数量未上报']
+      ? [t('备份数量未上报')]
       : backupCount === 0
-        ? ['暂无备份', `当前保留 ${backupRetainedCount ?? 0} 份`]
+        ? [t('暂无备份'), `${t('当前保留 {backupRetainedCount} 份', {backupRetainedCount: backupRetainedCount ?? 0})}`]
         : latestBackup
           ? [
-              latestBackup.name || '最近备份',
-              latestBackup.updated_at ? `备份于 ${formatHealthTime(latestBackup.updated_at)}` : '',
-              `自动保留 ${backupRetainedCount ?? backupCount} 份`,
-              backupTotalBytes != null ? `占用 ${formatBytes(backupTotalBytes)}` : '备份占用未上报',
+              latestBackup.name || t('最近备份'),
+              latestBackup.updated_at ? `${t('备份于 {formatHealthTime}', {formatHealthTime: formatHealthTime(latestBackup.updated_at)})}` : '',
+              `${t('自动保留 {backupRetainedCount} 份', {backupRetainedCount: backupRetainedCount ?? backupCount})}`,
+              backupTotalBytes != null ? `${t('占用 {formatBytes}', {formatBytes: formatBytes(backupTotalBytes)})}` : t('备份占用未上报'),
             ].filter(Boolean)
-          : ['最近备份未上报', `当前保留 ${backupRetainedCount ?? backupCount} 份`];
+          : [t('最近备份未上报'), `${t('当前保留 {backupRetainedCount} 份', {backupRetainedCount: backupRetainedCount ?? backupCount})}`];
   const logText = !logsKnown
-    ? ['日志状态未上报']
+    ? [t('日志状态未上报')]
     : galleryLog.error || uiLog.error
-      ? ['日志读取失败']
+      ? [t('日志读取失败')]
     : galleryLog.exists === false && uiLog.exists === false
-      ? ['日志文件未创建']
+      ? [t('日志文件未创建')]
       : [
-          galleryLog.size_bytes != null && uiLog.size_bytes != null ? `共 ${formatBytes(galleryLog.size_bytes + uiLog.size_bytes)}` : '日志大小未上报',
-          galleryLog.exists === true ? `应用 ${formatBytes(galleryLog.size_bytes)}` : '应用日志文件未创建',
-          uiLog.exists === true ? `浏览器 ${formatBytes(uiLog.size_bytes)}` : '浏览器日志文件未创建',
+          galleryLog.size_bytes != null && uiLog.size_bytes != null ? `${t('共 {formatBytes}', {formatBytes: formatBytes(galleryLog.size_bytes + uiLog.size_bytes)})}` : t('日志大小未上报'),
+          galleryLog.exists === true ? `${t('应用 {formatBytes}', {formatBytes: formatBytes(galleryLog.size_bytes)})}` : t('应用日志文件未创建'),
+          uiLog.exists === true ? `${t('浏览器 {formatBytes}', {formatBytes: formatBytes(uiLog.size_bytes)})}` : t('浏览器日志文件未创建'),
         ];
   const errorHtml = !errorsKnown
-    ? '<span>错误状态未上报</span>'
+    ? `<span>${t('错误状态未上报')}</span>`
     : errors.length
-      ? `<details class="error-lines"><summary>最近 ${errors.length} 条错误</summary>${errors.map(row => `<code>${escHtml(row.source || '')}: ${escHtml(row.line || '')}</code>`).join('')}</details>`
-      : '<span>最近没有错误记录</span>';
+      ? `<details class="error-lines"><summary>${t('最近 {errors} 条错误', {errors: errors.length})}</summary>${errors.map(row => `<code>${escHtml(row.source || '')}: ${escHtml(row.line || '')}</code>`).join('')}</details>`
+      : `<span>${t('最近没有错误记录')}</span>`;
   grid.innerHTML = `
-    <div class="maintenance-card status-card ${overallStatus}"><b>整体状态</b><span title="${escHtml(overallText)}">${escHtml(overallText)}</span></div>
-    <div class="maintenance-card status-card ${databaseStatus}"><b>数据库</b>${healthSummaryDetail(databaseText, 2)}</div>
-    <div class="maintenance-card status-card ${backupStatus}"><b>最近备份</b>${healthSummaryDetail(backupText, 1)}<span class="health-schedule">${escHtml(formatHealthSchedule(backupSchedule, 'next_run_at'))}</span></div>
-    <div class="maintenance-card status-card ${scanStatus}"><b>扫描</b><span title="${escHtml(formatHealthScanStatus(scan))}">${escHtml(formatHealthScanStatus(scan))}</span><span class="health-schedule">${escHtml(formatHealthSchedule(scanSchedule, 'next_auto_scan_at'))}</span></div>
-    <div class="maintenance-card status-card ${hashStatus}"><b>相同文件检查</b><span title="${escHtml(formatHealthHashStatus(hash))}">${escHtml(formatHealthHashStatus(hash))}</span></div>
-    <div class="maintenance-card status-card ${archiveStatus}"><b>文件夹整理</b><span title="${escHtml(archiveFailedPlans == null ? '状态未上报' : (archiveFailedPlans ? `执行失败 ${archiveFailedPlans}` : '无执行失败'))}">${escHtml(archiveFailedPlans == null ? '状态未上报' : (archiveFailedPlans ? `执行失败 ${archiveFailedPlans}` : '无执行失败'))}</span></div>
-    <button class="maintenance-card status-card ${errorArtistsCount ? 'status-danger' : 'status-ok'} error-artists-card" type="button" data-error-artists-open aria-haspopup="dialog" title="点击查看出错画师列表及处理指引"><b>出错画师（按画师）</b><span title="${escHtml(errorArtistsCount == null ? '状态未上报' : (errorArtistsCount ? `${errorArtistsCount} 位画师` : '暂无出错画师'))}">${escHtml(errorArtistsCount == null ? '状态未上报' : (errorArtistsCount ? `${errorArtistsCount} 位画师` : '暂无出错画师'))}</span></button>
-    <div class="maintenance-card status-card ${logStatus}"><b>日志</b>${healthSummaryDetail(logText, 1)}</div>
-    <div class="maintenance-card status-card ${errorStatus}"><b>最近错误</b><span>${errorHtml}</span></div>
+    <div class="maintenance-card status-card ${overallStatus}"><b>${t('整体状态')}</b><span title="${escHtml(overallText)}">${escHtml(overallText)}</span></div>
+    <div class="maintenance-card status-card ${databaseStatus}"><b>${t('数据库')}</b>${healthSummaryDetail(databaseText, 2)}</div>
+    <div class="maintenance-card status-card ${backupStatus}"><b>${t('最近备份')}</b>${healthSummaryDetail(backupText, 1)}<span class="health-schedule">${escHtml(formatHealthSchedule(backupSchedule, 'next_run_at'))}</span></div>
+    <div class="maintenance-card status-card ${scanStatus}"><b>${t('扫描')}</b><span title="${escHtml(formatHealthScanStatus(scan))}">${escHtml(formatHealthScanStatus(scan))}</span><span class="health-schedule">${escHtml(formatHealthSchedule(scanSchedule, 'next_auto_scan_at'))}</span></div>
+    <div class="maintenance-card status-card ${hashStatus}"><b>${t('相同文件检查')}</b><span title="${escHtml(formatHealthHashStatus(hash))}">${escHtml(formatHealthHashStatus(hash))}</span></div>
+    <div class="maintenance-card status-card ${archiveStatus}"><b>${t('文件夹整理')}</b><span title="${escHtml(archiveFailedPlans == null ? t('状态未上报') : (archiveFailedPlans ? `执行失败 ${archiveFailedPlans}` : t('无执行失败')))}">${escHtml(archiveFailedPlans == null ? t('状态未上报') : (archiveFailedPlans ? `执行失败 ${archiveFailedPlans}` : t('无执行失败')))}</span></div>
+    <button class="maintenance-card status-card ${errorArtistsCount ? 'status-danger' : 'status-ok'} error-artists-card" type="button" data-error-artists-open aria-haspopup="dialog" title="${t('点击查看出错画师列表及处理指引')}"><b>${t('出错画师（按画师）')}</b><span title="${escHtml(errorArtistsCount == null ? t('状态未上报') : (errorArtistsCount ? t('{count} 位画师', {count: errorArtistsCount}) : t('暂无出错画师')))}">${escHtml(errorArtistsCount == null ? t('状态未上报') : (errorArtistsCount ? t('{count} 位画师', {count: errorArtistsCount}) : t('暂无出错画师')))}</span></button>
+    <div class="maintenance-card status-card ${logStatus}"><b>${t('日志')}</b>${healthSummaryDetail(logText, 1)}</div>
+    <div class="maintenance-card status-card ${errorStatus}"><b>${t('最近错误')}</b><span>${errorHtml}</span></div>
   `;
   renderHashStatus();
   renderDimensionBackfillStatus();
@@ -823,15 +824,15 @@ export function renderHealthSummary() {
 export function renderHashStatus() {
   const status = state.hashStatus;
   if (!status) {
-    $('#hashStatusText').textContent = '等待检查';
+    $('#hashStatusText').textContent = t('等待检查');
     return;
   }
   if (status.database_error) {
-    $('#hashStatusText').textContent = '数据库异常';
+    $('#hashStatusText').textContent = t('数据库异常');
     return;
   }
   if (!status.blake3_available) {
-    $('#hashStatusText').textContent = '暂时不能检查';
+    $('#hashStatusText').textContent = t('暂时不能检查');
     return;
   }
   const items = status.items || {};
@@ -840,15 +841,15 @@ export function renderHashStatus() {
   const importRemaining = Number(candidates.remaining || 0);
   const remaining = itemRemaining + importRemaining;
   $('#hashStatusText').textContent = importRemaining > 0
-    ? joinUiMeta(['正在自动入库', `还剩 ${importRemaining}`])
+    ? joinUiMeta([t('正在自动入库'), `${t('还剩 {importRemaining}', {importRemaining: importRemaining})}`])
     : formatHashWorkerStatus(status.worker || {}, remaining);
 }
 
 function formatHashWorkerStatus(worker, remaining) {
-  if (worker.last_error) return '检查异常';
-  if (remaining <= 0) return '检查完成';
-  if (worker.thread_alive) return joinUiMeta(['正在检查', `还剩 ${remaining}`]);
-  return joinUiMeta(['等待检查', `还剩 ${remaining}`]);
+  if (worker.last_error) return t('检查异常');
+  if (remaining <= 0) return t('检查完成');
+  if (worker.thread_alive) return joinUiMeta([t('正在检查'), `${t('还剩 {remaining}', {remaining: remaining})}`]);
+  return joinUiMeta([t('等待检查'), `${t('还剩 {remaining}', {remaining: remaining})}`]);
 }
 
 export async function startFullScan(event) {

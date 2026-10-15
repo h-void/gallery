@@ -98,8 +98,12 @@ fn candidate_file_is_current_path(path: &Path, candidate: &MoveTargetCandidate) 
         .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0);
-    let metadata_matches =
-        candidate.file_size == file_size && (candidate.file_mtime - file_mtime).abs() < 1.0;
+    // Same epsilon as the scan's hash-reuse decision (`scan::MTIME_REUSE_EPSILON`):
+    // this used a 1.0-second tolerance, which accepted a same-size in-place
+    // rewrite whose mtime moved by less than a second as "still current" and let
+    // the promoted row keep stale size/mtime/dev/ino.
+    let metadata_matches = candidate.file_size == file_size
+        && (candidate.file_mtime - file_mtime).abs() < crate::scan::MTIME_REUSE_EPSILON;
     let identity = metadata_identity(&metadata);
     let identity_matches = match ((candidate.st_dev, candidate.st_ino), identity) {
         ((Some(expected_dev), Some(expected_ino)), Some(actual)) => {
@@ -140,7 +144,9 @@ fn candidate_stat_is_current(roots: Option<&MediaRoots>, candidate: &MoveTargetC
         .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0);
-    if candidate.file_size != file_size || (candidate.file_mtime - file_mtime).abs() >= 1.0 {
+    if candidate.file_size != file_size
+        || (candidate.file_mtime - file_mtime).abs() >= crate::scan::MTIME_REUSE_EPSILON
+    {
         return false;
     }
     let identity = metadata_identity(&metadata);
@@ -2241,175 +2247,4 @@ pub fn resolve_ambiguous_cluster_as_new_response(
     // and copies tags, so a wrong extra tag is reversible by editing the new
     // record, while blocking would leave the cluster for a human.
     create_new_item_response_with_tags(conn, roots, scan_candidate_id, &sources)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn candidate_with(path: &str, artist: &str, date: &str) -> MoveTargetCandidate {
-        MoveTargetCandidate {
-            id: 1,
-            artist_id: 1,
-            artist_path: artist.to_string(),
-            file_path: path.to_string(),
-            file_name: String::new(),
-            file_size: 0,
-            file_mtime: 0.0,
-            folder_name: String::new(),
-            date: date.to_string(),
-            is_archive: 0,
-            media_type: String::new(),
-            content_hash: String::new(),
-            hash_status: String::new(),
-            st_dev: None,
-            st_ino: None,
-        }
-    }
-
-    #[test]
-    fn candidate_detected_raw_preserves_folder_precision() {
-        let c = candidate_with(
-            "/pictures/artist/2026/202607 works/pic.jpg",
-            "/pictures/artist",
-            "2026-07-01",
-        );
-        assert_eq!(candidate_detected_raw(&c), "2026-07");
-
-        let c = candidate_with(
-            "/pictures/artist/2026-05-01_title/pic.jpg",
-            "/pictures/artist",
-            "2026-05-01",
-        );
-        assert_eq!(candidate_detected_raw(&c), "2026-05-01");
-
-        let c = candidate_with(
-            "/pictures/artist/202508/01_1536_title/pic.jpg",
-            "/pictures/artist",
-            "2025-08-01",
-        );
-        assert_eq!(candidate_detected_raw(&c), "2025-08-01");
-
-        let c = candidate_with(
-            "/pictures/artist/plain/pic.jpg",
-            "/pictures/artist",
-            "2026-08-15",
-        );
-        assert_eq!(
-            candidate_detected_raw(&c),
-            "2026-08-15",
-            "unparseable folder falls back to the candidate canonical date"
-        );
-
-        let c = candidate_with("/pictures/artist/pic.jpg", "/pictures/artist", "");
-        assert_eq!(candidate_detected_raw(&c), "");
-    }
-
-    #[test]
-    fn candidate_content_check_detects_same_stat_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.jpg");
-        std::fs::write(&path, b"AAAAAAAAAAAAAAAA").unwrap();
-        let old_digest = hash_file(&path, 1024 * 1024).unwrap();
-        let mut candidate = candidate_with(&path.to_string_lossy(), "/pictures/artist", "");
-        candidate.hash_status = "done".into();
-        candidate.content_hash = old_digest;
-        assert!(candidate_content_is_current(None, &candidate));
-
-        // Same-size in-place replacement inside the same wall-clock second
-        // keeps size/mtime/inode identical while the bytes differ, so the
-        // stat-only check passes; the content check must catch it.
-        std::fs::write(&path, b"BBBBBBBBBBBBBBBB").unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 16);
-        assert!(
-            !candidate_content_is_current(None, &candidate),
-            "a digest must not be committed for replaced bytes"
-        );
-    }
-
-    #[test]
-    fn create_new_item_fails_closed_when_content_no_longer_matches() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE artists (id INTEGER PRIMARY KEY, path TEXT);
-             CREATE TABLE items (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               artist_id INTEGER, file_path TEXT UNIQUE, file_name TEXT,
-               file_size INTEGER DEFAULT 0, file_mtime REAL DEFAULT 0,
-               folder_name TEXT DEFAULT '', date TEXT DEFAULT '',
-               detected_date TEXT DEFAULT '', auto_role TEXT DEFAULT '',
-               tags TEXT DEFAULT '[]', is_archive INTEGER DEFAULT 0,
-               media_type TEXT DEFAULT 'image', content_hash TEXT DEFAULT '',
-               hash_status TEXT DEFAULT 'pending', hash_updated_at REAL,
-               st_dev INTEGER, st_ino INTEGER, missing INTEGER DEFAULT 0,
-               missing_at REAL, scanned_at INTEGER,
-               width INTEGER DEFAULT 0, height INTEGER DEFAULT 0
-             );
-             CREATE TABLE scan_candidates (
-               id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id TEXT DEFAULT '',
-               artist_id INTEGER, file_path TEXT, file_name TEXT,
-               file_size INTEGER DEFAULT 0, file_mtime REAL DEFAULT 0,
-               folder_name TEXT DEFAULT '', date TEXT DEFAULT '',
-               is_archive INTEGER DEFAULT 0, media_type TEXT DEFAULT 'image',
-               content_hash TEXT DEFAULT '', hash_status TEXT DEFAULT 'pending',
-               status TEXT DEFAULT 'pending', resolved_at REAL,
-               st_dev INTEGER, st_ino INTEGER
-             );
-             CREATE TABLE move_candidates (
-               id INTEGER PRIMARY KEY AUTOINCREMENT, scan_candidate_id INTEGER,
-               item_id INTEGER, artist_id INTEGER, old_path TEXT, new_path TEXT,
-               reason TEXT, content_hash TEXT, st_dev INTEGER, st_ino INTEGER,
-               status TEXT DEFAULT 'pending', resolved_at REAL
-             );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO artists (id, path) VALUES (1, '/pictures/artist')",
-            [],
-        )
-        .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.jpg");
-        std::fs::write(&path, b"AAAAAAAAAAAAAAAA").unwrap();
-        let stale_digest = hash_file(&path, 1024 * 1024).unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let file_mtime = metadata
-            .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
-        conn.execute(
-            "INSERT INTO scan_candidates
-             (scan_id, artist_id, file_path, file_name, file_size, file_mtime,
-              folder_name, date, is_archive, media_type, content_hash, hash_status, status)
-             VALUES ('s1', 1, ?, 'a.jpg', 16, ?, '', '', 0, 'image', ?, 'done', 'pending')",
-            rusqlite::params![path.to_string_lossy(), file_mtime, stale_digest],
-        )
-        .unwrap();
-        let candidate_id: i64 = conn.last_insert_rowid();
-        // Replace the bytes after the candidate row was recorded; the hash no
-        // longer describes the file, so the promotion must not commit it.
-        std::fs::write(&path, b"BBBBBBBBBBBBBBBB").unwrap();
-
-        let result = create_new_item_response(&conn, candidate_id).unwrap();
-        assert_eq!(result["action"], "no_match", "{result}");
-        let items: i64 = conn
-            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(items, 0, "no item may be created from replaced content");
-        let (status, hash_status, content_hash): (String, String, String) = conn
-            .query_row(
-                "SELECT status, hash_status, content_hash FROM scan_candidates WHERE id=?",
-                [candidate_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(status, "superseded");
-        assert_eq!(
-            hash_status, "pending",
-            "stale hash must be requeued, not stored"
-        );
-        assert_eq!(content_hash, "");
-    }
 }

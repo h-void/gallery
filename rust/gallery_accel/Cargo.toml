@@ -1,6 +1,6 @@
 [package]
 name = "gallery_accel"
-version = "1.1.6"
+version = "1.1.7"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/h-void/gallery"
@@ -41,6 +41,9 @@ url = "2.5"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24", "openvino"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 tempfile = "3.25"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tower = "0.5"

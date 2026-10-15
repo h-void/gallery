@@ -7,6 +7,7 @@ import { API } from '../../api.js';
 import { state, isActionBusy, setActionBusy } from '../../store.js';
 import { $, $$, escHtml, formatServerTime, isAbortError } from '../../utils.js';
 import { toast, logUiAction } from '../../logging.js';
+import { t } from '../../i18n.js';
 import { applyMode } from '../../events.js';
 import { loadArtists, selectArtist } from '../../router.js';
 import { selectFolder } from '../sidebar.js';
@@ -201,7 +202,7 @@ export function renderDownloadArtistFolder() {
   }
   if (rootSelect) {
     rootSelect.innerHTML = roots.map(root => (
-      `<option value="${Number(root.index)}">${escHtml(root.label || root.path || `目录 ${Number(root.index) + 1}`)}</option>`
+      `<option value="${Number(root.index)}">${escHtml(root.label || root.path || t('目录 {index}', {index: +root.index + 1}))}</option>`
     )).join('');
     rootSelect.value = String(state.downloadArtistRootIndex);
     rootSelect.disabled = !roots.length;
@@ -261,13 +262,13 @@ export function renderDownloadArtistCombo() {
   // creates the folder the user named, in the place the user picked, instead of
   // silently falling back to the numeric source id under the first root.
   const createValue = downloadArtistNewFolderPath(query);
-  const createLabel = query ? `新建目录“${query}”` : '按作者 ID 新建目录';
+  const createLabel = query ? `${t('新建目录“{query}”', {query: query})}` : '按作者 ID 新建目录';
   listbox.innerHTML = `<li role="option" data-download-artist-value="${escHtml(createValue)}" class="create-new">${escHtml(createLabel)}</li>`
     + matches.map(artist => {
       const name = String(artist.name || '');
       const path = String(artist.path || '');
       const selected = select.value === path ? ' active' : '';
-      return `<li role="option" data-download-artist-value="${escHtml(path)}" class="${selected}" title="${escHtml(path)}">${escHtml(name)}</li>`;
+      return `<li role="option" data-i18n-skip data-download-artist-value="${escHtml(path)}" class="${selected}" title="${escHtml(path)}">${escHtml(name)}</li>`;
     }).join('');
 }
 
@@ -280,12 +281,40 @@ export function openDownloadArtistCombo() {
   input.setAttribute('aria-expanded', 'true');
 }
 
+let downloadArtistComboActiveIndex = -1;
+
 export function closeDownloadArtistCombo() {
   const input = $('#downloadSubscriptionArtistInput');
   const listbox = $('#downloadSubscriptionArtistListbox');
   if (!input || !listbox) return;
+  downloadArtistComboActiveIndex = -1;
   listbox.hidden = true;
   input.setAttribute('aria-expanded', 'false');
+}
+
+export function moveDownloadArtistComboActive(step) {
+  const listbox = $('#downloadSubscriptionArtistListbox');
+  if (!listbox) return;
+  if (listbox.hidden) openDownloadArtistCombo();
+  const options = Array.from(listbox.querySelectorAll('[data-download-artist-value]'));
+  if (!options.length) return;
+  const count = options.length;
+  downloadArtistComboActiveIndex = downloadArtistComboActiveIndex < 0
+    ? (step > 0 ? 0 : count - 1)
+    : (downloadArtistComboActiveIndex + step + count) % count;
+  options.forEach((opt, idx) => opt.classList.toggle('active', idx === downloadArtistComboActiveIndex));
+  options[downloadArtistComboActiveIndex]?.scrollIntoView?.({block: 'nearest'});
+}
+
+export function selectActiveDownloadArtistCombo() {
+  const listbox = $('#downloadSubscriptionArtistListbox');
+  if (!listbox || listbox.hidden) return false;
+  const options = Array.from(listbox.querySelectorAll('[data-download-artist-value]'));
+  const option = options[downloadArtistComboActiveIndex >= 0 ? downloadArtistComboActiveIndex : 0];
+  if (!option) return false;
+  pickDownloadArtist(option.dataset.downloadArtistValue);
+  renderDownloadArtistCombo();
+  return true;
 }
 
 export function pickDownloadArtist(value) {
@@ -371,17 +400,6 @@ export function isSubscriptionComplete(row) {
   return days.every(day => dayComplete(day));
 }
 
-export function setDownloadSubscriptionFilter(filter) {
-  state.downloadSubscriptionFilter = ['pending', 'completed'].includes(filter) ? filter : 'all';
-  state.downloadSubscriptionsExpanded = false;
-  renderDownloadSubscriptions();
-}
-
-export function toggleDownloadSubscriptionsFold() {
-  state.downloadSubscriptionsExpanded = !state.downloadSubscriptionsExpanded;
-  renderDownloadSubscriptions();
-}
-
 export function toggleDownloadLogFold() {
   state.downloadLogExpanded = !state.downloadLogExpanded;
   renderDownloadLog();
@@ -407,9 +425,9 @@ export function renderDownloadSubscriptions() {
     if (!subscriptions.length) {
       count.textContent = '';
     } else if (searchQuery) {
-      count.textContent = `找到 ${visibleSubs.length} / 共 ${subscriptions.length} 个订阅`;
+      count.textContent = `${t('找到 {visibleSubs} / 共 {subscriptions} 个订阅', {visibleSubs: visibleSubs.length, subscriptions: subscriptions.length})}`;
     } else {
-      count.textContent = `共 ${subscriptions.length} 个订阅`;
+      count.textContent = `${t('共 {subscriptions} 个订阅', {subscriptions: subscriptions.length})}`;
     }
   }
 
@@ -436,8 +454,8 @@ export function renderDownloadSubscriptions() {
     const name = String(row.artist_name || row.user_id || '');
     const service = String(row.service || '');
     const target = String(row.target_dir || '');
-    const since = row.since_date ? String(row.since_date) : '不限';
-    const lastSync = row.last_discovery_at ? formatServerTime(row.last_discovery_at) : '尚未同步';
+    const since = row.since_date ? String(row.since_date) : t('不限');
+    const lastSync = row.last_discovery_at ? t(formatServerTime(row.last_discovery_at)) : t('尚未同步');
     const error = row.last_error ? String(row.last_error) : '';
     const coverage = downloadCoverageText(row.coverage);
     const isComplete = isSubscriptionComplete(row);
@@ -453,28 +471,28 @@ export function renderDownloadSubscriptions() {
     return `
       <div class="download-subscription-item" data-download-subscription="${id}">
         <div class="download-subscription-main">
-          <div class="download-subscription-title">${escHtml(name)}</div>
-          <div class="download-subscription-meta">${escHtml(service)} &#183; ${escHtml(String(row.user_id || ''))} &#183; 起始 ${escHtml(since)} &#183; 上次同步 ${escHtml(lastSync)}</div>
-          <div class="download-subscription-path" title="${escHtml(target)}">${escHtml(target)}</div>
+          <div class="download-subscription-title" data-i18n-skip>${escHtml(name)}</div>
+          <div class="download-subscription-meta">${t('{escHtml} \u00b7 {escHtml2} \u00b7 起始 {escHtml3} \u00b7 上次同步 {escHtml4}', {escHtml: escHtml(service), escHtml2: escHtml(String(row.user_id || '')), escHtml3: escHtml(since), escHtml4: escHtml(lastSync)})}</div>
+          <div class="download-subscription-path" data-i18n-skip title="${escHtml(target)}">${escHtml(target)}</div>
           ${coverage ? `<div class="download-subscription-coverage">${escHtml(coverage)}</div>` : ''}
           ${calendarDetails}
           ${dayPostsHtml}
           ${error ? `<div class="download-subscription-error">${escHtml(error)}</div>` : ''}
         </div>
         <div class="download-subscription-item-actions">
-          <label class="download-subscription-mode" title="自动：由轮次按已有记录补缺；手动：从全部作品里自己选着下">
+          <label class="download-subscription-mode" title="${t('自动：由轮次按已有记录补缺；手动：从全部作品里自己选着下')}">
             <span>模式</span>
             <select data-download-subscription-mode="${id}">
               <option value="manual" ${String(row.mode || 'manual') === 'manual' ? 'selected' : ''}>手动</option>
               <option value="auto" ${String(row.mode || 'manual') === 'auto' ? 'selected' : ''}>自动</option>
             </select>
           </label>
-          <label class="maintenance-auto-toggle" title="停用后不再检查这个画师的新作品">
+          <label class="maintenance-auto-toggle" title="${t('停用后不再检查这个画师的新作品')}">
             <input type="checkbox" data-download-subscription-toggle="${id}" ${row.enabled ? 'checked' : ''}>
             <span>启用</span>
           </label>
-          <button class="btn btn-ghost" type="button" data-download-subscription-check="${id}" ${roundBusy ? 'disabled' : ''} title="只发现这个画师的新作品并重算每天的缺失，不下载文件">检查缺失</button>
-          <button class="btn btn-ghost" type="button" data-download-subscription-reconcile="${id}" ${roundBusy ? 'disabled' : ''} title="只读取这个画师的本地目录与账本，重算每篇作品的状态">核对本地</button>
+          <button class="btn btn-ghost" type="button" data-download-subscription-check="${id}" ${roundBusy ? 'disabled' : ''} title="${t('只发现这个画师的新作品并重算每天的缺失，不下载文件')}">检查缺失</button>
+          <button class="btn btn-ghost" type="button" data-download-subscription-reconcile="${id}" ${roundBusy ? 'disabled' : ''} title="${t('只读取这个画师的本地目录与账本，重算每篇作品的状态')}">核对本地</button>
           <button class="btn btn-danger" type="button" data-download-subscription-delete="${id}">删除</button>
         </div>
       </div>`;
@@ -491,9 +509,9 @@ export function downloadEventWho(event) {
 
 // `发现 3 个帖子，2 天待补（2026-09-11 缺 3 个）`
 export function downloadEventText(event) {
-  const message = String(event?.message || '').trim();
-  const detail = String(event?.detail || '').trim();
-  return detail ? `${message}（${detail}）` : message;
+  const message = t(String(event?.message || '').trim());
+  const detail = t(String(event?.detail || '').trim());
+  return detail ? t('{message}（{detail}）', {message, detail}) : message;
 }
 
 // Seconds-resolution stamp for the log rows: these are all within the last few
@@ -532,7 +550,7 @@ function renderDownloadLog() {
     if (shouldFold) {
       foldWrap.hidden = false;
       const hiddenCount = events.length - DOWNLOAD_LOG_FOLD_THRESHOLD;
-      foldBtn.textContent = isExpanded ? '收起' : `展开剩余 ${hiddenCount} 条日志`;
+      foldBtn.textContent = isExpanded ? '收起' : `${t('展开剩余 {hiddenCount} 条日志', {hiddenCount: hiddenCount})}`;
     } else {
       foldWrap.hidden = true;
     }
@@ -574,18 +592,18 @@ export function downloadCoverageText(coverage) {
   // next to "36 天已齐" read as if only three were short while the window held
   // fifty-odd gaps, and the counts have to add up to the window before the
   // examples mean anything.
-  const head = gaps.length ? `${gaps.length} 天缺` : '全部已齐';
+  const head = gaps.length ? `${t('{gaps} 天缺', {gaps: gaps.length})}` : t('全部已齐');
   const parts = [head];
-  if (covered && gaps.length) parts.push(`${covered} 天已齐`);
-  if (gaps.length) parts.push(`共 ${days.length} 天`);
+  if (covered && gaps.length) parts.push(`${t('{covered} 天已齐', {covered: covered})}`);
+  if (gaps.length) parts.push(`${t('共 {days} 天', {days: days.length})}`);
   // A confirmation is a user decision, not a verification, so it is named
   // rather than folded into the covered count.
   const confirmed = days.reduce((sum, day) => sum + Number(day.confirmed_posts || 0), 0);
-  if (confirmed) parts.push(`${confirmed} 篇人工确认`);
+  if (confirmed) parts.push(`${t('{confirmed} 篇人工确认', {confirmed: confirmed})}`);
   const idle = days.reduce((sum, day) => sum + Number(day.not_required_posts || 0), 0);
-  if (idle) parts.push(`${idle} 篇无需下载`);
-  const samples = gaps.slice(0, 3).map(day => `${day.day} 缺 ${downloadDayMissing(day)} 篇`);
-  return samples.length ? `${parts.join('，')}（最近 ${samples.join('、')}）` : parts.join('，');
+  if (idle) parts.push(`${t('{idle} 篇无需下载', {idle: idle})}`);
+  const samples = gaps.slice(0, 3).map(day => `${t('{day} 缺 {downloadDayMissing} 篇', {day: day.day, downloadDayMissing: downloadDayMissing(day)})}`);
+  return samples.length ? `${t('{parts}（最近 {samples}）', {parts: parts.join('，'), samples: samples.join('、')})}` : parts.join('，');
 }
 
 // Posts on a day that are neither proven nor outside the current range. A day
@@ -698,7 +716,7 @@ export function downloadCalendar(coverage, today = new Date()) {
     }
     if (!key) continue;
     currentKey = key;
-    months.push({label: `${Number(key.slice(5, 7))}月`, columns: 1});
+    months.push({label: `${t('{Number}月', {Number: Number(key.slice(5, 7))})}`, columns: 1});
   }
 
   return {weeks, months, activeDays, missingDays, olderDays};
@@ -714,8 +732,8 @@ function downloadCalendarHtml(coverage, subscriptionId) {
   const weeks = calendar.weeks.map(cells => `<div class="download-calendar-week">${cells.map(cell => {
     if (!cell) return '<span class="download-calendar-cell is-future"></span>';
     const title = cell.total_posts
-      ? `${cell.day}：共 ${cell.total_posts} 篇，缺 ${cell.missing} 篇`
-      : `${cell.day}：无作品`;
+      ? t('{day}：共 {total} 篇，缺 {missing} 篇', {day: cell.day, total: cell.total_posts, missing: cell.missing})
+      : t('{day}：无作品', {day: cell.day});
     // A day with works opens its post list. Without one the cell stays inert,
     // so the grid is not 300-odd dead buttons.
     const attributes = cell.total_posts
@@ -725,13 +743,13 @@ function downloadCalendarHtml(coverage, subscriptionId) {
     return `<span class="download-calendar-cell${current}" data-download-calendar-level="${cell.level}" title="${escHtml(title)}"${attributes}></span>`;
   }).join('')}</div>`).join('');
   const keys = DOWNLOAD_CALENDAR_LEVELS
-    .map(item => `<span class="download-calendar-key"><i data-download-calendar-level="${item.level}"></i>${escHtml(item.label)}</span>`)
+    .map(item => `<span class="download-calendar-key"><i data-download-calendar-level="${item.level}"></i>${escHtml(t(item.label))}</span>`)
     .join('');
-  const summary = [`近 ${DOWNLOAD_CALENDAR_WEEKS} 周`, `${calendar.activeDays} 天有作品`];
-  if (calendar.missingDays) summary.push(`${calendar.missingDays} 天缺作品`);
-  if (calendar.olderDays) summary.push(`另有 ${calendar.olderDays} 天更早`);
+  const summary = [`${t('近 {DOWNLOAD_CALENDAR_WEEKS} 周', {DOWNLOAD_CALENDAR_WEEKS: DOWNLOAD_CALENDAR_WEEKS})}`, `${t('{calendar} 天有作品', {calendar: calendar.activeDays})}`];
+  if (calendar.missingDays) summary.push(`${t('{calendar} 天缺作品', {calendar: calendar.missingDays})}`);
+  if (calendar.olderDays) summary.push(`${t('另有 {calendar} 天更早', {calendar: calendar.olderDays})}`);
   const weekdays = DOWNLOAD_CALENDAR_WEEKDAYS
-    .map(day => `<span class="download-calendar-weekday">${escHtml(day)}</span>`)
+    .map(day => `<span class="download-calendar-weekday">${escHtml(day ? t(day) : '')}</span>`)
     .join('');
   return `
     <div class="download-calendar">
@@ -763,14 +781,14 @@ export const DOWNLOAD_POST_STATES = {
 
 export function downloadPostStateLabel(state) {
   const key = String(state || '');
-  return DOWNLOAD_POST_STATES[key] || key;
+  return t(DOWNLOAD_POST_STATES[key] || key);
 }
 
 function downloadPostCounts(post) {
   const missing = Number(post?.missing_assets || 0);
   const gapLabel = missing > 0 && (post?.date_skipped || post?.state === 'confirmed')
-    ? '未逐项核验' : '缺';
-  return `需要 ${Number(post?.required_assets || 0)}，已核验 ${Number(post?.proven_assets || 0)}，${gapLabel} ${missing}`;
+    ? t('未逐项核验') : t('缺');
+  return `${t('需要 {Number}，已核验 {Number2}，{gapLabel} {missing}', {Number: Number(post?.required_assets || 0), Number2: Number(post?.proven_assets || 0), gapLabel: gapLabel, missing: missing})}`;
 }
 
 // The state of one explicit request. Kept separate from the work's own state:
@@ -786,7 +804,7 @@ const DOWNLOAD_ATTEMPT_STATES = {
 
 export function downloadAttemptStateLabel(state) {
   const key = String(state || '');
-  return DOWNLOAD_ATTEMPT_STATES[key] || key;
+  return t(DOWNLOAD_ATTEMPT_STATES[key] || key);
 }
 
 // Ask the backend to fetch this one work explicitly. The work's existing
@@ -815,7 +833,7 @@ export async function downloadPostByHand(postId) {
   }
   const attempt = await startDownloadSelection([id], []);
   if (attempt) {
-    toast(`已发起下载：${Number(attempt.posts || 0)} 篇，${Number(attempt.resources || 0)} 个文件`, 'info');
+    toast(`${t('已发起下载：{Number} 篇，{Number2} 个文件', {Number: Number(attempt.posts || 0), Number2: Number(attempt.resources || 0)})}`, 'info');
     await loadDownloadDayPosts();
   }
   return attempt;
@@ -844,41 +862,42 @@ function downloadDayPostsHtml(subscriptionId) {
   if (!day) return '';
   const view = state.downloadDayPosts;
   if (!view || view.loading) {
-    return `<div class="download-day-posts"><div class="move-empty small">读取 ${escHtml(day)} 的作品中</div></div>`;
+    return `<div class="download-day-posts"><div class="move-empty small">${t('读取 {escHtml} 的作品中', {escHtml: escHtml(day)})}</div></div>`;
   }
   if (view.error) {
     return `<div class="download-day-posts"><div class="download-subscription-error">${escHtml(view.error)}</div></div>`;
   }
   if (!view.posts.length) {
-    return `<div class="download-day-posts"><div class="move-empty small">${escHtml(day)} 没有已发现的作品</div></div>`;
+    return `<div class="download-day-posts"><div class="move-empty small">${t('{escHtml} 没有已发现的作品', {escHtml: escHtml(day)})}</div></div>`;
   }
   const rows = view.posts.map(post => {
     const id = Number(post.id);
     const title = String(post.title || post.post_id || '');
-    const stateLabel = post.date_skipped ? '已有' : downloadPostStateLabel(post.state);
+    const stateLabel = post.date_skipped ? t('已有') : downloadPostStateLabel(post.state);
     const counts = downloadPostCounts(post);
     const target = post.source_url ? ` href="${escHtml(post.source_url)}" target="_blank" rel="noopener noreferrer"` : '';
     const attempt = String(post.last_attempt_state || '');
     const attemptLine = attempt
-      ? `<div class="download-day-post-attempt" data-download-post-attempt="${id}">手动请求：${escHtml(downloadAttemptStateLabel(attempt))}</div>`
+      ? `<div class="download-day-post-attempt" data-download-post-attempt="${id}">${t('手动请求：{escHtml}', {escHtml: escHtml(downloadAttemptStateLabel(attempt))})}</div>`
       : '';
     return `
       <div class="download-day-post" data-download-post="${id}">
         <div class="download-day-post-main">
           <div class="download-day-post-title">${target ? `<a${target}>${escHtml(title)}</a>` : escHtml(title)}</div>
-          <div class="download-day-post-meta">${escHtml(counts)} &#183; ${escHtml(post.reason || '')}</div>
+          <div class="download-day-post-meta">${escHtml(counts)} &#183; ${escHtml(t(post.reason || ''))}</div>
           ${attemptLine}
           ${downloadPostFilesHtml(id)}
           ${downloadCandidatesHtml(id)}
         </div>
         <div class="download-day-post-actions">
           <span class="download-day-post-state" data-download-post-state="${escHtml(String(post.state || ''))}">${escHtml(stateLabel)}</span>
-          <button class="btn btn-ghost" type="button" data-download-post-fetch="${id}" title="按当前选择重新获取这篇的作品文件，不覆盖已有文件">下载所选</button>
-          <button class="btn btn-ghost" type="button" data-download-post-files="${id}" title="列出这篇的文件，逐个重试">文件</button>
-          <button class="btn btn-ghost" type="button" data-download-post-import="${id}" title="把这篇已核验的文件绑入库内条目">入库</button>
-          <button class="btn btn-ghost" type="button" data-download-post-stop="${id}" title="停止这篇正在进行的手动请求">停止</button>
-          <button class="btn btn-ghost" type="button" data-download-post-verify="${id}" title="按来源哈希校验本地文件">校验</button>
-          <button class="btn btn-ghost" type="button" data-download-post-candidates="${id}" title="列出本画师目录里可能已有的文件">候选</button>
+          <button class="btn btn-ghost" type="button" data-download-post-fetch="${id}" title="${t('按当前选择重新获取这篇的作品文件，不覆盖已有文件')}">下载所选</button>
+          <button class="btn btn-ghost" type="button" data-download-post-files="${id}" title="${t('列出这篇的文件，逐个重试')}">文件</button>
+          <button class="btn btn-ghost" type="button" data-download-post-import="${id}" title="${t('把这篇已核验的文件绑入库内条目')}">入库</button>
+          <button class="btn btn-ghost" type="button" data-download-post-stop="${id}" title="${t('停止这篇正在进行的手动请求')}">停止</button>
+          <button class="btn btn-ghost" type="button" data-download-post-verify="${id}" title="${t('按来源哈希校验本地文件')}">校验</button>
+          <button class="btn btn-ghost" type="button" data-download-post-candidates="${id}" title="${t('列出本画师目录里可能已有的文件')}">候选</button>
+          <button class="btn btn-ghost" type="button" data-download-post-naming="${id}" title="${t('预览命名规则迁移')}">${t('命名预览')}</button>
           ${downloadPostCanDecide(post.state)
             ? `<button class="btn btn-ghost" type="button" data-download-post-decision="revoke" data-download-post-id="${id}">撤销</button>`
             : `<button class="btn btn-ghost" type="button" data-download-post-decision="confirm" data-download-post-id="${id}">已有</button>
@@ -891,7 +910,7 @@ function downloadDayPostsHtml(subscriptionId) {
     : '';
   return `
     <div class="download-day-posts">
-      <div class="download-day-posts-head">${escHtml(day)} &#183; 共 ${Number(view.total || 0)} 篇</div>
+      <div class="download-day-posts-head">${t('{escHtml} \u00b7 共 {Number} 篇', {escHtml: escHtml(day), Number: Number(view.total || 0)})}</div>
       ${rows}
       ${more}
     </div>`;
@@ -1020,9 +1039,16 @@ function renderDownloadSyncStatus() {
   }
   // A reconcile pass reports what the library holds, not what a round fetched.
   if (result.claimable !== undefined) {
-    el.textContent = `上次核对：${Number(result.posts || 0)} 篇作品，${Number(result.verified || 0)} 篇已核验，`
-      + `${Number(result.confirmed || 0)} 篇已确认，${Number(result.unverified || 0)} 篇待核验，`
-      + `${Number(result.claimable || 0)} 篇可下载`;
+    el.textContent = t(
+      '上次核对：{posts} 篇作品，{verified} 篇已核验，{confirmed} 篇已确认，{unverified} 篇待核验，{claimable} 篇可下载',
+      {
+        posts: Number(result.posts || 0),
+        verified: Number(result.verified || 0),
+        confirmed: Number(result.confirmed || 0),
+        unverified: Number(result.unverified || 0),
+        claimable: Number(result.claimable || 0),
+      }
+    );
     return;
   }
   const subscriptions = Number(result.synced_subscriptions || 0);
@@ -1030,8 +1056,8 @@ function renderDownloadSyncStatus() {
   const missing = Number(result.missing_days || 0);
   const isCheck = String(result.trigger || '') === 'check';
   el.textContent = isCheck
-    ? `上次检查：订阅 ${subscriptions} 个，新增 ${discovered} 篇，${missing} 天待补`
-    : `上次同步：订阅 ${subscriptions} 个，新增 ${discovered} 篇，下载 ${Number(result.downloaded_files || 0)} 个文件`;
+    ? `${t('上次检查：订阅 {subscriptions} 个，新增 {discovered} 篇，{missing} 天待补', {subscriptions: subscriptions, discovered: discovered, missing: missing})}`
+    : `${t('上次同步：订阅 {subscriptions} 个，新增 {discovered} 篇，下载 {Number} 个文件', {subscriptions: subscriptions, discovered: discovered, Number: Number(result.downloaded_files || 0)})}`;
 }
 
 function readDownloadsSettingsFromForm() {
@@ -1145,7 +1171,7 @@ export async function addDownloadSubscription() {
       const name = result?.subscription?.artist_name || result?.subscription?.user_id || '';
       // The status sits beside the button now: it names the subscription that
       // just landed and points at where to find it in the list below.
-      statusEl.textContent = name ? `已添加 ${name}，见下方列表` : '已添加，见下方列表';
+      statusEl.textContent = name ? `${t('已添加 {name}，见下方列表', {name: name})}` : '已添加，见下方列表';
     }
     logUiAction('download_subscription_add', {
       service_bound: Boolean(pickedDir),
@@ -1177,7 +1203,7 @@ export function resetDownloadArtistCombo() {
 export async function deleteDownloadSubscription(id) {
   const subscriptionId = Number(id);
   if (!Number.isFinite(subscriptionId)) return;
-  if (!window.confirm('删除这个订阅？已下载的文件不会删除。')) return;
+  if (!window.confirm(t('删除这个订阅？已下载的文件不会删除。'))) return;
   try {
     await API.del(`/api/pawchive/subscriptions/${subscriptionId}`);
     logUiAction('download_subscription_delete', {id: subscriptionId});
@@ -1344,9 +1370,9 @@ export function downloadAttemptText(attempt) {
   const state = String(attempt?.state || '');
   const label = downloadAttemptStateLabel(state);
   const fetched = Number(attempt?.fetched || 0);
-  const error = String(attempt?.error || '').trim();
-  if (error) return `${label}，${error}`;
-  if (state === 'done') return fetched ? `${label}，${fetched} 个文件` : label;
+  const error = t(String(attempt?.error || '').trim());
+  if (error) return t('{label}，{error}', {label, error});
+  if (state === 'done') return fetched ? `${t('{label}，{fetched} 个文件', {label: label, fetched: fetched})}` : label;
   return label;
 }
 
@@ -1442,7 +1468,7 @@ export async function reconcileDownloadLibrary() {
 // 409 handling is the same and the panel's status line keeps describing
 // whichever round actually won the slot.
 async function startSubscriptionRound(subscriptionId, action) {
-  const label = action === 'reconcile' ? '核对' : '检查';
+  const label = action === 'reconcile' ? t('核对') : t('检查');
   if (isActionBusy('downloadSubscriptionRound', subscriptionId)) return;
   setActionBusy('downloadSubscriptionRound', subscriptionId, true);
   try {
@@ -1467,7 +1493,7 @@ async function startSubscriptionRound(subscriptionId, action) {
     if (status?.running) {
       applySyncStatus(status);
     } else {
-      toast(`启动${label}失败：` + (error.message || error), 'error');
+      toast(t('启动{label}失败：{error}', {label, error: error.message || error}), 'error');
     }
   } finally {
     setActionBusy('downloadSubscriptionRound', subscriptionId, false);
@@ -1507,7 +1533,7 @@ function downloadCandidatesHtml(postId) {
 }
 
 export function downloadCandidateReason(reason) {
-  return String(reason || '') === 'folder' ? '本作品目录' : '同画师近日';
+  return String(reason || '') === 'folder' ? t('本作品目录') : t('同画师近日');
 }
 
 // Ask for the candidates of one post.
@@ -1656,7 +1682,7 @@ export async function importDownloadPost(postId) {
     // Reported as "linked / total" rather than as success: a work whose files
     // are not all on disk yet is not imported, and saying "入库完成" would be
     // the panel's own conclusion rather than the server's answer.
-    toast(total ? `已绑入库内 ${linked}/${total} 个文件` : '这篇作品还没有可入库的文件', 'info');
+    toast(total ? `${t('已绑入库内 {linked}/{total} 个文件', {linked: linked, total: total})}` : '这篇作品还没有可入库的文件', 'info');
     logUiAction('download_post_import', {id, linked, total});
   } catch (error) {
     toast('入库失败：' + (error.message || error), 'error');
@@ -1682,7 +1708,7 @@ function downloadPostFilesHtml(postId) {
     const fileId = Number(file.file_id);
     const name = escHtml(String(file.file_name || file.file_id));
     const meta = [escHtml(String(file.status || ''))];
-    if (Number(file.expected_length || 0) > 0) meta.push(`${Number(file.expected_length)} 字节`);
+    if (Number(file.expected_length || 0) > 0) meta.push(`${t('{Number} 字节', {Number: Number(file.expected_length)})}`);
     if (file.error) meta.push(escHtml(String(file.error)));
     // A file already bound to a library item is not a retry candidate: the
     // route refuses it, so the button is not offered.
@@ -1704,7 +1730,7 @@ function downloadPostFilesHtml(postId) {
 
 function downloadPostFactsHtml(view) {
   if (view.factsError) {
-    return `<div class="download-subscription-error">状态读取失败：${escHtml(view.factsError)}</div>`;
+    return `<div class="download-subscription-error">${t('状态读取失败：{escHtml}', {escHtml: escHtml(view.factsError)})}</div>`;
   }
   const facts = view.facts;
   if (!facts || !Array.isArray(facts.requested_resources)) return '';
@@ -1712,12 +1738,12 @@ function downloadPostFactsHtml(view) {
   const amount = value => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
   const integrity = facts.integrity || {};
   const demand = facts.needs_confirmation || facts.blocked_by_ambiguity
-    ? '待确认' : `待获取 ${count(facts.requires_fetch)} 项`;
+    ? t('待确认') : `${t('待获取 {count} 项', {count: count(facts.requires_fetch)})}`;
   const lines = [
-    `获取记录：已获取 ${count(facts.acquired_resources)} / 需要 ${count(facts.requested_resources)}`,
-    `目录关联：${count(facts.association)} 组`,
-    `资源需求：${demand}${facts.manifest_complete ? '' : '，清单未完整'}`,
-    `完整性：未核验 ${amount(integrity.unverified_assets)}，缺失 ${amount(integrity.missing_assets)}，异常 ${amount(integrity.integrity_failed_assets)}`,
+    `${t('获取记录：已获取 {count} / 需要 {count2}', {count: count(facts.acquired_resources), count2: count(facts.requested_resources)})}`,
+    `${t('目录关联：{count} 组', {count: count(facts.association)})}`,
+    (facts.manifest_complete ? t('资源需求：{demand}', {demand}) : t('资源需求：{demand}，清单未完整', {demand})),
+    `${t('完整性：未核验 {amount}，缺失 {amount2}，异常 {amount3}', {amount: amount(integrity.unverified_assets), amount2: amount(integrity.missing_assets), amount3: amount(integrity.integrity_failed_assets)})}`,
   ];
   const reason = facts.blocked_reason || integrity.reason;
   return `<div data-download-post-facts>${lines.map(line => `<div class="download-file-meta">${escHtml(line)}</div>`).join('')}${reason ? `<div class="download-file-meta">${escHtml(String(reason))}</div>` : ''}</div>`;
@@ -1737,7 +1763,7 @@ export async function verifyDownloadPost(postId) {
     // with, so nothing was verified and the message must not imply otherwise.
     toast(
       checked
-        ? `校验完成：${matched} 个一致，${mismatched} 个不一致${skipped ? `，${skipped} 个无来源哈希` : ''}`
+        ? (skipped ? t('校验完成：{matched} 个一致，{mismatched} 个不一致，{skipped} 个无来源哈希', {matched, mismatched, skipped}) : t('校验完成：{matched} 个一致，{mismatched} 个不一致', {matched, mismatched}))
         : '没有可比对的来源哈希，未做校验',
       mismatched ? 'error' : 'info'
     );
@@ -1899,7 +1925,7 @@ export function renderDownloadWorksArtistCombo() {
       const name = String(artist.name || artist.path || artist.id);
       const idStr = String(artist.id);
       const selected = picked === idStr ? ' active' : '';
-      return `<li role="option" data-download-works-artist-value="${escHtml(idStr)}" class="${selected}" title="${escHtml(name)}">${escHtml(name)}</li>`;
+      return `<li role="option" data-i18n-skip data-download-works-artist-value="${escHtml(idStr)}" class="${selected}" title="${escHtml(name)}">${escHtml(name)}</li>`;
     }).join('');
 }
 
@@ -1912,12 +1938,39 @@ export function openDownloadWorksArtistCombo() {
   input.setAttribute('aria-expanded', 'true');
 }
 
+let downloadWorksArtistComboActiveIndex = -1;
+
 export function closeDownloadWorksArtistCombo() {
   const input = $('#downloadWorksArtistInput');
   const listbox = $('#downloadWorksArtistListbox');
   if (!input || !listbox) return;
+  downloadWorksArtistComboActiveIndex = -1;
   listbox.hidden = true;
   input.setAttribute('aria-expanded', 'false');
+}
+
+export function moveDownloadWorksArtistComboActive(step) {
+  const listbox = $('#downloadWorksArtistListbox');
+  if (!listbox) return;
+  if (listbox.hidden) openDownloadWorksArtistCombo();
+  const options = Array.from(listbox.querySelectorAll('[data-download-works-artist-value]'));
+  if (!options.length) return;
+  const count = options.length;
+  downloadWorksArtistComboActiveIndex = downloadWorksArtistComboActiveIndex < 0
+    ? (step > 0 ? 0 : count - 1)
+    : (downloadWorksArtistComboActiveIndex + step + count) % count;
+  options.forEach((opt, idx) => opt.classList.toggle('active', idx === downloadWorksArtistComboActiveIndex));
+  options[downloadWorksArtistComboActiveIndex]?.scrollIntoView?.({block: 'nearest'});
+}
+
+export function selectActiveDownloadWorksArtistCombo() {
+  const listbox = $('#downloadWorksArtistListbox');
+  if (!listbox || listbox.hidden) return false;
+  const options = Array.from(listbox.querySelectorAll('[data-download-works-artist-value]'));
+  const option = options[downloadWorksArtistComboActiveIndex >= 0 ? downloadWorksArtistComboActiveIndex : 0];
+  if (!option) return false;
+  pickDownloadWorksArtist(option.dataset.downloadWorksArtistValue, option.textContent);
+  return true;
 }
 
 export function pickDownloadWorksArtist(value, label) {
@@ -1993,9 +2046,15 @@ export async function loadDownloadAllWorks(options = {}) {
     error: '',
   };
   renderDownloadAllWorks();
+  // Same guard as loadDownloadDayPosts: the query string pins the filter and
+  // cursor this read was built from, so a slow "load more" for the previous
+  // filter cannot overwrite a newer filtered first page that already landed.
+  const request = downloadWorksQuery(cursor);
+  state.downloadAllWorksRequest = request;
   try {
     const fetchOptions = options.signal ? {signal: options.signal} : {};
-    const result = await API.get(downloadWorksQuery(cursor), fetchOptions);
+    const result = await API.get(request, fetchOptions);
+    if (state.downloadAllWorksRequest !== request) return;
     const posts = downloadWorksDayPosts(result);
     // A page the earlier read already holds is not appended twice when a refresh
     // lands after a "load more": the walk keeps its order and its rows.
@@ -2012,6 +2071,7 @@ export async function loadDownloadAllWorks(options = {}) {
     pruneDownloadWorksSelection(merged);
   } catch (error) {
     if (isAbortError(error)) return;
+    if (state.downloadAllWorksRequest !== request) return;
     state.downloadAllWorks = {
       ...(state.downloadAllWorks || {}),
       loading: false,
@@ -2049,12 +2109,35 @@ export function openDownloadAllWorks() {
   return loadDownloadAllWorks();
 }
 
-export function toggleDownloadWorkSelection(postId, selected) {
+export function toggleDownloadWorkSelection(postId, selected, options = {}) {
   const id = Number(postId);
   if (!Number.isFinite(id)) return;
   const next = new Set(selectedDownloadWorks());
-  if (selected) next.add(id);
-  else next.delete(id);
+  const posts = state.downloadAllWorks?.posts || [];
+  if (options.shift && state.lastDownloadWorkSelectedId != null && posts.length > 0) {
+    const prevIdx = posts.findIndex(p => Number(p?.id) === Number(state.lastDownloadWorkSelectedId));
+    const currIdx = posts.findIndex(p => Number(p?.id) === id);
+    if (prevIdx !== -1 && currIdx !== -1) {
+      const start = Math.min(prevIdx, currIdx);
+      const end = Math.max(prevIdx, currIdx);
+      for (let i = start; i <= end; i += 1) {
+        const rowId = Number(posts[i]?.id);
+        if (Number.isFinite(rowId)) {
+          if (selected) next.add(rowId);
+          else next.delete(rowId);
+        }
+      }
+    } else if (selected) {
+      next.add(id);
+    } else {
+      next.delete(id);
+    }
+  } else if (selected) {
+    next.add(id);
+  } else {
+    next.delete(id);
+  }
+  state.lastDownloadWorkSelectedId = id;
   state.downloadAllSelection = next;
   // A ticked row after "all works of this filter" means the two are no longer
   // the same statement, so the explicit set takes over from the filter.
@@ -2086,6 +2169,7 @@ export function toggleDownloadWorksSelectAll(selected) {
 export function clearDownloadWorksSelection() {
   state.downloadAllSelection = new Set();
   state.downloadAllSelectAll = false;
+  state.lastDownloadWorkSelectedId = null;
   renderDownloadAllWorks();
 }
 
@@ -2120,11 +2204,11 @@ function downloadWorksSelectionText() {
   const view = state.downloadAllWorks || {};
   const total = Number(view.total || 0);
   if (state.downloadAllSelectAll) {
-    return total ? `已全选当前筛选的 ${total} 篇作品` : '已全选当前筛选的作品';
+    return total ? `${t('已全选当前筛选的 {total} 篇作品', {total: total})}` : '已全选当前筛选的作品';
   }
   const count = selectedDownloadWorks().size;
   if (!count) return '未选择作品';
-  return total ? `已选 ${count} 篇（当前筛选共 ${total} 篇）` : `已选 ${count} 篇`;
+  return total ? `${t('已选 {count} 篇（当前筛选共 {total} 篇）', {count: count, total: total})}` : `${t('已选 {count} 篇', {count: count})}`;
 }
 
 export function findFolderMatchingDay(node, day, title = '') {
@@ -2253,14 +2337,14 @@ function downloadWorksRowHtml(post) {
   const title = String(post?.title || post?.post_id || '');
   const stateLabel = downloadPostStateLabel(post?.state);
   const artist = String(post?.artist_name || '');
-  const day = String(post?.day || '') || '无日期';
+  const day = String(post?.day || '') || t('无日期');
   const missing = Number(post?.missing_assets || 0);
   const covered = Boolean(post?.date_skipped || post?.state === 'confirmed');
   const isMissing = !covered && (missing > 0 || post?.state === 'pending' || post?.state === 'partial');
   const isComplete = covered || post?.state === 'verified';
-  const badgeLabel = post?.date_skipped ? '已有' : isMissing
-    ? (missing > 0 ? `缺 ${missing} 项` : (post?.state === 'pending' ? '未下载' : stateLabel))
-    : (isComplete ? '已齐' : stateLabel);
+  const badgeLabel = post?.date_skipped ? t('已有') : isMissing
+    ? (missing > 0 ? `${t('缺 {missing} 项', {missing: missing})}` : (post?.state === 'pending' ? t('未下载') : stateLabel))
+    : (isComplete ? t('已齐') : stateLabel);
   const badgeClass = isMissing ? 'is-missing' : (isComplete ? 'is-complete' : '');
   const counts = downloadPostCounts(post);
   const selected = state.downloadAllSelectAll || selectedDownloadWorks().has(id);
@@ -2268,29 +2352,29 @@ function downloadWorksRowHtml(post) {
   const target = post?.source_url ? ` href="${escHtml(post.source_url)}" target="_blank" rel="noopener noreferrer"` : '';
   const dayText = escHtml(day);
   const dayHtml = post?.artist_id && post?.day
-    ? `<button class="download-works-day-jump" type="button" data-download-works-jump-artist="${escHtml(String(post.artist_id))}" data-download-works-jump-day="${escHtml(post.day)}" data-download-works-jump-title="${escHtml(post.title || '')}" title="在画库中定位对应文件夹">${dayText}</button>`
+    ? `<button class="download-works-day-jump" type="button" data-download-works-jump-artist="${escHtml(String(post.artist_id))}" data-download-works-jump-day="${escHtml(post.day)}" data-download-works-jump-title="${escHtml(post.title || '')}" title="${t('在画库中定位对应文件夹')}">${dayText}</button>`
     : dayText;
 
   const hasExt = Boolean(post?.has_external_links);
   const hasDirect = Boolean(post?.has_direct_files || (!post?.has_external_links && Number(post?.required_assets || 0) > 0));
   const extCount = Number(post?.external_link_count || 0);
   const extBadge = hasExt
-    ? `<span class="download-works-badge is-external" title="这篇作品的外部网盘链接数量">含网盘资源${extCount > 1 ? ` ${extCount} 个链接` : ''}</span>`
+    ? `<span class="download-works-badge is-external" title="${t('这篇作品的外部网盘链接数量')}">${extCount > 1 ? t('含网盘资源 {count} 个链接', {count: extCount}) : t('含网盘资源')}</span>`
     : '';
   let actionButtons = '';
   if (hasExt && !hasDirect) {
-    actionButtons = `<button class="btn btn-ghost" type="button" data-download-works-netdisk="${id}" title="投递至下载器/网盘任务">投递网盘</button>`;
+    actionButtons = `<button class="btn btn-ghost" type="button" data-download-works-netdisk="${id}" title="${t('投递至下载器/网盘任务')}">投递网盘</button>`;
   } else if (hasExt && hasDirect) {
-    actionButtons = `<button class="btn btn-ghost" type="button" data-download-works-fetch="${id}" title="按当前选择只下载这篇，不覆盖已有文件">下载</button>
-      <button class="btn btn-ghost" type="button" data-download-works-netdisk="${id}" title="投递至下载器/网盘任务">投递网盘</button>`;
+    actionButtons = `<button class="btn btn-ghost" type="button" data-download-works-fetch="${id}" title="${t('按当前选择只下载这篇，不覆盖已有文件')}">下载</button>
+      <button class="btn btn-ghost" type="button" data-download-works-netdisk="${id}" title="${t('投递至下载器/网盘任务')}">投递网盘</button>`;
   } else {
-    actionButtons = `<button class="btn btn-ghost" type="button" data-download-works-fetch="${id}" title="按当前选择只下载这篇，不覆盖已有文件">下载</button>`;
+    actionButtons = `<button class="btn btn-ghost" type="button" data-download-works-fetch="${id}" title="${t('按当前选择只下载这篇，不覆盖已有文件')}">下载</button>`;
   }
 
   return `
       <div class="download-works-row${selected ? ' is-selected' : ''}" data-download-works-row="${id}">
         <span class="download-works-pick">
-          <input type="checkbox" data-download-works-pick="${id}" aria-label="选择这篇作品" ${selected ? 'checked' : ''}>
+          <input type="checkbox" data-download-works-pick="${id}" aria-label="${t('选择这篇作品')}" ${selected ? 'checked' : ''}>
         </span>
         <div class="download-works-main">
           <div class="download-works-title">${target ? `<a${target}>${escHtml(title)}</a>` : escHtml(title)}</div>
@@ -2315,7 +2399,7 @@ export function renderDownloadAllWorks() {
   syncDownloadWorksFilterControls();
   if (countEl) {
     const total = Number(view?.total || 0);
-    countEl.textContent = total ? `共 ${total} 篇作品` : '';
+    countEl.textContent = total ? `${t('共 {total} 篇作品', {total: total})}` : '';
   }
   if (!list) return;
   if (!view) {
@@ -2389,6 +2473,13 @@ export async function downloadWorksSelection(frozen, options = {}) {
     });
     const direct = Number(preview?.resources || 0);
     const externalPosts = Array.isArray(preview?.external_posts) ? preview.external_posts : [];
+    // A truncated filter is safe for the pure-direct path because its durable
+    // selection reports the cap. Netdisk posts are sent as an explicit id list,
+    // so a truncated preview would silently omit the rest of the filter.
+    if (!explicit && preview?.truncated && (!direct || externalPosts.length > 0)) {
+      toast('筛选结果超过单批上限，请缩小筛选范围后重试', 'warn');
+      return null;
+    }
 
     if (!direct && !externalPosts.length) {
       toast('所选作品没有可下载的文件或外链', 'warn');
@@ -2405,17 +2496,17 @@ export async function downloadWorksSelection(frozen, options = {}) {
         }
         return singleRes;
       }
-      const ok = window.confirm(`已选择 ${externalPosts.length} 篇作品（均无直连文件），将投递至网盘下载器。是否继续？`);
+      const ok = window.confirm(`${t('已选择 {externalPosts} 篇作品（均无直连文件），将投递至网盘下载器。是否继续？', {externalPosts: externalPosts.length})}`);
       if (!ok) return null;
       if (!(await ensureNetdiskDispatchReady())) return null;
       const job = await API.postJson('/api/netdisk/jobs', { post_ids: externalPosts });
       const delivered = resolveNetdiskBatchDeliveredCount(job, externalPosts.length);
       const skippedCount = Array.isArray(job?.skipped) ? job.skipped.length : 0;
       if (delivered === 0 && skippedCount > 0) {
-        toast(`所选 ${skippedCount} 篇作品已有进行中网盘任务，已跳过`, 'warn');
+        toast(`${t('所选 {skippedCount} 篇作品已有进行中网盘任务，已跳过', {skippedCount: skippedCount})}`, 'warn');
       } else {
-        const skippedSuffix = skippedCount > 0 ? `（跳过 ${skippedCount} 篇）` : '';
-        toast(`已投递网盘：${delivered} 篇作品${skippedSuffix}`, 'info');
+        const skippedSuffix = skippedCount > 0 ? `${t('（跳过 {skippedCount} 篇）', {skippedCount: skippedCount})}` : '';
+        toast(`${t('已投递网盘：{delivered} 篇作品{skippedSuffix}', {delivered: delivered, skippedSuffix: skippedSuffix})}`, 'info');
       }
       clearDownloadWorksSelection();
       await loadDownloadAllWorks();
@@ -2426,7 +2517,13 @@ export async function downloadWorksSelection(frozen, options = {}) {
     if (!options.directOnly && direct > 0 && externalPosts.length > 0) {
       const total = explicit ? explicit.length : Number(preview?.posts || 0);
       const directPosts = preview?.plans ? preview.plans.filter(p => p.resources && p.resources.length > 0).length : (total - externalPosts.length);
-      const confirmMsg = `已选择 ${total ? total + ' 篇' : ''}作品：${directPosts > 0 ? directPosts + ' 篇' : ''}将下载直连文件（共 ${direct} 个），${externalPosts.length} 篇将投递至网盘下载器。是否继续？`;
+      const confirmMsg = total
+        ? (directPosts > 0
+          ? t('已选择 {total} 篇作品：{directPosts} 篇将下载直连文件（共 {direct} 个），{external} 篇将投递至网盘下载器。是否继续？', {total, directPosts, direct, external: externalPosts.length})
+          : t('已选择 {total} 篇作品：将下载直连文件（共 {direct} 个），{external} 篇将投递至网盘下载器。是否继续？', {total, direct, external: externalPosts.length}))
+        : (directPosts > 0
+          ? t('已选择作品：{directPosts} 篇将下载直连文件（共 {direct} 个），{external} 篇将投递至网盘下载器。是否继续？', {directPosts, direct, external: externalPosts.length})
+          : t('已选择作品：将下载直连文件（共 {direct} 个），{external} 篇将投递至网盘下载器。是否继续？', {direct, external: externalPosts.length}));
       const ok = window.confirm(confirmMsg);
       if (!ok) return null;
 
@@ -2451,10 +2548,10 @@ export async function downloadWorksSelection(frozen, options = {}) {
       }
 
       const parts = [];
-      if (attempt) parts.push(`直连下载 ${Number(attempt.posts || 0)} 篇（${Number(attempt.resources || 0)} 个文件）`);
-      if (job) parts.push(`网盘投递 ${resolveNetdiskBatchDeliveredCount(job, externalPosts.length)} 篇`);
+      if (attempt) parts.push(`${t('直连下载 {Number} 篇（{Number2} 个文件）', {Number: Number(attempt.posts || 0), Number2: Number(attempt.resources || 0)})}`);
+      if (job) parts.push(`${t('网盘投递 {resolveNetdiskBatchDeliveredCount} 篇', {resolveNetdiskBatchDeliveredCount: resolveNetdiskBatchDeliveredCount(job, externalPosts.length)})}`);
       if (parts.length) {
-        toast(`已发起：${parts.join('，')}`, 'info');
+        toast(`${t('已发起：{parts}', {parts: parts.join('，')})}`, 'info');
       }
       clearDownloadWorksSelection();
       await loadDownloadAllWorks();
@@ -2473,9 +2570,9 @@ export async function downloadWorksSelection(frozen, options = {}) {
       filtered: !explicit,
     });
     if (selection.truncated) {
-      toast(`当前筛选的作品超过一次能冻结的数量，本次只创建了前 ${Number(selection.matched || 0)} 篇的任务，其余请再点一次`, 'warn');
+      toast(`${t('当前筛选的作品超过一次能冻结的数量，本次只创建了前 {Number} 篇的任务，其余请再点一次', {Number: Number(selection.matched || 0)})}`, 'warn');
     } else {
-      toast(`已发起下载：${Number(attempt.posts || 0)} 篇，${Number(attempt.resources || 0)} 个文件`, 'info');
+      toast(`${t('已发起下载：{Number} 篇，{Number2} 个文件', {Number: Number(attempt.posts || 0), Number2: Number(attempt.resources || 0)})}`, 'info');
     }
     clearDownloadWorksSelection();
     await loadDownloadAllWorks();
@@ -2533,6 +2630,10 @@ export async function downloadWorksNetdiskSelection(frozen) {
       ...works,
     });
     const externalPosts = Array.isArray(preview?.external_posts) ? preview.external_posts : [];
+    if (!explicit && preview?.truncated) {
+      toast('筛选结果超过单批上限，请缩小筛选范围后重试', 'warn');
+      return null;
+    }
     if (!externalPosts.length) {
       toast('所选作品没有可投递的网盘链接', 'warn');
       return null;
@@ -2547,7 +2648,7 @@ export async function downloadWorksNetdiskSelection(frozen) {
       return singleRes;
     }
 
-    const ok = window.confirm(`已选择 ${externalPosts.length} 篇含网盘链接的作品，将投递至网盘下载器。是否继续？`);
+    const ok = window.confirm(`${t('已选择 {externalPosts} 篇含网盘链接的作品，将投递至网盘下载器。是否继续？', {externalPosts: externalPosts.length})}`);
     if (!ok) return null;
     if (!(await ensureNetdiskDispatchReady())) return null;
 
@@ -2555,10 +2656,10 @@ export async function downloadWorksNetdiskSelection(frozen) {
     const delivered = resolveNetdiskBatchDeliveredCount(job, externalPosts.length);
     const skippedCount = Array.isArray(job?.skipped) ? job.skipped.length : 0;
     if (delivered === 0 && skippedCount > 0) {
-      toast(`所选 ${skippedCount} 篇作品已有进行中网盘任务，已跳过`, 'warn');
+      toast(`${t('所选 {skippedCount} 篇作品已有进行中网盘任务，已跳过', {skippedCount: skippedCount})}`, 'warn');
     } else {
-      const skippedSuffix = skippedCount > 0 ? `（跳过 ${skippedCount} 篇）` : '';
-      toast(`已投递网盘：${delivered} 篇作品${skippedSuffix}`, 'info');
+      const skippedSuffix = skippedCount > 0 ? `${t('（跳过 {skippedCount} 篇）', {skippedCount: skippedCount})}` : '';
+      toast(`${t('已投递网盘：{delivered} 篇作品{skippedSuffix}', {delivered: delivered, skippedSuffix: skippedSuffix})}`, 'info');
     }
     clearDownloadWorksSelection();
     await loadDownloadAllWorks();
@@ -2572,6 +2673,152 @@ export async function downloadWorksNetdiskSelection(frozen) {
       netdiskBtn.disabled = false;
       netdiskBtn.textContent = originalText;
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 命名迁移预览与显式切换
+// ---------------------------------------------------------------------------
+//
+// The migration switch is this dialog: the operator reviews what each stored
+// rule source renders for one work, then explicitly picks the one that becomes
+// the shared download/organize authority. Nothing is written without that
+// choice; the backend CAS-guards the apply with naming_revision and refuses it
+// while a folder archive operation is in progress.
+
+let namingMigration = {workKey: null, preview: null, selected: -1};
+
+export function namingMigrationPreviewHtml(preview, selected) {
+  const rows = (preview?.previews || []).map((row, i) => {
+    const rendered = row.rendered || {};
+    const warnings = Array.isArray(rendered.warnings) ? rendered.warnings : [];
+    return `
+      <label class="naming-migration-row">
+        <input type="radio" name="namingMigrationRule" value="${i}" ${i === selected ? 'checked' : ''}>
+        <span class="naming-migration-row-head">${escHtml(String(row.label || ''))} &#183; ${escHtml(String(row.semantics || ''))}</span>
+        <span class="naming-migration-row-path">${escHtml(String(rendered.folder_relative || ''))}</span>
+        <span class="naming-migration-row-file">${escHtml(String(rendered.image_filename || ''))}</span>
+        <span class="naming-migration-row-file">${escHtml(String(rendered.attachment_filename || ''))}</span>
+        ${rendered.lossy ? `<span class="naming-migration-row-lossy">${t('有损输出')}</span>` : ''}
+        ${warnings.map(warning => `<span class="naming-migration-row-warning">${escHtml(String(warning))}</span>`).join('')}
+      </label>`;
+  }).join('');
+  const conflicts = (preview?.conflicts || []).map(conflict => `
+    <div class="naming-migration-conflict">${escHtml(String(conflict.left_label || ''))} / ${escHtml(String(conflict.right_label || ''))}：${escHtml(String(conflict.detail || ''))}</div>`).join('');
+  const notes = (preview?.notes || []).map(note => `<div class="naming-migration-note">${escHtml(String(note))}</div>`).join('');
+  return `
+    <div class="naming-migration-body">
+      <div class="naming-migration-title">${t('命名迁移预览')}</div>
+      ${rows}
+      ${conflicts ? `<div class="naming-migration-section">${t('冲突')}</div>${conflicts}` : ''}
+      ${notes ? `<div class="naming-migration-section">${t('说明')}</div>${notes}` : ''}
+      <div class="naming-migration-hint">${t('应用后下载与整理共用所选规则')}</div>
+      <div class="naming-migration-actions">
+        <button class="btn btn-primary" type="button" data-naming-migration-apply ${selected >= 0 ? '' : 'disabled'}>${t('应用共享规则')}</button>
+        <button class="btn btn-ghost" type="button" data-naming-migration-close>${t('关闭')}</button>
+      </div>
+    </div>`;
+}
+
+function namingMigrationDialog() {
+  let dialog = $('#namingMigrationDialog');
+  if (!dialog) {
+    dialog = document.createElement('dialog');
+    dialog.id = 'namingMigrationDialog';
+    dialog.className = 'artist-links-dialog';
+    document.body.appendChild(dialog);
+  }
+  return dialog;
+}
+
+function bindNamingMigrationDialog(dialog) {
+  if (!dialog || dialog.dataset.namingMigrationBound) return;
+  dialog.dataset.namingMigrationBound = '1';
+  dialog.addEventListener('click', event => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+    if (target.closest('[data-naming-migration-close]')) {
+      closeNamingMigration();
+      return;
+    }
+    if (target.closest('[data-naming-migration-apply]')) {
+      applyNamingMigrationSwitch();
+    }
+  });
+  dialog.addEventListener('change', event => {
+    const target = event.target instanceof Element ? event.target : null;
+    const radio = target && target.closest('input[name="namingMigrationRule"]');
+    if (radio) selectNamingMigrationRule(Number(radio.value));
+  });
+}
+
+export function closeNamingMigration() {
+  const dialog = $('#namingMigrationDialog');
+  if (dialog && typeof dialog.close === 'function' && dialog.open) dialog.close();
+  namingMigration = {workKey: null, preview: null, selected: -1};
+}
+
+export async function openNamingMigrationPreview(postId) {
+  const workKey = Number(postId);
+  if (!Number.isFinite(workKey)) return null;
+  const dialog = namingMigrationDialog();
+  namingMigration = {workKey, preview: null, selected: -1};
+  dialog.innerHTML = `<div class="naming-migration-body">${t('读取中')}</div>`;
+  bindNamingMigrationDialog(dialog);
+  if (typeof dialog.showModal === 'function' && !dialog.open) dialog.showModal();
+  try {
+    const result = await API.get(`/api/pawchive/naming/preview?work_key=${workKey}`);
+    const preview = result?.preview || {};
+    namingMigration.preview = preview;
+    // No preselection: picking the rule source is the decision this dialog
+    // exists for, so the apply button stays disabled until the operator chooses.
+    dialog.innerHTML = namingMigrationPreviewHtml(preview, -1);
+    bindNamingMigrationDialog(dialog);
+    return preview;
+  } catch (error) {
+    toast(t('命名预览失败：{detail}', {detail: String(error.message || error)}), 'error');
+    closeNamingMigration();
+    return null;
+  }
+}
+
+export function selectNamingMigrationRule(index) {
+  const picked = Number(index);
+  if (!Number.isInteger(picked) || picked < 0) return;
+  namingMigration.selected = picked;
+  const dialog = $('#namingMigrationDialog');
+  if (!dialog) return;
+  dialog.innerHTML = namingMigrationPreviewHtml(namingMigration.preview, picked);
+  bindNamingMigrationDialog(dialog);
+}
+
+export async function applyNamingMigrationSwitch() {
+  const {preview, selected} = namingMigration;
+  const row = preview && Array.isArray(preview.previews) ? preview.previews[selected] : null;
+  if (!row) return null;
+  const templates = row.templates || {};
+  const body = {
+    expected_revision: Number(preview.revision) || 0,
+    semantic_version: String(row.semantics || ''),
+    folder_template: String(templates.folder || ''),
+  };
+  if (templates.image) body.image_template = String(templates.image);
+  if (templates.attachment) body.attachment_template = String(templates.attachment);
+  try {
+    const result = await API.postJson('/api/pawchive/naming/apply', body);
+    toast(t('共享命名规则已更新'), 'success');
+    closeNamingMigration();
+    return result;
+  } catch (error) {
+    const kind = error?.body?.error || String(error.message || '');
+    if (kind === 'naming revision conflict') {
+      toast(t('命名版本已变化，请重新预览'), 'warn');
+    } else if (kind === 'archive operation in progress') {
+      toast(t('整理进行中，请稍后重试'), 'warn');
+    } else {
+      toast(t('应用失败：{detail}', {detail: String(error.message || error)}), 'error');
+    }
+    return null;
   }
 }
 

@@ -4,6 +4,7 @@
 
 import { $, $$ } from './utils.js';
 import { state } from './store.js';
+import { t } from './i18n.js';
 
 const FRONTEND_ERROR_LOG_LIMIT = 20;
 const FRONTEND_ERROR_DEDUPE_MS = 30000;
@@ -110,10 +111,13 @@ export function installFrontendErrorLogging() {
 }
 
 export function toast(msg, type) {
+  // The UI log keeps the caller's source text; the visible toast speaks the
+  // active language. t() is idempotent, so call sites that already pass
+  // translated text translate again to themselves.
   logUiAction('toast', {message: String(msg ?? ''), type: String(type || '')});
   const el = document.createElement('div');
   el.className = `toast ${type}`;
-  el.textContent = msg;
+  el.textContent = t(msg);
   // 错误提示立即播报（alert），其余礼貌播报（status），保证辅助技术能收到。
   el.setAttribute('role', type === 'error' ? 'alert' : 'status');
   const openDialogs = typeof document.querySelectorAll === 'function'

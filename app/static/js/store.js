@@ -83,6 +83,7 @@ const browse = createStore({
   view: 'grid',
   cardRatio: '4x3',
   themeMode: 'light',
+  lang: 'zh',
   activeRole: null,
   activeFolder: null,
   activeTriage: 'all',
@@ -125,6 +126,7 @@ const browse = createStore({
 
 const selection = createStore({
   selectedIds: new Set(),
+  lastSelectedItemId: null,
   editMode: false,
   selectedEditTagIds: new Set(),
   selectedEditTagNames: new Set(),
@@ -198,6 +200,18 @@ const maintenance = createStore({
   moveHistoryLoading: false,
   folderRenameAuto: null,
   recycleBin: null,
+  recycleSelectedIds: new Set(),
+  lastRecycleSelectedId: null,
+  recycleViewMode: (function() {
+    try {
+      const saved = localStorage.getItem('gallery_recycle_view_mode');
+      return (saved === 'grid' || saved === 'table') ? saved : 'grid';
+    } catch (_) {
+      return 'grid';
+    }
+  })(),
+  recycleStrategy: 'system',
+  recycleSystemSupported: true,
   archivePlans: [],
   archiveSettings: null,
   archivePreview: null,
@@ -215,6 +229,9 @@ const maintenance = createStore({
   directoryPickerPath: '',
   directoryPickerEntries: [],
   directoryPickerLoading: false,
+  directoryPickerFilter: '',
+  itemMoveFolderTarget: '',
+  itemMoveFolderFilter: '',
   downloadArtistRoots: [],
   downloadArtistRootIndex: 0,
   downloadArtistParentPath: '',
@@ -272,12 +289,16 @@ const maintenance = createStore({
   // `downloadAllSelection` 是显式勾选的 post id；`downloadAllSelectAll` 表示
   // 「当前筛选的全部作品」——它不是一个 id 列表，所以不能与前者混为一谈。
   downloadAllWorks: null,
+  // Query string the in-flight 全部作品 read was built from; a late response
+  // for an older filter/cursor is dropped instead of overwriting newer rows.
+  downloadAllWorksRequest: null,
   // Bumped when the panel is opened, so the 全部作品 list is re-read then and not
   // on every auto-refresh tick; `...LoadedRevision` records what has been read.
   downloadAllWorksRevision: 0,
   downloadAllWorksLoadedRevision: 0,
   downloadAllFilter: {subscriptionId: null, day: '', state: '', search: '', artistId: null},
   downloadAllSelection: new Set(),
+  lastDownloadWorkSelectedId: null,
   downloadAllSelectAll: false,
   downloadAllSearchTimer: null,
   downloadSyncPolling: false,

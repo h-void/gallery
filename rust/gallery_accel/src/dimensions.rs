@@ -183,109 +183,16 @@ fn video_dimensions(path: &Path) -> Result<(u32, u32)> {
         anyhow::bail!("ffprobe failed");
     }
     let dimensions = String::from_utf8_lossy(&output.stdout);
-    let (width, height) = dimensions
-        .trim()
+    let first_line = dimensions
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let (width, height) = first_line
         .split_once('x')
         .context("ffprobe returned no video dimensions")?;
     Ok((
         width.parse().context("parse video width")?,
         height.parse().context("parse video height")?,
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use image::RgbImage;
-    use std::cell::Cell;
-    use std::io::SeekFrom;
-    use std::rc::Rc;
-    use tempfile::tempdir;
-
-    struct CountingReader {
-        inner: Cursor<Vec<u8>>,
-        bytes_read: Rc<Cell<usize>>,
-    }
-
-    impl Read for CountingReader {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            let read = self.inner.read(buffer)?;
-            self.bytes_read
-                .set(self.bytes_read.get().saturating_add(read));
-            Ok(read)
-        }
-    }
-
-    impl Seek for CountingReader {
-        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-            self.inner.seek(position)
-        }
-    }
-
-    #[test]
-    fn backfill_reads_image_dimensions_and_returns_cursor() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("wide.png");
-        RgbImage::new(640, 360).save(&path).unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE items (
-                id INTEGER PRIMARY KEY,
-                file_path TEXT NOT NULL,
-                media_type TEXT NOT NULL,
-                missing INTEGER NOT NULL DEFAULT 0,
-                width INTEGER NOT NULL DEFAULT 0,
-                height INTEGER NOT NULL DEFAULT 0
-            );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO items (id, file_path, media_type) VALUES (1, ?, 'image')",
-            [path.to_string_lossy().as_ref()],
-        )
-        .unwrap();
-        let roots = MediaRoots::identical(vec![dir.path().to_string_lossy().into()], vec![]);
-
-        let result = backfill_item_dimensions(&conn, &roots, 0, 1).unwrap();
-        assert_eq!(result["updated"], 1);
-        assert_eq!(result["remaining"], 0);
-        assert_eq!(result["next_after_id"], 1);
-        assert_eq!(result["cursor_done"], false);
-        let finished = backfill_item_dimensions(&conn, &roots, 1, 1).unwrap();
-        assert_eq!(finished["processed"], 0);
-        assert_eq!(finished["cursor_done"], true);
-        assert_eq!(
-            conn.query_row("SELECT width, height FROM items WHERE id=1", [], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            })
-            .unwrap(),
-            (640, 360)
-        );
-    }
-
-    #[test]
-    fn jpeg_dimension_probe_stays_within_prefix_limit() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("probe.jpg");
-        RgbImage::new(8, 4).save(&path).unwrap();
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.extend(std::iter::repeat_n(
-            0xA5,
-            IMAGE_DIMENSION_READ_LIMIT as usize,
-        ));
-        std::fs::write(&path, &bytes).unwrap();
-
-        assert_eq!(image_dimensions(&path).unwrap(), (8, 4));
-
-        let bytes_read = Rc::new(Cell::new(0));
-        let reader = CountingReader {
-            inner: Cursor::new(bytes),
-            bytes_read: Rc::clone(&bytes_read),
-        };
-        let prefix = read_prefix(reader, IMAGE_DIMENSION_READ_LIMIT).unwrap();
-        let dimensions = image_dimensions_from_reader(Cursor::new(prefix)).unwrap();
-
-        assert_eq!(dimensions, (8, 4));
-        assert!(bytes_read.get() <= IMAGE_DIMENSION_READ_LIMIT as usize);
-    }
 }

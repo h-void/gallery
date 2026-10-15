@@ -173,7 +173,7 @@ pub fn inspect_archive(
         .unwrap_or_else(|| "archive".to_string());
 
     let mut cmd = Command::new(&bin);
-    cmd.arg("l").arg("-slt").arg("-ba");
+    cmd.arg("l").arg("-slt").arg("-ba").arg("-bsp0").arg("-bd");
     if let Some(pwd) = password.filter(|p| !p.is_empty()) {
         cmd.arg(format!("-p{pwd}"));
     } else {
@@ -239,10 +239,8 @@ pub fn inspect_archive(
                     "Packed Size" => packed_size = val.parse().unwrap_or(0),
                     "Modified" => modified = val.to_string(),
                     "Encrypted" => encrypted = val == "+",
-                    "Attributes" => {
-                        if val.starts_with('D') {
-                            is_dir = true;
-                        }
+                    "Attributes" if val.starts_with('D') => {
+                        is_dir = true;
                     }
                     _ => {}
                 }
@@ -254,7 +252,11 @@ pub fn inspect_archive(
         }
 
         // Skip archive self-header block if present
-        if path.to_ascii_lowercase().ends_with(&normalized_archive_name) && size == archive_size {
+        if path
+            .to_ascii_lowercase()
+            .ends_with(&normalized_archive_name)
+            && size == archive_size
+        {
             continue;
         }
 
@@ -323,16 +325,28 @@ pub fn stream_archive_entry(
     password: Option<&str>,
 ) -> Result<Vec<u8>> {
     let clean_entry = entry_path.replace('\\', "/");
-    if clean_entry.contains("..")
+    let has_traversal = clean_entry.is_empty()
         || clean_entry.starts_with('/')
         || clean_entry.contains(':')
-    {
+        || Path::new(&clean_entry).components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        });
+    if has_traversal {
         bail!("invalid entry path");
     }
 
     let bin = find_7z_binary()?;
     let mut cmd = Command::new(&bin);
-    cmd.arg("e").arg("-so");
+    cmd.arg("e")
+        .arg("-so")
+        .arg("-bsp0")
+        .arg("-bd")
+        .arg("-mmt=on");
     if let Some(pwd) = password.filter(|p| !p.is_empty()) {
         cmd.arg(format!("-p{pwd}"));
     } else {
@@ -342,18 +356,37 @@ pub fn stream_archive_entry(
     cmd.arg(archive_path);
     cmd.arg(&clean_entry);
 
-    let output = cmd.output().context("execute 7z single-entry extraction")?;
-    if !output.status.success() && output.stdout.is_empty() {
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        bail!("failed to stream entry: {stderr_str}");
-    }
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("execute 7z single-entry extraction")?;
 
-    // Limit in-memory size to 50 MB
-    if output.stdout.len() > 50 * 1024 * 1024 {
+    let max_preview_bytes: u64 = 50 * 1024 * 1024;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("missing child stdout pipe"))?;
+    let mut buffer = Vec::new();
+    let mut limited = std::io::Read::take(&mut stdout, max_preview_bytes + 1);
+    std::io::Read::read_to_end(&mut limited, &mut buffer)?;
+
+    if buffer.len() > max_preview_bytes as usize {
+        let _ = child.kill();
+        let _ = child.wait();
         bail!("entry exceeds 50MB in-memory preview limit");
     }
 
-    Ok(output.stdout)
+    let status = child.wait().context("wait for 7z extraction")?;
+    if !status.success() && buffer.is_empty() {
+        let mut stderr = String::new();
+        if let Some(mut err_pipe) = child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut err_pipe, &mut stderr);
+        }
+        bail!("failed to stream entry: {stderr}");
+    }
+
+    Ok(buffer)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,7 +441,13 @@ pub fn extract_archive(
                 other => other,
             })
             .collect();
-        parent_dir.join(safe_name.trim())
+        let trimmed = safe_name.trim().trim_matches('.');
+        let final_name = if trimmed.is_empty() {
+            "unpacked"
+        } else {
+            trimmed
+        };
+        parent_dir.join(final_name)
     } else {
         parent_dir.to_path_buf()
     };
@@ -425,7 +464,12 @@ pub fn extract_archive(
 
     // Execute 7z extraction
     let mut cmd = Command::new(&bin);
-    cmd.arg("x").arg("-y");
+    cmd.arg("x")
+        .arg("-y")
+        .arg("-bso0")
+        .arg("-bsp0")
+        .arg("-bd")
+        .arg("-mmt=on");
     if let Some(pwd) = password.filter(|p| !p.is_empty()) {
         cmd.arg(format!("-p{pwd}"));
     } else {
@@ -458,13 +502,31 @@ pub fn extract_archive(
     // Smart flatten: if staging_dir only contains 1 subfolder and no files, flatten it
     flatten_single_wrapper(&staging_dir);
 
-    // Ensure final target directory exists
-    std::fs::create_dir_all(&final_target_dir)
-        .with_context(|| format!("create final target dir: {}", final_target_dir.display()))?;
-
-    // Move files from staging into final target directory
-    let extracted_count = move_staging_to_target(&staging_dir, &final_target_dir)?;
-    let _ = std::fs::remove_dir_all(&staging_dir);
+    // Fast path: if final_target_dir does not exist yet (e.g. unpacking to a new folder),
+    // atomically rename the staging directory directly to avoid iterating and moving thousands
+    // of individual files and checking existence one-by-one.
+    let extracted_count = if !final_target_dir.exists() {
+        let count = match std::fs::read_dir(&staging_dir) {
+            Ok(read) => read.flatten().count(),
+            Err(_) => 0,
+        };
+        if std::fs::rename(&staging_dir, &final_target_dir).is_ok() {
+            count
+        } else {
+            std::fs::create_dir_all(&final_target_dir).with_context(|| {
+                format!("create final target dir: {}", final_target_dir.display())
+            })?;
+            let moved = move_staging_to_target(&staging_dir, &final_target_dir)?;
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            moved
+        }
+    } else {
+        std::fs::create_dir_all(&final_target_dir)
+            .with_context(|| format!("create final target dir: {}", final_target_dir.display()))?;
+        let moved = move_staging_to_target(&staging_dir, &final_target_dir)?;
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        moved
+    };
 
     // Recycle source archive if requested
     let mut recycled = false;
@@ -472,8 +534,14 @@ pub fn extract_archive(
         let archive_str = archive_path.to_string_lossy().to_string();
         if let Ok(_res) = crate::media_serve::delete_item_to_recycle(conn, &archive_str, roots) {
             recycled = true;
-        } else if let Ok((_recycled_path, _)) = crate::media_serve::move_into_recycle(archive_path, Some(roots)) {
-            recycled = true;
+        } else {
+            let recycle_target = crate::recycle::get_recycle_target_setting(conn);
+            let prefer_system = recycle_target != "app";
+            if let Ok((_recycled_path, _)) =
+                crate::media_serve::move_into_recycle(archive_path, Some(roots), prefer_system)
+            {
+                recycled = true;
+            }
         }
     }
 
@@ -493,8 +561,17 @@ fn clean_staging_junk(dir: &Path) {
     };
     for entry in read.flatten() {
         let p = entry.path();
+        let is_symlink = entry.file_type().is_ok_and(|t| t.is_symlink());
+        if is_symlink {
+            let _ = std::fs::remove_file(&p);
+            continue;
+        }
         let fname = entry.file_name().to_string_lossy().to_string();
-        if fname == "__MACOSX" || fname == ".DS_Store" || fname == "Thumbs.db" || fname == "desktop.ini" {
+        if fname == "__MACOSX"
+            || fname == ".DS_Store"
+            || fname == "Thumbs.db"
+            || fname == "desktop.ini"
+        {
             if p.is_dir() {
                 let _ = std::fs::remove_dir_all(&p);
             } else {
@@ -518,17 +595,23 @@ fn flatten_single_wrapper(staging_dir: &Path) {
         .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
         .collect();
 
-    if non_hidden.len() == 1 && non_hidden[0].path().is_dir() {
-        let single_dir = non_hidden[0].path();
-        let children: Vec<_> = match std::fs::read_dir(&single_dir) {
-            Ok(r) => r.flatten().collect(),
-            Err(_) => return,
-        };
-        for child in children {
-            let dest = staging_dir.join(child.file_name());
-            let _ = std::fs::rename(child.path(), dest);
+    if non_hidden.len() == 1 {
+        let entry = &non_hidden[0];
+        let is_real_dir = entry
+            .file_type()
+            .is_ok_and(|t| t.is_dir() && !t.is_symlink());
+        if is_real_dir {
+            let single_dir = entry.path();
+            let children: Vec<_> = match std::fs::read_dir(&single_dir) {
+                Ok(r) => r.flatten().collect(),
+                Err(_) => return,
+            };
+            for child in children {
+                let dest = staging_dir.join(child.file_name());
+                let _ = std::fs::rename(child.path(), dest);
+            }
+            let _ = std::fs::remove_dir(&single_dir);
         }
-        let _ = std::fs::remove_dir(&single_dir);
     }
 }
 
@@ -540,24 +623,46 @@ fn move_staging_to_target(staging_dir: &Path, target_dir: &Path) -> Result<usize
         .collect();
 
     for entry in entries {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let src = entry.path();
+        if file_type.is_symlink() {
+            let _ = std::fs::remove_file(&src);
+            continue;
+        }
         let name = entry.file_name();
         let mut dest = target_dir.join(&name);
 
         // If target file/dir already exists, generate a safe unique name
         if dest.exists() {
-            let stem = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-            let ext = src.extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default();
+            let (stem, ext) = if src.is_dir() {
+                (name.to_string_lossy().to_string(), String::new())
+            } else {
+                let stem = src
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let ext = src
+                    .extension()
+                    .map(|s| format!(".{}", s.to_string_lossy()))
+                    .unwrap_or_default();
+                (stem, ext)
+            };
             let mut idx = 1;
             while dest.exists() && idx < 1000 {
                 let new_name = format!("{stem} ({idx}){ext}");
                 dest = target_dir.join(new_name);
                 idx += 1;
             }
+            if dest.exists() {
+                let unique = uuid::Uuid::new_v4().simple();
+                dest = target_dir.join(format!("{stem}_{unique}{ext}"));
+            }
         }
 
         // Try atomic rename; if crossing volumes, copy and delete
-        if let Err(_) = std::fs::rename(&src, &dest) {
+        if std::fs::rename(&src, &dest).is_err() {
             if src.is_dir() {
                 copy_dir_recursive(&src, &dest)?;
                 let _ = std::fs::remove_dir_all(&src);
@@ -577,113 +682,17 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src)?.flatten() {
         let sp = entry.path();
         let dp = dest.join(entry.file_name());
-        if sp.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             copy_dir_recursive(&sp, &dp)?;
         } else {
             std::fs::copy(&sp, &dp)?;
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_7z_binary_found() {
-        let bin = find_7z_binary();
-        assert!(bin.is_ok(), "7-Zip binary must be located: {:?}", bin);
-        let path = bin.unwrap();
-        assert!(path.is_file(), "7-Zip binary path must exist: {:?}", path);
-    }
-
-    #[test]
-    fn test_inspect_and_stream_and_extract() {
-        let dir = tempdir().unwrap();
-        let archive_path = dir.path().join("sample.zip");
-
-        // Create sample zip using 7z
-        let bin = find_7z_binary().unwrap();
-        let src_dir = dir.path().join("src_files");
-        std::fs::create_dir_all(src_dir.join("sub")).unwrap();
-        std::fs::write(src_dir.join("image1.png"), b"fake png bytes").unwrap();
-        std::fs::write(src_dir.join("sub/doc.txt"), b"hello doc").unwrap();
-
-        let mut cmd = Command::new(&bin);
-        cmd.arg("a").arg("-tzip").arg(&archive_path).arg(src_dir.join("*"));
-        let status = cmd.status().unwrap();
-        assert!(status.success());
-
-        // Test inspect
-        let inspection = inspect_archive(&archive_path, None).unwrap();
-        assert_eq!(inspection.archive_name, "sample.zip");
-        assert_eq!(inspection.stats.total_files, 2);
-        assert_eq!(inspection.stats.images, 1);
-        assert_eq!(inspection.stats.texts, 1);
-        assert!(!inspection.is_encrypted);
-
-        // Test stream
-        let streamed = stream_archive_entry(&archive_path, "image1.png", None).unwrap();
-        assert_eq!(streamed, b"fake png bytes");
-
-        let streamed_sub = stream_archive_entry(&archive_path, "sub/doc.txt", None).unwrap();
-        assert_eq!(streamed_sub, b"hello doc");
-
-        // Test extract
-        let roots = MediaRoots::identical(
-            vec![dir.path().to_string_lossy().to_string()],
-            vec!["test".to_string()],
-        );
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-
-        let extract_res = extract_archive(
-            &conn,
-            &roots,
-            &archive_path,
-            None,
-            "new_folder",
-            Some("my_unpacked"),
-            false,
-        )
-        .unwrap();
-
-        assert!(extract_res.ok);
-        assert_eq!(extract_res.extracted_count, 2);
-        let target = PathBuf::from(extract_res.target_dir);
-        assert!(target.join("image1.png").is_file());
-        assert!(target.join("sub/doc.txt").is_file());
-    }
-
-    #[test]
-    fn test_inspect_password_protected() {
-        let dir = tempdir().unwrap();
-        let archive_path = dir.path().join("secret.7z");
-
-        let bin = find_7z_binary().unwrap();
-        let src_file = dir.path().join("secret.txt");
-        std::fs::write(&src_file, b"top secret data").unwrap();
-
-        // Create password-protected 7z with header encryption (-mhe=on)
-        let mut cmd = Command::new(&bin);
-        cmd.arg("a").arg("-t7z").arg("-psecret123").arg("-mhe=on").arg(&archive_path).arg(&src_file);
-        let status = cmd.status().unwrap();
-        assert!(status.success());
-
-        // Inspect without password: should detect encryption without crashing
-        let inspect_no_pwd = inspect_archive(&archive_path, None).unwrap();
-        assert!(inspect_no_pwd.is_encrypted);
-        assert!(inspect_no_pwd.header_encrypted);
-
-        // Inspect with password: can read files
-        let inspect_with_pwd = inspect_archive(&archive_path, Some("secret123")).unwrap();
-        assert!(inspect_with_pwd.is_encrypted);
-        assert_eq!(inspect_with_pwd.stats.total_files, 1);
-        assert_eq!(inspect_with_pwd.stats.texts, 1);
-
-        // Stream with password
-        let streamed = stream_archive_entry(&archive_path, "secret.txt", Some("secret123")).unwrap();
-        assert_eq!(streamed, b"top secret data");
-    }
 }

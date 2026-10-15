@@ -229,25 +229,33 @@ fn assemble_move_row(
     Ok(build_move_row(
         roots,
         row,
-        item_artist,
-        candidate_artist,
-        item_artist_id,
-        candidate_artist_id,
-        item_hash,
-        item_missing,
+        MoveRowItemContext {
+            item_artist,
+            candidate_artist,
+            item_artist_id,
+            candidate_artist_id,
+            item_hash,
+            item_missing,
+        },
     ))
 }
 
-fn build_move_row(
-    roots: &MediaRoots,
-    row: BasicMoveRow,
-    item_artist: Option<&ArtistContext>,
-    candidate_artist: Option<&ArtistContext>,
+struct MoveRowItemContext<'a> {
+    item_artist: Option<&'a ArtistContext>,
+    candidate_artist: Option<&'a ArtistContext>,
     item_artist_id: Option<i64>,
     candidate_artist_id: Option<i64>,
     item_hash: String,
     item_missing: Option<i64>,
-) -> MoveRow {
+}
+
+fn build_move_row(roots: &MediaRoots, row: BasicMoveRow, ctx: MoveRowItemContext<'_>) -> MoveRow {
+    let item_artist = ctx.item_artist;
+    let candidate_artist = ctx.candidate_artist;
+    let item_artist_id = ctx.item_artist_id;
+    let candidate_artist_id = ctx.candidate_artist_id;
+    let item_hash = ctx.item_hash;
+    let item_missing = ctx.item_missing;
     let item_artist_name = item_artist
         .map(|artist| artist.name.clone())
         .unwrap_or_default();

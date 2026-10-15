@@ -15,15 +15,21 @@
       var meta=document.querySelector('meta[name="theme-color"]');
       if(meta)meta.setAttribute('content','#1A1612');
     }
+    // Language applies before first paint: <html lang> drives fonts and
+    // assistive tech, data-lang lets CSS key off the active language.
+    // initI18n syncs both again once the module graph loads.
+    var l=localStorage.getItem('gallery.lang')==='en'?'en':'zh-CN';
+    document.documentElement.setAttribute('lang',l);
+    document.documentElement.setAttribute('data-lang',l==='en'?'en':'zh');
   }catch(e){}
 })();
 </script>
 <title>画廊</title>
 <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%23F4ECDD"/><circle cx="24" cy="24" r="7" fill="%23C04B3A"/><path d="M12 48l14-18 10 12 6-7 10 13z" fill="%23C04B3A"/></svg>'>
-<link rel="stylesheet" href="/static/styles/tokens.css?v=1.1.6">
-<link rel="stylesheet" href="/static/styles/base.css?v=1.1.6">
-<link rel="stylesheet" href="/static/styles/layout.css?v=1.1.6">
-<link rel="stylesheet" href="/static/styles/views.css?v=1.1.6">
+<link rel="stylesheet" href="/static/styles/tokens.css?v=1.1.7">
+<link rel="stylesheet" href="/static/styles/base.css?v=1.1.7">
+<link rel="stylesheet" href="/static/styles/layout.css?v=1.1.7">
+<link rel="stylesheet" href="/static/styles/views.css?v=1.1.7">
 <!-- Boot module graph, preloaded without ?v= so the hrefs match the import
      specifiers exactly (./store.js from main.js resolves to /static/js/store.js).
      Without these the browser discovers each module depth-by-depth from the
@@ -35,6 +41,7 @@
 <link rel="modulepreload" href="/static/js/router.js">
 <link rel="modulepreload" href="/static/js/justified.js">
 <link rel="modulepreload" href="/static/js/events.js">
+<link rel="modulepreload" href="/static/js/i18n.js">
 <link rel="modulepreload" href="/static/js/views/theme.js">
 <link rel="modulepreload" href="/static/js/views/sidebar.js">
 <link rel="modulepreload" href="/static/js/views/grid.js">
@@ -111,6 +118,7 @@
   <button id="scanBtn" class="btn btn-ghost" type="button" title="扫描全库">扫描全库</button>
   <button id="scanFolderBtn" class="btn btn-ghost scan-folder-btn" type="button" style="display:none">扫描文件夹</button>
   <button id="stopScanBtn" class="btn btn-danger" type="button" title="停止扫描" style="display:none">停止</button>
+  <button id="langToggleBtn" class="btn btn-ghost header-lang-toggle" type="button" aria-label="切换语言" title="切换语言">EN</button>
   <button id="themeToggleBtn" class="btn btn-ghost btn-icon header-theme-toggle" type="button" aria-label="切换到深色模式" title="切换到深色模式">
     <span class="btn-glyph theme-icon-moon" aria-hidden="true">
       <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -237,6 +245,9 @@
         </button>
       </div>
       <div class="sidebar-section-body" id="folderSectionBody">
+        <div class="folder-search-bar" id="folderSearchBar" hidden>
+          <input type="search" id="folderSearchInput" placeholder="筛选文件夹" maxlength="100" autocomplete="off" aria-label="筛选文件夹">
+        </div>
         <div class="folder-tree" id="folderTree"></div>
       </div>
     </div>
@@ -254,6 +265,7 @@
       <select id="mediaFilter" class="media-filter-select" aria-label="媒体筛选" title="媒体筛选" disabled>
         <option value="">全部媒体</option>
       </select>
+      <button id="extractArtistArchivesBtn" class="btn btn-ghost" type="button" style="display:none" title="解压当前画师全部压缩包">解压压缩包</button>
       <div id="archiveTriageToggle" class="view-toggle archive-triage-toggle" role="group" aria-label="整理状态">
         <button class="btn btn-segment active" type="button" data-triage="all" aria-pressed="true">全部</button>
         <button class="btn btn-segment" type="button" data-triage="inbox" aria-pressed="false">待整理</button>
@@ -318,6 +330,7 @@
         </div>
         <div class="edit-bar-group" data-group="action" role="group" aria-label="退出与删除">
           <button class="btn btn-soft-primary" id="editArchiveFolderBtn" type="button" hidden>整理归档</button>
+          <button class="btn btn-ghost" id="editExtractArchivesBtn" type="button" hidden>解压所选</button>
           <button class="btn btn-ghost" id="editBundleItemsBtn" type="button" hidden>打包文件夹</button>
           <button class="btn btn-ghost" id="editCancelBtn" type="button">取消</button>
           <button class="btn btn-danger edit-delete-selected" id="editDeleteSelectedBtn" type="button">删除所选</button>
@@ -1011,7 +1024,43 @@
         <div class="maintenance-view-panel" data-maintenance-view-panel="records" hidden>
         <details class="maintenance-section recycle-bin-panel maintenance-advanced-detail" id="recycleBinPanel" open>
           <summary>回收站</summary>
-          <div class="maintenance-section-head"><div><div class="move-section-title">已删除作品</div><div class="health-subtitle">支持一键恢复至原位置</div></div><div class="maintenance-section-actions"><button id="recycleClearBtn" class="btn btn-ghost btn-danger" type="button" title="清空回收站">清空回收站</button><button id="recycleRefreshBtn" class="btn btn-ghost" type="button">刷新列表</button></div></div>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">已删除作品</div>
+              <div class="health-subtitle" id="recycleStrategySubtitle">当前策略：飞牛系统回收站</div>
+            </div>
+            <div class="maintenance-section-actions recycle-toolbar">
+              <div class="segment-group" role="group" aria-label="回收策略">
+                <button id="recycleStrategySystemBtn" class="btn btn-segment active" type="button" title="文件移入飞牛系统回收站" aria-pressed="true">系统回收站</button>
+                <button id="recycleStrategyAppBtn" class="btn btn-segment" type="button" title="文件移入画廊应用回收站" aria-pressed="false">应用回收站</button>
+              </div>
+              <div class="view-toggle" role="group" aria-label="视图模式">
+                <button id="recycleViewGridBtn" class="btn btn-segment active" type="button" title="网格视图" aria-pressed="true">网格</button>
+                <button id="recycleViewTableBtn" class="btn btn-segment" type="button" title="列表视图" aria-pressed="false">列表</button>
+              </div>
+              <button id="recycleRefreshBtn" class="btn btn-ghost" type="button">刷新列表</button>
+              <div class="recycle-danger-zone">
+                <button id="recycleClearBtn" class="btn btn-danger" type="button" title="清空回收站">清空回收站</button>
+              </div>
+            </div>
+          </div>
+          <div class="recycle-strategy-card" id="recycleStrategyCard">
+            <div class="recycle-strategy-card-title" id="recycleStrategyCardTitle">当前回收策略说明</div>
+            <div class="recycle-strategy-card-body" id="recycleStrategyCardBody"></div>
+          </div>
+          <div class="recycle-batch-bar" id="recycleBatchBar" hidden>
+            <div class="recycle-batch-info">
+              <label class="recycle-select-all-label">
+                <input type="checkbox" id="recycleSelectAll">
+                <span id="recycleSelectedCount">已选 0 项</span>
+              </label>
+            </div>
+            <div class="recycle-batch-actions">
+              <button id="recycleBatchRestoreBtn" class="btn btn-ops" type="button" title="还原所选作品">批量还原</button>
+              <button id="recycleBatchPurgeBtn" class="btn btn-ghost btn-danger" type="button" title="从磁盘彻底删除所选作品">彻底删除</button>
+              <button id="recycleBatchCancelBtn" class="btn btn-ghost" type="button">取消选择</button>
+            </div>
+          </div>
           <div class="recycle-bin-summary" id="recycleBinSummary">回收站读取中</div><div class="recycle-bin-list" id="recycleBinList"></div><div class="recycle-bin-more" id="recycleBinMore"></div>
         </details>
 
@@ -1093,10 +1142,41 @@
     </button>
   </div>
   <div class="artist-folder-picker-body">
-    <div class="artist-folder-picker-path" id="artistFolderMoveDirectoryPath"></div>
-    <div class="artist-folder-picker-actions"><button class="btn btn-ghost" id="artistFolderMoveDirectoryUpBtn" type="button">上一级</button></div>
+    <div class="artist-folder-picker-search-bar">
+      <input type="search" id="artistFolderMoveDirectorySearch" class="artist-folder-picker-search" placeholder="快速过滤目录" autocomplete="off">
+    </div>
+    <div class="artist-folder-picker-nav">
+      <div class="artist-folder-picker-path" id="artistFolderMoveDirectoryPath"></div>
+      <button class="btn btn-ghost btn-sm" id="artistFolderMoveDirectoryUpBtn" type="button">上一级</button>
+    </div>
     <div class="artist-folder-picker-list" id="artistFolderMoveDirectoryList"></div>
     <div class="artist-folder-picker-footer"><button class="btn btn-primary" id="artistFolderMoveDirectorySelectBtn" type="button">确定选择此目录</button></div>
+  </div>
+</dialog>
+
+<dialog class="artist-folder-picker-dialog" id="itemMoveFolderDialog" aria-labelledby="itemMoveFolderDialogTitle">
+  <div class="artist-links-dialog-head">
+    <h2 id="itemMoveFolderDialogTitle">移动至文件夹</h2>
+    <button class="btn btn-ghost btn-icon" id="itemMoveFolderCloseBtn" type="button" aria-label="关闭文件夹选择" title="关闭文件夹选择">
+      <span class="btn-glyph" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12"></path><path d="M18 6 6 18"></path></svg></span>
+    </button>
+  </div>
+  <div class="artist-folder-picker-body">
+    <div class="artist-folder-picker-search-bar">
+      <input type="search" id="itemMoveFolderSearch" class="artist-folder-picker-search" placeholder="搜索或输入新文件夹名称" autocomplete="off">
+    </div>
+    <div class="item-move-recent-bar" id="itemMoveRecentBar" hidden>
+      <span class="item-move-recent-title">最近使用</span>
+      <div class="item-move-recent-list" id="itemMoveRecentList"></div>
+    </div>
+    <div class="artist-folder-picker-list item-move-folder-tree" id="itemMoveFolderTree"></div>
+    <div class="artist-folder-picker-footer">
+      <div class="item-move-target-preview" id="itemMoveTargetPreview">未选择目标文件夹</div>
+      <div class="item-move-footer-actions">
+        <button class="btn btn-ghost" id="itemMoveFolderCancelBtn" type="button">取消</button>
+        <button class="btn btn-primary" id="itemMoveFolderConfirmBtn" type="button" disabled>确定移动</button>
+      </div>
+    </div>
   </div>
 </dialog>
 
@@ -1199,6 +1279,64 @@
   </div>
 </dialog>
 
+<dialog class="artist-links-dialog archive-dialog batch-archive-dialog" id="batchArchiveDialog" aria-labelledby="batchArchiveDialogTitle">
+  <div class="artist-links-dialog-head">
+    <h2 id="batchArchiveDialogTitle">批量解压压缩包</h2>
+    <button class="btn btn-ghost btn-icon" id="batchArchiveDialogCloseBtn" type="button" aria-label="关闭批量解压窗口" title="关闭批量解压窗口">
+      <span class="btn-glyph" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path d="M6 6l12 12"></path>
+          <path d="M18 6 6 18"></path>
+        </svg>
+      </span>
+    </button>
+  </div>
+  <div class="artist-links-dialog-body archive-dialog-body">
+    <div class="archive-info-summary" id="batchArchiveInfoSummary"></div>
+    <div class="batch-archive-scope-toggle" id="batchArchiveScopeToggleWrap" style="display:none">
+      <label class="archive-radio-label">
+        <input type="radio" name="batchArchiveScope" value="selected" checked>
+        <span id="batchArchiveScopeSelectedLabel">解压选中的压缩包</span>
+      </label>
+      <label class="archive-radio-label">
+        <input type="radio" name="batchArchiveScope" value="all_artist">
+        <span id="batchArchiveScopeArtistLabel">解压该画师全部压缩包</span>
+      </label>
+    </div>
+    <div class="archive-options-section">
+      <div class="archive-target-modes">
+        <label class="archive-radio-label">
+          <input type="radio" name="batchArchiveTargetMode" value="new_folder" checked>
+          <span>为每个压缩包新建同名文件夹 (推荐，防文件混淆)</span>
+        </label>
+        <label class="archive-radio-label">
+          <input type="radio" name="batchArchiveTargetMode" value="current_folder">
+          <span>解压到当前所在目录</span>
+        </label>
+      </div>
+      <div class="batch-archive-password-wrap">
+        <label for="batchArchivePasswordInput"><span>通用解压密码（可选，遇密码错误自动跳过）：</span></label>
+        <input type="password" id="batchArchivePasswordInput" class="input input-sm" placeholder="输入密码，留空则尝试无密码解压" autocomplete="off" aria-label="通用解压密码">
+      </div>
+      <label class="archive-checkbox-label">
+        <input type="checkbox" id="batchArchiveRecycleSource" checked>
+        <span>解压后将原压缩包移入回收站 (可在回收站随时恢复)</span>
+      </label>
+      <label class="archive-checkbox-label">
+        <input type="checkbox" id="batchArchiveAutoArchive">
+        <span>解压后生成归档计划</span>
+      </label>
+    </div>
+  </div>
+  <div class="archive-dialog-footer">
+    <div class="archive-status-msg" id="batchArchiveStatusMsg"></div>
+    <div class="archive-dialog-actions">
+      <button class="btn btn-ghost" type="button" id="batchArchiveCancelBtn">取消</button>
+      <button class="btn btn-danger" type="button" id="batchArchiveExtractBtn">开始批量解压</button>
+    </div>
+  </div>
+</dialog>
+
 <dialog class="artist-links-dialog error-artists-dialog" id="errorArtistsDialog" aria-labelledby="errorArtistsDialogTitle">
   <div class="artist-links-dialog-head">
     <h2 id="errorArtistsDialogTitle">出错画师</h2>
@@ -1247,8 +1385,8 @@
           <ul class="maintenance-guide-list">
             <li>按画师、文件夹、角色多维度筛选，或搜索角色与文件名。</li>
             <li>画师支持全名、拼音及关键字模糊搜索。</li>
-            <li>图片支持大图浏览，视频即点即播，文本（.txt/.md/.html）直接阅读，源文件与压缩包支持原文件下载。</li>
-            <li>缩略图按需生成并自动缓存，再次打开更快。</li>
+            <li>图片支持大图浏览，视频即点即播，文本（.txt/.md/.html）直接阅读；ZIP/RAR/7Z 压缩包支持免解压目录树预览与直接解压。</li>
+            <li>支持 4:3 完整展示与 3:4 竖版裁切卡片比例切换；缩略图按需生成并自动缓存。</li>
           </ul>
         </section>
 
@@ -1294,6 +1432,26 @@
           <div class="maintenance-guide-item">
             <b>备份</b>
             <span>点击「立即备份数据库」创建快照，保存角色/路径等元数据，不含图片与视频。</span>
+          </div>
+          <div class="maintenance-guide-item">
+            <b>订阅与转存</b>
+            <span>在「订阅下载」管理画师自动抓取与命名模板；在「网盘转存」对接下载器与转存任务。</span>
+          </div>
+        </section>
+
+        <section class="maintenance-guide-block">
+          <h3>快捷操作</h3>
+          <div class="maintenance-guide-item">
+            <b>检索与删除</b>
+            <span>按 Ctrl+K 聚焦搜索框；选定文件后按 Delete 可移入回收站。</span>
+          </div>
+          <div class="maintenance-guide-item">
+            <b>灯箱操作</b>
+            <span>按 ← / → 切换前后项，Esc 退出；F 收藏，D 下载，I 切换信息面板。</span>
+          </div>
+          <div class="maintenance-guide-item">
+            <b>语言切换</b>
+            <span>顶栏右侧支持 EN / 中 一键切换界面语言。</span>
           </div>
         </section>
 
@@ -1400,7 +1558,7 @@
     </span>
   </button>
   <div class="lightbox-stage" id="lightboxStage">
-    <img id="lightboxImg" alt="" style="display:none">
+    <img id="lightboxImg" alt="" draggable="false" style="display:none">
     <video id="lightboxVideo" controls preload="metadata" playsinline webkit-playsinline style="display:none"></video>
     <div id="lightboxFile" class="lightbox-file" style="display:none"></div>
     <div id="lightboxText" class="lightbox-text" style="display:none"></div>
@@ -1418,7 +1576,7 @@
   </div>
 </div>
 
-<script type="module" src="/static/js/main.js?v=1.1.6"></script>
+<script type="module" src="/static/js/main.js?v=1.1.7"></script>
 
 </body>
 </html>

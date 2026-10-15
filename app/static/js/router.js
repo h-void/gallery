@@ -157,7 +157,9 @@ export function naturalArtistList(artists = state.artists) {
 }
 
 export function artistOptionButtonHtml(artist, className = 'artist-option', extraAttrs = '') {
-  return `<button class="${className}" type="button"${extraAttrs} data-artist-id="${artist.id}" title="${escHtml(artist.path || artist.name)}">
+  // The artist name and path are user data, so neither the label nor the title
+  // may be rewritten by the i18n auto pass.
+  return `<button class="${className}" type="button"${extraAttrs} data-i18n-skip data-artist-id="${artist.id}" title="${escHtml(artist.path || artist.name)}">
     <span>${escHtml(artist.name)}</span>
     <strong>${artist.item_count || 0}</strong>
   </button>`;

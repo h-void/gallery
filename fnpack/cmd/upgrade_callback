@@ -12,11 +12,20 @@ log() {
     printf '%s\n' "$*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
+NO_LEGACY_SOURCES=""
+
 copy_legacy_share() {
     source_dir="$1"
     target_dir="$2"
     label="$3"
-    [ -n "$source_dir" ] && [ -d "$source_dir" ] || return 0
+    if [ -z "$source_dir" ] || [ ! -d "$source_dir" ]; then
+        # Record the miss instead of reporting a silent success: the caller uses
+        # it to tell "this library has no legacy share" apart from "the lookup
+        # found nothing", which used to look identical — and permanently disabled
+        # the fallback while the app served an empty data share.
+        NO_LEGACY_SOURCES="1"
+        return 0
+    fi
     if ! mkdir -p "$target_dir" || ! cp -a "$source_dir"/. "$target_dir"/; then
         log "Gallery upgrade aborted: unable to migrate legacy $label from $source_dir to $target_dir."
         return 1
@@ -28,7 +37,10 @@ copy_legacy_share_if_missing() {
     source_dir="$1"
     target_dir="$2"
     label="$3"
-    [ -n "$source_dir" ] && [ -d "$source_dir" ] || return 0
+    if [ -z "$source_dir" ] || [ ! -d "$source_dir" ]; then
+        NO_LEGACY_SOURCES="1"
+        return 0
+    fi
     if [ -e "$target_dir" ] && [ ! -d "$target_dir" ]; then
         log "Gallery upgrade aborted: destination $label is not a directory."
         return 1
@@ -40,12 +52,28 @@ copy_legacy_share_if_missing() {
     copy_legacy_share "$source_dir" "$target_dir" "$label"
 }
 
+is_valid_database() {
+    db_path="$1"
+    [ -n "$db_path" ] && [ -f "$db_path" ] || return 1
+    if command -v sqlite3 >/dev/null 2>&1; then
+        quick_check_output="$(sqlite3 "$db_path" 'PRAGMA quick_check;' 2>&1)" || return 1
+        [ "$(printf '%s\n' "$quick_check_output" | head -n 1)" = "ok" ]
+    else
+        [ "$(head -c 15 "$db_path" 2>/dev/null || true)" = "SQLite format 3" ]
+    fi
+}
+
 verify_database_integrity() {
     db_path="$1"
     [ -n "$db_path" ] && [ -f "$db_path" ] || return 0
     if ! command -v sqlite3 >/dev/null 2>&1; then
-        log "Gallery upgrade aborted: sqlite3 CLI unavailable; cannot validate $db_path."
-        return 1
+        header="$(head -c 15 "$db_path" 2>/dev/null || true)"
+        if [ "$header" = "SQLite format 3" ]; then
+            log "Gallery upgrade note: sqlite3 CLI unavailable; verified SQLite header for $db_path."
+        else
+            log "Gallery upgrade warning: sqlite3 CLI unavailable and $db_path does not start with the SQLite header; the file may be corrupt or replaced. Continuing upgrade without an integrity check."
+        fi
+        return 0
     fi
     quick_check_output="$(sqlite3 "$db_path" 'PRAGMA quick_check;' 2>&1)"
     sqlite3_rc=$?
@@ -89,10 +117,46 @@ migrate_legacy_data_shares() {
         log "Gallery upgrade aborted: destination database is not a regular file."
         return 1
     fi
+    # Reset the miss flag so it speaks only for this run, then remember whether a
+    # database actually came across: that is the one thing this migration cannot
+    # fabricate, and its absence is what makes an empty data share possible.
+    NO_LEGACY_SOURCES=""
+    database_migrated=0
     if [ -f "$destination_db" ]; then
-        log "Gallery upgrade found existing gallery/data/gallery.db; leaving database unchanged."
-    elif ! copy_legacy_share "$legacy_data_dir" "$data_share_root/data" "database data"; then
-        return 1
+        if is_valid_database "$destination_db"; then
+            log "Gallery upgrade found existing gallery/data/gallery.db; leaving database unchanged."
+        elif [ -f "$legacy_data_dir/gallery.db" ]; then
+            # An interrupted migration (power loss or full disk during the copy)
+            # can leave a half-written destination database behind. Mere
+            # existence used to read as "already migrated", so every later
+            # upgrade aborted on the integrity check with no recovery path. The
+            # legacy source is still present, so the copy is restartable: move
+            # the unreadable file aside and migrate again.
+            aside="$destination_db.interrupted-$(date +%Y%m%d%H%M%S)"
+            if ! mv "$destination_db" "$aside"; then
+                log "Gallery upgrade aborted: unable to move the unreadable $destination_db aside."
+                return 1
+            fi
+            [ -f "$destination_db-wal" ] && mv "$destination_db-wal" "$aside-wal" 2>/dev/null || true
+            [ -f "$destination_db-shm" ] && mv "$destination_db-shm" "$aside-shm" 2>/dev/null || true
+            log "Gallery upgrade moved the failed database aside: $aside; re-migrating from $legacy_data_dir."
+            if ! copy_legacy_share "$legacy_data_dir" "$data_share_root/data" "database data"; then
+                return 1
+            fi
+            if [ -f "$destination_db" ]; then
+                database_migrated=1
+            fi
+        else
+            log "Gallery upgrade aborted: $destination_db failed its integrity check and no legacy source database exists to re-migrate from."
+            return 1
+        fi
+    else
+        if ! copy_legacy_share "$legacy_data_dir" "$data_share_root/data" "database data"; then
+            return 1
+        fi
+        if [ -f "$destination_db" ]; then
+            database_migrated=1
+        fi
     fi
     if ! verify_database_integrity "$destination_db"; then
         return 1
@@ -104,6 +168,14 @@ migrate_legacy_data_shares() {
     if [ -n "$migration_root" ] && [ -d "$migration_root" ] && ! rm -rf "$migration_root"; then
         log "Gallery upgrade aborted: unable to remove legacy migration staging."
         return 1
+    fi
+    if [ "$database_migrated" -eq 0 ] && [ -n "$NO_LEGACY_SOURCES" ] && [ ! -f "$destination_db" ]; then
+        # No destination database, nobody supplied one, and no source was found in
+        # either location: almost certainly a path/name mismatch rather than
+        # "this library has nothing to migrate". Leave the marker unwritten so the
+        # next upgrade retries, and say which paths were probed.
+        log "Gallery upgrade legacy share migration skipped: no legacy data found (probed $legacy_data_dir, and $destination_db is absent). Not recording completion so the next upgrade retries."
+        return 0
     fi
     if ! : > "$migration_marker"; then
         log "Gallery upgrade aborted: unable to record legacy migration completion."

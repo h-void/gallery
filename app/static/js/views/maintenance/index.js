@@ -8,7 +8,7 @@ import { toast, logUiAction } from '../../logging.js';
 import { loadHealthSummary, loadHashStatus, loadFolderRenameAutoStatus, loadErrorArtistsSummary, loadMlRuntime, loadDimensionBackfillStatus, renderHealthSummary, renderHashStatus, renderFolderRenameAutoStatus, renderMlRuntime, renderOverviewActions, renderDimensionBackfillStatus } from './overview.js';
 import { renderMovePathSummary, renderMoveCandidates, renderMoveCandidateGroups, renderMoveHistory } from './paths.js';
 import { loadArtistFolderMove, loadArchiveWorkbench, renderArtistFolderMove, renderArchiveWorkbench, archiveCurrentArtistId } from './organize.js';
-import { loadCharacterLibrary, characterImportJobBusy, renderCharacterLibrary } from './characters.js';
+import { loadCharacterLibrary, characterImportJobBusy, renderCharacterLibrary, stopCharacterImportPolling } from './characters.js';
 import { loadDownloadsPanel, renderDownloadsPanel, stopDownloadSyncPolling, openDownloadAllWorks } from './downloads.js';
 import { loadNetdiskPanel, renderNetdiskPanel } from './netdisk.js';
 import { loadOperationLog, loadRecycleBin, renderOperationLog, renderRecycleBin } from './records.js';
@@ -156,7 +156,24 @@ function maintenanceRefreshDelayMs() {
   return activeMaintenanceViewHasActiveWork() ? MAINTENANCE_AUTO_REFRESH_MS : MAINTENANCE_IDLE_REFRESH_MS;
 }
 
+export function syncMaintenanceTabBadges() {
+  const pathsTab = $('.maintenance-view-tabs [data-maintenance-view="paths"]');
+  if (pathsTab) {
+    const pendingPaths = Number(state.movePendingTotal || 0);
+    if (pendingPaths > 0) pathsTab.dataset.badge = String(pendingPaths);
+    else delete pathsTab.dataset.badge;
+  }
+  const organizeTab = $('.maintenance-view-tabs [data-maintenance-view="organize"]');
+  if (organizeTab) {
+    const plans = Array.isArray(state.archivePlans) ? state.archivePlans : [];
+    const pendingPlans = plans.filter(p => p && p.status !== 'executed' && p.status !== 'reverted').length;
+    if (pendingPlans > 0) organizeTab.dataset.badge = String(pendingPlans);
+    else delete organizeTab.dataset.badge;
+  }
+}
+
 function renderActiveMaintenanceView(view) {
+  syncMaintenanceTabBadges();
   if (view === 'overview') {
     renderHealthSummary();
     renderHashStatus();
@@ -204,12 +221,18 @@ function maintenanceRequestScope(view) {
 }
 
 export async function refreshActiveMaintenanceView(options = {}) {
-  const preservedScrollTop = options.preserveScroll ? movePanelScrollTop() : null;
   const view = options.view || state.maintenanceView || 'overview';
   const scope = maintenanceRequestScope(view);
   if (activeMaintenanceRequest && activeMaintenanceRequest.view === view && activeMaintenanceRequest.scope === scope) {
-    return activeMaintenanceRequest.promise;
+    // Reusing the in-flight request must still serve this caller's scroll
+    // intent. The capture happens here, not before this branch: a value taken
+    // earlier belonged to the older request, which restores its own position,
+    // so this caller's restore never ran and the panel kept a stale scroll.
+    const reused = activeMaintenanceRequest.promise;
+    if (!options.preserveScroll) return activeMaintenanceRequest.promise;
+    return reused.then(() => restoreMovePanelScroll(movePanelScrollTop()));
   }
+  const preservedScrollTop = options.preserveScroll ? movePanelScrollTop() : null;
   const seq = nextRequestSeq('maintenanceLoadSeq');
   abortActiveMaintenanceRequest();
   const controller = new AbortController();
@@ -314,12 +337,22 @@ export function setMaintenanceView(view, options = {}) {
   // Without this the poll keeps hitting /api/pawchive/status every 2s for up to
   // SYNC_POLL_MAX ticks after the user has navigated away.
   if (selected !== 'downloads') stopDownloadSyncPolling();
+  // Same reason for the character import poll (1s): the 角色 panel is hidden, so
+  // the progress it reports is invisible, and its own stop paths only run when
+  // the job ends or five polls fail in a row.
+  if (selected !== 'characters') stopCharacterImportPolling();
   // 全部作品 is read when the panel is shown, not on every auto-refresh tick:
   // it is a paged list the user is building a selection in. The call is
   // fire-and-forget because the view renders from store state, and its own error
   // state is where a failure shows.
   if (selected === 'downloads') {
     openDownloadAllWorks().catch(() => {});
+  }
+  if (selected === 'organize') {
+    const workbenchPanel = $('#archiveWorkbenchPanel');
+    if (workbenchPanel && !workbenchPanel.open) {
+      workbenchPanel.open = true;
+    }
   }
   if (selected === 'paths') {
     const target = $('.maintenance-workbench');

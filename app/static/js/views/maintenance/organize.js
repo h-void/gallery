@@ -3,12 +3,14 @@
 
 import { API } from '../../api.js';
 import { state, isActionBusy, setActionBusy, isCurrentRequestSeq } from '../../store.js';
-import { $, escHtml, formatBytes, formatSize, joinUiMeta, isAbortError, copyText, folderTreeHasPath } from '../../utils.js';
+import { $, escHtml, formatBytes, formatSize, joinUiMeta, isAbortError, copyText, folderTreeHasPath, buttonIcon } from '../../utils.js';
 import { toast } from '../../logging.js';
+import { t } from '../../i18n.js';
 import { loadArtists, selectArtist } from '../../router.js';
 import { applyMode } from '../../events.js';
 import { selectFolder } from '../sidebar.js';
 import { renderDownloadArtistFolder } from './downloads.js';
+import { syncMaintenanceTabBadges } from './index.js';
 
 export async function loadArtistFolderMove(options = {}) {
   try {
@@ -40,6 +42,11 @@ function artistFolderMoveRelativeDestination() {
 // Which root the browser walks, and where a confirmed path lands. Each caller
 // keeps its own root select and its own destination field, so one dialog serves
 // both the artist-move destination and a new subscription's parent folder.
+function artistFolderMoveRootIndex() {
+  const rootIndex = Number($('#artistFolderMoveRoot')?.value);
+  return Number.isInteger(rootIndex) ? rootIndex : null;
+}
+
 function directoryPickerRootIndex() {
   const selector = state.directoryPickerPurpose === 'downloadArtist'
     ? '#downloadSubscriptionRoot'
@@ -60,7 +67,7 @@ export function closeDirectoryPicker() {
   if (dialog?.open) dialog.close();
 }
 
-function renderDirectoryPicker() {
+export function renderDirectoryPicker() {
   const path = $('#artistFolderMoveDirectoryPath');
   const list = $('#artistFolderMoveDirectoryList');
   const up = $('#artistFolderMoveDirectoryUpBtn');
@@ -74,20 +81,50 @@ function renderDirectoryPicker() {
   }
   const currentPath = state.directoryPickerPath || '';
   const root = directoryPickerRoots().find(item => Number(item.index) === directoryPickerRootIndex());
-  path.textContent = [root?.label || root?.path || '媒体目录', currentPath].filter(Boolean).join(' / ');
+  const rootLabel = root?.label || root?.path || '媒体目录';
+
+  const segments = currentPath ? currentPath.split('/').filter(Boolean) : [];
+  let trail = `<button class="artist-folder-breadcrumb-item" type="button" data-artist-folder-breadcrumb="">${escHtml(rootLabel)}</button>`;
+  let cur = '';
+  for (let i = 0; i < segments.length; i++) {
+    cur = cur ? `${cur}/${segments[i]}` : segments[i];
+    trail += ` <span class="artist-folder-breadcrumb-sep" aria-hidden="true">/</span> `;
+    if (i === segments.length - 1) {
+      trail += `<span class="artist-folder-breadcrumb-current">${escHtml(segments[i])}</span>`;
+    } else {
+      trail += `<button class="artist-folder-breadcrumb-item" type="button" data-artist-folder-breadcrumb="${escHtml(cur)}">${escHtml(segments[i])}</button>`;
+    }
+  }
+  path.innerHTML = trail;
+
   up.disabled = state.directoryPickerLoading || !currentPath;
   select.disabled = state.directoryPickerLoading;
   select.textContent = state.directoryPickerLoading ? '读取中' : '确定选择此目录';
+
+  const filterText = String(state.directoryPickerFilter || '').trim().toLowerCase();
+  const entries = state.directoryPickerEntries || [];
+  const filtered = filterText
+    ? entries.filter(name => String(name).toLowerCase().includes(filterText))
+    : entries;
+
   list.innerHTML = state.directoryPickerLoading
-    ? '<div class="move-empty small">读取目录中</div>'
-    : (state.directoryPickerEntries.length
-      ? state.directoryPickerEntries.map(name => `<button class="artist-folder-picker-entry" type="button" data-artist-folder-directory="${escHtml(name)}">${escHtml(name)}</button>`).join('')
-      : '<div class="move-empty small">这个目录下没有可进入的文件夹</div>');
+    ? `<div class="move-empty small">${t('读取目录中')}</div>`
+    : (filtered.length
+      ? filtered.map(name => `
+        <button class="artist-folder-picker-entry" type="button" data-artist-folder-directory="${escHtml(name)}">
+          <span class="artist-folder-entry-icon" aria-hidden="true">${buttonIcon('folder')}</span>
+          <span class="artist-folder-entry-name" data-i18n-skip>${escHtml(name)}</span>
+        </button>
+      `).join('')
+      : `<div class="move-empty small">${filterText ? t('未找到匹配的文件夹') : t('这个目录下没有可进入的文件夹')}</div>`);
 }
 
 export async function loadDirectoryPicker(path = '') {
   const rootIndex = directoryPickerRootIndex();
   if (rootIndex == null || state.directoryPickerLoading) return;
+  state.directoryPickerFilter = '';
+  const searchInput = $('#artistFolderMoveDirectorySearch');
+  if (searchInput) searchInput.value = '';
   state.directoryPickerLoading = true;
   renderDirectoryPicker();
   try {
@@ -113,6 +150,9 @@ export async function openDirectoryPicker(purpose, opener) {
   if (directoryPickerRootIndex() == null) return;
   state.directoryPickerPath = '';
   state.directoryPickerEntries = [];
+  state.directoryPickerFilter = '';
+  const searchInput = $('#artistFolderMoveDirectorySearch');
+  if (searchInput) searchInput.value = '';
   dialog.showModal();
   await loadDirectoryPicker();
   opener?.blur();
@@ -155,7 +195,7 @@ export function renderOrganizeArtistSelect() {
 
   const options = [
     '<option value="">选择画师...</option>',
-    ...artists.map(a => `<option value="${Number(a.id)}"${currentId === Number(a.id) ? ' selected' : ''}>${escHtml(a.name || a.path || `画师 #${a.id}`)}</option>`),
+    ...artists.map(a => `<option value="${Number(a.id)}"${currentId === Number(a.id) ? ' selected' : ''}>${escHtml(a.name || a.path || t('画师 #{id}', {id: a.id}))}</option>`),
   ];
   select.innerHTML = options.join('');
   if (currentId != null) select.value = String(currentId);
@@ -219,7 +259,7 @@ export function renderArtistFolderMove() {
     : String(rootSelect?.value ?? state.artistFolderMovePreview?.target_root_index ?? '');
   if (rootSelect) {
     rootSelect.innerHTML = state.artistFolderMoveRoots.map(root => (
-      `<option value="${Number(root.index)}">${escHtml(root.label || root.path || `目录 ${Number(root.index) + 1}`)}</option>`
+      `<option value="${Number(root.index)}">${escHtml(root.label || root.path || t('目录 {index}', {index: +root.index + 1}))}</option>`
     )).join('');
     if (selectedRoot && state.artistFolderMoveRoots.some(root => String(root.index) === selectedRoot)) {
       rootSelect.value = selectedRoot;
@@ -253,26 +293,26 @@ export function renderArtistFolderMove() {
   if (!artist) {
     result.textContent = '先选择画师';
   } else if (state.artistFolderMoveError) {
-    result.textContent = `读取失败：${state.artistFolderMoveError}`;
+    result.textContent = `${t('读取失败：{state}', {state: state.artistFolderMoveError})}`;
   } else if (!preview || Number(preview.artist_id) !== Number(artist.id)) {
     result.textContent = '';
   } else {
     const conflicts = Array.isArray(preview.conflicts) ? preview.conflicts : [];
     const status = preview.can_execute
-      ? '可以移动'
-      : (preview.target_exists ? '目标文件夹已存在，不会覆盖' : `与现有记录冲突（${conflicts.length} 处）`);
+      ? t('可以移动')
+      : (preview.target_exists ? t('目标文件夹已存在，不会覆盖') : `${t('与现有记录冲突（{conflicts} 处）', {conflicts: conflicts.length})}`);
     const conflictPaths = conflicts.map(row => String(row?.path || '')).filter(Boolean).slice(0, 2);
     const conflictNote = conflicts.length
-      ? `<div class="move-warning">${escHtml(conflictPaths.join('；'))}${conflicts.length > 2 ? ` 等 ${conflicts.length} 处` : ''}</div>`
+      ? `<div class="move-warning">${escHtml(conflictPaths.join('；'))}${conflicts.length > 2 ? ` ${t('等 {count} 处', {count: conflicts.length})}` : ''}</div>`
       : '';
     // P6: 来源与去向并排展示，容量随 P1 的 formatSize。
     result.innerHTML = `
       <strong>${escHtml(status)}</strong>
       <div class="artist-folder-move-paths">
-        <div><span>来源</span><code title="${escHtml(preview.source || '')}">${escHtml(preview.source || '')}</code></div>
-        <div><span>去向</span><code title="${escHtml(preview.target || '')}">${escHtml(preview.target || '')}</code></div>
+        <div><span>${t('来源')}</span><code title="${escHtml(preview.source || '')}">${escHtml(preview.source || '')}</code></div>
+        <div><span>${t('去向')}</span><code title="${escHtml(preview.target || '')}">${escHtml(preview.target || '')}</code></div>
       </div>
-      <span>${Number(preview.item_count || 0)} 个文件 \u00b7 ${preview.total_size != null ? formatSize(preview.total_size) : '容量未上报'}</span>
+      <span>${joinUiMeta([t('{count} 个文件', {count: Number(preview.item_count || 0)}), preview.total_size != null ? formatSize(preview.total_size) : t('容量未上报')])}</span>
       ${conflictNote}`;
   }
 }
@@ -310,7 +350,7 @@ export async function executeArtistFolderMove() {
   const preview = state.artistFolderMovePreview;
   if (!artist || !preview?.can_execute || state.artistFolderMoveLoading) return;
   // P6 确认终稿：路径来自当前有效预览。
-  if (!confirm(`将整个画师文件夹从以下位置移动到新位置。\n从：${preview.source || ''}\n到：${preview.target || ''}\n\n执行前会备份数据库。目标已存在时不会覆盖。`)) return;
+  if (!confirm(`${t('将整个画师文件夹从以下位置移动到新位置。 从：{preview} 到：{preview2} 执行前会备份数据库。目标已存在时不会覆盖。', {preview: preview.source || '', preview2: preview.target || ''})}`)) return;
   state.artistFolderMoveLoading = true;
   state.artistFolderMoveError = '';
   renderArtistFolderMove();
@@ -512,7 +552,7 @@ export async function applyArchiveTemplate() {
     state.archivePreview = result.preview || result;
     await loadArchiveWorkbench({keepRun: true});
     const updated = Number(result.updated || result.applied || 0);
-    toast(updated ? `已更新 ${updated} 个整理项` : '没有可更新的整理项', updated ? 'success' : 'info');
+    toast(updated ? `${t('已更新 {updated} 个整理项', {updated: updated})}` : '没有可更新的整理项', updated ? 'success' : 'info');
   } catch (e) {
     toast('更新整理项失败：' + (e.message || e), 'error');
   } finally {
@@ -653,6 +693,7 @@ export function toggleArchivePlansFold() {
 }
 
 export function renderArchiveWorkbench() {
+  syncMaintenanceTabBadges();
   const planList = $('#archivePlanList');
   const planSummary = $('#archivePlanSummary');
   const previewSummary = $('#archivePreviewSummary');
@@ -691,7 +732,7 @@ export function renderArchiveWorkbench() {
   }
 
   if (settings?.error) {
-    ruleStatus.textContent = `读取 Default 规则失败：${settings.error}`;
+    ruleStatus.textContent = `${t('读取 Default 规则失败：{settings}', {settings: settings.error})}`;
   } else if (profile) {
     const collisionLabel = profile.collision_strategy === 'reject'
       ? '冲突跳过'
@@ -717,27 +758,29 @@ export function renderArchiveWorkbench() {
   const reverted = plans.filter(plan => plan.status === 'reverted').length;
   const needsAttention = plans.filter(plan => ['needs_date', 'date_conflict', 'needs_tags', 'inconsistent_tags', 'manual_review', 'blocked'].includes(plan.status)).length;
   planSummary.textContent = joinUiMeta([
-    `${plans.length} 个文件夹`,
-    ready ? `${ready} 待确认` : '',
-    confirmed ? `${confirmed} 已确认（将执行）` : '',
-    needsAttention ? `${needsAttention} 需处理` : '',
-    executed ? `${executed} 已整理` : '',
-    reverted ? `${reverted} 已撤销` : '',
+    `${t('{plans} 个文件夹', {plans: plans.length})}`,
+    ready ? `${t('{ready} 待确认', {ready: ready})}` : '',
+    confirmed ? `${t('{confirmed} 已确认（将执行）', {confirmed: confirmed})}` : '',
+    needsAttention ? `${t('{needsAttention} 需处理', {needsAttention: needsAttention})}` : '',
+    executed ? `${t('{executed} 已整理', {executed: executed})}` : '',
+    reverted ? `${t('{reverted} 已撤销', {reverted: reverted})}` : '',
   ]);
 
   if (state.archiveRun?.results?.length) {
     const blocked = state.archiveRun.results.filter(row => row.status === 'error' || row.reason || row.error).length;
     previewSummary.textContent = joinUiMeta([
-      `${state.archiveRun.dry_run ? '检查' : '执行'}完成：${state.archiveRun.results.length} 个整理项`,
-      blocked ? `${blocked} 个需处理` : state.archiveRun.dry_run ? '全部可以执行' : '全部成功',
+      `${t(state.archiveRun.dry_run ? '检查完成：{count} 个整理项' : '执行完成：{count} 个整理项', {count: state.archiveRun.results.length})}`,
+      blocked ? `${t('{blocked} 个需处理', {blocked: blocked})}` : state.archiveRun.dry_run ? t('全部可以执行') : t('全部成功'),
     ]);
   } else {
     const previewPlans = state.archivePreview?.plans || [];
     if (state.archivePreview?.error) {
-      previewSummary.textContent = `预览失败：${state.archivePreview.error}`;
+      previewSummary.textContent = `${t('预览失败：{state}', {state: state.archivePreview.error})}`;
     } else if (previewPlans.length) {
       const conflicts = state.archivePreview?.conflicts?.length || 0;
-      previewSummary.textContent = `${previewPlans.length} 个目标预览${conflicts ? `，${conflicts} 个冲突` : '，均可应用'}`;
+      previewSummary.textContent = conflicts
+        ? t('{count} 个目标预览，{conflicts} 个冲突', {count: previewPlans.length, conflicts: conflicts})
+        : t('{count} 个目标预览，均可应用', {count: previewPlans.length});
     } else {
       previewSummary.textContent = '';
     }
@@ -757,21 +800,21 @@ export function renderArchiveWorkbench() {
         autoBadge.className = 'archive-auto-badge';
         confirmAllBtn.after(autoBadge);
       }
-      autoBadge.textContent = '自动整理已开启（无需确认）';
-      autoBadge.title = '自动整理开启时，符合规则的文件夹将在全库扫描时自动处理，无需手动确认';
+      autoBadge.textContent = t('自动整理已开启（无需确认）');
+      autoBadge.title = t('自动整理开启时，符合规则的文件夹将在全库扫描时自动处理，无需手动确认');
     } else {
       confirmAllBtn.hidden = false;
       if (autoBadge) autoBadge.remove();
       const unconfirmedReady = plans.filter(plan => plan.status === 'ready' && archivePlanHasTarget(plan));
       const confirmedPlans = plans.filter(plan => plan.status === 'confirmed');
       if (unconfirmedReady.length > 0) {
-        confirmAllBtn.textContent = `全部确认（${unconfirmedReady.length}）`;
+        confirmAllBtn.textContent = `${t('全部确认（{unconfirmedReady}）', {unconfirmedReady: unconfirmedReady.length})}`;
         confirmAllBtn.disabled = !artistId;
       } else if (confirmedPlans.length > 0) {
-        confirmAllBtn.textContent = `全部取消确认（${confirmedPlans.length}）`;
+        confirmAllBtn.textContent = `${t('全部取消确认（{confirmedPlans}）', {confirmedPlans: confirmedPlans.length})}`;
         confirmAllBtn.disabled = !artistId;
       } else {
-        confirmAllBtn.textContent = '全部确认';
+        confirmAllBtn.textContent = t('全部确认');
         confirmAllBtn.disabled = true;
       }
     }
@@ -790,7 +833,7 @@ export function renderArchiveWorkbench() {
     if (shouldFold) {
       foldWrap.hidden = false;
       const hiddenCount = plans.length - ARCHIVE_PLANS_FOLD_THRESHOLD;
-      foldBtn.textContent = isExpanded ? '收起' : `展开剩余 ${hiddenCount} 项`;
+      foldBtn.textContent = isExpanded ? '收起' : `${t('展开剩余 {hiddenCount} 项', {hiddenCount: hiddenCount})}`;
     } else {
       foldWrap.hidden = true;
     }
@@ -810,7 +853,7 @@ export function renderArchiveWorkbench() {
     const explanation = archiveStatusExplanation(plan);
     const confirmLabel = plan.status === 'confirmed' ? '取消确认' : '确认';
     const confirmBtnMarkup = isAutoOrganize
-      ? `<span class="archive-auto-hint" title="自动整理开启时，全库扫描完成后自动处理">自动就绪</span>`
+      ? `<span class="archive-auto-hint" title="${t('自动整理开启时，全库扫描完成后自动处理')}">${t('自动就绪')}</span>`
       : `<button class="btn btn-ghost" type="button" data-archive-plan-confirm="${planId}" ${locked || !canConfirm ? 'disabled' : ''}>${confirmLabel}</button>`;
     return `
       <div class="archive-plan-row${plan.status === 'executed' ? ' executed' : ''}${plan.status === 'reverted' ? ' reverted' : ''}" data-archive-plan-id="${planId}">
@@ -826,16 +869,16 @@ export function renderArchiveWorkbench() {
           <span class="archive-diff-arrow">➔</span>
           <div class="archive-diff-target" title="${escHtml(target)}">
             <span class="diff-tag">归档至</span>
-            <code>${escHtml(target || '（未生成目标路径）')}</code>
+            <code>${escHtml(target || t('（未生成目标路径）'))}</code>
           </div>
         </div>
         ${explanation ? `<div class="archive-plan-preview${plan.status === 'aligned' ? '' : ' blocked'}">${escHtml(explanation)}</div>` : ''}
         <div class="archive-plan-row-actions">
-          <span>${plan.file_count ? `${plan.file_count} 项` : ''}</span>
+          <span>${plan.file_count ? t('{count} 项', {count: plan.file_count}) : ''}</span>
           <div class="archive-plan-row-controls">
-            <button class="btn btn-ghost" type="button" data-archive-plan-jump="${planId}" title="在画库中定位对应文件夹">在画库中定位</button>
-            ${plan.status === 'needs_tags' ? `<button class="btn btn-ghost" type="button" data-archive-plan-annotate="${planId}" title="为该文件夹设置角色">设置角色</button>` : ''}
-            ${plan.status === 'needs_date' ? `<button class="btn btn-ghost" type="button" data-archive-plan-annotate="${planId}" title="为该文件夹设置日期">设置日期</button>` : ''}
+            <button class="btn btn-ghost" type="button" data-archive-plan-jump="${planId}" title="${t('在画库中定位对应文件夹')}">${t('在画库中定位')}</button>
+            ${plan.status === 'needs_tags' ? `<button class="btn btn-ghost" type="button" data-archive-plan-annotate="${planId}" title="${t('为该文件夹设置角色')}">${t('设置角色')}</button>` : ''}
+            ${plan.status === 'needs_date' ? `<button class="btn btn-ghost" type="button" data-archive-plan-annotate="${planId}" title="${t('为该文件夹设置日期')}">${t('设置日期')}</button>` : ''}
             ${confirmBtnMarkup}
             ${plan.status === 'executed' && !isSplit ? `<button class="btn btn-ops" type="button" data-archive-plan-undo="${planId}" ${canUndo ? '' : 'disabled'} ${undoing ? 'aria-busy="true"' : ''}>${undoing ? '撤销中' : '撤销整理'}</button>` : ''}
           </div>
@@ -914,11 +957,11 @@ export async function toggleAllArchivePlansConfirmation() {
     if (unconfirmedReady.length > 0) {
       const result = await API.postJson('/api/folder-renames/confirm-all', {artist_id: artistId});
       const count = Number(result?.confirmed || 0);
-      toast(count ? `已全部确认 ${count} 个整理项` : '没有可确认的整理项', count ? 'success' : 'info');
+      toast(count ? `${t('已全部确认 {count} 个整理项', {count: count})}` : '没有可确认的整理项', count ? 'success' : 'info');
     } else {
       const result = await API.postJson('/api/folder-renames/unconfirm-all', {artist_id: artistId});
       const count = Number(result?.unconfirmed || 0);
-      toast(`已全部取消确认（${count} 个整理项）`, 'info');
+      toast(`${t('已全部取消确认（{count} 个整理项）', {count: count})}`, 'info');
     }
     await loadArchiveWorkbench();
   } catch (e) {
@@ -934,7 +977,7 @@ export async function undoArchivePlan(planId) {
   if (!plan || !Number.isFinite(id) || plan.status !== 'executed' || isActionBusy('archive-plan-undo', String(id))) return;
   const source = String(plan.source_folder || '原始位置');
   const target = String(plan.target_folder || '整理后的位置');
-  if (!window.confirm(`确定要撤销本次整理吗？\n将把「${target}」恢复至原始路径「${source}」。`)) return;
+  if (!window.confirm(`${t('确定要撤销本次整理吗？ 将把「{target}」恢复至原始路径「{source}」。', {target: target, source: source})}`)) return;
   setActionBusy('archive-plan-undo', String(id), true);
   renderArchiveWorkbench();
   try {
@@ -980,8 +1023,8 @@ export async function executeArchivePlans(dryRun) {
   const plans = archivePlanRows();
   const unconfirmedReady = plans.filter(p => p.status === 'ready' && archivePlanHasTarget(p));
   const confirmMsg = isDirty
-    ? `确定要执行整理操作吗？\n将同时保存当前修改的规则模板「${template}」并执行整理。系统将在执行前自动创建数据库备份，确保数据安全。`
-    : '确定要执行整理操作吗？\n系统将在执行前自动创建数据库备份，确保数据安全。';
+    ? `${t('确定要执行整理操作吗？ 将同时保存当前修改的规则模板「{template}」并执行整理。系统将在执行前自动创建数据库备份，确保数据安全。', {template: template})}`
+    : t('确定要执行整理操作吗？\n系统将在执行前自动创建数据库备份，确保数据安全。');
   if (!dryRun && !window.confirm(confirmMsg)) return;
   setActionBusy('archive-plan-execute', '', true);
   try {
@@ -1015,17 +1058,17 @@ export async function executeArchivePlans(dryRun) {
     if (dryRun && successful === 0) {
       const confirmed = plans.filter(p => p.status === 'confirmed' && archivePlanHasTarget(p));
       if (confirmed.length > 0) {
-        toast(`检查完成：0 个可执行（${confirmed.length} 个已确认但未通过检查）`, 'info');
+        toast(`${t('检查完成：0 个可执行（{confirmed} 个已确认但未通过检查）', {confirmed: confirmed.length})}`, 'info');
       } else if (unconfirmedReady.length > 0) {
-        toast(`检查完成：0 个可执行（${unconfirmedReady.length} 个待确认）`, 'info');
+        toast(`${t('检查完成：0 个可执行（{unconfirmedReady} 个待确认）', {unconfirmedReady: unconfirmedReady.length})}`, 'info');
       } else {
         toast('检查完成：0 个可执行', 'info');
       }
     } else if (!dryRun && failed > 0) {
       // S9: a mixed run must not read as a full success.
-      toast(`部分整理失败：${successful} 个成功${skipped ? `、${skipped} 个跳过` : ''}、${failed} 个失败`, 'error');
+      toast((skipped ? t('部分整理失败：{successful} 个成功、{skipped} 个跳过、{failed} 个失败', {successful, skipped, failed}) : t('部分整理失败：{successful} 个成功、{failed} 个失败', {successful, failed})), 'error');
     } else {
-      toast(dryRun ? `检查完成：${successful} 个整理项可执行` : `整理完成：${successful} 个整理项`, successful ? 'success' : 'info');
+      toast(dryRun ? `${t('检查完成：{successful} 个整理项可执行', {successful: successful})}` : `${t('整理完成：{successful} 个整理项', {successful: successful})}`, successful ? 'success' : 'info');
     }
   } catch (e) {
     toast((dryRun ? '执行检查失败：' : '整理操作失败：') + (e.message || e), 'error');
@@ -1048,7 +1091,7 @@ export async function annotateArchivePlan(planId) {
   // date. The date gap cannot be closed by tagging, so it asks for a date and
   // sends the manual_date the annotate endpoint already accepts.
   if (plan.status === 'needs_date') {
-    const rawDate = window.prompt(`为「${plan.source_folder}」设置日期（YYYY-MM 或 YYYY-MM-DD）：`);
+    const rawDate = window.prompt(`${t('为「{plan}」设置日期（YYYY-MM 或 YYYY-MM-DD）：', {plan: plan.source_folder})}`);
     if (rawDate == null || !rawDate.trim()) return;
     const manualDate = rawDate.trim();
     if (!/^\d{4}-\d{2}(-\d{2})?$/.test(manualDate)) {
@@ -1061,14 +1104,14 @@ export async function annotateArchivePlan(planId) {
         folder: plan.source_folder,
         manual_date: manualDate,
       });
-      toast(`已设置日期 ${manualDate}`, 'success');
+      toast(`${t('已设置日期 {manualDate}', {manualDate: manualDate})}`, 'success');
       await loadArchiveWorkbench({keepPreview: true});
     } catch (e) {
       toast('设置日期失败：' + (e.message || e), 'error');
     }
     return;
   }
-  const tagName = window.prompt(`为「${plan.source_folder}」补充角色：`);
+  const tagName = window.prompt(`${t('为「{plan}」补充角色：', {plan: plan.source_folder})}`);
   if (!tagName || !tagName.trim()) return;
   try {
     await API.postJson('/api/folders/annotate', {

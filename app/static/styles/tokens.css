@@ -35,6 +35,12 @@
   --accent:#C04B3A;--accent-solid:#C04B3A;--accent-deep:#9A3B2E;--accent-soft:rgba(192,75,58,.12);
   --accent-line:rgba(192,75,58,.45);--accent-faint:rgba(192,75,58,.08);
   --accent-selection:rgba(192,75,58,.28);
+  /* --primary: legacy alias for the accent. Six rules in views.css (recycle
+     selection, artist folder picker) reference it without a fallback, so an
+     undefined name silently dropped those declarations — a selected recycle
+     card lost its frame and picker links lost their colour. Kept as an alias
+     rather than by rewriting the call sites so the accent stays single-source. */
+  --primary:var(--accent);
   /* Secondary hues: indigo for links' hover, ochre for favorites/warnings,
      moss for success, rose-stone for neutral caution, wine for destructive. */
   --indigo:#2F4A6B;

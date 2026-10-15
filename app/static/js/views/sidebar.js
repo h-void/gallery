@@ -5,14 +5,15 @@
 import { API } from '../api.js';
 import { state, nextRequestSeq, isCurrentRequestSeq } from '../store.js';
 import {
-  $, $$, escHtml, mergeTagsByNameCollator, buttonIcon,
+  $, $$, escHtml, mergeTagsByNameCollator, buttonIcon, searchableTextMatches,
 } from '../utils.js';
 import { toast, logUiAction, collectUiLogContext } from '../logging.js';
+import { t } from '../i18n.js';
 import {
   BROWSE_KINDS, syncBrowseUrl, getSavedTagSort,
 } from '../router.js';
 import { renderGrid, appendItemsToGrid, releaseAllImageLoads, releaseAllVideoPreviewLoads } from './grid.js';
-import { updateEditBar, resetCharacterTagSuggestions, scheduleCharacterTagSuggestions, applySelectionChange } from './editbar.js';
+import { updateEditBar, resetCharacterTagSuggestions, scheduleCharacterTagSuggestions, applySelectionChange, executeBundleSelectedItems } from './editbar.js';
 
 // Three-state lifecycle of the duplicate-folder section across hydration and
 // runtime updates: 'unknown' before the first completed render, 'empty' after
@@ -115,7 +116,7 @@ export function renderLibraryEmptyState() {
     // The page header already reads 「画廊」; drop the duplicate eyebrow here.
     $('#libraryEmptyKicker').hidden = true;
     $('#libraryEmptyTitle').textContent = '选择一位画师开始浏览';
-    $('#libraryEmptyText').textContent = `已有 ${state.artists.length} 位画师。从顶部搜索并选择画师，即可查看其角色、文件夹与媒体作品。`;
+    $('#libraryEmptyText').textContent = t('已有 {count} 位画师。从顶部搜索并选择画师，即可查看其角色、文件夹与媒体作品。', {count: state.artists.length});
     $('#libraryEmptyMeta').textContent = '支持全名、拼音与部分名搜索，也可全局查找角色或文件名。';
     return;
   }
@@ -255,12 +256,13 @@ function normalizeSearchScope() {
 }
 
 function searchOptionsLabel() {
-  const labels = {auto: '范围', artist: '画师', folder: '文件夹', global: '全局'};
   const scope = validSearchScope(state.searchScope);
   const tagsOnly = state.searchTarget === 'tags';
-  if (scope === 'auto' && tagsOnly) return '仅角色';
-  if (scope === 'auto') return '范围';
-  return tagsOnly ? `${labels[scope]}/角色` : labels[scope];
+  if (scope === 'auto') return tagsOnly ? t('仅角色') : t('范围');
+  if (scope === 'artist') return tagsOnly ? `${t('画师')}/${t('角色')}` : t('画师');
+  if (scope === 'folder') return tagsOnly ? `${t('文件夹')}/${t('角色')}` : t('文件夹');
+  if (scope === 'global') return tagsOnly ? `${t('全局')}/${t('角色')}` : t('全局');
+  return t('范围');
 }
 
 // S6: the clear affordance exists only while a query is present. Typed input
@@ -410,7 +412,7 @@ export function setSidebarTagRatio(ratio, persist = false) {
   const divider = $('#sidebarTagDivider');
   if (divider) {
     divider.setAttribute('aria-valuenow', String(desired));
-    divider.setAttribute('aria-valuetext', `角色 ${desired}%`);
+    divider.setAttribute('aria-valuetext', `${t('角色')} ${desired}%`);
   }
   if (persist) {
     try { localStorage.setItem(SIDEBAR_TAG_RATIO_STORAGE_KEY, String(desired)); } catch (e) {}
@@ -474,8 +476,10 @@ export function syncSidebarCollapse() {
       section.querySelectorAll('[data-sidebar-section-toggle], [data-sidebar-chevron-toggle]').forEach(toggle => {
         toggle.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
         if (toggle.dataset.sidebarChevronToggle !== undefined) {
-          const name = SIDEBAR_SECTION_NAMES[key] || key;
-          toggle.setAttribute('aria-label', `${isCollapsed ? '展开' : '折叠'}${name}`);
+          const labelKey = isCollapsed
+            ? (key === 'duplicates' ? '展开重复文件夹' : key === 'filters' ? '展开排序与日期' : key === 'tags' ? '展开角色' : '展开文件夹')
+            : (key === 'duplicates' ? '折叠重复文件夹' : key === 'filters' ? '折叠排序与日期' : key === 'tags' ? '折叠角色' : '折叠文件夹');
+          toggle.setAttribute('aria-label', t(labelKey));
         }
       });
     });
@@ -682,7 +686,7 @@ export function renderDuplicateFolders() {
   duplicateSectionLifecycle = 'present';
   section.style.display = '';
   if (appeared) setSidebarCollapsed('duplicates', false, true);
-  $('#duplicateCount').textContent = `${groups.length}组`;
+  $('#duplicateCount').textContent = t('{count}组', {count: groups.length});
   $('#duplicateList').innerHTML = groups.map(group => `
     <div class="duplicate-group">
       <div class="duplicate-name">${escHtml(group.name)} <span>${group.count}</span></div>
@@ -751,32 +755,91 @@ export function sortSidebarTags(tags) {
 
 export function renderMediaFilter() {
   const select = $('#mediaFilter');
+  const extractArtistArchivesBtn = $('#extractArtistArchivesBtn');
   const s = state.currentArtist ? state.stats : null;
   if (!s) {
     select.innerHTML = '<option value="">全部媒体</option>';
     select.disabled = true;
+    if (extractArtistArchivesBtn) extractArtistArchivesBtn.style.display = 'none';
     return;
   }
   const active = Object.values(BROWSE_KINDS).includes(state.activeRole) ? state.activeRole : '';
   const filters = [
-    ['', '全部媒体', s.total],
-    [BROWSE_KINDS.favorites, '收藏', s.favorites || 0],
-    [BROWSE_KINDS.archives, '压缩包', s.archives || 0],
-    [BROWSE_KINDS.videos, '视频', s.videos || 0],
-    [BROWSE_KINDS.sources, '源文件', s.sources || 0],
+    ['', '全部媒体 {count}', s.total],
+    [BROWSE_KINDS.favorites, '收藏 {count}', s.favorites || 0],
+    [BROWSE_KINDS.archives, '压缩包 {count}', s.archives || 0],
+    [BROWSE_KINDS.videos, '视频 {count}', s.videos || 0],
+    [BROWSE_KINDS.sources, '源文件 {count}', s.sources || 0],
   ].filter(([value, , count]) => !value || count > 0 || value === active || value === BROWSE_KINDS.favorites);
-  select.innerHTML = filters.map(([value, label, count]) =>
-    `<option value="${value}">${label} ${count}</option>`
+  select.innerHTML = filters.map(([value, template, count]) =>
+    `<option value="${value}">${t(template, {count})}</option>`
   ).join('');
   select.value = active && active !== BROWSE_KINDS.untagged ? active : '';
   select.disabled = false;
+
+  if (extractArtistArchivesBtn) {
+    const archiveCount = Number(s.archives || 0);
+    if (archiveCount > 0) {
+      extractArtistArchivesBtn.style.display = '';
+      extractArtistArchivesBtn.textContent = t('解压全部压缩包 ({count})', {count: archiveCount});
+      extractArtistArchivesBtn.title = t('批量解压当前画师名下的全部压缩包 ({count})', {count: archiveCount});
+    } else {
+      extractArtistArchivesBtn.style.display = 'none';
+    }
+  }
+}
+
+const collapsedFolderPaths = new Set();
+let folderFilterQuery = '';
+
+function countFolderNodes(node) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return 0;
+  const children = Array.isArray(node.children) ? node.children : [];
+  let total = node.path ? 1 : 0;
+  for (const child of children) {
+    total += countFolderNodes(child);
+  }
+  return total;
+}
+
+function folderNodeMatchesFilter(node, query) {
+  if (!query) return true;
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return false;
+  if (searchableTextMatches(node.name || node.path || '', query)) return true;
+  const children = Array.isArray(node.children) ? node.children : [];
+  return children.some(child => folderNodeMatchesFilter(child, query));
+}
+
+export function toggleFolderCollapse(path) {
+  if (!path) return;
+  if (collapsedFolderPaths.has(path)) {
+    collapsedFolderPaths.delete(path);
+  } else {
+    collapsedFolderPaths.add(path);
+  }
+  renderFolderTree();
 }
 
 export function renderFolderTree() {
   const tree = state.folders;
+  const searchBar = $('#folderSearchBar');
+  const searchInput = $('#folderSearchInput');
+  if (searchInput && !searchInput.dataset.bound) {
+    searchInput.dataset.bound = '1';
+    searchInput.addEventListener('input', e => {
+      folderFilterQuery = (e.target.value || '').trim();
+      renderFolderTree();
+    });
+  }
   if (!tree || typeof tree !== 'object' || Array.isArray(tree)) {
     $('#folderTree').innerHTML = '';
+    if (searchBar) searchBar.hidden = true;
     return;
+  }
+
+  const totalFolders = countFolderNodes(tree);
+  if (searchBar) {
+    searchBar.hidden = totalFolders <= 5 && !folderFilterQuery;
   }
 
   $('#folderTree').innerHTML = renderFolderNode(tree, 0);
@@ -788,31 +851,57 @@ function renderFolderNode(node, level) {
   if (Array.isArray(node)) return '';
   const path = node.path || '';
   const name = path ? node.name : '全部';
+  const children = Array.isArray(node.children) ? node.children : [];
+  if (path && folderFilterQuery && !folderNodeMatchesFilter(node, folderFilterQuery)) {
+    return '';
+  }
   const active = state.activeFolder === path || (!state.activeFolder && !path);
+  const hasChildren = Boolean(path && children.length > 0);
+  const isCollapsed = hasChildren && collapsedFolderPaths.has(path) && !folderFilterQuery;
+  const collapseToggle = hasChildren
+    ? `<button class="folder-collapse-toggle${isCollapsed ? ' is-collapsed' : ''}" type="button" data-folder-toggle="${escHtml(path)}" aria-expanded="${!isCollapsed}" title="${t('折叠或展开子目录')}" aria-label="${t('折叠或展开子目录')}">\u25be</button>`
+    : '';
   // The tree root ("全部") is a scope, not a directory: only real folders
   // carry actions.
   const folderActions = path
-    ? `<button class="btn btn-ghost btn-icon folder-annotate" type="button" data-folder-annotate="${escHtml(path)}" title="设置角色" aria-label="为文件夹「${escHtml(name)}」设置角色">${buttonIcon('file')}</button>`
-      + `<button class="btn btn-ghost btn-icon folder-delete" type="button" data-folder-delete="${escHtml(path)}" title="移入回收站" aria-label="将文件夹「${escHtml(name)}」移入回收站">${buttonIcon('trash')}</button>`
+    ? `<button class="btn btn-ghost btn-icon folder-annotate" type="button" data-folder-annotate="${escHtml(path)}" title="${t('设置角色')}" aria-label="${t('为文件夹「{name}」设置角色', {name: escHtml(name)})}">${buttonIcon('file')}</button>`
+      + `<button class="btn btn-ghost btn-icon folder-delete" type="button" data-folder-delete="${escHtml(path)}" title="${t('移入回收站')}" aria-label="${t('将文件夹「{name}」移入回收站', {name: escHtml(name)})}">${buttonIcon('trash')}</button>`
     : '';
-  let html = `<div class="folder-item${path ? '' : ' folder-all'}${active ? ' active' : ''}" data-folder="${escHtml(path)}" role="button" tabindex="0" title="${escHtml(path || name)}" style="--level:${level}">
-    <span class="folder-name">${escHtml(name)}</span><span class="count">${node.item_count || 0}</span>${folderActions}
+  // A real folder's name and title are user data ("数据" on disk), while the
+  // tree root is the "全部" scope label the UI owns, so only real folders opt
+  // out of the i18n auto pass.
+  const userDataAttr = path ? ' data-i18n-skip' : '';
+  let html = `<div class="folder-item${path ? '' : ' folder-all'}${active ? ' active' : ''}"${userDataAttr} data-folder="${escHtml(path)}" role="button" tabindex="0" title="${escHtml(path || name)}" style="--level:${level}">
+    ${collapseToggle}<span class="folder-name"${userDataAttr}>${escHtml(name)}</span><span class="count">${node.item_count || 0}</span>${folderActions}
   </div>`;
-  const children = Array.isArray(node.children) ? node.children : [];
-  children.forEach(child => {
-    html += renderFolderNode(child, level + 1);
-  });
+  if (!isCollapsed) {
+    children.forEach(child => {
+      html += renderFolderNode(child, level + 1);
+    });
+  }
   return html;
 }
 
 export function selectFolder(folder) {
   state.activeFolder = folder || null;
+  if (folder) {
+    const parts = String(folder).split('/').filter(Boolean);
+    let prefix = '';
+    for (let i = 0; i < parts.length - 1; i++) {
+      prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+      collapsedFolderPaths.delete(prefix);
+    }
+  }
   state.search = '';
   $('#searchInput').value = '';
   state.tagSearchResults = [];
   applySelectionChange([], {reason: 'select_folder', schedule: false});
   syncSearchOptionsControl();
   renderFolderTree();
+  const activeEl = $('#folderTree .folder-item.active');
+  if (activeEl && typeof activeEl.scrollIntoView === 'function') {
+    activeEl.scrollIntoView({block: 'nearest'});
+  }
   updateDuplicateFilesButton();
   scrollToItemsTop();
   syncBrowseUrl('push');
@@ -838,15 +927,23 @@ export async function deleteArtistFolder(folder) {
   if (!artist || !folder) return;
   const node = findFolderNode(state.folders, folder);
   const name = node && node.name ? node.name : folder;
-  if (!confirm(`确定将文件夹「${name}」移入回收站吗？文件夹内全部文件会一并移入回收站，可在回收站恢复。`)) return;
+  if (!confirm(t('确定将文件夹「{name}」移入回收站吗？文件夹内全部文件会一并移入回收站，可在回收站恢复。', {name}))) return;
   try {
     const result = await API.postJson('/api/folders/delete', {artist_id: artist.id, folder});
     const recycled = Number(result.recycled_items || 0) + Number(result.recycled_loose_files || 0);
     const failed = Number(result.failed || 0);
     if (failed > 0) {
-      toast(`部分文件未能移入回收站：成功 ${recycled}，失败 ${failed}`, 'error');
+      // Name the files that stayed: the backend leaves a file it could not delete
+      // as an item in place (deleting it would take the bytes with the row still
+      // active and no recycle record), so this list is what the operator has to
+      // act on.
+      const failedPaths = (Array.isArray(result.failed_paths) ? result.failed_paths : []).filter(Boolean);
+      const shown = failedPaths.slice(0, 3).join('、');
+      const more = failedPaths.length > 3 ? t('等 {count} 个', {count: failedPaths.length}) : '';
+      const detail = shown ? `（${shown}${more}）` : '';
+      toast(t('部分文件未能移入回收站：成功 {recycled}，失败 {failed}{detail}', {recycled, failed, detail}), 'error');
     } else {
-      toast(`文件夹已移入回收站：${recycled} 个文件`, 'success');
+      toast(t('文件夹已移入回收站：{count} 个文件', {count: recycled}), 'success');
     }
     if (state.activeFolder && (state.activeFolder === folder || state.activeFolder.startsWith(`${folder}/`))) {
       state.activeFolder = null;
@@ -862,14 +959,14 @@ export async function deleteArtistFolder(folder) {
     syncBrowseUrl('replace');
     loadItems();
   } catch (e) {
-    toast('删除文件夹失败：' + (e.message || e), 'error');
+    toast(t('删除文件夹失败：{detail}', {detail: e.message || e}), 'error');
   }
 }
 
 export async function annotateArtistFolder(folder) {
   const artist = state.currentArtist;
   if (!artist || !folder) return;
-  const tagName = prompt(`为文件夹「${folder}」批量添加角色：`);
+  const tagName = prompt(t('为文件夹「{folder}」批量添加角色：', {folder}));
   if (!tagName || !tagName.trim()) return;
   const { classifyFolder } = await import('./editbar.js');
   await classifyFolder(folder, [], 'add', [tagName.trim()]);
@@ -881,6 +978,12 @@ function bindFolderEvents() {
   tree.dataset.folderBound = '1';
   tree.addEventListener('click', e => {
     const target = e.target instanceof Element ? e.target : null;
+    const toggleBtn = target ? target.closest('[data-folder-toggle]') : null;
+    if (toggleBtn && tree.contains(toggleBtn)) {
+      e.stopPropagation();
+      toggleFolderCollapse(toggleBtn.dataset.folderToggle || '');
+      return;
+    }
     const annotateBtn = target ? target.closest('[data-folder-annotate]') : null;
     if (annotateBtn && tree.contains(annotateBtn)) {
       e.stopPropagation();
@@ -902,11 +1005,33 @@ function bindFolderEvents() {
     if (!target) return;
     // A focused action button keeps its native Enter/Space click; the row's
     // scope-selection handler must not also fire on those keys.
-    if (target.closest('[data-folder-delete]') || target.closest('[data-folder-annotate]')) return;
+    if (target.closest('[data-folder-delete]') || target.closest('[data-folder-annotate]') || target.closest('[data-folder-toggle]')) return;
     const el = target.closest('.folder-item');
     if (!el || !tree.contains(el)) return;
     e.preventDefault();
     selectFolder(el.dataset.folder || '');
+  });
+  tree.addEventListener('dragover', e => {
+    if (state.selectedIds.size === 0) return;
+    const el = e.target instanceof Element ? e.target.closest('.folder-item') : null;
+    if (!el || !el.dataset.folder) return;
+    e.preventDefault();
+    el.classList.add('drag-over');
+  });
+  tree.addEventListener('dragleave', e => {
+    const el = e.target instanceof Element ? e.target.closest('.folder-item') : null;
+    if (el) el.classList.remove('drag-over');
+  });
+  tree.addEventListener('drop', e => {
+    if (state.selectedIds.size === 0) return;
+    const el = e.target instanceof Element ? e.target.closest('.folder-item') : null;
+    if (!el) return;
+    e.preventDefault();
+    el.classList.remove('drag-over');
+    const folder = el.dataset.folder || '';
+    if (folder && folder !== state.activeFolder) {
+      executeBundleSelectedItems(folder);
+    }
   });
 }
 
@@ -1235,13 +1360,13 @@ export function renderTagSearchResults() {
     if (signature !== tagResultsSignature || (visible && !container.firstElementChild)) {
       tagResultsSignature = signature;
       container.innerHTML = visible
-        ? `<div class="tag-result-title">角色结果</div>
+        ? `<div class="tag-result-title">${t('角色结果')}</div>
         <div class="tag-result-list">
           ${state.tagSearchResults.map(tag => `
-            <button class="tag-result-card" type="button" data-tag-jump="${tag.id}" data-artist-id="${tag.artist_id}" title="转到 ${escHtml(tag.artist_name || '')}">
-              <span>${escHtml(tag.name)}</span>
-              <em>${escHtml(tag.artist_name || '未知画师')}</em>
-              <strong>${tag.item_count || 0} 项</strong>
+            <button class="tag-result-card" type="button" data-tag-jump="${tag.id}" data-artist-id="${tag.artist_id}" title="${t('转到 {name}', {name: escHtml(tag.artist_name || '')})}">
+              <span data-i18n-skip>${escHtml(tag.name)}</span>
+              <em${tag.artist_name ? ' data-i18n-skip' : ''}>${escHtml(tag.artist_name || '未知画师')}</em>
+              <strong>${t('{count} 项', {count: tag.item_count || 0})}</strong>
             </button>
           `).join('')}
         </div>`
@@ -1320,7 +1445,7 @@ export function syncArchiveTriageToggle() {
     btn.setAttribute('aria-pressed', active ? 'true' : 'false');
     btn.disabled = disabled;
     if (btn.dataset.triage === 'inbox' && state.stats && typeof state.stats.inbox === 'number') {
-      btn.textContent = state.stats.inbox > 0 ? `待整理 (${state.stats.inbox})` : '待整理';
+      btn.textContent = state.stats.inbox > 0 ? t('待整理 ({count})', {count: state.stats.inbox}) : '待整理';
     } else if (btn.dataset.triage === 'inbox') {
       btn.textContent = '待整理';
     }

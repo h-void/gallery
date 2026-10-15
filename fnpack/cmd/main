@@ -46,6 +46,11 @@ configure_media_roots() {
     root_index=1
     old_ifs="$IFS"
     IFS=":"
+    # Word splitting is wanted here, pathname expansion is not: a media path
+    # containing glob metacharacters (e.g. a folder named `[Group] Title`, which
+    # this library has) would otherwise expand against the working directory and
+    # shift the alias → real-path mapping handed to the app.
+    set -f
     for real_root in $TRIM_DATA_ACCESSIBLE_PATHS; do
         if [ -z "$real_root" ]; then
             continue
@@ -61,6 +66,7 @@ configure_media_roots() {
         root_index=$((root_index + 1))
     done
     IFS="$old_ifs"
+    set +f
 
     if [ -n "$legacy_roots" ]; then
         export PICTURES_ROOT="$legacy_roots"
@@ -199,7 +205,6 @@ prepare_env() {
         exit 1
     fi
 
-    export PYTHONPATH="$APP_DIR"
     configure_media_roots
 }
 
@@ -263,13 +268,45 @@ is_running() {
 
 pid_file_running() {
     pid_file="$1"
-    [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null
+    [ -f "$pid_file" ] || return 1
+    pid_is_gallery "$(cat "$pid_file" 2>/dev/null)"
 }
 
 gallery_process_pids() {
     if command -v pgrep >/dev/null 2>&1; then
         pgrep -u "$APP_USER" -x gallery-accel 2>/dev/null || true
     fi
+}
+
+# True only for a pid that really is this package's service or its `sg` wrapper.
+#
+# The pid files are written from `port_listener_pids`, which filters on nothing,
+# and every reader here used to trust the file with `kill -0` alone. A recycled
+# pid, or a foreign process that took the port after gallery-accel died during
+# the launch window, was therefore adopted as "ours": `status` reported running,
+# `start` logged success and recorded it, and a later `stop` sent it
+# SIGTERM/SIGKILL. Identity is checked against `comm`, plus the package user when
+# `ps` can report one.
+pid_is_gallery() {
+    candidate_pid="$1"
+    [ -n "$candidate_pid" ] || return 1
+    case "$candidate_pid" in
+        *[!0-9]*) return 1 ;;
+    esac
+    cmd=$(ps -p "$candidate_pid" -o comm= 2>/dev/null | tr -d '[:space:]')
+    case "$cmd" in
+        gallery-accel|sg) ;;
+        *) return 1 ;;
+    esac
+    if [ "$cmd" = "gallery-accel" ]; then
+        owner=$(ps -p "$candidate_pid" -o user= 2>/dev/null | tr -d '[:space:]')
+        # An unattributable owner is accepted (BusyBox ps, restricted /proc);
+        # the name check above is the part that matters.
+        if [ -n "$owner" ] && [ "$owner" != "$APP_USER" ]; then
+            return 1
+        fi
+    fi
+    return 0
 }
 
 gallery_processes_exist() {
@@ -374,18 +411,27 @@ stop_pid_file() {
     stop_file="$1"
     stop_label="$2"
     if pid_file_running "$stop_file"; then
-        kill "$(cat "$stop_file")" 2>/dev/null || true
+        stop_pid=$(cat "$stop_file" 2>/dev/null)
+        kill "$stop_pid" 2>/dev/null || true
         # Brief wait so children (sg → gallery-accel) can exit with the parent.
         sleep 1
-        if pid_file_running "$stop_file"; then
-            kill -9 "$(cat "$stop_file")" 2>/dev/null || true
+        if kill -0 "$stop_pid" 2>/dev/null; then
+            kill -9 "$stop_pid" 2>/dev/null || true
+            sleep 1
         fi
         rm -f "$stop_file"
+        # Re-check before claiming success: a pid that survived SIGKILL, or one
+        # this user may not signal, used to be reported as "stopped."
+        if kill -0 "$stop_pid" 2>/dev/null; then
+            log "$stop_label pid $stop_pid is still alive after SIGKILL."
+            return 1
+        fi
         log "$stop_label stopped."
-    else
-        rm -f "$stop_file"
-        log "$stop_label is not running."
+        return 0
     fi
+    rm -f "$stop_file"
+    log "$stop_label is not running."
+    return 0
 }
 
 launch_rust_primary() {
@@ -531,13 +577,22 @@ start_app() {
 }
 
 stop_app() {
-    stop_pid_file "$PID_FILE" "Gallery"
-    stop_pid_file "$RUST_ACCEL_PID_FILE" "Gallery Rust primary"
+    stop_ok=0
+    stop_pid_file "$PID_FILE" "Gallery" || stop_ok=1
+    stop_pid_file "$RUST_ACCEL_PID_FILE" "Gallery Rust primary" || stop_ok=1
     # sg render is setuid-root on fnOS, so the package user cannot inspect the
     # listener via ss/fuser or signal the wrapper. Kill its owned child by name.
-    stop_gallery_processes || true
-    # Always clear port leftovers (sg → gallery-accel orphans, stale upgrades).
-    free_service_port || true
+    stop_gallery_processes || stop_ok=1
+    # Clear port leftovers (sg → gallery-accel orphans, stale upgrades). The
+    # refusal here is the one that matters: `stop` used to swallow it and exit 0
+    # while the old binary was still serving the port, so the framework believed
+    # the service was down and an upgrade left the old version running.
+    free_service_port || stop_ok=1
+    if [ "$stop_ok" -ne 0 ]; then
+        log "Gallery stop did not fully complete; see the lines above."
+        return 1
+    fi
+    return 0
 }
 
 status_app() {
@@ -557,7 +612,10 @@ case "${1:-status}" in
         stop_app
         ;;
     restart)
-        stop_app
+        # Under `set -e` a failed stop would otherwise abort before start_app,
+        # leaving the service down: let start_app (and its port-freeing
+        # retries) deal with whatever stop could not finish.
+        stop_app || true
         start_app
         ;;
     status)

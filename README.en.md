@@ -2,7 +2,7 @@
 
 # Gallery
 
-**Self-Hosted Media Library & Digital Asset Manager Written in Pure Rust**
+**Self-Hosted Media Library & Artist Asset Manager Written in Pure Rust**
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 [![Platform: fnOS (Native FPK)](https://img.shields.io/badge/Platform-fnOS%20FPK-brightgreen.svg)](#deployment)
@@ -19,57 +19,37 @@
 
 ## Introduction
 
-**Gallery** is a self-hosted media library management system for local creative asset collections. The backend is written entirely in pure Rust (Axum + rusqlite + Tokio) with a responsive single-page web UI; it organizes media by artist (directories define artists) with multi-dimensional tags, AI character recognition, BLAKE3 content-hash deduplication, and standardized folder archiving.
+**Gallery** is a self-hosted digital asset and media library manager built for local illustration and creator collections. Powered by a pure-Rust backend (Axum + rusqlite + Tokio) with zero Python runtime dependencies and a responsive single-page web UI, it organizes libraries around **artists as top-level directories** and provides multi-dimensional tagging, AI character recognition, BLAKE3 content-hash deduplication, rule-based folder archiving, and creator subscriptions.
 
 ---
 
 ## Key Features
 
-### 1. Multi-Format Browsing & Smooth Playback
-- Images (JPG/PNG/WebP/AVIF/BMP), inline GIF hover preview, and in-browser video streaming (MP4/WebM/MOV/MKV via ffmpeg/HLS); plus .txt/.md/.html text and PSD/CLIP/PSB/ZIP/RAR sources.
-- Archive preview and extraction: Click ZIP/RAR/7Z cards to inspect directory tree and file sizes without extraction, preview internal image covers on demand, and safely extract to current directory or a new folder with optional recycling of the source archive.
-- Card ratio option: the maintenance Status page offers 4:3 full (default) and 3:4 portrait grid thumbnails; the choice is stored per browser.
-- Lightbox: full-screen zoom, drag-pan, mobile pinch; ←/→ navigate, Esc close, download/favorite/delete shortcuts.
-- URL-synced state: artist, folder, tags, date, sort, and search are written to the address bar for back/forward and sharing.
-
-### 2. Artist Partitioning & Multi-Dimensional Tagging
-- Artist as top-level boundary (folders define artists); filter inside by folder tree and multi-tag combinations.
-- Batch tagging: single/marquee/whole-folder add or remove; tags sort by default/name/count with pinyin search for artists and tags.
-- Sidebar role list pins an "Untagged" todo entry, keeping folders and works without character tags one click away.
-- Archive status filter: All / Pending / Archived separates pending from organized content and syncs with the address bar.
-- Link indexing: auto-extract text/cloud links and passcodes; manage external profiles (Pixiv, Fanbox, Patreon, Twitter/X, Bilibili).
-
-### 3. AI Character Recognition (CCIP & OpenVINO)
-- CCIP recognition on by default; backend auto-selects CUDA → OpenVINO → CPU and auto-downloads models and CUDA runtime; falls back to CPU when GPU unavailable.
-- Single-character reference libraries capture varied styles; built-in semantic deduplication (≥0.95) and outlier pruning.
-- Manual character creation and reference photo upload for characters not covered by AI.
-- Human-in-the-loop: AI suggests only in Edit Mode and applies only after your confirmation.
-
-### 4. Content-Hash Deduplication & Path Tracking
-- BLAKE3 fingerprinting locates duplicates with sidebar group views.
-- Renamed/moved files re-link via hash and inode; same-artist moves keep tags, cross-artist conflicts route to Maintenance review.
-
-### 5. Standardized Folder Archiving & Rule Engine
-- Editable Default template (initial {year}/{date} {tags}); preview before execution.
-- Safety: automatic SQLite online backup before any move; previews and revalidates source/target/authorization, never overwrites occupied targets.
-- Execution records: Current successful plans are deleted in the same transaction and cannot be undone.
-- Fill gaps in place: the sidebar folder panel adds character tags and manual dates directly; works missing a recognized date fall back to the posting date derived from the Twitter/X snowflake ID.
-- Archive the current folder and bundle into folders: the Edit Bar archives the current folder in place; multi-selected files can be bundled into a target path as one locked set with automatic rollback on failure, and folders missing characters or dates stay pending until completed.
-- Controlled auto-archive: Maintenance "Auto Organize" off by default; runs only after a successful full scan; single-artist/folder scans never trigger.
-
-### 6. Storage Safety & Isolated State
-- Metadata and indexes in SQLite; media stays within authorized directories; organization never crosses boundaries.
-- Safe recycle: deletes prefer the system recycle bin, falling back to gallery/data/recycle, with one-click restore, single-entry permanent purge, and full recycle bin emptying.
-
-### 7. Download Subscriptions & Netdisk Dispatch
-- Subscribe to creator platforms and automatically discover new works with per-artist round scheduling.
-- Netdisk batch dispatch: bridge external links to JDownloader via Event Scripter with manual review and one-click delivery.
-- All Works panel with post link navigation, date folder jumps, and searchable artist filtering.
-- Collapsible variable reference tables for download naming templates and folder archive rules.
-- Subscription cards include a 53-week download coverage calendar; shading shows each week's gaps and narrow cards scroll sideways for the full year.
+- **Multi-Format Browsing & Bilingual UI**
+  - **Broad media support**: Browse JPG/PNG/WebP/AVIF/BMP images, inline GIF hover previews, and streamed MP4/WebM/MOV/MKV videos (`ffmpeg` / HLS), alongside `.txt`/`.md`/`.html` text files and PSD/CLIP/PSB source assets.
+  - **Zero-extraction archive inspection & batch extraction**: Click ZIP/RAR/7Z cards to inspect directory trees, file sizes, and image covers on demand (with strict memory limits for single-item previews, keyboard arrow navigation, and index counters); extract selected archives or all archives under an artist with one click, supporting per-archive subfolders, remembered passwords, automatic source recycling, and unified top 3-column progress tracking.
+  - **Flexible views, drag-and-drop & URL state**: Switch between `4:3 Full` and `3:4 Portrait` grid ratios, a compact single-row desktop list view, and a full-screen lightbox with 1:1 zero-latency panning, zoom reset pill, and folder locator. Drag cards directly onto sidebar folders to move or character rows to tag; sidebar folder tree supports collapsible parent folders and search filtering; full `Shift + Click` contiguous range selection. Active filters, sorting, and folders sync directly with the browser URL.
+  - **Instant English/Chinese toggle**: Built-in lightweight native internationalization (i18n) across the main UI, maintenance views, downloads, and modals with instant switching and local persistence.
+- **Artist Partitioning & Multi-Dimensional Tagging**
+  - **Directories define artists**: First-level subfolders under each media root map to artists, with hierarchical folder trees, multi-tag filtering, and `All / Pending / Archived` organization views inside each artist.
+  - **Fast batch tagging & search**: Apply or remove tags via single selection, marquee drag-selection, or whole-folder actions; pin an "Untagged" character todo entry in the sidebar; search artists and tags with native pinyin matching.
+  - **Automatic link indexing**: Extracts web URLs, cloud-drive links, and passcodes from artist text files, and manages external creator profiles (Pixiv, Fanbox, Patreon, Twitter/X, Bilibili).
+- **AI Character Recognition (CCIP)**
+  - **Automatic hardware acceleration**: Enabled by default; prepares the CCIP model and CUDA runtime in the background after startup and automatically selects `CUDA → OpenVINO → CPU` (with automatic CPU fallback).
+  - **Reference library & human-in-the-loop review**: Builds per-character embedding libraries from single-character works (with ≥0.95 near-duplicate pruning and outlier cleanup) and supports manual character creation and reference uploads. Suggestions appear in the Edit Bar and apply only after confirmation.
+- **Content-Hash Deduplication & Move Tracking**
+  - **BLAKE3 deduplication**: Groups duplicate folders and files in the sidebar and silently refreshes views as background hashing completes.
+  - **Automatic move reconciliation**: Relinks renamed or moved files via BLAKE3 hash and inode; unambiguous same-artist moves keep their tags automatically, while cross-artist conflicts route to Maintenance review.
+- **Standardized Folder Archiving & Safe Recycle Bin**
+  - **Rule engine & in-place actions**: Uses an editable `Default` template (default `{year}/{date} {tags}`, falling back to Twitter/X snowflake posting dates when unrecognized). Fill missing character tags or manual dates directly from the folder sidebar, archive the current folder in one click, bundle selected files into a target folder with automatic rollback on failure, and preview naming rule migrations with explicit CAS version switching.
+  - **Data safety guarantees**: Takes an automatic SQLite online backup and revalidates paths before any move, never overwrites occupied targets, and supports optional auto-archiving after completed full-library scans.
+  - **Selectable recycle bin strategy**: Choose between native fnOS system trash and internal app trash from the Maintenance panel (with pros and cons comparison cards); supports folder-level deletion, grid/table view toggle, one-click batch restore, permanent purge, and bin emptying.
+- **Download Subscriptions & Netdisk Dispatch**
+  - **Scheduled discovery & coverage calendar**: Subscribe to creator profiles with fair per-artist round scheduling and a 53-week coverage calendar on each subscription card.
+  - **All Works & JDownloader bridge**: Filter across all subscriptions, freeze filter-wide download snapshots, and dispatch external cloud links to JDownloader via the local Event Scripter bridge with automatic import and handshake hardening.
 
 > [!WARNING]
-> **Network Security Notice**: Gallery listens on port `8899` by default and **provides no built-in user authentication**. It is intended strictly for trusted local area networks (LAN). When exposing the service to public networks, configure authentication via fnOS or an upstream reverse proxy (such as Nginx or Caddy).
+> **Network Security Notice**: Gallery listens on port `8899` by default and **includes no built-in user authentication**. It is designed strictly for trusted local area networks (LAN). Before exposing it to public networks, configure authentication through fnOS or an upstream reverse proxy (Nginx / Caddy).
 
 ---
 
@@ -77,137 +57,101 @@
 
 ### Method 1: fnOS Native FPK Package (Recommended)
 
-Gallery offers an optimized native FPK package for fnOS, delivering native performance with minimal memory overhead.
+Gallery ships as a native fnOS package (FPK) that runs as a single Rust binary directly on the host with minimal memory overhead and a bundled `7zz` engine.
 
-1. **Download FPK**: Obtain the latest `gallery_<version>_x86_64.fpk` from [Releases](https://github.com/h-void/gallery/releases).
-2. **Install via App Center**: Open the fnOS App Center, choose manual installation, and select the `.fpk` file.
-3. **Authorize Media Directories**: Grant access to the media shares you want Gallery to manage.
-4. **Persistent Data Layout**: fnOS creates a persistent `@appshare/gallery` directory structured as:
-   ```text
-   @appshare/gallery/
-   ├── data/      # Main database gallery.db, runtime logs logs/, online backups db-backups/, recycle/
-   ├── cache/     # Preview thumbnails transcode-cache/ and video segments
-   └── models/    # AI models and OpenVINO runtime cache files
-   ```
-5. **Install AI Character Model**: The CCIP model downloads automatically in the background after startup; for offline installs, download it manually and place it at (create the directory if needed):
-   ```text
-   gallery/models/character/ccip-caformer_b36-24/model_feat.onnx
-   ```
-6. **Launch**: Access `http://<NAS_IP>:8899/` and click "Scan All" to start the initial index.
+1. **Download & Install**: Download `gallery_<version>_x86_64.fpk` from [Releases](https://github.com/h-void/gallery/releases) and install it manually via the fnOS App Center.
+2. **Authorize Media Folders**: Select the media shares you want Gallery to manage during the setup wizard.
+3. **Launch & Scan**: Open `http://<NAS_IP>:8899/` and click **Scan All** to build the initial index.
+
+Persistent application state is stored under `@appshare/gallery` (strictly separated from your media roots):
+
+```text
+@appshare/gallery/
+├── data/      # Main database gallery.db, runtime logs/, online db-backups/, fallback recycle/
+├── cache/     # Preview thumbnails, video frames, and HLS segments under transcode-cache/
+└── models/    # AI character models, OpenVINO caches, and CUDA runtime caches
+```
+
+> [!TIP]
+> **Offline Model Placement**: The CCIP model downloads automatically in the background after startup. For offline NAS setups, place the model manually at `gallery/models/character/ccip-caformer_b36-24/model_feat.onnx` (see [docs/FNOS_NATIVE.md](docs/FNOS_NATIVE.md)).
 
 ---
 
-### Method 2: Docker Deployment (NAS / Local PC)
+### Method 2: Docker Deployment (NAS GUI / Local PC)
 
-Prefer the native fnOS FPK for production. Choose either Docker workflow below:
+For Synology Container Manager, QNAP Container Station, UGOS, fnOS Docker, or Windows/Linux PCs, choose either workflow below:
 
-| Configuration file | Purpose and usage |
-| :--- | :--- |
-| `docker-compose.yml` | **Universal configuration (recommended)**. Single file with built-in switching for CPU, Intel iGPU, and NVIDIA; CPU is active by default. Just fill in your media path. |
-| `docker-compose.gpu.yml` | **Intel integrated GPU preset**. Preconfigured with `/dev/dri` passthrough; fill in your media path to launch. |
-| `docker-compose.cuda.yml` | **NVIDIA GPU preset**. Preconfigured with GPU resource reservations; fill in your media path to launch. |
-| `gallery.yml` | **Minimal launcher configuration**. Contains only mode and directories; used by `start.cmd` / `start.sh`. |
-| `.env` | **Common parameter configuration**. Modify ports, scan/backup intervals, AI settings, etc.; read automatically on startup. |
-| `docker-compose.launcher.yml` | **Internal launcher template**. Bundled in the project directory for the startup script; manual download or editing is not required. |
+#### Workflow A: One-Click Script Startup (Windows / Linux PC)
 
-#### Workflow A: NAS Graphical Interface (No SSH or Python)
+Requires Docker (with Docker Compose) and Python 3.10+ (standard library only):
 
-Suitable for Synology Container Manager, fnOS Docker, QNAP Container Station, UGOS, and similar NAS interfaces:
-
-1. **Create Project**: Open your NAS Docker management app and create a new Project / Compose.
-2. **Set Path and Confirm Mode**:
-   - Open `docker-compose.yml`, change `/volume1/photo` under `volumes` to your actual absolute media directory. Each subfolder is recognized as an artist.
-   - CPU mode is enabled by default (no GPU needed, universal compatibility). To enable Intel iGPU or NVIDIA, uncomment the respective section and comment out CPU (or use the ready-made `.gpu.yml` or `.cuda.yml` presets).
-3. **Configure Parameters (Optional)**: Web port (default 8899), scan intervals, and backup retention have built-in defaults. To customize them, edit `.env` in the same project directory.
-4. **Deploy and Scan**: Start the project, open `http://<NAS_IP>:8899/` in your browser, and click "Scan All".
-
-> [!NOTE]
-> - **Hardware Acceleration**: Intel graphics requires NAS `/dev/dri` passthrough; if permission issues arise, specify `GALLERY_RENDER_GID` and `GALLERY_VIDEO_GID` in `.env`. NVIDIA requires host GPU drivers and NVIDIA Container Toolkit. Images target x86_64 architecture.
-> - **Media Safety & Read-Only**: Media folders are mounted read-only (`:ro`) by default. To enable recycle bin or archive operations, remove the trailing `:ro` and redeploy.
-> - **Data Persistence**: Database, logs, backups, caches, and models are persisted in the `gallery-storage` volume. Switching modes preserves all data. Never delete the volume (avoid `docker compose down -v`).
-> - **Archive Preview & Extraction**: The fnOS native FPK package bundles the 7-Zip (`7zz`) engine out of the box. When running via Docker, if you wish to use archive preview and extraction, ensure 7-Zip (`7zz` or `p7zip-full`) is installed in your container or environment, or specify its path via the `GALLERY_7Z_PATH` environment variable.
-
-#### Workflow B: One-Click Script Startup (Windows / Linux PC)
-
-Requires Docker Desktop or Docker Engine with Docker Compose, and Python 3.10+ (standard library only, no extra Python packages required):
-
-1. **Get Project**: Download the repository ZIP and extract it (or run `git clone`), keeping the directory structure intact (the launcher template `docker-compose.launcher.yml` and `tools/` are bundled inside).
-2. **Configure**: Open `gallery.yml` and set the running mode and media directories:
-
+1. **Configure mode & directories**: Edit `gallery.yml` with your inference mode (`cpu` / `gpu` / `cuda`) and local absolute media paths (use `/` on Windows; first-level subfolders under each path define artists):
    ```yaml
    模式: cpu
    目录:
      - D:/Pictures
      - E:/Art
    ```
+2. **Start**: Double-click `start.cmd` on Windows or run `sh start.sh` on Linux, then open `http://localhost:8899/`.
+3. **Common flags** (re-run the script anytime after editing `gallery.yml` to update mounts):
+   - `start.cmd --writable` (or `sh start.sh --writable`): Enable media write access for recycle-bin deletions and folder archiving (omitting the flag restores read-only mode)
+   - `start.cmd --pull` / `--build`: Pull the latest image / build from local source
+   - `start.cmd --check`: Validate configuration without starting containers
 
-   - **Path format**: One absolute path per line, unlimited count. Use `/` in Windows paths (e.g. `D:/Pictures`, `E:/Art`); use full paths on Linux (e.g. `/home/user/pictures`). Local disks only; network shares and UNC paths are not supported.
-   - **Artist hierarchy**: Top-level subfolders are recognized as artists (e.g. `D:/Pictures/ArtistA/001.jpg`; loose files directly under the media root are not indexed).
-3. **Start**: On Windows, double-click `start.cmd`. On Linux, run `sh start.sh` from the project directory.
-4. **Access**: Open `http://localhost:8899/` (use host IP for other LAN devices) and click "Scan All". Models download automatically in the background.
+#### Workflow B: NAS Graphical Interface (Docker Compose, No SSH)
 
-| Mode | Supported Hardware & Environment |
+1. **Pick a Compose file**:
+   - `docker-compose.yml`: Universal file (CPU active by default, with inline comments for Intel iGPU and NVIDIA)
+   - `docker-compose.gpu.yml`: Intel iGPU preset (preconfigured with `/dev/dri` passthrough)
+   - `docker-compose.cuda.yml`: NVIDIA GPU preset (preconfigured with GPU reservations and CUDA image)
+2. **Set media path**: Replace `/volume1/photo` under `volumes` with your actual NAS media directory path (customize port `8899` or intervals in `.env` if needed).
+3. **Deploy**: Start the Compose project in your NAS UI, open `http://<NAS_IP>:8899/`, and click **Scan All**.
+
+| Mode | Hardware & Environment Requirements |
 | :--- | :--- |
-| `cpu` | Default mode; uses CPU inference with universal compatibility. |
-| `gpu` | Intel integrated graphics on native Linux; device group IDs are detected automatically (not supported by Windows Docker Desktop). |
-| `cuda` | NVIDIA GPU. Linux requires NVIDIA drivers and Container Toolkit; Windows Docker Desktop requires WSL2 backend and compatible drivers. No CUDA Toolkit required. |
+| `cpu` | Default mode; runs on CPU across all `x86_64` hosts. |
+| `gpu` | Intel iGPU on native Linux (`/dev/dri` passthrough; set `GALLERY_RENDER_GID` and `GALLERY_VIDEO_GID` in `.env` if needed on NAS; not supported on Windows Docker Desktop). |
+| `cuda` | NVIDIA GPU (requires host drivers + NVIDIA Container Toolkit on Linux, or WSL2 backend + compatible drivers on Windows Docker Desktop; image bundles CUDA 12.x / cuDNN 9.x libraries). |
 
-After adding directories or switching modes, re-run the same startup script; it automatically updates mounts and restarts the service; mode and directories come from `gallery.yml`. GPU initialization failures fall back to CPU by default; the maintenance page shows the actual GPU/CPU status.
-
-**Data and upgrades**:
-
-- The `gallery-storage` volume persists the database, logs, backups, recycle bin, caches, and models under `data/`, `cache/`, and `models/`. Switching modes preserves data. Do not add `-v` to `docker compose down`: it deletes the data volume.
-- Keep `.gallery-launcher`, which records directory mappings so reordering directories does not change existing paths. Existing `.env` media mappings are inherited on the first launcher run.
-- Media is read-only by default. Browsing, tagging, and recognition work; recycle-bin and archive operations require write access. Run `start.cmd --writable` or `sh start.sh --writable` to enable it. Starting without this flag restores read-only access. Operations still validate source/target paths and create SQLite online backups; database backups do not include media files.
-- Offline model location: `models/character/ccip-caformer_b36-24/model_feat.onnx` inside the data volume. The CUDA runtime cache is under `models/ort/cuda-1.24.1`; the CUDA image includes CUDA 12.x / cuDNN 9.x user-space libraries.
-- Keep an independent database backup before upgrading. Update the image with `start.cmd --pull` or `sh start.sh --pull`; build from current source with `start.cmd --build` or `sh start.sh --build`.
-- To validate configuration without starting containers, use `start.cmd --check` or `sh start.sh --check`.
-
-**fnOS parameters**: The FPK has no generic environment-variable editor. Docker `.env` does not apply to FPK. fnOS injects `TRIM_*` paths and ports. To change other defaults, edit `fnpack/cmd/main`, rebuild with `tools/build_rust_accel.py` and `tools/build_fnpack.py`, install the FPK, and restart Gallery.
+> [!IMPORTANT]
+> **Docker Data Safety & Permissions**
+> - **Preserve the data volume**: Database, logs, backups, caches, and AI models live in the `gallery-storage` volume (offline model path: `models/character/ccip-caformer_b36-24/model_feat.onnx`). **Never run `docker compose down -v`**. Script users should also keep `.gallery-launcher` to preserve `/mediaN` directory slot mappings.
+> - **Read-only media default**: Media folders mount read-only (`:ro`) by default. Remove `:ro` in Compose or pass `--writable` to the launcher script to enable recycle-bin and archive operations.
+> - **7-Zip in Docker**: To inspect or extract archives in Docker, ensure `7zz` / `p7zip-full` is available in the container or set `GALLERY_7Z_PATH`.
 
 ---
 
 ## Configuration
 
-Usually no changes are needed. In the NAS interface, edit Compose ports or environment directly. For script startup, advanced options such as the port, scan interval, and backups can still be set in `.env`; run the launcher again to apply them. Mode and directories come from `gallery.yml`. Only variables explicitly referenced by Compose reach the container; the selected mode determines the inference provider. Internal data and model paths are set by the image. For fnOS, use the rebuild process above.
+Most deployments need no manual tuning. In Docker, customize settings via `.env` or Compose environment variables. The native fnOS FPK has no generic environment editor (`TRIM_*` variables are injected by fnOS and other defaults live in `fnpack/cmd/main`).
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `CHARACTER_RECOGNITION_ENABLED` | `1` | Enable AI character recognition (1 on / 0 off). |
-| `CHARACTER_RECOGNITION_PROVIDER` | `auto` | NAS Compose files and the launcher set cpu, openvino, or cuda according to the selected mode. |
-| `CHARACTER_ALLOW_CPU_FALLBACK` | `1` | Fall back to CPU when GPU init fails (0 disables; legacy `CHARACTER_OPENVINO_ALLOW_CPU_FALLBACK` still honored). |
-| `ONNXRUNTIME_AUTO_DOWNLOAD` | `1` | Auto-download missing CCIP model and CUDA runtime in the background after startup (0 disables, for offline installs). |
-| `CHARACTER_MODEL_IDLE_TIMEOUT_SECONDS` | `600` | Idle timeout in seconds before unloading the model (0 keeps resident). |
-| `SCAN_INTERVAL` | `21600` | Background full-scan interval in seconds (default 6 hours; 0 disables). |
+| `CHARACTER_RECOGNITION_ENABLED` | `1` | Enable AI character recognition (`1` on / `0` off). |
+| `CHARACTER_RECOGNITION_PROVIDER` | `auto` | Inference provider (`auto` selects `CUDA → OpenVINO → CPU`; Docker presets set `cpu`, `openvino`, or `cuda`). |
+| `CHARACTER_ALLOW_CPU_FALLBACK` | `1` | Fall back to CPU when GPU initialization fails (`0` disables). |
+| `ONNXRUNTIME_AUTO_DOWNLOAD` | `1` | Auto-download missing CCIP model and CUDA runtime in the background after startup (`0` disables for offline installs). |
+| `CHARACTER_MODEL_IDLE_TIMEOUT_SECONDS` | `600` | Unload the AI model after N idle seconds (`0` keeps it resident). |
+| `SCAN_INTERVAL` | `21600` | Scheduled full-scan interval in seconds (default 6 hours; `0` disables). |
 | `HASH_INTERVAL` | `30` | Background content-hash poll interval in seconds. |
-| `DB_BACKUP_INTERVAL` | `43200` | Database auto-backup interval in seconds (default 12 hours). |
+| `DB_BACKUP_INTERVAL` | `43200` | Automatic SQLite online backup interval in seconds (default 12 hours). |
 | `DB_BACKUP_RETENTION` | `8` | Maximum number of retained backup snapshots. |
-
-For the remaining runtime variables and their defaults, see `fnpack/cmd/main` and `Dockerfile`.
 
 ---
 
 ## Building & Packaging
 
-### 1. Prerequisites for Release Builds (Windows)
-- **WSL 2** with **Podman** installed (build scripts cross-compile the Linux binary inside an isolated Debian Bookworm container).
-- Official `fnpack` packaging binary: download URL is in [docs/FNOS_NATIVE.md](docs/FNOS_NATIVE.md); place `fnpack-1.2.3-windows-amd64.exe` in `output/fnpack/`.
-
-### 2. Full Release Build (Compile Rust & Package FPK)
-In Windows PowerShell, run the release pipeline:
+Cross-compiling the Linux `x86_64` binary and packaging the fnOS FPK on Windows requires **WSL 2** with **Podman** and the official [`fnpack-1.2.3-windows-amd64.exe`](https://static2.fnnas.com/fnpack/fnpack-1.2.3-windows-amd64) placed in `output/fnpack/`:
 
 ```powershell
+# Cross-compile the Linux Rust runtime and package the validated FPK
 python tools/build_release.py --fnpack .\output\fnpack\fnpack-1.2.3-windows-amd64.exe
-```
 
-### 3. Compile Linux Rust Runtime Only
-To compile the Linux Rust binary for fnOS without packaging:
-
-```powershell
+# Compile the Linux Rust binary only (outputs app/bin/gallery-accel)
 python tools/build_rust_accel.py
 ```
 
-The compiled binary will be placed at `app/bin/gallery-accel`.
+See [`docs/API.md`](docs/API.md), [`docs/OPERATIONS.md`](docs/OPERATIONS.md), and [`docs/FNOS_NATIVE.md`](docs/FNOS_NATIVE.md) for API contracts, operations, and packaging specifications.
 
 ---
 
@@ -215,24 +159,19 @@ The compiled binary will be placed at `app/bin/gallery-accel`.
 
 ```text
 gallery/
-├── rust/gallery_accel/   # Core Rust runtime: Axum HTTP API, SQLite connection pool, background scan/hash workers, CCIP engine
-├── app/static/           # Single-page web application: HTML5 shell, layered styles/ design system, and ES-module JS scripts
-├── fnpack/               # fnOS native package definition (package.json), lifecycle entry scripts (cmd/main), and permissions
-├── Dockerfile            # Pure-Rust Docker image build definition (default target is runtime)
-├── Dockerfile.cuda       # CUDA image variant (builds runtime-cuda for CI)
-├── docker-compose.yml    # Docker Compose configuration (supports CPU, iGPU, and CUDA)
-└── tools/                # Automation scripts for FPK packaging, Rust compilation, work logging, and public repository generation
+├── rust/gallery_accel/   # Pure-Rust backend: Axum HTTP API, SQLite pool, scan/hash workers, CCIP inference & subscriptions
+├── app/static/           # Responsive web SPA: HTML5 shell, 4-layer CSS design system, and native ES-module scripts
+├── fnpack/               # fnOS native package manifest (package.json), lifecycle scripts (cmd/main), and permissions
+├── Dockerfile            # Pure-Rust Docker image build definition (Dockerfile.cuda for CUDA variant)
+├── docker-compose.yml    # Docker Compose configuration (with .gpu.yml, .cuda.yml, and gallery.yml)
+├── docs/                 # REST API reference, fnOS packaging specs, operations guide, and release notes
+└── tools/                # Build pipelines, FPK packager, local launcher, and public-release generator
 ```
 
 ---
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0 only](LICENSE) (`GPL-3.0-only`).
-Copyright (C) 2026 h-void.
+Licensed under the [GNU General Public License v3.0 only](LICENSE) (`GPL-3.0-only`). Copyright (C) 2026 h-void. Redistributing this project or modified derivatives requires providing corresponding source code under `GPL-3.0-only`.
 
-Redistributing this project or modified derivatives requires providing corresponding source code under GPL-3.0-only.
-
-## Third-Party Licenses
-
-Bundled license notices for ONNX Runtime, OpenVINO, 7-Zip (`7zz`, © Igor Pavlov, LGPL-2.1+), and third-party Rust crates in FPK and Docker distributions are available in `fnpack/app/licenses/`.
+Third-party license notices for ONNX Runtime, OpenVINO, 7-Zip (`7zz`, © Igor Pavlov, LGPL-2.1+), and Rust crates are located in `fnpack/app/licenses/`.

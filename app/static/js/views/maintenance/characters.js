@@ -7,6 +7,7 @@ import {
   $, escHtml, joinUiMeta, formatBytes, formatHealthTime, buttonIcon, isAbortError,
 } from '../../utils.js';
 import { toast } from '../../logging.js';
+import { t } from '../../i18n.js';
 
 const CHARACTER_IMPORT_POLL_MS = 1000;
 const CHARACTER_LIBRARY_VIEWS = ['characters', 'references'];
@@ -200,10 +201,10 @@ function characterLibrarySummaryText(library) {
   const status = summary.status || {};
   const scope = '全部画师';
   const parts = [
-    `范围 ${scope}`,
-    `${totals.tags || (summary.tags || []).length || 0} 个可导入角色`,
-    `${totals.characters || (summary.characters || []).length || 0} 个已建角色`,
-    `${totals.references || 0} 张参考图`,
+    `${t('范围 {scope}', {scope: scope})}`,
+    `${t('{totals} 个可导入角色', {totals: totals.tags || (summary.tags || []).length || 0})}`,
+    `${t('{totals} 个已建角色', {totals: totals.characters || (summary.characters || []).length || 0})}`,
+    `${t('{totals} 张参考图', {totals: totals.references || 0})}`,
   ];
   if (status.available === false) {
     parts.push(status.reason || '角色识别未启用');
@@ -240,7 +241,7 @@ function characterImportFailureText(result) {
     .map(failure => failure && (failure.reason || failure.error || failure.message))
     .filter(Boolean);
   const reason = firstReason || failureReasons[0] || '未返回失败原因';
-  return `导入失败：${reason}`;
+  return `${t('导入失败：{reason}', {reason: reason})}`;
 }
 
 export function characterImportJobBusy() {
@@ -260,10 +261,10 @@ function characterImportJobSummary(job) {
   return joinUiMeta([
     labels[job.status] || job.status || '导入任务',
     `${job.processed || 0} / ${job.total || 0}`,
-    `新增 ${job.added || job.added_references || 0}`,
-    `跳过 ${job.skipped_existing || job.skipped_existing_references || 0}`,
-    `失败 ${job.failed || 0}`,
-    job.current_tag ? `当前 ${job.current_tag}` : '',
+    `${t('新增 {job}', {job: job.added || job.added_references || 0})}`,
+    `${t('跳过 {job}', {job: job.skipped_existing || job.skipped_existing_references || 0})}`,
+    `${t('失败 {job}', {job: job.failed || 0})}`,
+    job.current_tag ? `${t('当前 {job}', {job: job.current_tag})}` : '',
   ]);
 }
 
@@ -279,12 +280,12 @@ function characterImportJobMarkup(job) {
     <div class="character-import-job">
       <div class="character-import-job-head">
         <span>${escHtml(characterImportJobSummary(job))}</span>
-        ${busy ? `<button class="btn btn-danger" type="button" data-character-import-cancel="${escHtml(job.job_id || '')}">${buttonIcon('close')}取消</button>` : ''}
+        ${busy ? `<button class="btn btn-danger" type="button" data-character-import-cancel="${escHtml(job.job_id || '')}">${t('{buttonIcon}取消', {buttonIcon: buttonIcon('close')})}</button>` : ''}
       </div>
-      <div class="character-import-progress" aria-label="角色库导入进度">
+      <div class="character-import-progress" aria-label="${t('角色库导入进度')}">
         <span style="width:${pct}%"></span>
       </div>
-      ${failureText ? `<div class="character-import-failures">失败：${escHtml(failureText)}</div>` : ''}
+      ${failureText ? `<div class="character-import-failures">${t('失败：{escHtml}', {escHtml: escHtml(failureText)})}</div>` : ''}
     </div>
   `;
 }
@@ -295,7 +296,6 @@ function characterReferencePreviewVersion(reference) {
 
 export function renderCharacterLibrary() {
   const summaryEl = $('#characterLibrarySummary');
-  const tagList = $('#characterTagImportList');
   const characterList = $('#characterList');
   const referenceList = $('#characterReferenceList');
   if (!summaryEl || !characterList || !referenceList) return;
@@ -303,7 +303,6 @@ export function renderCharacterLibrary() {
   const library = state.characterLibrary;
   if (!library) {
     summaryEl.textContent = state.characterLibraryLoading ? '角色库读取中' : '角色特征库未加载';
-    if (tagList) tagList.innerHTML = '<div class="character-library-empty">暂无可导入的角色</div>';
     characterList.innerHTML = state.characterLibraryLoading
       ? '<div class="character-library-empty">角色库读取中</div>'
       : '<div class="character-library-empty">暂无已建角色</div>';
@@ -312,8 +311,7 @@ export function renderCharacterLibrary() {
     return;
   }
   if (library.error) {
-    summaryEl.textContent = `角色库读取失败：${library.error}`;
-    if (tagList) tagList.innerHTML = `<div class="character-library-empty">${escHtml(library.error)}</div>`;
+    summaryEl.textContent = `${t('角色库读取失败：{library}', {library: library.error})}`;
     characterList.innerHTML = '<div class="character-library-empty">角色库不可用</div>';
     referenceList.innerHTML = '<div class="character-library-empty">角色库不可用</div>';
     applyCharacterLibraryMobileView();
@@ -331,11 +329,10 @@ export function renderCharacterLibrary() {
     searchClearBtn.hidden = !query;
   }
 
-  const rawTags = summary.tags || [];
+  // The search box filters the 已建角色 list. The importable-tag list it used to
+  // filter as well went away with the single-tag import column in 1.0.425;
+  // `summary.tags` is still read for the "N 个可导入角色" summary count.
   const rawCharacters = summary.characters || [];
-  const tags = query
-    ? rawTags.filter(t => String(t.name || '').toLowerCase().includes(query) || String(t.character_id) === query)
-    : rawTags;
   const characters = query
     ? rawCharacters.filter(c => String(c.name || '').toLowerCase().includes(query) || String(c.id) === query)
     : rawCharacters;
@@ -366,29 +363,6 @@ export function renderCharacterLibrary() {
   summaryEl.textContent = characterLibrarySummaryText(library);
   const jobMarkup = characterImportJobMarkup(state.characterImportJob);
 
-  const tagButtons = tags.length ? tags.map(tag => {
-    const referenceCount = Number(tag.reference_count || 0);
-    const singleTagCount = Number(tag.single_tag_image_count || 0);
-    const imported = referenceCount > 0;
-    const stateBadge = tag.character_id
-      ? `<span class="character-library-badge${imported ? ' character-library-imported' : ''}">${imported ? `${referenceCount} 张参考图` : '未导入'}</span>`
-      : '<span class="character-library-badge">未导入</span>';
-    const artistCount = Number(tag.artist_count || 0);
-    const sourceLabel = artistCount > 1 ? `来自 ${artistCount} 个画师` : '';
-    const tagName = String(tag.name || '');
-    return `
-      <div class="character-tag-row">
-        <div class="character-tag-main">
-          <b>${escHtml(tagName)}</b>
-          <span>${escHtml(joinUiMeta([`${singleTagCount} 张单角色图`, sourceLabel]))}</span>
-        </div>
-        <div class="character-tag-actions">
-          ${stateBadge}
-        </div>
-      </div>
-    `;
-  }).join('') : `<div class="character-library-empty">${query ? `未找到匹配的角色 "${escHtml(query)}"` : '暂无可导入角色'}</div>`;
-
   const characterButtons = characters.length ? characters.map(character => {
     const active = selectedCharacterId && Number(character.id) === Number(selectedCharacterId);
     const referenceCount = Number(character.reference_count || 0);
@@ -396,17 +370,17 @@ export function renderCharacterLibrary() {
       <div class="character-card-shell${active ? ' active' : ''}">
         <button type="button" class="btn character-card-select" data-character-select="${character.id}">
           <div class="character-card-head">
-            <b>${escHtml(character.name)}</b>
+            <b data-i18n-skip>${escHtml(character.name)}</b>
           </div>
           <div class="character-card-meta">
             <div class="character-card-meta-row">
-              <span>${escHtml(`${referenceCount} 张参考图`)}</span>
+              <span>${escHtml(t('{totals} 张参考图', {totals: referenceCount}))}</span>
             </div>
           </div>
         </button>
         <div class="character-card-actions">
-          <button type="button" class="btn btn-ghost btn-icon character-card-search" data-character-search="${escHtml(character.name)}" title="在画廊中检索「${escHtml(character.name)}」" aria-label="在画廊中检索「${escHtml(character.name)}」">${buttonIcon('search')}</button>
-          <button type="button" class="btn btn-danger btn-icon character-card-delete" data-character-delete="${character.id}" title="删除角色" aria-label="删除角色">${buttonIcon('trash')}</button>
+          <button type="button" class="btn btn-ghost btn-icon character-card-search" data-character-search="${escHtml(character.name)}" title="${t('在画廊中检索「{name}」', {name: escHtml(character.name)})}" aria-label="${t('在画廊中检索「{name}」', {name: escHtml(character.name)})}">${buttonIcon('search')}</button>
+          <button type="button" class="btn btn-danger btn-icon character-card-delete" data-character-delete="${character.id}" title="${t('删除角色')}" aria-label="${t('删除角色')}">${buttonIcon('trash')}</button>
         </div>
       </div>
     `;
@@ -437,7 +411,7 @@ export function renderCharacterLibrary() {
               <b>${escHtml(reference.character_name || '')}</b>
               <span>${escHtml(detail)}</span>
             </div>
-            <button class="btn btn-danger character-reference-delete" type="button" data-character-reference-delete="${reference.id}" data-character-id="${reference.character_id}">${buttonIcon('trash')}删除</button>
+            <button class="btn btn-danger character-reference-delete" type="button" data-character-reference-delete="${reference.id}" data-character-id="${reference.character_id}">${t('{buttonIcon}删除', {buttonIcon: buttonIcon('trash')})}</button>
           </div>
           <div class="character-reference-path">
             <code title="${escHtml(reference.file_path || '')}">${escHtml(pathText)}</code>
@@ -447,7 +421,6 @@ export function renderCharacterLibrary() {
     `;
   }).join('') : `<div class="character-library-empty">${selectedCharacterId ? '该角色暂无参考图' : '请选择角色后查看参考图'}</div>`;
 
-  if (tagList) tagList.innerHTML = jobMarkup + tagButtons;
   const jobContainer = $('#characterImportJobContainer');
   if (jobContainer) jobContainer.innerHTML = jobMarkup;
   characterList.innerHTML = characterButtons;
@@ -458,7 +431,7 @@ export function renderCharacterLibrary() {
   const selectedMeta = $('#characterLibrarySelectedMeta');
   if (selectedMeta) {
     selectedMeta.textContent = selectedCharacter
-      ? joinUiMeta([`#${selectedCharacter.id}`, selectedCharacter.created_at ? `创建于 ${formatHealthTime(selectedCharacter.created_at)}` : ''])
+      ? joinUiMeta([`#${selectedCharacter.id}`, selectedCharacter.created_at ? `${t('创建于 {formatHealthTime}', {formatHealthTime: formatHealthTime(selectedCharacter.created_at)})}` : ''])
       : '';
   }
 
@@ -470,14 +443,14 @@ export function renderCharacterLibrary() {
       importScopeSelect.value = 'all';
     }
     importScopeSelect.disabled = importCurrentDisabled && importAllDisabled;
-    importScopeSelect.title = currentArtistId ? `当前画师：${state.currentArtist.name}` : '先选择画师';
+    importScopeSelect.title = currentArtistId ? `${t('当前画师：{state}', {state: state.currentArtist.name})}` : '先选择画师';
   }
   const importBtn = $('#characterImportBtn');
   if (importBtn) {
     const scope = importScopeSelect && importScopeSelect.value === 'all' ? 'all' : 'artist';
     importBtn.disabled = scope === 'artist' ? importCurrentDisabled : importAllDisabled;
     importBtn.title = scope === 'artist'
-      ? (currentArtistId ? `导入当前画师 ${state.currentArtist.name}` : '先选择画师')
+      ? (currentArtistId ? `${t('导入当前画师 {state}', {state: state.currentArtist.name})}` : '先选择画师')
       : '导入全库中符合条件的角色';
   }
   const rebuildBtn = $('#characterRebuildIndexBtn');
@@ -503,7 +476,10 @@ function rememberCharacterImportJob(job) {
   renderCharacterLibrary();
 }
 
-function stopCharacterImportPolling() {
+// Stopping is also the view switcher's job, not only the poll's own exit paths:
+// the interval is 1s and the panel is hidden once the operator leaves 角色, so
+// it would otherwise keep hitting the jobs endpoint with nobody watching.
+export function stopCharacterImportPolling() {
   if (!state.characterImportJobTimer) return;
   clearInterval(state.characterImportJobTimer);
   state.characterImportJobTimer = null;
@@ -545,9 +521,9 @@ async function finishCharacterImportJob(result) {
   } else if (result.status === 'cancelled') {
     toast('角色库导入已取消', 'error');
   } else if (result.status === 'failed') {
-    toast(`部分导入失败：成功 ${result.added || result.added_references || 0}，失败 ${result.failed || 0}`, 'error');
+    toast(`${t('部分导入失败：成功 {result}，失败 {result2}', {result: result.added || result.added_references || 0, result2: result.failed || 0})}`, 'error');
   } else {
-    toast(`已导入 ${result.added || result.added_references || 0} 张参考图`, 'success');
+    toast(`${t('已导入 {result} 张参考图', {result: result.added || result.added_references || 0})}`, 'success');
   }
   const importedCharacterId = characterIdFromImportResult(result);
   await loadCharacterLibrary({characterId: importedCharacterId || state.characterLibrarySelectedCharacterId});
@@ -658,7 +634,7 @@ export async function rebuildCharacterIndex() {
     // The Rust runtime reports reference_count; the legacy runtime reports
     // vector_count. Whichever is present is the number of linked references.
     const referenceTotal = Number(result.reference_count ?? result.vector_count ?? 0);
-    const text = result.ok ? `角色参考已刷新：${referenceTotal} 条` : (result.reason || '刷新失败');
+    const text = result.ok ? `${t('角色参考已刷新：{referenceTotal} 条', {referenceTotal: referenceTotal})}` : (result.reason || '刷新失败');
     toast(text, result.ok ? 'success' : 'error');
     await loadCharacterLibrary({characterId: state.characterLibrarySelectedCharacterId});
   } catch (e) {
@@ -677,7 +653,7 @@ export async function createCharacter(name) {
   try {
     const result = await API.postJson('/api/characters', { name: cleanName });
     const characterId = result && (result.id || result.character_id);
-    toast(`已创建角色「${cleanName}」`);
+    toast(`${t('已创建角色「{cleanName}」', {cleanName: cleanName})}`);
     await loadCharacterLibrary({ characterId });
     return result;
   } catch (err) {

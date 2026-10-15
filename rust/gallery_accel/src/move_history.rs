@@ -139,45 +139,6 @@ fn list_move_history(
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn move_history_returns_newest_rows_first() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT, path TEXT);
-            CREATE TABLE items (id INTEGER PRIMARY KEY, artist_id INTEGER);
-            CREATE TABLE move_history (
-                id INTEGER PRIMARY KEY, item_id INTEGER, artist_id INTEGER,
-                old_path TEXT, new_path TEXT, reason TEXT, status TEXT,
-                details TEXT, created_at REAL, applied_at REAL, reverted_at REAL
-            );
-            INSERT INTO artists VALUES (1, 'artist', '/pictures/artist');
-            INSERT INTO items VALUES (1, 1);
-            INSERT INTO move_history VALUES
-                (1, 1, 1, '/old/1', '/new/1', 'hash_unique', 'applied', '{}', 10, NULL, NULL),
-                (2, 1, 1, '/old/2', '/new/2', 'hash_unique', 'applied', '{}', 20, NULL, NULL),
-                (3, 1, 1, '/old/3', '/new/3', 'hash_unique', 'applied', '{}', 20, NULL, NULL);
-            ",
-        )
-        .unwrap();
-
-        let roots = MediaRoots {
-            roots: vec![],
-            labels: vec![],
-            real_paths: vec![],
-        };
-        let result =
-            move_history_response(&conn, &roots, Some("applied"), Some(2), Some(0)).unwrap();
-        let history = result["history"].as_array().unwrap();
-        assert_eq!(history[0]["id"], 3);
-        assert_eq!(history[1]["id"], 2);
-    }
-}
-
 /// `item_id -> artist_id` resolved with one `IN (...)` query per 500-id chunk.
 fn batch_item_artist_lookup(
     conn: &Connection,

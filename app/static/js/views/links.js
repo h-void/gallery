@@ -6,6 +6,7 @@ import {
   $, $$, escHtml, searchableTextMatches, UI_FIELD_SEPARATOR, copyText, folderTreeHasPath,
 } from '../utils.js';
 import { toast } from '../logging.js';
+import { t } from '../i18n.js';
 import { selectFolder } from './sidebar.js';
 import { ensureNetdiskDispatchReady } from './maintenance/netdisk.js';
 
@@ -186,14 +187,14 @@ function artistLinkSourceMarkup(source) {
   const parentDir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : path;
   const location = source.line_number > 0 ? `第 ${source.line_number} 行` : '';
   const meta = [location, source.label].filter(Boolean).join(UI_FIELD_SEPARATOR);
-  const passcode = source.passcode ? `<code>提取码 ${escHtml(source.passcode)}</code>` : '';
+  const passcode = source.passcode ? `<code>${t('提取码 {code}', {code: escHtml(source.passcode)})}</code>` : '';
   const folder = artistLinkSourceFolder(source);
   const artistId = state.currentArtist ? String(state.currentArtist.id) : '';
   const context = source.context ? `<small class="artist-link-context">${escHtml(source.context)}</small>` : '';
   return `
     <li title="${escHtml(path)}">
-      <span class="artist-link-source-file">文件：${escHtml(file)}</span>
-      <span class="artist-link-source-path">路径：${escHtml(parentDir || path)}</span>
+      <span class="artist-link-source-file">${t('文件：{name}', {name: escHtml(file)})}</span>
+      <span class="artist-link-source-path">${t('路径：{name}', {name: escHtml(parentDir || path)})}</span>
       ${meta ? `<em>${escHtml(meta)}</em>` : ''}
       ${passcode}
       <button class="btn btn-ghost btn-sm" type="button" data-artist-link-source-folder="${escHtml(folder)}" data-artist-link-source-artist="${escHtml(artistId)}">定位文件夹</button>
@@ -217,13 +218,13 @@ function artistLinkMarkup(link, index = 0) {
         <a href="${escHtml(link.url)}" target="_blank" rel="noopener noreferrer" title="${escHtml(link.display_url || link.url)}">${escHtml(link.display_url || link.url)}</a>
       </div>
       <div class="artist-link-actions">
-        ${passcodes.length ? `<code class="artist-link-passcode">提取码 ${escHtml(passcodes.join(' / '))}</code>` : ''}
+        ${passcodes.length ? `<code class="artist-link-passcode">${t('提取码 {code}', {code: escHtml(passcodes.join(' / '))})}</code>` : ''}
         <button class="btn btn-ghost btn-sm" type="button" data-artist-link-copy="${escHtml(link.url)}">复制链接</button>
         ${copyWithCode}
         <button class="btn btn-ghost btn-sm" type="button" data-artist-link-deliver="${index}">投递网盘</button>
       </div>
       <details class="artist-link-sources">
-        <summary>来自 ${sourceCount} 个位置</summary>
+        <summary>${t('来自 {count} 个位置', {count: sourceCount})}</summary>
         <ul>${sources}</ul>
       </details>
     </article>
@@ -295,14 +296,14 @@ export function renderArtistLinks() {
     list.innerHTML = '';
     return;
   }
-  summary.textContent = `${counts.cloud_drives || 0} 个网盘 \u00b7 ${counts.links || 0} 条链接`;
+  summary.textContent = t('{drives} 个网盘 \u00b7 {links} 条链接', {drives: counts.cloud_drives || 0, links: counts.links || 0});
   const errors = Number(counts.errors || 0);
   status.textContent = documents.length
-    ? `已扫描 ${documents.length} 个文本文件${errors ? `（${errors} 个文件未能解析）` : ''}`
-    : '未找到已扫描的 .txt、.html 或 .htm 说明文件';
+    ? (errors ? t('已扫描 {count} 个文本文件（{errors} 个文件未能解析）', {count: documents.length, errors}) : t('已扫描 {count} 个文本文件', {count: documents.length}))
+    : t('未找到已扫描的 .txt、.html 或 .htm 说明文件');
   const visible = filteredArtistLinks(links);
   if (!visible.length) {
-    list.innerHTML = `<div class="artist-links-empty">${links.length ? '没有符合当前筛选条件的链接' : '暂无已索引链接'}</div>`;
+    list.innerHTML = `<div class="artist-links-empty">${links.length ? t('没有符合当前筛选条件的链接') : t('暂无已索引链接')}</div>`;
     return;
   }
   visible.sort((left, right) => {
@@ -316,7 +317,7 @@ export function renderArtistLinks() {
   const currentFolderCount = visible.filter(isCurrentFolderCloudLink).length;
   list.innerHTML = visible.map((link, index) => {
     const heading = index === 0 && currentFolderCount
-      ? `<h3 class="artist-links-group-title">当前文件夹网盘 ${currentFolderCount}</h3>`
+      ? `<h3 class="artist-links-group-title">${t('当前文件夹网盘 {count}', {count: currentFolderCount})}</h3>`
       : index === currentFolderCount && currentFolderCount
         ? '<h3 class="artist-links-group-title">其他链接</h3>' : '';
     return heading + artistLinkMarkup(link, index);
@@ -452,10 +453,10 @@ export function bindArtistLinks() {
         if (!isCurrentArtistLinkRequest(artistId, artistSeq)) return;
         await loadArtistLinks(artistId, artistSeq);
         if (!isCurrentArtistLinkRequest(artistId, artistSeq)) return;
-        toast(`链接索引完成：${result.links || 0} 条`, 'success');
+        toast(t('链接索引完成：{count} 条', {count: result.links || 0}), 'success');
       } catch (error) {
         if (isCurrentArtistLinkRequest(artistId, artistSeq)) {
-          toast(`链接索引失败：${error.message || error}`, 'error');
+          toast(t('链接索引失败：{error}', {error: error.message || error}), 'error');
         }
       } finally {
         setActionBusy('artist-links-reindex', artistId, false);
@@ -549,7 +550,7 @@ function bindArtistProfileLinkDeletes() {
         toast('主页链接已删除', 'success');
       } catch (error) {
         if (isCurrentArtistLinkRequest(artistId, artistSeq)) {
-          toast(`删除失败：${error.message || error}`, 'error');
+          toast(t('删除失败：{error}', {error: error.message || error}), 'error');
         }
       } finally {
         setActionBusy('artist-profile-link-delete', linkId, false);
@@ -604,7 +605,7 @@ export function renderArtistProfileLinks() {
   // Entry title stays fixed at the dialog name; the link count lives in the summary row.
   const entryTitle = opener.querySelector('.artist-links-entry-title');
   summary.hidden = !totalLinks;
-  if (totalLinks) summary.textContent = `${counts.social || 0} 个社交主页 \u00b7 ${counts.subscription || 0} 个赞助订阅`;
+  if (totalLinks) summary.textContent = t('{social} 个社交主页 \u00b7 {sub} 个赞助订阅', {social: counts.social || 0, sub: counts.subscription || 0});
   status.textContent = links.length ? '' : '尚未添加任何主页或订阅链接';
   const social = links.filter(link => link.kind === 'social');
   const subscription = links.filter(link => link.kind === 'subscription');
@@ -649,7 +650,7 @@ export function bindArtistProfileLinks() {
       toast('主页链接已保存', 'success');
     } catch (error) {
       if (isCurrentArtistLinkRequest(artistId, artistSeq)) {
-        toast(`保存失败：${error.message || error}`, 'error');
+        toast(t('保存失败：{error}', {error: error.message || error}), 'error');
       }
     } finally {
       setActionBusy('artist-profile-link-add', artistId, false);

@@ -61,6 +61,7 @@ ensure_data_share_ownership() {
         if [ "${TRIM_RUN_USERNAME:-}" = "root" ] || [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
             chown -R "$APP_USER" "$data_share_root" 2>/dev/null || true
         fi
+        : > "$data_share_root/.legacy-share-migration-complete" 2>/dev/null || true
     fi
 }
 

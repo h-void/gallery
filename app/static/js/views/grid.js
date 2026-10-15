@@ -8,10 +8,11 @@ import {
 } from '../utils.js';
 import { computeJustifiedRows, justifiedRowHeight } from '../justified.js';
 import { toast, logUiAction, collectSelectionLayoutLogContext } from '../logging.js';
+import { t } from '../i18n.js';
 import {
   renderTagSearchResults, isGlobalSearchActive, renderSidebar, loadItemsPreservingDepth,
 } from './sidebar.js';
-import { toggleSelect, selectOnly, applySelectionChange, scheduleCharacterTagSuggestions } from './editbar.js';
+import { toggleSelect, selectOnly, applySelectionChange, scheduleCharacterTagSuggestions, executeBundleSelectedItems, classifyItems } from './editbar.js';
 import { openLightbox } from './lightbox.js';
 import { openArchiveModal } from './archive_modal.js';
 import { selectArtist } from '../router.js';
@@ -377,8 +378,8 @@ function renderDuplicateGroups(items) {
     const cards = renderItemCards(group.items, startIndex);
     startIndex += group.items.length;
     const count = state.hasMoreItems && index === groups.length - 1
-      ? `已加载 ${group.items.length} 个相同文件`
-      : `${group.items.length} 个相同文件`;
+      ? t('已加载 {count} 个相同文件', {count: group.items.length})
+      : t('{count} 个相同文件', {count: group.items.length});
     return `<section class="duplicate-file-group">
       <div class="duplicate-file-group-title">${count}</div>
       <div class="duplicate-file-group-items grid${viewClass}">${cards}</div>
@@ -390,11 +391,17 @@ function renderRecognizedDatePreview(item) {
   const date = String(item.display_date || item.date || '').trim();
   if (!/^\d{4}-\d{2}(-\d{2})?$/.test(date)) return '';
   const cls = String(item.manual_date || '').trim() ? ' recognized-date manual' : ' recognized-date';
-  return `<span class="${cls}" title="${String(item.manual_date || '').trim() ? '手动设置的日期' : '扫描检测到的日期'}">${escHtml(date)}</span>`;
+  return `<span class="${cls}" title="${String(item.manual_date || '').trim() ? t('手动设置的日期') : t('扫描检测到的日期')}">${escHtml(date)}</span>`;
 }
 
 export function itemCardRenderKey(html) {
   html = html.replace(/data-idx="\d+"/, 'data-idx=""');
+  // Language-independent key: title/aria-label values change with the UI
+  // language (they carry t() output and item names) but not with item content.
+  // Content changes still move the key through the title text, classes, and
+  // data attributes, so a language switch can never rebuild unchanged cards.
+  html = html.replace(/title="[^"]*"/g, 'title=""');
+  html = html.replace(/aria-label="[^"]*"/g, 'aria-label=""');
   let hash = 5381;
   for (let i = 0; i < html.length; i += 1) {
     hash = ((hash << 5) + hash + html.charCodeAt(i)) | 0;
@@ -431,20 +438,27 @@ function buildItemCardHtml(item, idx) {
     const fileUrl = API.fileUrl(item.file_path, fileVersionParam(item));
     const previewFileUrl = API.previewUrl(item.file_path, fileVersionParam(item), IMAGE_PREVIEW_MAX_EDGE);
     const checkVisible = selected ? ' visible' : '';
+    const imagePriority = idx < IMAGE_PRIORITY_HIGH_COUNT ? 'high' : 'low';
     const recognizedDateHtml = renderRecognizedDatePreview(item);
     const cardMetaFields = [renderTagNamesHtml(item.tags), recognizedDateHtml].filter(part => part);
     const cardMetaRow = cardMetaFields.length
       ? `<div class="date card-meta">${cardMetaFields.join('')}</div>`
       : '';
-    const favoriteLabel = item.favorite ? '取消收藏' : '收藏';
-    const favorite = `<button class="btn btn-ghost btn-icon card-favorite${item.favorite ? ' active' : ''}" type="button" data-favorite="${item.id}" title="${favoriteLabel}" aria-label="${favoriteLabel} ${escHtml(item.file_name)}" aria-pressed="${item.favorite ? 'true' : 'false'}"><span data-favorite-glyph aria-hidden="true">${buttonIcon(item.favorite ? 'starFilled' : 'star')}</span></button>`;
-    const download = `<a class="btn btn-ghost btn-icon card-download" data-download href="${fileUrl}" download="${escHtml(downloadFileName(item))}" title="下载文件" aria-label="下载 ${escHtml(item.file_name)}">${buttonIcon('download')}</a>`;
+    // Translated slots stay literal-first-argument t() calls (the drift guard
+    // checks them); visible label text stays Chinese source so the render key
+    // and the DOM auto-translation both keep working.
+    const favoriteLabel = item.favorite ? t('取消收藏') : t('收藏');
+    const favoriteAria = item.favorite
+      ? t('取消收藏 {name}', {name: escHtml(item.file_name)})
+      : t('收藏 {name}', {name: escHtml(item.file_name)});
+    const favorite = `<button class="btn btn-ghost btn-icon card-favorite${item.favorite ? ' active' : ''}" type="button" data-favorite="${item.id}" title="${favoriteLabel}" aria-label="${favoriteAria}" aria-pressed="${item.favorite ? 'true' : 'false'}"><span data-favorite-glyph aria-hidden="true">${buttonIcon(item.favorite ? 'starFilled' : 'star')}</span></button>`;
+    const download = `<a class="btn btn-ghost btn-icon card-download" data-download href="${fileUrl}" download="${escHtml(downloadFileName(item))}" title="${t('下载文件')}" aria-label="${t('下载 {name}', {name: escHtml(item.file_name)})}">${buttonIcon('download')}</a>`;
     // Full file name stays reachable on every card (hover/AT tooltip) even
     // when the one-line title truncates.
-    const titleRow = `<div class="card-title-row"><div class="file-name" title="${escHtml(item.file_name)}">${escHtml(item.file_name)}</div></div>`;
+    const titleRow = `<div class="card-title-row"><div class="file-name" data-i18n-skip title="${escHtml(item.file_name)}">${escHtml(item.file_name)}</div></div>`;
     const cardActions = `<div class="card-actions">${favorite}${download}</div>`;
     const artistJump = isGlobalSearchActive() && item.artist_id
-      ? `<button class="btn btn-ghost artist-jump" type="button" data-artist-jump="${item.artist_id}" title="转到 ${escHtml(item.artist_name || '画师')}">转到画师</button>`
+      ? `<button class="btn btn-ghost artist-jump" type="button" data-artist-jump="${item.artist_id}" title="${t('转到 {name}', {name: escHtml(item.artist_name || '画师')})}">转到画师</button>`
       : '';
     const previewUrl = escHtml(videoPreviewUrl(item));
 
@@ -466,7 +480,7 @@ function buildItemCardHtml(item, idx) {
         ${cardActions}
         <div class="video-preview">
           <img class="video-thumb loading" data-preview-src="${previewUrl}" alt="" decoding="async" draggable="false">
-          ${mediaFilePlaceholder('播放', 'play')}
+          ${mediaFilePlaceholder(t('播放'), 'play')}
         </div>
         <div class="info">
           ${titleRow}
@@ -517,7 +531,7 @@ function buildItemCardHtml(item, idx) {
     return `<div class="card${sel}" data-id="${item.id}" data-idx="${idx}" role="button" tabindex="0">
         <div class="check${checkVisible}${chk}" data-check="${item.id}"></div>
         ${cardActions}
-        <img class="thumb" data-src="${previewFileUrl}" decoding="async" fetchpriority="low" draggable="false">
+        <img class="thumb" data-src="${previewFileUrl}" decoding="async" fetchpriority="${imagePriority}" draggable="false">
         <div class="info">
           ${titleRow}
           ${cardMetaRow}
@@ -527,6 +541,10 @@ function buildItemCardHtml(item, idx) {
 }
 
 const IMAGE_PREVIEW_MAX_EDGE = 512;
+// Priority is decided at build time, never rewritten on scroll: the first
+// screen of cards loads at high priority, every later page stays low so the
+// browser scheduler keeps a sane order on large grids.
+const IMAGE_PRIORITY_HIGH_COUNT = 12;
 
 // Grid interactions use one delegated listener on the container: reconcile
 // swaps card nodes freely and no per-card binding ever needs a rebind.
@@ -574,7 +592,11 @@ export function bindGridEvents() {
         e.preventDefault();
         return;
       }
-      toggleSelect(parseInt(chk.dataset.check), {reason: selectionModifierActive(e) ? 'ctrl_check' : 'check'});
+      if (e.shiftKey) {
+        toggleSelect(parseInt(chk.dataset.check), {reason: 'shift_check', shift: true});
+      } else {
+        toggleSelect(parseInt(chk.dataset.check), {reason: selectionModifierActive(e) ? 'ctrl_check' : 'check'});
+      }
       return;
     }
     const card = target.closest('.card');
@@ -603,12 +625,12 @@ export function bindGridEvents() {
     if (cardInnerControlTarget(target)) return;
     const card = target.closest('.card');
     if (!card || !grid.contains(card)) return;
-    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft' || e.key === 'Home' || e.key === 'End') {
       const cards = Array.from(grid.querySelectorAll('.card[data-id]'));
       const idx = cards.indexOf(card);
-      if (idx !== -1) {
-        const nextIdx = e.key === 'ArrowRight' ? idx + 1 : idx - 1;
-        if (nextIdx >= 0 && nextIdx < cards.length) {
+      if (idx !== -1 && cards.length > 0) {
+        const nextIdx = e.key === 'Home' ? 0 : (e.key === 'End' ? cards.length - 1 : (e.key === 'ArrowRight' ? idx + 1 : idx - 1));
+        if (nextIdx >= 0 && nextIdx < cards.length && nextIdx !== idx) {
           e.preventDefault();
           cards[nextIdx].focus();
         }
@@ -633,7 +655,20 @@ function activateCard(card, e) {
       e.preventDefault();
       return;
     }
+    if (e && e.shiftKey) {
+      toggleSelect(parseInt(card.dataset.id), {reason: 'shift_click', shift: true});
+      return;
+    }
     toggleSelect(parseInt(card.dataset.id), {reason: selectionModifierActive(e) ? 'ctrl_click' : 'edit_mode_click'});
+    return;
+  }
+  if (e && e.shiftKey && state.selectedIds.size === 0) {
+    if (state.suppressNextGridClick) {
+      state.suppressNextGridClick = false;
+      e.preventDefault();
+      return;
+    }
+    toggleSelect(parseInt(card.dataset.id), {reason: 'shift_click', shift: true});
     return;
   }
   if (state.selectedIds.size > 0 || selectionModifierActive(e)) {
@@ -642,7 +677,9 @@ function activateCard(card, e) {
       e.preventDefault();
       return;
     }
-    if (selectionModifierActive(e)) {
+    if (e && e.shiftKey) {
+      toggleSelect(parseInt(card.dataset.id), {reason: 'shift_click', shift: true});
+    } else if (selectionModifierActive(e)) {
       toggleSelect(parseInt(card.dataset.id), {reason: 'ctrl_click'});
     } else {
       selectOnly(parseInt(card.dataset.id), {reason: 'click'});
@@ -707,6 +744,7 @@ function startSelectionMarquee(e) {
   if (!container.contains(e.target instanceof Node ? e.target : null)) return;
   state.suppressNextGridClick = false;
   const targetCard = e.target instanceof Element ? e.target.closest('.card') : null;
+  const cardId = targetCard ? Number(targetCard.dataset.id) : 0;
   state.selectionMarquee = {
     pointerId: e.pointerId,
     startX: e.clientX,
@@ -716,9 +754,13 @@ function startSelectionMarquee(e) {
     active: false,
     moved: false,
     onCard: Boolean(targetCard),
+    cardId: Number.isFinite(cardId) ? cardId : 0,
     modifier: selectionModifierActive(e),
     baseSelectedIds: new Set(state.selectedIds),
     overlay: null,
+    dropTarget: null,
+    dragIds: null,
+    dragBadge: null,
   };
   window.addEventListener('pointermove', moveSelectionMarquee);
   window.addEventListener('pointerup', finishSelectionMarquee);
@@ -840,13 +882,120 @@ function marqueeCardLayout(selection) {
   return cards;
 }
 
+function clearSidebarDragOverHighlights() {
+  $$('.folder-item.drag-over, .sidebar-item.drag-over').forEach(el => el.classList.remove('drag-over'));
+}
+
+function resolveSidebarDropTarget(clientX, clientY) {
+  if (typeof document.elementFromPoint !== 'function') return null;
+  const hit = document.elementFromPoint(clientX, clientY);
+  if (!(hit instanceof Element)) return null;
+  const sidebar = $('#filterSidebar');
+  if (!sidebar || !sidebar.contains(hit)) return null;
+  const folderEl = hit.closest('#folderTree .folder-item');
+  if (folderEl) {
+    const folderPath = folderEl.dataset.folder || '';
+    if (folderPath && folderPath !== state.activeFolder) {
+      const nameEl = folderEl.querySelector('.folder-name');
+      return {
+        type: 'folder',
+        path: folderPath,
+        name: (nameEl ? nameEl.textContent : folderPath) || folderPath,
+        el: folderEl,
+      };
+    }
+    return {type: 'sidebar-idle'};
+  }
+  const tagEl = hit.closest('#sidebarList .sidebar-item');
+  if (tagEl) {
+    const role = tagEl.dataset.role || '';
+    if (role && !role.startsWith('__')) {
+      const nameEl = tagEl.querySelector('.tag-name, span');
+      return {
+        type: 'tag',
+        role: parseInt(role, 10),
+        name: (nameEl ? nameEl.textContent : role) || role,
+        el: tagEl,
+      };
+    }
+    return {type: 'sidebar-idle'};
+  }
+  return {type: 'sidebar-idle'};
+}
+
+function resolveDragItemIds(selection) {
+  if (!selection) return new Set();
+  if (selection.cardId && selection.baseSelectedIds.has(selection.cardId)) {
+    return new Set(selection.baseSelectedIds);
+  }
+  if (selection.baseSelectedIds.size > 0 && (!selection.boxedIds || selection.boxedIds.length <= 1)) {
+    return new Set(selection.baseSelectedIds);
+  }
+  if (selection.boxedIds && selection.boxedIds.length > 0) {
+    return new Set(selection.boxedIds);
+  }
+  if (selection.cardId > 0) {
+    return new Set([selection.cardId]);
+  }
+  return new Set(selection.baseSelectedIds);
+}
+
+function syncDragGhostBadge(selection, dropTarget, dragCount) {
+  if (!selection) return;
+  if (!dropTarget || dragCount <= 0) {
+    if (selection.dragBadge) {
+      selection.dragBadge.remove();
+      selection.dragBadge = null;
+    }
+    return;
+  }
+  let badge = selection.dragBadge;
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.className = 'grid-drag-ghost';
+    document.body.appendChild(badge);
+    selection.dragBadge = badge;
+  }
+  if (dropTarget.type === 'folder') {
+    badge.textContent = t('移动 {count} 项到「{name}」', {count: dragCount, name: dropTarget.name});
+    badge.classList.add('is-valid-target');
+  } else if (dropTarget.type === 'tag') {
+    badge.textContent = t('为 {count} 项添加角色「{name}」', {count: dragCount, name: dropTarget.name});
+    badge.classList.add('is-valid-target');
+  } else {
+    badge.textContent = t('拖放到左侧文件夹或角色（已选 {count} 项）', {count: dragCount});
+    badge.classList.remove('is-valid-target');
+  }
+  badge.style.left = `${selection.currentX + 14}px`;
+  badge.style.top = `${selection.currentY + 14}px`;
+}
+
 function updateSelectionMarquee() {
   if (!state.selectionMarquee || !state.selectionMarquee.active) return;
+  const selection = state.selectionMarquee;
   const container = $('#gridContainer');
   const containerRect = container.getBoundingClientRect();
-  const box = marqueeRect(state.selectionMarquee, containerRect);
-  const overlay = state.selectionMarquee.overlay;
+  const dropTarget = resolveSidebarDropTarget(selection.currentX, selection.currentY);
+  clearSidebarDragOverHighlights();
+  if (dropTarget) {
+    const dragIds = resolveDragItemIds(selection);
+    if (dragIds.size > 0) {
+      selection.dropTarget = dropTarget;
+      selection.dragIds = dragIds;
+      if (dropTarget.el) dropTarget.el.classList.add('drag-over');
+      if (selection.overlay) selection.overlay.style.opacity = '0';
+      syncDragGhostBadge(selection, dropTarget, dragIds.size);
+      applySelectionChange(dragIds, {reason: 'selection_box', boxed_count: dragIds.size, modifier: selection.modifier, schedule: false, log: false});
+      return;
+    }
+  }
+  selection.dropTarget = null;
+  selection.dragIds = null;
+  syncDragGhostBadge(selection, null, 0);
+  const box = marqueeRect(selection, containerRect);
+  const overlay = selection.overlay;
   if (overlay) {
+    overlay.style.opacity = '';
     overlay.style.left = `${box.localLeft + container.scrollLeft}px`;
     overlay.style.top = `${box.localTop + container.scrollTop}px`;
     overlay.style.width = `${box.width}px`;
@@ -884,6 +1033,18 @@ function finishSelectionMarquee(e) {
     updateSelectionMarquee();
     state.suppressNextGridClick = true;
     setTimeout(() => { state.suppressNextGridClick = false; }, 250);
+    const dropTarget = selection.dropTarget;
+    const dragIds = selection.dragIds;
+    if (dropTarget && dragIds && dragIds.size > 0 && (dropTarget.type === 'folder' || dropTarget.type === 'tag')) {
+      applySelectionChange(dragIds, {reason: 'drag_drop', schedule: false});
+      cleanupSelectionMarquee(e);
+      if (dropTarget.type === 'folder' && dropTarget.path) {
+        executeBundleSelectedItems(dropTarget.path);
+      } else if (dropTarget.type === 'tag' && Number.isFinite(dropTarget.role)) {
+        classifyItems([...dragIds], [dropTarget.role], 'add');
+      }
+      return;
+    }
     logUiAction('selection_box_apply', collectSelectionLayoutLogContext({
       modifier: selection.modifier,
       boxed_count: selection.boxedCount || 0,
@@ -906,6 +1067,11 @@ function cleanupSelectionMarquee(e) {
   if (state.selectionMarquee && state.selectionMarquee.updateFrame) {
     cancelAnimationFrame(state.selectionMarquee.updateFrame);
     state.selectionMarquee.updateFrame = 0;
+  }
+  clearSidebarDragOverHighlights();
+  if (state.selectionMarquee && state.selectionMarquee.dragBadge) {
+    state.selectionMarquee.dragBadge.remove();
+    state.selectionMarquee.dragBadge = null;
   }
   if (state.selectionMarquee && state.selectionMarquee.overlay) {
     state.selectionMarquee.overlay.remove();
@@ -931,10 +1097,12 @@ export function syncFavoriteButtons(item) {
   if (!item) return;
   $$(`[data-favorite="${item.id}"]`).forEach(btn => {
     const favorite = Boolean(item.favorite);
-    const label = favorite ? '取消收藏' : '收藏';
+    const label = favorite ? t('取消收藏') : t('收藏');
     btn.classList.toggle('active', favorite);
     btn.setAttribute('aria-pressed', String(favorite));
-    btn.setAttribute('aria-label', `${label} ${item.file_name || ''}`.trim());
+    btn.setAttribute('aria-label', favorite
+      ? t('取消收藏 {name}', {name: item.file_name || ''})
+      : t('收藏 {name}', {name: item.file_name || ''}));
     btn.title = label;
     btn.disabled = isActionBusy('item-favorite', item.id);
     const glyph = btn.querySelector('[data-favorite-glyph]');

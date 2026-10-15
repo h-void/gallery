@@ -7,8 +7,10 @@ import {
   $, $$, escHtml, formatSize, copyText, downloadFileName, renderTagNamesHtml,
 } from '../utils.js';
 import { toast, logUiAction, collectUiLogContext, frontendErrorText } from '../logging.js';
+import { t } from '../i18n.js';
 import { syncFavoriteButtons, toggleItemFavorite, isGifItem, fileVersionParam, renderGrid } from './grid.js';
-import { renderSidebar } from './sidebar.js';
+import { renderSidebar, renderToolbar, selectFolder, isGlobalSearchActive } from './sidebar.js';
+import { selectArtist } from '../router.js';
 
 const LIGHTBOX_ZOOM_MIN = 0.5;
 const LIGHTBOX_ZOOM_MAX = 4;
@@ -272,7 +274,7 @@ function syncLightboxAccessibleName(item) {
   const lightbox = $('#lightbox');
   if (!lightbox) return;
   const name = item && (item.file_name || '').trim();
-  lightbox.setAttribute('aria-label', name ? `${name} 预览` : '预览');
+  lightbox.setAttribute('aria-label', name ? t('{name} 预览', {name}) : '预览');
 }
 
 export function openLightbox(idx) {
@@ -343,35 +345,89 @@ export function toggleLightboxCaption(force) {
 
 const LIGHTBOX_PRELOAD_LIMIT = 4;
 const lightboxPreloadCache = new Map();
+let lightboxPreloadGeneration = 0;
+let lightboxPreloadActive = null;
+const lightboxPreloadQueue = [];
+
+// Full cancel: dropping queued entries and aborting the in-flight fetch keeps
+// a fast close (or a fast arrow run) from leaving neighbor downloads running
+// against the media share.
+function cancelLightboxPreloadWork() {
+  lightboxPreloadGeneration += 1;
+  if (lightboxPreloadActive) {
+    const {img} = lightboxPreloadActive;
+    img.onload = null;
+    img.onerror = null;
+    try { img.src = ''; } catch (e) {}
+    lightboxPreloadActive = null;
+  }
+  lightboxPreloadQueue.length = 0;
+}
 
 export function clearLightboxPreloadCache() {
+  cancelLightboxPreloadWork();
   lightboxPreloadCache.clear();
 }
 
+function finishLightboxPreload(entry, img, loaded) {
+  if (lightboxPreloadActive && lightboxPreloadActive.img === img) lightboxPreloadActive = null;
+  if (entry.generation === lightboxPreloadGeneration && loaded) {
+    lightboxPreloadCache.set(entry.url, img);
+    if (lightboxPreloadCache.size > LIGHTBOX_PRELOAD_LIMIT) {
+      const firstKey = lightboxPreloadCache.keys().next().value;
+      lightboxPreloadCache.delete(firstKey);
+    }
+  }
+  pumpLightboxPreloadQueue();
+}
+
+function pumpLightboxPreloadQueue() {
+  if (lightboxPreloadActive) return;
+  while (lightboxPreloadQueue.length) {
+    const entry = lightboxPreloadQueue.shift();
+    if (entry.generation !== lightboxPreloadGeneration) continue;
+    if (lightboxPreloadCache.has(entry.url)) continue;
+    const img = new Image();
+    img.decoding = 'async';
+    lightboxPreloadActive = {url: entry.url, img};
+    img.onload = () => finishLightboxPreload(entry, img, true);
+    img.onerror = () => finishLightboxPreload(entry, img, false);
+    img.src = entry.url;
+    return;
+  }
+}
+
+// Neighbor originals (images only) queue behind the current image's decode:
+// steady-state concurrency stays at one fetch, repeats are deduplicated, and
+// the list ends clamp instead of wrap so the first/last item preloads exactly
+// one neighbor.
 export function preloadAdjacentLightboxMedia(items, currentIndex) {
   if (!Array.isArray(items) || items.length <= 1) return;
-  const deltas = [1, -1];
-  for (const delta of deltas) {
-    const targetIdx = (currentIndex + delta + items.length) % items.length;
+  cancelLightboxPreloadWork();
+  const generation = lightboxPreloadGeneration;
+  for (const delta of [1, -1]) {
+    const targetIdx = Math.min(items.length - 1, Math.max(0, currentIndex + delta));
+    if (targetIdx === currentIndex) continue;
     const targetItem = items[targetIdx];
     if (!targetItem) continue;
     const mediaType = targetItem.media_type || (targetItem.is_archive ? 'archive' : 'image');
-    if (mediaType === 'image' && !isGifItem(targetItem)) {
-      const url = API.fileUrl(targetItem.file_path, fileVersionParam(targetItem));
-      if (!lightboxPreloadCache.has(url)) {
-        const img = new Image();
-        img.decoding = 'async';
-        img.src = url;
-        if (typeof img.decode === 'function') {
-          img.decode().catch(() => {});
-        }
-        lightboxPreloadCache.set(url, img);
-        if (lightboxPreloadCache.size > LIGHTBOX_PRELOAD_LIMIT) {
-          const firstKey = lightboxPreloadCache.keys().next().value;
-          lightboxPreloadCache.delete(firstKey);
-        }
-      }
-    }
+    if (mediaType !== 'image' || isGifItem(targetItem)) continue;
+    const url = API.fileUrl(targetItem.file_path, fileVersionParam(targetItem));
+    if (lightboxPreloadCache.has(url)) continue;
+    if (lightboxPreloadQueue.some(queued => queued.url === url)) continue;
+    lightboxPreloadQueue.push({url, generation});
+  }
+  const kick = () => {
+    if (generation === lightboxPreloadGeneration) pumpLightboxPreloadQueue();
+  };
+  const current = $('#lightboxImg');
+  if (current && current.complete === false && typeof current.addEventListener === 'function') {
+    current.addEventListener('load', kick, {once: true});
+    current.addEventListener('error', kick, {once: true});
+  } else if (current && typeof current.decode === 'function' && current.complete) {
+    current.decode().then(kick, kick);
+  } else {
+    kick();
   }
 }
 
@@ -455,7 +511,7 @@ export function showLightboxImage(items) {
     video.style.display = '';
   } else if (mediaType === 'source') {
     img.classList.remove('loading');
-    file.innerHTML = `<div class="source-mark">SRC</div><div>${escHtml(item.file_name)}</div><small>${formatSize(item.file_size)}</small>`;
+    file.innerHTML = `<div class="source-mark">SRC</div><div data-i18n-skip>${escHtml(item.file_name)}</div><small>${formatSize(item.file_size)}</small>`;
     file.style.display = 'flex';
   } else if (mediaType === 'text') {
     img.classList.remove('loading');
@@ -465,7 +521,7 @@ export function showLightboxImage(items) {
     API.get(API.textUrl(item.file_path))
       .then(data => {
         if (loadToken !== state.lightboxLoadToken) return;
-        const truncNote = data.truncated ? `<div class="lightbox-text-truncated">仅显示部分内容，文件共 ${formatSize(data.size)}</div>` : '';
+        const truncNote = data.truncated ? `<div class="lightbox-text-truncated">${t('仅显示部分内容，文件共 {size}', {size: formatSize(data.size)})}</div>` : '';
         textEl.innerHTML = `<pre class="lightbox-text-pre">${escHtml(data.content)}</pre>${truncNote}`;
       })
       .catch(() => {
@@ -502,34 +558,39 @@ export function showLightboxImage(items) {
       };
       fallbackLoader.src = fallbackSrc;
     };
-    const loader = new Image();
-    loader.decoding = 'async';
-    loader.onload = () => revealLoadedImage(displayFileUrl);
-    loader.onerror = () => {
-      if (loadToken !== state.lightboxLoadToken) return;
-      if (img.dataset.fallbackSrc) {
-        const fallbackSrc = img.dataset.fallbackSrc;
-        delete img.dataset.fallbackSrc;
-        loadFallbackImage(fallbackSrc);
-        return;
+    const preloaded = lightboxPreloadCache.get(displayFileUrl);
+    if (preloaded && preloaded.complete && preloaded.naturalWidth > 0) {
+      revealLoadedImage(displayFileUrl);
+    } else {
+      const loader = new Image();
+      loader.decoding = 'async';
+      loader.onload = () => revealLoadedImage(displayFileUrl);
+      loader.onerror = () => {
+        if (loadToken !== state.lightboxLoadToken) return;
+        if (img.dataset.fallbackSrc) {
+          const fallbackSrc = img.dataset.fallbackSrc;
+          delete img.dataset.fallbackSrc;
+          loadFallbackImage(fallbackSrc);
+          return;
+        }
+        img.classList.remove('loading', 'ready', 'placeholder');
+        img.classList.add('failed');
+        if (!placeholderUrl) img.style.display = '';
+      };
+      if (placeholderUrl) {
+        img.src = placeholderUrl;
+        img.classList.remove('loading', 'failed');
+        img.classList.add('ready', 'placeholder');
+        img.style.display = '';
       }
-      img.classList.remove('loading', 'ready', 'placeholder');
-      img.classList.add('failed');
-      if (!placeholderUrl) img.style.display = '';
-    };
-    if (placeholderUrl) {
-      img.src = placeholderUrl;
-      img.classList.remove('loading', 'failed');
-      img.classList.add('ready', 'placeholder');
-      img.style.display = '';
+      loader.src = displayFileUrl;
     }
-    loader.src = displayFileUrl;
   }
   applyLightboxZoom();
   const download = $('#lightboxDownloadBtn');
   download.href = fileUrl;
   download.download = downloadFileName(item);
-  download.setAttribute('aria-label', `下载 ${item.file_name}`);
+  download.setAttribute('aria-label', t('下载 {name}', {name: item.file_name}));
   const favoriteBtn = $('#lightboxFavoriteBtn');
   favoriteBtn.dataset.favorite = String(item.id);
   syncFavoriteButtons(item);
@@ -541,13 +602,30 @@ export function showLightboxImage(items) {
     resetLightboxDeleteBtn(deleteBtn);
   }
   const copyPath = item.real_file_path || item.file_path;
+  const normFile = String(copyPath || '').replace(/\\/g, '/');
+  const normArtist = String(item.artist_path || state.currentArtist?.path || '').replace(/\\/g, '/').replace(/\/+$/, '');
+  const lastSlash = normFile.lastIndexOf('/');
+  let itemFolderRel = item.folder_name || '';
+  if (lastSlash > 0 && normArtist && normFile.slice(0, lastSlash).startsWith(normArtist + '/')) {
+    itemFolderRel = normFile.slice(normArtist.length + 1, lastSlash);
+  } else if (lastSlash > 0 && normArtist && normFile.slice(0, lastSlash) === normArtist) {
+    itemFolderRel = '';
+  }
+  const canJumpFolder = Boolean(itemFolderRel && (state.activeFolder !== itemFolderRel || isGlobalSearchActive()));
+  const jumpFolderBtnHtml = canJumpFolder
+    ? `<button type="button" class="btn btn-ghost btn-sm lightbox-folder-jump" id="lightboxFolderJumpBtn" data-jump-folder="${escHtml(itemFolderRel)}" data-jump-artist="${item.artist_id || ''}" title="${t('定位到所在文件夹')}">${t('定位文件夹')}</button>`
+    : '';
+  const indexBadgeHtml = items.length > 0
+    ? `<span class="lightbox-meta-index" data-i18n-skip>${state.lightboxIndex + 1} / ${items.length}</span>`
+    : '';
   const lightboxMeta = [
+    indexBadgeHtml,
     `<span class="lightbox-meta-tags">${renderTagNamesHtml(item.tags)}</span>`,
     item.date ? `<span class="lightbox-meta-date">${escHtml(item.date)}</span>` : '<span class="lightbox-meta-date"></span>',
-    item.file_name ? `<span class="lightbox-meta-name">${escHtml(item.file_name)}</span>` : '',
+    item.file_name ? `<span class="lightbox-meta-name" data-i18n-skip>${escHtml(item.file_name)}</span>` : '',
   ];
   $('#lightboxPath').innerHTML = `
-    <button type="button" class="btn lightbox-path-panel" data-copy-path="${escHtml(copyPath)}" title="${escHtml(copyPath)}">${escHtml(item.display_file_path || item.real_file_path || item.file_path)}</button>
+    <button type="button" class="btn lightbox-path-panel" data-i18n-skip data-copy-path="${escHtml(copyPath)}" title="${escHtml(copyPath)}">${escHtml(item.display_file_path || item.real_file_path || item.file_path)}</button>${jumpFolderBtnHtml}
   `;
   $('#lightboxInfo').innerHTML = `
     ${lightboxMeta.filter(part => part).join('')}
@@ -561,17 +639,70 @@ export function showLightboxImage(items) {
       toast(ok ? '真实路径已复制' : '复制路径失败', ok ? 'success' : 'error');
     });
   }
+  const jumpFolderBtn = $('#lightboxFolderJumpBtn');
+  if (jumpFolderBtn) {
+    jumpFolderBtn.addEventListener('click', async e => {
+      e.stopPropagation();
+      const targetFolder = jumpFolderBtn.dataset.jumpFolder || '';
+      const targetArtistId = Number(jumpFolderBtn.dataset.jumpArtist || 0);
+      if (!targetFolder) return;
+      closeLightbox();
+      if (targetArtistId > 0 && (!state.currentArtist || Number(state.currentArtist.id) !== targetArtistId)) {
+        await selectArtist(targetArtistId, {loadItems: false});
+      }
+      selectFolder(targetFolder);
+    });
+  }
   bindLightboxInPlaceEditing(item);
   preloadAdjacentLightboxMedia(items, state.lightboxIndex);
+}
+
+let lightboxJustPanned = false;
+let lightboxJustPannedTimer = 0;
+
+export function consumeLightboxJustPanned() {
+  if (!lightboxJustPanned) return false;
+  lightboxJustPanned = false;
+  if (lightboxJustPannedTimer) {
+    clearTimeout(lightboxJustPannedTimer);
+    lightboxJustPannedTimer = 0;
+  }
+  return true;
+}
+
+function syncLightboxZoomBadge() {
+  const info = $('#lightboxInfo');
+  if (!info) return;
+  let badge = $('#lightboxZoomResetBtn');
+  const zoomed = Math.abs((state.lightboxZoom || 1) - 1) > 0.01;
+  if (!zoomed) {
+    if (badge) badge.remove();
+    return;
+  }
+  if (!badge) {
+    badge = document.createElement('button');
+    badge.type = 'button';
+    badge.id = 'lightboxZoomResetBtn';
+    badge.className = 'btn btn-ghost btn-sm lightbox-zoom-reset';
+    badge.title = t('点击重置缩放 (100%)');
+    badge.addEventListener('click', e => {
+      e.stopPropagation();
+      resetLightboxTransform();
+    });
+    info.prepend(badge);
+  }
+  badge.textContent = `${Math.round(state.lightboxZoom * 100)}%`;
 }
 
 export function applyLightboxZoom() {
   const img = $('#lightboxImg');
   if (!img) return;
+  img.classList.toggle('panning', Boolean(state.lightboxPanActive));
   Object.assign(img.style, {
     transform: `translate(${state.lightboxPanX}px, ${state.lightboxPanY}px) scale(${state.lightboxZoom})`,
     cursor: state.lightboxZoom > 1 ? 'grab' : 'default',
   });
+  syncLightboxZoomBadge();
 }
 
 export function clampLightboxZoom(value) {
@@ -708,6 +839,16 @@ export function moveLightboxPan(e) {
   if (!state.lightboxPanActive || state.lightboxZoom <= 1) return;
   e.preventDefault();
   e.stopPropagation();
+  const dx = e.clientX - state.lightboxPanPointerX;
+  const dy = e.clientY - state.lightboxPanPointerY;
+  if (Math.hypot(dx, dy) > 3) {
+    lightboxJustPanned = true;
+    if (lightboxJustPannedTimer) clearTimeout(lightboxJustPannedTimer);
+    lightboxJustPannedTimer = setTimeout(() => {
+      lightboxJustPanned = false;
+      lightboxJustPannedTimer = 0;
+    }, 250);
+  }
   state.lightboxPanX = state.lightboxPanStartX + (e.clientX - state.lightboxPanPointerX);
   state.lightboxPanY = state.lightboxPanStartY + (e.clientY - state.lightboxPanPointerY);
   applyLightboxZoom();
@@ -724,7 +865,10 @@ export function stopLightboxPan(e) {
   } else {
     state.lightboxPointers.clear();
   }
-  if (state.lightboxPanActive) state.lightboxPanActive = false;
+  if (state.lightboxPanActive) {
+    state.lightboxPanActive = false;
+    applyLightboxZoom();
+  }
   if (state.lightboxPointers.size < 2) {
     state.lightboxPinchActive = false;
     state.lightboxPinchStartDistance = 0;
@@ -817,6 +961,23 @@ export function onLightboxKey(e) {
     openLightboxTagInput();
     return;
   }
+  if ((e.key === 'd' || e.key === 'D') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (state.readOnlyMode) return;
+    const dateBtn = $('#lightboxDateBtn');
+    if (dateBtn && dateBtn.style.display !== 'none') {
+      e.preventDefault();
+      dateBtn.click();
+    }
+    return;
+  }
+  if ((e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    const pathBtn = $('#lightboxPath .lightbox-path-panel');
+    if (pathBtn) {
+      e.preventDefault();
+      pathBtn.click();
+    }
+    return;
+  }
   if ((e.key === 'i' || e.key === 'I') && !e.ctrlKey && !e.metaKey && !e.altKey) {
     e.preventDefault();
     toggleLightboxCaption();
@@ -907,15 +1068,15 @@ export function onLightboxKey(e) {
 function collectLightboxTagSuggestions() {
   const suggestions = new Set();
   if (Array.isArray(state.tags)) {
-    state.tags.forEach(t => { if (t && t.name) suggestions.add(t.name); });
+    state.tags.forEach(tag => { if (tag && tag.name) suggestions.add(tag.name); });
   }
   if (Array.isArray(state.stats?.tags)) {
-    state.stats.tags.forEach(t => { if (t && t.name) suggestions.add(t.name); });
+    state.stats.tags.forEach(tag => { if (tag && tag.name) suggestions.add(tag.name); });
   }
   if (Array.isArray(state.allItems)) {
     state.allItems.forEach(i => {
       if (Array.isArray(i.tags)) {
-        i.tags.forEach(t => { if (t && t.name) suggestions.add(t.name); });
+        i.tags.forEach(tag => { if (tag && tag.name) suggestions.add(tag.name); });
       }
     });
   }
@@ -966,10 +1127,10 @@ function renderLightboxTags(item) {
   if (tags.length === 0) {
     html += '<span class="meta-tag meta-tag-empty">未加角色</span>';
   } else {
-    html += tags.map(t => `
-      <span class="meta-tag meta-tag-editable" data-tag-name="${escHtml(t.name)}">
-        <span>${escHtml(t.name)}</span>
-        ${readOnly ? '' : `<button type="button" class="meta-tag-remove" data-remove-tag="${escHtml(t.name)}" title="移除角色" aria-label="移除角色 ${escHtml(t.name)}">×</button>`}
+    html += tags.map(tag => `
+      <span class="meta-tag meta-tag-editable" data-tag-name="${escHtml(tag.name)}">
+        <span data-i18n-skip>${escHtml(tag.name)}</span>
+        ${readOnly ? '' : `<button type="button" class="meta-tag-remove" data-remove-tag="${escHtml(tag.name)}" title="${t('移除角色')}" aria-label="${t('移除角色 {name}', {name: escHtml(tag.name)})}">×</button>`}
       </span>
     `).join('');
   }
@@ -1003,11 +1164,11 @@ function renderLightboxTags(item) {
         if (Array.isArray(state.allItems)) {
           state.allItems.forEach(row => {
             if (row && changedIds.has(Number(row.id))) {
-              row.tags = (row.tags || []).filter(t => t.name !== tagName);
+              row.tags = (row.tags || []).filter(tag => tag.name !== tagName);
             }
           });
         }
-        item.tags = (item.tags || []).filter(t => t.name !== tagName);
+        item.tags = (item.tags || []).filter(tag => tag.name !== tagName);
         if (isCurrentLightboxItem(item)) {
           renderLightboxTags(item);
         }
@@ -1060,7 +1221,7 @@ function renderLightboxTags(item) {
           const appendNames = target => {
             if (!Array.isArray(target.tags)) target.tags = [];
             names.forEach(name => {
-              if (!target.tags.some(t => t.name === name)) {
+              if (!target.tags.some(tag => tag.name === name)) {
                 target.tags.push({name});
               }
             });
@@ -1113,8 +1274,8 @@ function renderLightboxDate(item) {
   }
   const isMonthManual = /^\d{4}-\d{2}$/.test(String(item.manual_date || ''));
   container.innerHTML = `
-    <button type="button" class="btn btn-ghost btn-xs lightbox-meta-date-btn" id="lightboxDateBtn" title="修改日期" aria-label="修改日期"${state.readOnlyMode ? ' disabled' : ''}>${escHtml(displayDate || '设置日期')}</button>
-    <input type="date" class="input input-sm lightbox-date-input" id="lightboxDateInput" data-initial-value="${escHtml(inputVal)}" style="display:none" value="${escHtml(inputVal)}" aria-label="设置有效日期">
+    <button type="button" class="btn btn-ghost btn-xs lightbox-meta-date-btn" id="lightboxDateBtn" title="${t('修改日期')}" aria-label="${t('修改日期')}"${state.readOnlyMode ? ' disabled' : ''}>${escHtml(displayDate || t('设置日期'))}</button>
+    <input type="date" class="input input-sm lightbox-date-input" id="lightboxDateInput" data-initial-value="${escHtml(inputVal)}" style="display:none" value="${escHtml(inputVal)}" aria-label="${t('设置有效日期')}">
   `;
 
   const dateBtn = $('#lightboxDateBtn');
@@ -1167,7 +1328,7 @@ function renderLightboxDate(item) {
         item.manual_date = nextDate || null;
         item.display_date = fallbackDate || '';
       }
-      toast(nextDate ? `已设置日期 ${nextDate}` : '已恢复检测日期', 'success');
+      toast(nextDate ? t('已设置日期 {date}', {date: nextDate}) : '已恢复检测日期', 'success');
       if (isCurrentLightboxItem(item)) {
         renderLightboxDate(item);
       }
@@ -1217,6 +1378,12 @@ function bindLightboxInPlaceEditing(item) {
 
 export function onLightboxWheel(e) {
   if (Math.abs(e.deltaY) < 1) return;
+  if (!e.ctrlKey && e.target instanceof Element) {
+    const textHost = e.target.closest('#lightboxText');
+    if (textHost && textHost.scrollHeight > textHost.clientHeight + 1) {
+      return;
+    }
+  }
   e.preventDefault();
   e.stopPropagation();
 
@@ -1258,16 +1425,41 @@ export async function deleteMediaItem({filePath, itemId, fileName = '', button =
   if (!filePath || !itemId) return false;
   const busyId = String(itemId);
   if (isActionBusy('media-delete', busyId)) return false;
-  if (!skipConfirm && !window.confirm(`确定要将文件「${fileName || '此文件'}」移入回收站吗？`)) return false;
+  if (!skipConfirm && !window.confirm(t('确定要将文件「{name}」移入回收站吗？', {name: fileName || t('此文件')}))) return false;
   setActionBusy('media-delete', busyId, true);
   if (button) button.classList.add('deleting');
   try {
     await API.del(API.deleteFileUrl(filePath));
+    const removedItem = (state.allItems || []).find(i => i.id === itemId) || null;
     state.allItems = state.allItems.filter(i => i.id !== itemId);
     state.itemsOffset = state.allItems.length;
     state.selectedIds.delete(itemId);
+    if (removedItem && state.stats) {
+      if (typeof state.stats.total === 'number') state.stats.total = Math.max(0, state.stats.total - 1);
+      if (removedItem.favorite && typeof state.stats.favorites === 'number') state.stats.favorites = Math.max(0, state.stats.favorites - 1);
+      const rType = removedItem.media_type || (removedItem.is_archive ? 'archive' : 'image');
+      if ((rType === 'archive' || removedItem.is_archive) && typeof state.stats.archives === 'number') state.stats.archives = Math.max(0, state.stats.archives - 1);
+      if (rType === 'video' && typeof state.stats.videos === 'number') state.stats.videos = Math.max(0, state.stats.videos - 1);
+      if (rType === 'source' && typeof state.stats.sources === 'number') state.stats.sources = Math.max(0, state.stats.sources - 1);
+      const rTags = Array.isArray(removedItem.tags) ? removedItem.tags : [];
+      if (rTags.length === 0 && typeof state.stats.untagged === 'number') state.stats.untagged = Math.max(0, state.stats.untagged - 1);
+      if (rTags.length > 0 && Array.isArray(state.stats.tags)) {
+        const tagNames = new Set(rTags.map(tag => tag && tag.name).filter(Boolean));
+        state.stats.tags.forEach(tag => {
+          if (tag && tagNames.has(tag.name) && typeof tag.count === 'number') {
+            tag.count = Math.max(0, tag.count - 1);
+          }
+        });
+      }
+    }
     if (closeLightboxAfter) closeLightbox();
-    if (renderAfter) renderGrid();
+    if (renderAfter) {
+      if (removedItem && state.stats) {
+        renderSidebar();
+        renderToolbar();
+      }
+      renderGrid();
+    }
     if (toastOnSuccess) toast('文件已移入回收站', 'success');
     return true;
   } catch (e) {

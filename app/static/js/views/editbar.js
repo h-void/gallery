@@ -5,9 +5,10 @@
 import { API, scheduleFolderRenamesRefresh } from '../api.js';
 import { state, nextRequestSeq, isCurrentRequestSeq, isActionBusy, setActionBusy } from '../store.js';
 import {
-  $, $$, escHtml, searchableTextMatches, UI_FIELD_SEPARATOR, compareNameParts, compareCharacterNames,
+  $, $$, escHtml, buttonIcon, searchableTextMatches, UI_FIELD_SEPARATOR, compareNameParts, compareCharacterNames,
 } from '../utils.js';
 import { toast, logUiAction, collectUiLogContext, collectSelectionLayoutLogContext } from '../logging.js';
+import { t } from '../i18n.js';
 import {
   isTaggableItem, captureGridScrollAnchor, restoreGridScrollAnchor, renderGrid, syncSelectedCards,
 } from './grid.js';
@@ -44,6 +45,7 @@ export function applySelectionChange(ids, options = {}) {
   const restoreSeq = nextRequestSeq('selectionRestoreSeq');
   const nextIds = normalizeSelectionIds(ids instanceof Set ? ids : new Set(ids || []));
   const changed = !selectionSetsEqual(state.selectedIds, nextIds);
+  if (nextIds.size === 0) state.lastSelectedItemId = null;
   if (changed) {
     state.selectedIds = nextIds;
     resetCharacterTagSuggestions();
@@ -71,12 +73,29 @@ export function applySelectionChange(ids, options = {}) {
 }
 
 export function toggleSelect(id, options = {}) {
+  const numId = Number(id);
   const nextIds = new Set(state.selectedIds);
-  if (state.selectedIds.has(id)) {
+  if (options.shift && state.lastSelectedItemId != null) {
+    const taggable = (state.allItems || []).filter(isTaggableItem);
+    const prevIdx = taggable.findIndex(item => Number(item.id) === Number(state.lastSelectedItemId));
+    const currIdx = taggable.findIndex(item => Number(item.id) === numId);
+    if (prevIdx !== -1 && currIdx !== -1) {
+      const start = Math.min(prevIdx, currIdx);
+      const end = Math.max(prevIdx, currIdx);
+      for (let i = start; i <= end; i += 1) {
+        nextIds.add(Number(taggable[i].id));
+      }
+    } else if (state.selectedIds.has(id)) {
+      nextIds.delete(id);
+    } else {
+      nextIds.add(id);
+    }
+  } else if (state.selectedIds.has(id)) {
     nextIds.delete(id);
   } else {
     nextIds.add(id);
   }
+  if (Number.isFinite(numId)) state.lastSelectedItemId = numId;
   const changed = applySelectionChange(nextIds, {
     reason: options.reason || 'toggle',
     event: 'item_select',
@@ -94,11 +113,13 @@ export function toggleSelect(id, options = {}) {
 }
 
 export function selectOnly(id, options = {}) {
+  const numId = Number(id);
   applySelectionChange([id], {
     reason: options.reason || 'click',
     event: 'item_select',
     log: false,
   });
+  if (Number.isFinite(numId)) state.lastSelectedItemId = numId;
   logUiAction('item_select', collectSelectionLayoutLogContext({
     reason: options.reason || 'click',
     id,
@@ -129,7 +150,7 @@ export async function deleteSelectedMediaItems() {
     toast('请先选择要删除的媒体作品', 'error');
     return;
   }
-  if (!window.confirm(`确定要将选中的 ${items.length} 项移入回收站吗？`)) return;
+  if (!window.confirm(t('确定要将选中的 {count} 项移入回收站吗？', {count: items.length}))) return;
 
   setActionBusy('edit-delete-selected', '', true);
   if (btn) {
@@ -156,7 +177,11 @@ export async function deleteSelectedMediaItems() {
         failedItemIds.push(itemId);
       }
     }
-    if (deletedItemIds.length) renderGrid();
+    if (deletedItemIds.length) {
+      renderSidebar();
+      renderToolbar();
+      renderGrid();
+    }
     applySelectionChange([], {reason: 'delete_selected', log: false});
     logUiAction('edit_delete_selected_result', {
       item_ids: ids,
@@ -166,9 +191,9 @@ export async function deleteSelectedMediaItems() {
       failed_count: failedItemIds.length,
     });
     if (failedItemIds.length) {
-      toast(`已移入回收站 ${deletedItemIds.length} 项，${failedItemIds.length} 项处理失败`, 'error');
+      toast(t('已移入回收站 {deleted} 项，{failed} 项处理失败', {deleted: deletedItemIds.length, failed: failedItemIds.length}), 'error');
     } else {
-      toast(`已成功将 ${deletedItemIds.length} 项移入回收站`, 'success');
+      toast(t('已成功将 {count} 项移入回收站', {count: deletedItemIds.length}), 'success');
     }
   } finally {
     resetEditDeleteSelectedButton(btn);
@@ -233,12 +258,12 @@ export function updateEditBar() {
     bar.classList.toggle('is-empty-selection', !selectionActive);
     bar.classList.toggle('has-folder-scope', folderScopeActive);
     if (selectionActive) {
-      $('#selectedCount').textContent = `已选 ${state.selectedIds.size} 项`;
+      $('#selectedCount').textContent = t('已选 {count} 项', {count: state.selectedIds.size});
     } else if (folderScopeActive) {
-      $('#selectedCount').textContent = `当前文件夹：${state.activeFolder}`;
+      $('#selectedCount').textContent = t('当前文件夹：{name}', {name: state.activeFolder});
     } else {
       // Edit mode holds the bar up with nothing selected yet.
-      $('#selectedCount').textContent = '已选 0 项';
+      $('#selectedCount').textContent = t('已选 {count} 项', {count: 0});
     }
     const selectAllBtn = $('#editSelectAllBtn');
     if (selectAllBtn) {
@@ -254,6 +279,18 @@ export function updateEditBar() {
     if (bundleBtn) {
       bundleBtn.hidden = !selectionActive;
     }
+    const extractArchivesBtn = $('#editExtractArchivesBtn');
+    if (extractArchivesBtn) {
+      const selectedArchives = selectionActive
+        ? (state.allItems || []).filter(item => state.selectedIds.has(item.id) && (item.media_type === 'archive' || item.is_archive))
+        : [];
+      if (selectedArchives.length > 0) {
+        extractArchivesBtn.hidden = false;
+        extractArchivesBtn.textContent = t('解压所选 ({count})', {count: selectedArchives.length});
+      } else {
+        extractArchivesBtn.hidden = true;
+      }
+    }
   } else {
     bar.classList.remove('visible');
     bar.classList.remove('is-empty-selection');
@@ -262,6 +299,8 @@ export function updateEditBar() {
     if (archiveBtn) archiveBtn.hidden = true;
     const bundleBtn = $('#editBundleItemsBtn');
     if (bundleBtn) bundleBtn.hidden = true;
+    const extractArchivesBtn = $('#editExtractArchivesBtn');
+    if (extractArchivesBtn) extractArchivesBtn.hidden = true;
   }
   if (!selectionActive) resetEditDeleteSelectedButton();
   renderEditTagPicker();
@@ -326,7 +365,7 @@ export function renderEditDateControl() {
   } else {
     if (monthInput) monthInput.value = '';
     if (dayInput) dayInput.value = '';
-    if (summary) summary.textContent = items.length > 1 ? '' : '未识别日期';
+    if (summary) summary.textContent = items.length > 1 ? '' : t('未识别日期');
   }
 }
 
@@ -367,7 +406,7 @@ export async function applyItemDateBatch(manualDate) {
       manual_date: manualDate || null,
       plans_invalidated: result?.plans_invalidated || 0,
     });
-    toast(manualDate ? `已设置日期 ${manualDate}（${result.updated} 项）` : `已恢复检测日期（${result.updated} 项）`, 'success');
+    toast(manualDate ? t('已设置日期 {manualDate}（{updated} 项）', {manualDate, updated: result.updated}) : t('已恢复检测日期（{updated} 项）', {updated: result.updated}), 'success');
     renderEditDateControl();
     await loadItemsPreservingDepth();
     restoreGridScrollAnchor(gridScrollAnchor);
@@ -610,23 +649,23 @@ export function resetCharacterTagSuggestions({clearCache = false} = {}) {
 function characterSuggestionSampleText() {
   const total = Number(state.characterSuggestionSampleTotal || 0);
   const limit = Number(state.characterSuggestionSampleLimit || 0);
-  if (total > limit && limit > 0) return `已抽样 ${limit}/${total} 张`;
+  if (total > limit && limit > 0) return t('已抽样 {limit}/{total} 张', {limit, total});
   return '';
 }
 
 function characterSuggestionStatusText() {
   const sampleText = characterSuggestionSampleText();
-  if (state.selectedIds.size === 0) return '未识别';
-  if (state.characterSuggestionLoading) return sampleText ? `正在识别${UI_FIELD_SEPARATOR}${sampleText}` : '正在识别';
-  if (state.characterSuggestionStatus === 'unavailable') return '角色识别不可用';
-  if (state.characterSuggestionStatus === 'empty') return '无可识别媒体';
-  if (state.characterSuggestionStatus === 'none') return sampleText ? `暂无建议${UI_FIELD_SEPARATOR}${sampleText}` : '暂无建议';
-  if (state.characterSuggestionMessage) return state.characterSuggestionMessage;
+  if (state.selectedIds.size === 0) return t('未识别');
+  if (state.characterSuggestionLoading) return sampleText ? `${t('正在识别')}${UI_FIELD_SEPARATOR}${sampleText}` : t('正在识别');
+  if (state.characterSuggestionStatus === 'unavailable') return t('角色识别不可用');
+  if (state.characterSuggestionStatus === 'empty') return t('无可识别媒体');
+  if (state.characterSuggestionStatus === 'none') return sampleText ? `${t('暂无建议')}${UI_FIELD_SEPARATOR}${sampleText}` : t('暂无建议');
+  if (state.characterSuggestionMessage) return t(state.characterSuggestionMessage);
   if (state.characterTagSuggestions.length) {
-    const base = `建议 ${state.characterTagSuggestions.length} 个`;
+    const base = t('建议 {count} 个', {count: state.characterTagSuggestions.length});
     return sampleText ? `${base}${UI_FIELD_SEPARATOR}${sampleText}` : base;
   }
-  return '未识别';
+  return t('未识别');
 }
 
 function characterSuggestionsShouldShow() {
@@ -655,10 +694,10 @@ export function renderCharacterTagSuggestions() {
     const name = suggestion.name || '';
     const weak = suggestion.status === 'needs_review' ? ' weak' : '';
     const selected = selectedNameKeys.has(tagNameKey(name));
-    const meta = suggestion.count > 1 ? `${suggestion.count} 张` : `${Math.round((suggestion.confidence || 0) * 100)}%`;
+    const meta = suggestion.count > 1 ? t('{count} 张', {count: suggestion.count}) : `${Math.round((suggestion.confidence || 0) * 100)}%`;
     return `
       <button class="btn character-suggestion-chip${weak}${selected ? ' selected' : ''}" type="button" data-character-suggestion-tag="${escHtml(name)}" aria-pressed="${selected ? 'true' : 'false'}">
-        <span>${escHtml(name)}</span>
+        <span data-i18n-skip>${escHtml(name)}</span>
         <em>${escHtml(meta)}</em>
       </button>
     `;
@@ -1072,7 +1111,7 @@ export function renderEditTagPicker() {
     const meta = tag.character_library ? '角色库' : (tag.item_count || 0);
     return `
       <button class="btn tag-picker-option${selected ? ' selected' : ''}" type="button" data-tag-id="${tag.id}"${globalAttr} data-tag-name="${escHtml(tag.name)}" aria-pressed="${selected ? 'true' : 'false'}">
-        <span>${escHtml(tag.name)}</span>
+        <span data-i18n-skip>${escHtml(tag.name)}</span>
         <em>${escHtml(String(meta))}</em>
       </button>
     `;
@@ -1100,13 +1139,14 @@ export function renderEditTagPicker() {
   if (query && !state.editGlobalTagSearchLoading && !exactEditTagMatch(query)) {
     rows.push(`
       <button class="btn tag-picker-option tag-picker-create" type="button" data-create-tag="${escHtml(query)}">
-        <span>创建角色：${escHtml(query)}</span>
+        <span>${t('创建角色：{query}', {query: escHtml(query)})}</span>
       </button>
     `);
   }
   const emptyText = query
     ? '没有匹配的全局角色，按回车创建'
     : '输入角色名搜索全局角色';
+  editTagPickerActiveIndex = -1;
   panel.innerHTML = rows.join('') || `<div class="tag-picker-empty">${emptyText}</div>`;
   bindEditTagPickerPanel(panel);
   updateEditTagPickerSummary();
@@ -1137,7 +1177,7 @@ function bindEditTagPickerPanel(panel) {
 function updateEditTagPickerSummary() {
   const count = selectedEditTagNames().length;
   const summary = $('#editTagPickerSummary');
-  if (summary) summary.textContent = count ? `已选 ${count} 个角色` : '未选角色';
+  if (summary) summary.textContent = count ? t('已选 {count} 个角色', {count}) : '未选角色';
   const input = $('#editTagSearch');
   if (input) input.placeholder = count ? '继续搜索角色' : '选择或搜索角色';
 }
@@ -1228,7 +1268,40 @@ function toggleEditTagSelection(tagId, tagName = '') {
   ensureEditTagContext();
 }
 
+let editTagPickerActiveIndex = -1;
+
+export function moveEditTagPickerActive(step) {
+  const picker = $('#editTagPicker');
+  if (picker && !picker.classList.contains('open')) {
+    openEditTagPicker();
+  }
+  const panel = $('#editTagPickerPanel');
+  if (!panel) return;
+  const options = Array.from(panel.querySelectorAll('.tag-picker-option'));
+  if (!options.length) return;
+  const count = options.length;
+  editTagPickerActiveIndex = editTagPickerActiveIndex < 0
+    ? (step > 0 ? 0 : count - 1)
+    : (editTagPickerActiveIndex + step + count) % count;
+  options.forEach((opt, idx) => opt.classList.toggle('active', idx === editTagPickerActiveIndex));
+  options[editTagPickerActiveIndex]?.scrollIntoView?.({block: 'nearest'});
+}
+
 export function selectFirstEditTagResult() {
+  const panel = $('#editTagPickerPanel');
+  if (panel && editTagPickerActiveIndex >= 0) {
+    const options = Array.from(panel.querySelectorAll('.tag-picker-option'));
+    const active = options[editTagPickerActiveIndex];
+    if (active) {
+      editTagPickerActiveIndex = -1;
+      if (active.dataset.createTag) {
+        createOrSelectEditTag(active.dataset.createTag);
+      } else if (active.dataset.tagId) {
+        toggleEditTagSelection(active.dataset.tagId, active.dataset.tagName || '');
+      }
+      return;
+    }
+  }
   const query = (state.editTagQuery || '').trim();
   const exact = exactEditTagMatch(query);
   if (exact) {
@@ -1354,7 +1427,7 @@ export function characterSuggestionCoverageWarning(itemIds, tagNames) {
   if (!suggestion) return '';
   const hitIds = new Set((suggestion.item_ids || []).map(Number));
   const hitCount = selectedItemIds.filter(id => hitIds.has(Number(id))).length;
-  return `角色建议命中 ${hitCount}/${selectedItemIds.length} 项，角色仍会应用到全部 ${selectedItemIds.length} 项；是否继续？`;
+  return t('角色建议命中 {hit}/{total} 项，角色仍会应用到全部 {total} 项；是否继续？', {hit: hitCount, total: selectedItemIds.length});
 }
 
 export async function classifyItems(ids, tagIds, mode='add') {
@@ -1499,7 +1572,7 @@ export async function classifyFolder(folder, tagIds, mode='add', explicitTagName
     updateEditBar();
     const folderChanged = Number(result?.updated ?? 0);
     if (folderChanged > 0) {
-      toast(`文件夹角色已更新：${result.updated} 张`, 'success');
+      toast(t('文件夹角色已更新：{count} 张', {count: result.updated}), 'success');
     } else {
       toast('角色未变化', 'warn');
     }
@@ -1570,7 +1643,7 @@ function archivePlanTargetLabel(plan) {
   if (plan?.plan_kind === 'split_by_tag') {
     const targets = (Array.isArray(plan.target_folders) ? plan.target_folders : [])
       .map(value => String(value || '')).filter(Boolean);
-    return targets.join('；') || `拆分到 ${Number(plan.split_action_count || 0)} 个位置`;
+    return targets.join('；') || t('拆分到 {count} 个位置', {count: Number(plan.split_action_count || 0)});
   }
   return String(plan?.target_folder || '');
 }
@@ -1623,7 +1696,7 @@ export async function archiveCurrentFolder() {
     const otherRuns = plans.filter(p => p !== plan && p.status === 'confirmed' && archivePlanHasMoveTarget(p));
     const runList = [plan, ...otherRuns];
     const runLines = runList.map(p => `${p.source_folder} → ${archivePlanTargetLabel(p)}`);
-    const confirmMsg = `整理归档将执行该画师全部已确认计划，共移动 ${runList.length} 个文件夹：\n${runLines.join('\n')}\n确定继续？`;
+    const confirmMsg = t('整理归档将执行该画师全部已确认计划，共移动 {count} 个文件夹：\n{lines}\n确定继续？', {count: runList.length, lines: runLines.join('\n')});
     if (!confirm(confirmMsg)) return;
     if (!artistRequestIsCurrent()) return;
     if (plan.status !== 'confirmed') {
@@ -1639,11 +1712,15 @@ export async function archiveCurrentFolder() {
     const failed = rows.filter(row => row.status === 'error').length;
     const skipped = Math.max(0, rows.length - successful - failed);
     if (failed > 0 && successful > 0) {
-      toast(`部分整理失败：${successful} 个成功${skipped ? `、${skipped} 个跳过` : ''}、${failed} 个失败`, 'error');
+      toast(skipped
+        ? t('部分整理失败：{successful} 个成功、{skipped} 个跳过、{failed} 个失败', {successful, skipped, failed})
+        : t('部分整理失败：{successful} 个成功、{failed} 个失败', {successful, failed}), 'error');
     } else if (failed > 0) {
-      toast(`整理失败：${failed} 个整理项${skipped ? `、${skipped} 个跳过` : ''}`, 'error');
+      toast(skipped
+        ? t('整理失败：{failed} 个整理项、{skipped} 个跳过', {failed, skipped})
+        : t('整理失败：{failed} 个整理项', {failed}), 'error');
     } else {
-      toast(`整理完成：${successful} 个整理项`, successful ? 'success' : 'info');
+      toast(t('整理完成：{successful} 个整理项', {successful}), successful ? 'success' : 'info');
     }
     if (currentPlanExecuted) state.activeFolder = null;
     const [stats, folders] = await Promise.all([
@@ -1719,7 +1796,181 @@ export async function removeSelectedTagsFromItems() {
   }
 }
 
-export async function bundleSelectedItems() {
+const RECENT_MOVE_FOLDERS_KEY = 'gallery_recent_move_folders';
+// Folder names are per artist: a name that exists under one artist must not be
+// silently reused for another, which would create the folder in the wrong library.
+function recentMoveFoldersKey() {
+  const artistId = state.currentArtist ? Number(state.currentArtist.id) : null;
+  return artistId ? `${RECENT_MOVE_FOLDERS_KEY}:${artistId}` : RECENT_MOVE_FOLDERS_KEY;
+}
+function getRecentMoveFolders() {
+  try {
+    const raw = localStorage.getItem(recentMoveFoldersKey());
+    if (!raw) return [];
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list.filter(s => typeof s === 'string' && s.trim()) : [];
+  } catch {
+    return [];
+  }
+}
+function saveRecentMoveFolder(folder) {
+  try {
+    const list = getRecentMoveFolders().filter(f => f !== folder);
+    list.unshift(folder);
+    if (list.length > 8) list.length = 8;
+    localStorage.setItem(recentMoveFoldersKey(), JSON.stringify(list));
+  } catch {}
+}
+
+export function closeItemMoveFolderDialog() {
+  const dialog = $('#itemMoveFolderDialog');
+  if (dialog?.open) dialog.close();
+}
+
+export function openItemMoveFolderDialog() {
+  const dialog = $('#itemMoveFolderDialog');
+  if (!dialog || typeof dialog.showModal !== 'function') return;
+  if (state.selectedIds.size === 0 || !state.currentArtist) return;
+  state.itemMoveFolderTarget = '';
+  state.itemMoveFolderFilter = '';
+  const searchInput = $('#itemMoveFolderSearch');
+  if (searchInput) searchInput.value = '';
+  renderItemMoveFolderDialog();
+  dialog.showModal();
+  if (searchInput) searchInput.focus();
+}
+
+export function setItemMoveFolderFilter(query) {
+  state.itemMoveFolderFilter = String(query || '');
+  renderItemMoveFolderDialog();
+}
+
+export function selectItemMoveFolderTarget(folder) {
+  state.itemMoveFolderTarget = String(folder || '').trim();
+  renderItemMoveFolderDialog();
+}
+
+export function moveItemMoveFolderActive(step) {
+  const tree = $('#itemMoveFolderTree');
+  if (!tree) return;
+  const entries = Array.from(tree.querySelectorAll('[data-item-move-folder]'));
+  if (!entries.length) return;
+  const currentIdx = entries.findIndex(el => el.dataset.itemMoveFolder === state.itemMoveFolderTarget);
+  const count = entries.length;
+  const nextIdx = currentIdx < 0
+    ? (step > 0 ? 0 : count - 1)
+    : (currentIdx + step + count) % count;
+  const target = entries[nextIdx]?.dataset?.itemMoveFolder || '';
+  if (target) {
+    selectItemMoveFolderTarget(target);
+    const updatedEntries = Array.from(tree.querySelectorAll('[data-item-move-folder]'));
+    updatedEntries[nextIdx]?.scrollIntoView?.({block: 'nearest'});
+  }
+}
+
+export function renderItemMoveFolderDialog() {
+  const dialog = $('#itemMoveFolderDialog');
+  if (!dialog) return;
+
+  const filter = String(state.itemMoveFolderFilter || '').trim();
+  const filterLower = filter.toLowerCase();
+
+  // 1. Recent Bar
+  const recentBar = $('#itemMoveRecentBar');
+  const recentList = $('#itemMoveRecentList');
+  if (recentBar && recentList) {
+    const recents = getRecentMoveFolders();
+    if (recents.length > 0 && !filter) {
+      recentBar.hidden = false;
+      recentList.innerHTML = recents.map(folder => `
+        <button class="item-move-recent-pill${state.itemMoveFolderTarget === folder ? ' active' : ''}" type="button" data-i18n-skip data-item-move-folder="${escHtml(folder)}">
+          ${escHtml(folder)}
+        </button>
+      `).join('');
+    } else {
+      recentBar.hidden = true;
+      recentList.innerHTML = '';
+    }
+  }
+
+  // 2. Folder List / Tree
+  const treeContainer = $('#itemMoveFolderTree');
+  if (treeContainer) {
+    const allFolders = [];
+    function collect(node, level = 0) {
+      if (!node || typeof node !== 'object' || Array.isArray(node)) return;
+      if (node.path) {
+        allFolders.push({
+          path: node.path,
+          name: node.name || node.path,
+          item_count: node.item_count || 0,
+          level,
+        });
+      }
+      const children = Array.isArray(node.children) ? node.children : [];
+      children.forEach(c => collect(c, node.path ? level + 1 : 0));
+    }
+    collect(state.folders);
+
+    const filtered = filterLower
+      ? allFolders.filter(f => f.path.toLowerCase().includes(filterLower) || f.name.toLowerCase().includes(filterLower))
+      : allFolders;
+
+    let itemsHtml = '';
+    const exactMatch = allFolders.some(f => f.path.toLowerCase() === filterLower);
+
+    if (filter && !exactMatch) {
+      const isSelected = state.itemMoveFolderTarget === filter;
+      itemsHtml += `
+        <button class="artist-folder-picker-entry item-move-create-entry${isSelected ? ' selected' : ''}" type="button" data-item-move-folder="${escHtml(filter)}">
+          <span class="artist-folder-entry-icon" aria-hidden="true">${buttonIcon('folder')}</span>
+          <span class="artist-folder-entry-name">${t('创建「{folder}」并移动', {folder: escHtml(filter)})}</span>
+        </button>
+      `;
+    }
+
+    if (filtered.length > 0) {
+      itemsHtml += filtered.map(folder => {
+        const isSelected = state.itemMoveFolderTarget === folder.path;
+        return `
+          <button class="artist-folder-picker-entry${isSelected ? ' selected' : ''}" type="button" data-item-move-folder="${escHtml(folder.path)}" style="--level: ${folder.level}">
+            <span class="artist-folder-entry-icon" aria-hidden="true">${buttonIcon('folder')}</span>
+            <span class="artist-folder-entry-name" data-i18n-skip>${escHtml(folder.path)}</span>
+            <span class="artist-folder-entry-count">${folder.item_count}</span>
+          </button>
+        `;
+      }).join('');
+    } else if (!filter) {
+      itemsHtml = `<div class="move-empty small">${t('当前画师暂无子文件夹，可直接在上方输入新文件夹名')}</div>`;
+    } else if (!itemsHtml) {
+      itemsHtml = `<div class="move-empty small">${t('未找到匹配的文件夹')}</div>`;
+    }
+
+    treeContainer.innerHTML = itemsHtml;
+  }
+
+  // 3. Footer Preview & Confirm Button
+  const preview = $('#itemMoveTargetPreview');
+  const confirmBtn = $('#itemMoveFolderConfirmBtn');
+  const currentTarget = state.itemMoveFolderTarget;
+
+  if (preview) {
+    if (currentTarget) {
+      preview.textContent = t('目标文件夹：{folder}', {folder: currentTarget});
+    } else if (filter) {
+      preview.textContent = t('将创建新文件夹：{folder}', {folder: filter});
+    } else {
+      preview.textContent = t('未选择目标文件夹');
+    }
+  }
+
+  if (confirmBtn) {
+    const effectiveTarget = currentTarget || filter;
+    confirmBtn.disabled = !effectiveTarget;
+  }
+}
+
+export async function executeBundleSelectedItems(targetFolder) {
   const artist = state.currentArtist;
   const artistIdAtStart = artist ? Number(artist.id) : null;
   const artistLoadSeqAtStart = Number(state.artistLoadSeq || 0);
@@ -1727,28 +1978,28 @@ export async function bundleSelectedItems() {
     && Number(state.currentArtist?.id) === artistIdAtStart;
   const selectedCount = state.selectedIds.size;
   if (!artist || selectedCount === 0 || isActionBusy('edit-bundle-items')) return;
-  const folderName = window.prompt('输入目标文件夹名称（例如 2024-05 [展会]）：');
-  if (!folderName || !folderName.trim()) return;
-  const targetFolder = folderName.trim();
+  if (!targetFolder || !targetFolder.trim()) return;
+  const trimmedTarget = targetFolder.trim();
+
+  saveRecentMoveFolder(trimmedTarget);
+  closeItemMoveFolderDialog();
   setActionBusy('edit-bundle-items', '', true);
   try {
     const res = await API.postJson('/api/items/bundle', {
       artist_id: artist.id,
       item_ids: [...state.selectedIds],
-      target_folder: targetFolder,
+      target_folder: trimmedTarget,
     });
     if (!artistRequestIsCurrent()) return;
-    // moved_count skips items the server could not move (missing or already
-    // gone), so report the real split instead of claiming the full selection.
     const moved = Number(res?.moved_count ?? 0);
     const unmoved = selectedCount - moved;
     if (unmoved > 0) {
-      toast(`已移动 ${moved} 项，${unmoved} 项未移动`, 'error');
+      toast(t('已移动 {moved} 项，{unmoved} 项未移动', {moved, unmoved}), 'error');
     } else {
-      toast(`已将 ${moved} 项移至「${targetFolder}」`, 'success');
+      toast(t('已将 {moved} 项移至「{folder}」', {moved, folder: trimmedTarget}), 'success');
     }
     logUiAction('edit_bundle_items_result', {
-      target_folder: targetFolder,
+      target_folder: trimmedTarget,
       requested_count: selectedCount,
       moved_count: moved,
       unmoved_count: unmoved,
@@ -1775,7 +2026,36 @@ export async function bundleSelectedItems() {
   }
 }
 
+export async function repeatLastBundleSelectedItems() {
+  if (state.selectedIds.size === 0 || !state.currentArtist) return;
+  const recents = getRecentMoveFolders();
+  if (recents.length > 0) {
+    // Shift+D is an easy mis-key: confirm before moving real files, matching the
+    // dialog path's explicit "确定移动" step.
+    const folder = recents[0];
+    if (!window.confirm(t('确定要将选中的 {count} 项移动到「{folder}」吗？', {count: state.selectedIds.size, folder: folder}))) return;
+    return executeBundleSelectedItems(folder);
+  }
+  openItemMoveFolderDialog();
+}
+
+export async function bundleSelectedItems(directTarget) {
+  if (typeof directTarget === 'string' && directTarget.trim()) {
+    return executeBundleSelectedItems(directTarget.trim());
+  }
+
+  const dialog = $('#itemMoveFolderDialog');
+  if (dialog && typeof dialog.showModal === 'function') {
+    openItemMoveFolderDialog();
+    return;
+  }
+
+  const folderName = window.prompt(t('输入目标文件夹名称（例如 2024-05 [展会]）：'));
+  if (!folderName || !folderName.trim()) return;
+  return executeBundleSelectedItems(folderName.trim());
+}
+
 // Cross-module imports closing the editbar cycles; all call sites are inside
 // function bodies, never at module evaluation time.
-import { renderSidebar, renderFolderTree } from './sidebar.js';
+import { renderSidebar, renderFolderTree, renderToolbar } from './sidebar.js';
 import { syncBrowseUrl } from '../router.js';

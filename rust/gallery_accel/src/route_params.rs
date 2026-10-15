@@ -1,6 +1,10 @@
 use serde::Deserialize;
 
-fn deserialize_bool_lenient<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+/// Query-string booleans as they actually arrive: `serde_urlencoded` parses
+/// `bool` with `str::parse::<bool>()`, which rejects `1`/`0` and `yes`/`no`, so
+/// a route that does not opt into this visitor answers 400 for the values the
+/// frontend sends. Every query `Option<bool>` in this crate must use it.
+pub(crate) fn deserialize_bool_lenient<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

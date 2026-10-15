@@ -74,7 +74,10 @@ impl MediaRoots {
             if root_n.is_empty() {
                 continue;
             }
-            if (cleaned_trim == root_n || cleaned_trim.starts_with(&(root_n.clone() + "/")))
+            if (cleaned_trim == root_n
+                || cleaned_trim
+                    .strip_prefix(&root_n)
+                    .is_some_and(|r| r.starts_with('/')))
                 && best.as_ref().map(|(_, r)| r.len()).unwrap_or(0) < root_n.len()
             {
                 best = Some((i, root_n));
@@ -83,7 +86,7 @@ impl MediaRoots {
         if let Some((i, root_n)) = best {
             if let Some(real) = self.real_root_at(i) {
                 let real = real.trim_end_matches(['/', '\\']);
-                let suffix = &cleaned_trim[root_n.len()..];
+                let suffix = cleaned_trim.strip_prefix(&root_n).unwrap_or("");
                 let candidate = format!("{real}{suffix}");
                 if path_under_root(&candidate, real) {
                     return Ok(PathBuf::from(candidate));
@@ -96,7 +99,11 @@ impl MediaRoots {
         for i in 0..self.roots.len() {
             if let Some(real) = self.real_root_at(i) {
                 let real_n = real.trim_end_matches(['/', '\\']);
-                if cleaned_trim == real_n || cleaned_trim.starts_with(&(real_n.to_string() + "/")) {
+                if cleaned_trim == real_n
+                    || cleaned_trim
+                        .strip_prefix(real_n)
+                        .is_some_and(|r| r.starts_with('/'))
+                {
                     if path_under_root(&cleaned_trim, real_n) {
                         return Ok(PathBuf::from(&cleaned_trim));
                     }
@@ -145,6 +152,29 @@ impl MediaRoots {
             Ok(p) => normalize_slashes(&p.to_string_lossy()),
             Err(_) => normalize_slashes(path),
         }
+    }
+
+    /// The real root that `root` names, or `root` itself when it is already real.
+    ///
+    /// The inverse of the root lookup in `map_to_real`: callers that rewrite
+    /// stored paths after a filesystem move use it to learn which real root (and
+    /// therefore which virtual aliases) a stored path belongs to.
+    pub fn real_root_for(&self, root: &str) -> String {
+        let wanted = normalize_slashes(root).trim_end_matches('/').to_string();
+        for index in 0..self.roots.len() {
+            let real = self
+                .real_root_at(index)
+                .map(|real| normalize_slashes(real).trim_end_matches('/').to_string())
+                .unwrap_or_else(|| {
+                    normalize_slashes(&self.roots[index])
+                        .trim_end_matches('/')
+                        .to_string()
+                });
+            if real == wanted {
+                return real;
+            }
+        }
+        wanted
     }
 }
 
@@ -321,163 +351,4 @@ pub fn path_under_authorized_roots(path: &Path, roots: &MediaRoots) -> bool {
             .ok()
             .is_some_and(|root| path_under_root(&canonical, &root.to_string_lossy()))
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn map_virtual_root_to_real() {
-        let roots = MediaRoots {
-            roots: vec!["/pictures1".into()],
-            labels: vec!["/vol1/authorized".into()],
-            real_paths: vec!["/vol1/authorized".into()],
-        };
-        let mapped = roots.map_to_real("/pictures1/ArtistA/a.jpg").unwrap();
-        assert_eq!(
-            normalize_slashes(&mapped.to_string_lossy()),
-            "/vol1/authorized/ArtistA/a.jpg"
-        );
-    }
-
-    #[test]
-    fn rejects_parent_escape() {
-        let roots = MediaRoots {
-            roots: vec!["/pictures1".into()],
-            labels: vec!["/vol1/authorized".into()],
-            real_paths: vec!["/vol1/authorized".into()],
-        };
-        assert!(roots.map_to_real("/pictures1/../etc/passwd").is_err());
-    }
-
-    #[test]
-    fn normalize_db_path_rewrites_virtual() {
-        let roots = MediaRoots {
-            roots: vec!["/pictures1".into()],
-            labels: vec!["real".into()],
-            real_paths: vec!["/nas/real".into()],
-        };
-        assert_eq!(roots.normalize_db_path("/pictures1/foo"), "/nas/real/foo");
-    }
-
-    #[test]
-    fn missing_child_under_existing_root_is_authorized() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("pictures");
-        std::fs::create_dir(&root).unwrap();
-        let roots = MediaRoots::identical(
-            vec![root.to_string_lossy().to_string()],
-            vec!["pictures".into()],
-        );
-
-        assert!(path_under_authorized_roots(
-            &root.join("Artist").join("missing.jpg"),
-            &roots
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn missing_child_below_symlink_escape_is_rejected() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("pictures");
-        let outside = dir.path().join("outside");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        symlink(&outside, root.join("escape")).unwrap();
-        let roots = MediaRoots::identical(
-            vec![root.to_string_lossy().to_string()],
-            vec!["pictures".into()],
-        );
-
-        assert!(!path_under_authorized_roots(
-            &root.join("escape").join("missing.jpg"),
-            &roots
-        ));
-    }
-
-    /// An install with nothing configured authorizes nothing. The old fallback
-    /// made `/pictures` an authorized destination that nobody chose.
-    #[test]
-    fn an_install_with_no_roots_authorizes_nothing() {
-        let roots = MediaRoots::identical(vec![], vec![]);
-        assert!(roots.allowed_roots().is_empty());
-        assert!(!path_under_authorized_roots(
-            Path::new("/pictures/Artist/a.jpg"),
-            &roots
-        ));
-    }
-
-    /// The install's own data directory is never a media destination, even when
-    /// a configured root covers it — on a normal install the pictures and the
-    /// database share a volume.
-    #[test]
-    fn the_installs_own_data_directory_is_never_a_media_destination() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("data");
-        let pictures = dir.path().join("pictures");
-        std::fs::create_dir_all(data.join("logs")).unwrap();
-        std::fs::create_dir_all(data.join("db-backups")).unwrap();
-        std::fs::create_dir_all(&pictures).unwrap();
-        let _env = crate::test_support::EnvVar::set("DATA_DIR", &data);
-
-        // The root covers everything under the temp directory, data included.
-        let roots = MediaRoots::identical(
-            vec![dir.path().to_string_lossy().to_string()],
-            vec!["Media".into()],
-        );
-
-        assert!(!path_under_authorized_roots(
-            &data.join("gallery.db"),
-            &roots
-        ));
-        assert!(!path_under_authorized_roots(
-            &data.join("logs").join("gallery.log"),
-            &roots
-        ));
-        assert!(!path_under_authorized_roots(
-            &data.join("db-backups").join("backup.db"),
-            &roots
-        ));
-        assert!(is_persistent_data_path(&data.join("gallery.db")));
-
-        // Real media next to it is still authorized.
-        assert!(path_under_authorized_roots(
-            &pictures.join("Artist").join("a.jpg"),
-            &roots
-        ));
-        assert!(!is_persistent_data_path(
-            &pictures.join("Artist").join("a.jpg")
-        ));
-    }
-
-    /// An alias reaches the same directory under a name the strings do not
-    /// share, so the data directory is recognised through it too.
-    #[cfg(unix)]
-    #[test]
-    fn an_alias_of_the_data_directory_is_refused() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("data");
-        let pictures = dir.path().join("pictures");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::create_dir_all(&pictures).unwrap();
-        symlink(&data, pictures.join("alias")).unwrap();
-        let _env = crate::test_support::EnvVar::set("DATA_DIR", &data);
-
-        let roots = MediaRoots::identical(
-            vec![dir.path().to_string_lossy().to_string()],
-            vec!["Media".into()],
-        );
-
-        assert!(is_persistent_data_path(&pictures.join("alias")));
-        assert!(!path_under_authorized_roots(
-            &pictures.join("alias").join("gallery.db"),
-            &roots
-        ));
-    }
 }

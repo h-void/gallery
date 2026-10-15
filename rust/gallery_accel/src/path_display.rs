@@ -30,13 +30,22 @@ pub(crate) fn display_path(path: &str, roots: &MediaRoots) -> String {
     }
     candidates.sort_by_key(|(index, root)| (std::cmp::Reverse(root.len()), *index));
     for (index, root) in candidates {
-        if normalized == root || normalized.starts_with(&(root.clone() + "/")) {
-            let rel = normalized[root.len()..].trim_start_matches('/');
+        if normalized == root {
+            return roots
+                .labels
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| default_label(&root));
+        } else if let Some(suffix) = normalized
+            .strip_prefix(&root)
+            .and_then(|r| r.strip_prefix('/'))
+        {
             let label = roots
                 .labels
                 .get(index)
                 .cloned()
                 .unwrap_or_else(|| default_label(&root));
+            let rel = suffix.trim_start_matches('/');
             if rel.is_empty() {
                 return label;
             }

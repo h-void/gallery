@@ -112,26 +112,39 @@ header #scanBtn,header .scan-folder-btn,header #stopScanBtn{
   }
 }
 
-/* ---- Scan progress: full-width 3px bar, one status line, no box ---- */
+/* ---- Scan progress: three-column inline bar (meta | track | path) ---- */
 .scan-progress{
-  display:none;grid-template-columns:auto minmax(160px,1fr) minmax(160px,34vw);
-  align-items:center;gap:12px;padding:0 16px 8px;
+  display:none;position:relative;
   background:var(--bg-chrome);
   flex-shrink:0;font-size:var(--fs-small);
+  padding:6px 16px;
+  border-bottom:1px solid var(--border);
 }
-.scan-progress.visible{display:grid;animation:scan-fade-in var(--motion) ease-out}
+.scan-progress.visible{
+  display:flex;flex-wrap:nowrap;align-items:center;gap:16px;
+  animation:scan-fade-in var(--motion) ease-out;
+}
 .scan-progress.hiding{opacity:0;transition:opacity var(--motion)}
 @keyframes scan-fade-in{from{opacity:0}to{opacity:1}}
-.scan-progress-meta{display:flex;align-items:center;gap:8px;white-space:nowrap;color:var(--text-2)}
+.scan-progress-meta{
+  display:flex;align-items:center;gap:8px;white-space:nowrap;
+  color:var(--text-2);flex:0 0 auto;
+}
 .scan-progress-meta span:first-child{color:var(--text-2);font-weight:600}
 .scan-progress-meta span:last-child{color:var(--text-3);font-variant-numeric:tabular-nums}
-.scan-progress-track{height:3px;background:rgba(31,26,20,.18);overflow:hidden}
-.scan-progress-track .fill{
-  height:100%;background:var(--accent);
-  will-change:width;
-  transition:width .3s;
+.scan-progress-track{
+  flex:1 1 auto;min-width:100px;height:3px;
+  background:rgba(31,26,20,.18);border-radius:2px;overflow:hidden;position:relative;
 }
-.scan-progress-path{color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+.scan-progress-track .fill{
+  height:100%;background:var(--accent);border-radius:2px;
+  will-change:width;
+  transition:width .2s ease-out;
+}
+.scan-progress-path{
+  color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  text-align:right;flex:0 1 45%;max-width:50%;min-width:0;
+}
 
 /* ---- Sidebar: paper band; zones split by crease rules, no boxes ---- */
 main{display:flex;flex:1;overflow:hidden}
@@ -164,7 +177,7 @@ main{display:flex;flex:1;overflow:hidden}
   border-top:1px solid var(--border-subtle);
 }
 .item-filter-section .sidebar-section-body{padding-bottom:10px}
-.item-filter-reset{border:0;background:transparent;color:var(--text-3);font:inherit;font-size:var(--fs-small);cursor:pointer}
+.item-filter-reset{border:0;background:transparent;color:var(--text-3);font:inherit;font-size:var(--fs-small);cursor:pointer;flex:0 0 auto;white-space:nowrap}
 .item-filter-reset:hover:not(:disabled),.item-filter-reset:focus-visible{color:var(--vermilion-deep);outline:none}
 .item-filter-reset:disabled{opacity:.6;cursor:not-allowed}
 .item-filter-field{display:grid;gap:5px;padding:0 12px;color:var(--text-3);font-size:var(--fs-small)}
@@ -253,6 +266,8 @@ body.sidebar-tag-resizing{cursor:row-resize;user-select:none}
   flex:1;min-width:0;display:flex;align-items:center;gap:8px;padding:0;
   border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;
 }
+/* Long en labels shrink the title instead of overlapping the header actions. */
+.sidebar-section-toggle>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sidebar-section-toggle:hover{color:var(--text-1)}
 /* Focus draws a full vermilion ring around the header row: an inset underline
    inside a 10px-radius full-width toggle reads as a stray dash, not focus. */

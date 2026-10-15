@@ -5,13 +5,15 @@ import { API } from '../../api.js';
 import { state, isActionBusy, setActionBusy } from '../../store.js';
 import { $, $$, escHtml } from '../../utils.js';
 import { toast, logUiAction } from '../../logging.js';
-import { refreshActiveMaintenanceView } from './index.js';
+import { t } from '../../i18n.js';
+import { refreshActiveMaintenanceView, syncMaintenanceTabBadges } from './index.js';
 import { renderHashStatus } from './overview.js';
 import { loadArtists } from '../../router.js';
 
 const MOVE_HISTORY_PAGE_SIZE = 80;
 
 export function renderMovePathSummary() {
+  syncMaintenanceTabBadges();
   const pending = state.movePendingTotal ?? state.moveCandidates.length;
   $('#movePendingCount').textContent = pending;
   const pendingCard = $('#movePendingCount')?.closest('.metric-card');
@@ -43,7 +45,7 @@ export function renderMoveCandidateGroups() {
     const applicableCount = Number(group.applicable_candidate_count ?? group.candidate_count ?? 0);
     const blockedCount = Number(group.blocked_candidate_count || 0);
     const blockedNote = blockedCount > 0
-      ? `<div class="move-warning">${blockedCount} 项目标重复会保留为待处理</div>`
+      ? `<div class="move-warning">${t('{blockedCount} 项目标重复会保留为待处理', {blockedCount: blockedCount})}</div>`
       : '';
     const samples = (group.sample_candidates || []).slice(0, 4).map(sample => {
       const oldPath = sample.display_old_path || sample.old_path || '';
@@ -60,7 +62,7 @@ export function renderMoveCandidateGroups() {
         <div class="move-group-main">
           <div class="move-card-top">
             <span class="move-reason">${escHtml(moveReasonLabel(group.reason))}</span>
-            <span class="move-id">${applicableCount} 可批量 / ${group.candidate_count} 项</span>
+            <span class="move-id">${t('{applicableCount} 可批量 / {group} 项', {applicableCount: applicableCount, group: group.candidate_count})}</span>
           </div>
           <div class="move-artist-paths">
             <div><span>旧画师</span><code title="${escHtml(group.item_artist_path || oldArtistPath)}">${escHtml(oldArtistPath || '-')}</code></div>
@@ -70,7 +72,7 @@ export function renderMoveCandidateGroups() {
           <div class="move-group-samples">${samples}</div>
         </div>
         <div class="move-actions">
-          <button class="btn btn-primary" type="button" data-move-group-action="merge" data-old-artist-id="${oldArtistId}" data-new-artist-id="${newArtistId}">批量确认 ${applicableCount} 项</button>
+          <button class="btn btn-primary" type="button" data-move-group-action="merge" data-old-artist-id="${oldArtistId}" data-new-artist-id="${newArtistId}">${t('批量确认 {applicableCount} 项', {applicableCount: applicableCount})}</button>
         </div>
       </div>`;
   }).join('');
@@ -93,7 +95,7 @@ export function renderMoveCandidates() {
   const candidates = (state.moveCandidates || []).filter(candidate => !groupedCandidateIds.has(Number(candidate.id)));
   if (candidates.length === 0) {
     if (groupedCount) {
-      list.innerHTML = '<div class="move-empty">已在上方按画师路径分组 ' + groupedCount + ' 项</div>';
+      list.innerHTML = `<div class="move-empty">${t('已在上方按画师路径分组 {count} 项', {count: groupedCount})}</div>`;
       return;
     }
     list.innerHTML = '<div class="move-empty">没有待确认的路径</div>';
@@ -121,8 +123,8 @@ export function renderMoveCandidates() {
     // 原始哈希保留在 title 详情里。
     const hashLabel = c.hash_match === true ? '内容相同' : '待核对内容';
     const hashDetail = [
-      c.content_hash ? `新路径 ${c.content_hash}` : '',
-      c.item_hash ? `旧记录 ${c.item_hash}` : '',
+      c.content_hash ? `${t('新路径 {c}', {c: c.content_hash})}` : '',
+      c.item_hash ? `${t('旧记录 {c}', {c: c.item_hash})}` : '',
     ].filter(Boolean).join(' / ') || '哈希未就绪';
     const warning = isCrossArtist
       ? '<div class="move-warning">内容相同，但画师不同，需要核对归属。跨画师移动需在上方画师分组中批量确认；单项请选择「保留为独立文件」或「忽略此匹配」。</div>'
@@ -146,8 +148,8 @@ export function renderMoveCandidates() {
         ${warning}
         ${artistPaths}
         <div class="move-meta">
-          <span>记录 ${c.item_id || '-'}</span>
-          <span>检查码 ${shortHash(c.content_hash)}</span>
+          <span>${t('记录 {c}', {c: c.item_id || '-'})}</span>
+          <span>${t('检查码 {shortHash}', {shortHash: shortHash(c.content_hash)})}</span>
           <span title="${escHtml(hashDetail)}">${hashLabel}</span>
         </div>
       </div>
@@ -187,7 +189,7 @@ export function renderMoveHistory() {
   const hasMore = history.length < total || state.moveHistoryHasMore === true;
   if (more) {
     more.innerHTML = hasMore
-      ? `<button class="btn btn-ghost" type="button" data-move-history-load-more ${state.moveHistoryLoading ? 'aria-busy="true"' : ''}>${state.moveHistoryLoading ? '读取中' : '加载更多'}</button>`
+      ? `<button class="btn btn-ghost" type="button" data-move-history-load-more ${state.moveHistoryLoading ? 'aria-busy="true"' : ''}>${state.moveHistoryLoading ? t('读取中') : t('加载更多')}</button>`
       : '';
   }
   bindMoveHistoryMore();
@@ -267,7 +269,7 @@ export async function applyMoveCandidateGroup(oldArtistId, newArtistId) {
     const applied = Number(result.applied || 0);
     const stale = Number(result.stale || 0);
     const skipped = Number(result.skipped || 0);
-    toast(`批量确认 ${applied} 项，已在库中 ${resolved} 项，清理陈旧 ${stale} 项，跳过 ${skipped} 项`, (applied || resolved || stale) ? 'success' : 'error');
+    toast(`${t('批量确认 {applied} 项，已在库中 {resolved} 项，清理陈旧 {stale} 项，跳过 {skipped} 项', {applied: applied, resolved: resolved, stale: stale, skipped: skipped})}`, (applied || resolved || stale) ? 'success' : 'error');
     await refreshActiveMaintenanceView({preserveScroll: true, view: 'paths'});
     await loadArtists();
   } catch (e) {
@@ -298,7 +300,7 @@ export async function autoResolveMoveCandidates(options = {}) {
     const skipped = Number(result.skipped || 0);
     const remaining = Number(result.remaining || 0);
     if (!silent) {
-      toast(`安全处理 ${applied + resolved + addedAsNew + stale} 项，新增独立文件 ${addedAsNew} 项，已在库中 ${resolved} 项，清理陈旧 ${stale} 项，跳过 ${skipped} 项，剩余 ${remaining} 项`, (applied || resolved || addedAsNew || stale) ? 'success' : 'info');
+      toast(`${t('安全处理 {applied} 项，新增独立文件 {addedAsNew} 项，已在库中 {resolved} 项，清理陈旧 {stale} 项，跳过 {skipped} 项，剩余 {remaining} 项', {applied: applied + resolved + addedAsNew + stale, addedAsNew: addedAsNew, resolved: resolved, stale: stale, skipped: skipped, remaining: remaining})}`, (applied || resolved || addedAsNew || stale) ? 'success' : 'info');
     }
     if (refresh) {
       await refreshActiveMaintenanceView({preserveScroll: true, view: 'paths'});
@@ -332,7 +334,7 @@ export async function runMoveAction(id, action) {
     new: '将此路径单独入库，不继承旧记录的角色。不会复制或删除原文件。',
     ignore: '忽略这组新旧路径的匹配，不会把新路径作为独立文件入库。',
   };
-  if (confirms[action] && !window.confirm(confirms[action])) return;
+  if (confirms[action] && !window.confirm(t(confirms[action]))) return;
   if (isActionBusy('move-action', `${action}:${id}`)) return;
   setActionBusy('move-action', `${action}:${id}`, true);
   try {

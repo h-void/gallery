@@ -14,6 +14,7 @@ import { API } from '../../api.js';
 import { state, isActionBusy, setActionBusy } from '../../store.js';
 import { $, $$, escHtml, isAbortError, copyText } from '../../utils.js';
 import { toast, logUiAction } from '../../logging.js';
+import { t } from '../../i18n.js';
 
 // 检查间隔: the plan allows 5–300 seconds; below that the local bridge would
 // spend its whole time in its own request.
@@ -285,11 +286,11 @@ export function renderNetdiskJobs() {
     if (!allJobs.length) {
       count.textContent = '';
     } else if (currentFilter === 'all') {
-      count.textContent = `共 ${allJobs.length} 个任务`;
+      count.textContent = `${t('共 {allJobs} 个任务', {allJobs: allJobs.length})}`;
     } else if (currentFilter === 'pending') {
-      count.textContent = `未完成 ${pendingJobs.length} 个`;
+      count.textContent = `${t('未完成 {pendingJobs} 个', {pendingJobs: pendingJobs.length})}`;
     } else if (currentFilter === 'completed') {
-      count.textContent = `已完成 ${completedJobs.length} 个`;
+      count.textContent = `${t('已完成 {completedJobs} 个', {completedJobs: completedJobs.length})}`;
     }
   }
 
@@ -321,7 +322,7 @@ export function renderNetdiskJobs() {
     if (shouldFold) {
       foldWrap.hidden = false;
       const hiddenCount = filteredJobs.length - NETDISK_JOBS_FOLD_THRESHOLD;
-      foldBtn.textContent = isExpanded ? '收起' : `展开剩余 ${hiddenCount} 项`;
+      foldBtn.textContent = isExpanded ? '收起' : `${t('展开剩余 {hiddenCount} 项', {hiddenCount: hiddenCount})}`;
     } else {
       foldWrap.hidden = true;
     }
@@ -337,11 +338,11 @@ export function renderNetdiskJobs() {
     const links = Number(job.link_count ?? 0);
     const total = Number(job.total ?? 0);
     const linked = Number(job.linked ?? 0);
-    const meta = [`状态 ${label}`];
-    if (links > 0) meta.push(`${links} 条链接`);
+    const meta = [`${t('状态 {label}', {label: label})}`];
+    if (links > 0) meta.push(`${t('{links} 条链接', {links: links})}`);
     // Reported as "linked / total", never as a percentage: the plan forbids a
     // bar that reaches 100% while files are still unbound.
-    if (total > 0) meta.push(`已入库 ${linked}/${total}`);
+    if (total > 0) meta.push(`${t('已入库 {linked}/{total}', {linked: linked, total: total})}`);
     if (job.attention) meta.push(escHtml(String(job.attention)));
     const actions = NETDISK_JOB_ACTIONS.map(item => {
       const allowed = NETDISK_ACTION_STATES[item.action] || [];
@@ -493,8 +494,8 @@ export async function checkNetdiskPaths() {
     // The route answers one fact per directory. Collapsing them into a single
     // boolean would hide which of the two is unusable.
     const reasons = [];
-    if (body?.staging && body.staging.ok === false) reasons.push(`暂存目录：${body.staging.reason || '不可用'}`);
-    if (body?.import && body.import.ok === false) reasons.push(`入库目录：${body.import.reason || '不可用'}`);
+    if (body?.staging && body.staging.ok === false) reasons.push(t('暂存目录：{reason}', {reason: body.staging.reason || '不可用'}));
+    if (body?.import && body.import.ok === false) reasons.push(t('入库目录：{reason}', {reason: body.import.reason || '不可用'}));
     const ok = body?.ok !== false && reasons.length === 0;
     toast(ok ? '目录检查通过' : reasons.join(' \u00b7 '), ok ? 'info' : 'error');
   } catch (e) {
@@ -658,7 +659,7 @@ export async function resolveNetdiskDispatchPost() {
   const schemeMatch = raw.match(/^([a-z][a-z0-9+.-]*):\/\//i);
   if (schemeMatch && !isLink) {
     preview.hidden = true;
-    toast(`仅支持 http 或 https 链接，不支持 ${schemeMatch[1]}://`, 'warn');
+    toast(`${t('仅支持 http 或 https 链接，不支持 {schemeMatch}://', {schemeMatch: schemeMatch[1]})}`, 'warn');
     return;
   }
 
@@ -679,7 +680,7 @@ export async function resolveNetdiskDispatchPost() {
         preview.hidden = false;
         const extCount = matched.external_link_count || (matched.has_external_links ? 1 : 0);
         preview.innerHTML = `<strong>${escHtml(matched.title || matched.post_id || '作品')}</strong>
-          <div>画师：${escHtml(matched.artist_name || '未知')} \u00b7 日期：${escHtml(matched.day || '无日期')} \u00b7 外部网盘链接：${extCount} 个</div>`;
+          <div>${t('画师：{artist} \u00b7 日期：{day} \u00b7 外部网盘链接：{count} 个', {artist: escHtml(matched.artist_name || '未知'), day: escHtml(matched.day || '无日期'), count: extCount})}</div>`;
         if (submitBtn) submitBtn.disabled = false;
         toast('已解析作品', 'info');
         return;
@@ -706,22 +707,37 @@ export async function submitNetdiskDispatch() {
   const input = $('#netdiskDispatchInput');
   const preview = $('#netdiskDispatchPreview');
   const submitBtn = $('#netdiskDispatchSubmitBtn');
-  const post = state.netdiskResolvedPost;
-  const link = state.netdiskResolvedLink || (input?.value.trim().match(/^https?:\/\//i) ? input.value.trim() : null);
 
-  if (!post && !link) {
+  // The 409 retry re-enters doSubmit, so the target is recomputed at the point
+  // of use instead of being closed over: the operator can resolve one work,
+  // edit the field to another, confirm the retry, and the old work must not be
+  // submitted. A resolution that no longer validates refuses the submit.
+  function buildPayload() {
+    const resolvedPost = state.netdiskResolvedPost;
+    const currentLink = state.netdiskResolvedLink
+      || (input?.value.trim().match(/^https?:\/\//i) ? input.value.trim() : null);
+    return resolvedPost ? { post_id: Number(resolvedPost.id) } : (currentLink ? { link: currentLink } : null);
+  }
+
+  if (!buildPayload()) {
     toast('请先输入并解析作品或链接', 'warn');
     return;
   }
 
   if (!(await ensureNetdiskDispatchReady())) return;
 
-  const payload = post ? { post_id: Number(post.id) } : { link };
   if (isActionBusy('netdiskDispatchSubmit')) return;
   setActionBusy('netdiskDispatchSubmit', '', true);
   if (submitBtn) submitBtn.disabled = true;
 
   async function doSubmit(extra = {}) {
+    const payload = buildPayload();
+    if (!payload) {
+      toast('投递目标已改变，请重新解析后再提交', 'warn');
+      setActionBusy('netdiskDispatchSubmit', '', false);
+      if (submitBtn) submitBtn.disabled = false;
+      return null;
+    }
     try {
       const res = await API.postJson('/api/netdisk/jobs', { ...payload, ...extra });
       if (res.auto_start) {

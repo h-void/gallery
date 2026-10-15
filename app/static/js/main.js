@@ -11,6 +11,7 @@ import {
   loadCardRatio, syncFilterDrawer, updateScanFolderButton, renderLibraryEmptyState,
 } from './views/sidebar.js';
 import { initTheme } from './views/theme.js';
+import { initI18n, t } from './i18n.js';
 
 let wsRetryDelay = 1000;
 
@@ -81,7 +82,11 @@ function showProgress(s) {
   const pct = s.total_estimate > 0 ? Math.round(s.scanned_count / s.total_estimate * 100) : 0;
   $('#progressFill').style.width = Math.min(pct, 100) + '%';
   $('#progressCount').textContent = `${s.scanned_count} / ${s.total_estimate}`;
-  $('#progressPath').textContent = s.current_path || '';
+  const pathEl = $('#progressPath');
+  if (pathEl) {
+    pathEl.textContent = s.current_path || '';
+    pathEl.title = s.current_path || '';
+  }
 }
 
 function hideProgress() {
@@ -105,11 +110,11 @@ async function refreshAfterScan(options = {}) {
     if (toastOnFinish && isCurrentRequestSeq('scanRefreshSeq', seq)) {
       if (isError) {
         const detail = options.error ? String(options.error).replace(/^error:\s*/i, '').trim() : '';
-        toast(detail ? `扫描失败：${detail}` : '扫描失败', 'error');
+        toast(detail ? t('扫描失败：{detail}', {detail}) : '扫描失败', 'error');
         logUiAction('scan_failed', collectUiLogContext({error: detail || 'scan_error'}));
       } else if (isPartial) {
         const detail = options.error ? String(options.error).replace(/^error:\s*/i, '').trim() : '';
-        toast(detail ? `扫描部分完成：${detail}` : '扫描部分完成', 'warning');
+        toast(detail ? t('扫描部分完成：{detail}', {detail}) : '扫描部分完成', 'warning');
         logUiAction('scan_partial', collectUiLogContext({error: detail || 'scan_partial'}));
       } else if (options.phase === 'stopped') {
         toast('扫描已停止', 'info');
@@ -134,6 +139,7 @@ async function init() {
   loadSidebarCollapsed();
   loadMobileColumns();
   initTheme();
+  initI18n();
   loadCardRatio();
   bindEvents();
   document.body.classList.toggle('mode-moves', state.mode === 'moves');

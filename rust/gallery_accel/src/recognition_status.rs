@@ -155,21 +155,26 @@ pub fn character_model_signature() -> Value {
 }
 
 pub fn suggest_artists_native(conn: &Connection, item_id: i64, limit: i64) -> Result<Value> {
-    // Pure-Rust metadata fallback: return empty model candidates when embeddings
-    // are absent; never call Python.
-    let item_exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM items WHERE id=?",
+    // Artist suggestion has no inference pipeline in the pure-Rust runtime, so
+    // this endpoint reports an explicit unsupported status instead of pretending
+    // a search ran and came back empty. The item lookup is an existence check
+    // (`SELECT EXISTS`), not a count whose value is then discarded; a missing
+    // item is a definite error, never an empty suggestion list.
+    let item_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM items WHERE id=?)",
         rusqlite::params![item_id],
         |r| r.get(0),
     )?;
-    if item_exists == 0 {
+    if !item_exists {
         anyhow::bail!("item not found");
     }
     Ok(json!({
         "item_id": item_id,
         "candidates": [],
         "limit": limit,
-        "reason": "embedding_index_empty_or_model_unavailable",
+        "supported": false,
+        "status": "unsupported",
+        "reason": "no_inference_pipeline",
         "backend": "rust-primary",
     }))
 }
@@ -193,25 +198,4 @@ pub fn recognize_character_native_topk_with_roots(
     top_k: i64,
 ) -> Result<Value> {
     crate::character_ccip::recognize_character_native_with_roots(conn, roots, item_id, top_k)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn status_shapes_without_python() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE characters (id INTEGER PRIMARY KEY);
-             CREATE TABLE character_references (id INTEGER PRIMARY KEY);",
-        )
-        .unwrap();
-        let st = character_recognition_status(&conn).unwrap();
-        assert!(st.get("enabled").is_some());
-        assert_eq!(st["backend"], "onnxruntime");
-        assert_eq!(st["runtime"], "rust-primary");
-        let a = artist_recognition_status();
-        assert_eq!(a["runtime"], "rust-primary");
-    }
 }

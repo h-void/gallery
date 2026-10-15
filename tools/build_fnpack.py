@@ -29,6 +29,8 @@ PACKAGE_ROOT_FILES = (
 )
 FNPACK_BINARY_ENV = "FNPACK_BINARY"
 
+# Scratch for `fnpack build` lives in output/fnpack/tmp on D:.
+
 # A real fnOS FPK is a gzip stream produced by official `fnpack build`.
 # A zip renamed to `.fpk` (or any other payload) is rejected by fnOS and must
 # never be staged or published. `MIN_FNPACK_SIZE` rejects trivial/truncated
@@ -278,6 +280,23 @@ def validate_skeleton() -> None:
         raise FileNotFoundError("missing fnpack files: " + ", ".join(missing))
 
 
+def verify_index_cache_busting(metadata: dict) -> None:
+    """Build-time guard: every ``?v=`` in index.html must equal the package
+    version, so a build can never ship mismatched cache-busting params after a
+    version bump."""
+    index_html = ROOT / "app" / "static" / "index.html"
+    source = index_html.read_text(encoding="utf-8")
+    # Version-shaped values only: prose in comments may legitimately mention
+    # "?v=" without carrying a cache-busting parameter.
+    versions = sorted(set(re.findall(r'\?v=(\d+\.\d+\.\d+)', source)))
+    expected = metadata["version"]
+    stale = [value for value in versions if value != expected]
+    if stale or not versions:
+        raise ValueError(
+            f"index.html cache-busting ?v= mismatch: expected {expected}, found {versions}"
+        )
+
+
 def render_generated_files(staging_dir: Path, metadata: dict) -> None:
     (staging_dir / "manifest").write_text(render_manifest(metadata), encoding="utf-8", newline="\n")
     ui_config = staging_dir / "app" / metadata["desktop_uidir"] / "config"
@@ -306,6 +325,7 @@ def stage_versioned_ui_icons(staging_dir: Path, metadata: dict) -> None:
 def stage_package(staging_dir: Path, metadata: dict | None = None) -> Path:
     metadata = metadata or load_package_metadata()
     validate_skeleton()
+    verify_index_cache_busting(metadata)
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
 
@@ -429,6 +449,16 @@ def validate_fnpack_artifact(artifact: Path, metadata: dict) -> None:
         )
 
 
+def fnpack_temp_dir(output_dir: Path) -> Path:
+    """Pick the scratch directory for `fnpack build` directly on D: workspace."""
+    if "FNPACK_TEMP" in os.environ:
+        scratch = Path(os.environ["FNPACK_TEMP"]).resolve()
+    else:
+        scratch = (output_dir / "tmp").resolve()
+    scratch.mkdir(parents=True, exist_ok=True)
+    return scratch
+
+
 def build_with_fnpack(staging_dir: Path, output_dir: Path, fnpack_binary: str, metadata: dict) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     artifact = staging_dir / f"{metadata['appname']}.fpk"
@@ -437,8 +467,7 @@ def build_with_fnpack(staging_dir: Path, output_dir: Path, fnpack_binary: str, m
 
     # Must use official `fnpack build`; a zip renamed to .fpk is rejected by fnOS.
     build_env = os.environ.copy()
-    temp_dir = (output_dir / "tmp").resolve()
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = fnpack_temp_dir(output_dir)
     build_env["TEMP"] = str(temp_dir)
     build_env["TMP"] = str(temp_dir)
     subprocess.run(

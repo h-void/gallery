@@ -73,7 +73,9 @@ def _normalize(path: str | Path) -> str:
 
 # The private tree ships Rust unit tests (src/tests.rs, src/test_support.rs,
 # src/tests/) that are stripped from the public snapshot. Their `mod`
-# declarations must be stripped too, or the public tree fails `cargo test`.
+# declarations must be stripped too, or the public tree fails `cargo test` —
+# and so must every inline `#[cfg(test)] mod … { … }` block, because they
+# reference `crate::test_support` as well (see strip_inline_test_modules).
 _TEST_MOD_FILES = {
     "rust/gallery_accel/src/lib.rs",
     "rust/gallery_accel/src/main.rs",
@@ -107,6 +109,265 @@ def strip_test_mod_declarations(relative: str, text: str) -> str:
         kept.append(line)
         pending_cfg = False
     return "".join(kept)
+
+
+def _rust_raw_string_end(text: str, start: int) -> int | None:
+    """Index just past a raw string literal starting at ``start`` ('r'), or None."""
+    i = start + 1
+    n = len(text)
+    hashes = 0
+    while i < n and text[i] == "#":
+        hashes += 1
+        i += 1
+    if i >= n or text[i] != '"':
+        return None
+    closer = '"' + "#" * hashes
+    end = text.find(closer, i + 1)
+    return n if end == -1 else end + len(closer)
+
+
+def _rust_string_end(text: str, start: int) -> int:
+    """Index just past a regular string literal whose opening quote is ``start``."""
+    i = start + 1
+    n = len(text)
+    while i < n:
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == '"':
+            return i + 1
+        i += 1
+    return n
+
+
+def _rust_char_or_lifetime_end(text: str, start: int) -> int:
+    """Index just past the quote-delimited token at ``start`` ('x' or 'static)."""
+    n = len(text)
+    if start + 1 >= n:
+        return start + 1
+    if text[start + 1] == "\\":
+        # Escape-aware scan from the opening quote: '\'' and '\\' must not
+        # terminate the literal at the escaped quote.
+        i = start + 1
+        while i < n:
+            if text[i] == "\\":
+                i += 2
+                continue
+            if text[i] == "'":
+                return i + 1
+            i += 1
+        return n
+    if start + 2 < n and text[start + 2] == "'":
+        return start + 3
+    # A lifetime or loop label: 'a, 'static — no closing quote.
+    i = start + 1
+    while i < n and (text[i].isalnum() or text[i] == "_"):
+        i += 1
+    return i
+
+
+def _skip_balanced_braces(text: str, open_index: int) -> int:
+    """Index just past the brace-balanced block whose '{' sits at ``open_index``."""
+    depth = 0
+    i = open_index
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "/" and text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j == -1 else j + 1
+        elif c == "/" and text.startswith("/*", i):
+            inner, i = 1, i + 2
+            while i < n and inner:
+                if text.startswith("/*", i):
+                    inner += 1
+                    i += 2
+                elif text.startswith("*/", i):
+                    inner -= 1
+                    i += 2
+                else:
+                    i += 1
+        elif c == '"':
+            i = _rust_string_end(text, i)
+        elif c == "r" and (j := _rust_raw_string_end(text, i)) is not None:
+            i = j
+        elif c == "'":
+            i = _rust_char_or_lifetime_end(text, i)
+        elif c == "{":
+            depth += 1
+            i += 1
+        elif c == "}":
+            depth -= 1
+            i += 1
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    return n
+
+
+def _skip_trivia(text: str, i: int) -> int:
+    """Index just past the whitespace and comments following ``i``."""
+    n = len(text)
+    while i < n:
+        if text[i].isspace():
+            i += 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j == -1 else j + 1
+        elif text.startswith("/*", i):
+            inner, i = 1, i + 2
+            while i < n and inner:
+                if text.startswith("/*", i):
+                    inner += 1
+                    i += 2
+                elif text.startswith("*/", i):
+                    inner -= 1
+                    i += 2
+                else:
+                    i += 1
+        else:
+            break
+    return i
+
+
+def _prune_preceding_outer_doc_comments(out: list[str]) -> None:
+    """Drop outer doc comments and test-item trivia attached to the upcoming test item."""
+    s = "".join(out)
+    lines = s.splitlines(keepends=True)
+    popped = False
+    while lines:
+        stripped = lines[-1].strip()
+        if not stripped:
+            lines.pop()
+            popped = True
+        elif (
+            stripped.startswith("///")
+            or (stripped.startswith("//") and not stripped.startswith("//!"))
+            or (stripped.startswith("#[") and not stripped.startswith("#!["))
+        ):
+            lines.pop()
+            popped = True
+        elif stripped.startswith("/*") and stripped.endswith("*/") and not stripped.startswith("/*!"):
+            lines.pop()
+            popped = True
+        else:
+            break
+    if popped:
+        res = "".join(lines)
+        if res and not res.endswith("\n"):
+            res += "\n"
+        out.clear()
+        out.append(res)
+
+
+def strip_inline_test_modules(text: str) -> str:
+    """Remove ``#[cfg(test)]`` items (brace-balanced) from Rust source.
+
+    The public snapshot ships production sources only: cfg(test) code — inline
+    test modules, test-only helpers, gated `use`/`static` items — references
+    ``crate::test_support``, which is not published, so leaving any of it
+    behind breaks `cargo test` in the public tree. A ``mod`` item is removed
+    with its balanced block; any other item or statement is removed up to and
+    including its first top-level ``;`` or brace-balanced ``{…}`` group, which
+    mirrors how rustc drops the cfg'd code from non-test builds. The scanner
+    skips comments and string/char/raw-string literals so braces inside them
+    cannot derail the extent search.
+    """
+    attribute = "#[cfg(test)]"
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "/" and text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j == -1 else j + 1
+            out.append(text[i:j])
+            i = j
+        elif c == "/" and text.startswith("/*", i):
+            inner, j = 1, i + 2
+            while j < n and inner:
+                if text.startswith("/*", j):
+                    inner += 1
+                    j += 2
+                elif text.startswith("*/", j):
+                    inner -= 1
+                    j += 2
+                else:
+                    j += 1
+            out.append(text[i:j])
+            i = j
+        elif c == '"':
+            j = _rust_string_end(text, i)
+            out.append(text[i:j])
+            i = j
+        elif c == "r" and (j := _rust_raw_string_end(text, i)) is not None:
+            out.append(text[i:j])
+            i = j
+        elif c == "'":
+            j = _rust_char_or_lifetime_end(text, i)
+            out.append(text[i:j])
+            i = j
+        elif text.startswith(attribute, i):
+            _prune_preceding_outer_doc_comments(out)
+            j = _skip_trivia(text, i + len(attribute))
+            if (
+                text.startswith("mod", j)
+                and (j + 3 >= n or not (text[j + 3].isalnum() or text[j + 3] == "_"))
+            ):
+                k = _skip_trivia(text, j + 3)
+                while k < n and (text[k].isalnum() or text[k] == "_"):
+                    k += 1
+                k = _skip_trivia(text, k)
+                if k < n and text[k] == "{":
+                    k = _skip_balanced_braces(text, k)
+                    while k < n and text[k] in " \t":
+                        k += 1
+                    if text.startswith("\r\n", k):
+                        k += 2
+                    elif k < n and text[k] == "\n":
+                        k += 1
+                    i = k
+                    continue
+            # Non-mod item or statement: drop the extent rustc would drop.
+            k = j
+            while k < n:
+                c2 = text[k]
+                if c2 == "/" and text.startswith("//", k):
+                    m = text.find("\n", k)
+                    k = n if m == -1 else m + 1
+                elif c2 == "/" and text.startswith("/*", k):
+                    inner, k = 1, k + 2
+                    while k < n and inner:
+                        if text.startswith("/*", k):
+                            inner += 1
+                            k += 2
+                        elif text.startswith("*/", k):
+                            inner -= 1
+                            k += 2
+                        else:
+                            k += 1
+                elif c2 == '"':
+                    k = _rust_string_end(text, k)
+                elif c2 == "r" and (m := _rust_raw_string_end(text, k)) is not None:
+                    k = m
+                elif c2 == "'":
+                    k = _rust_char_or_lifetime_end(text, k)
+                elif c2 == ";":
+                    k += 1
+                    break
+                elif c2 == "{":
+                    k = _skip_balanced_braces(text, k)
+                    break
+                else:
+                    k += 1
+            i = k
+            continue
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 def sanitize_public_env(text: str) -> str:
@@ -283,14 +544,15 @@ def stage_public_release(
                 encoding="utf-8",
             )
         elif relative in _TEST_MOD_FILES:
-            # Strip the declarations of the removed test modules so the
-            # public tree compiles (and `cargo test` passes) out of the box.
+            # Strip the declarations of the removed test modules, and every
+            # inline test block, so the public tree compiles (and `cargo test`
+            # passes) out of the box.
             text = source.read_text(encoding="utf-8")
-            destination.write_text(
-                strip_test_mod_declarations(relative, text),
-                encoding="utf-8",
-                newline="",
-            )
+            text = strip_inline_test_modules(strip_test_mod_declarations(relative, text))
+            destination.write_text(text, encoding="utf-8", newline="")
+        elif relative.startswith("rust/gallery_accel/src/") and relative.endswith(".rs"):
+            text = strip_inline_test_modules(source.read_text(encoding="utf-8"))
+            destination.write_text(text, encoding="utf-8", newline="")
         else:
             shutil.copy2(source, destination)
     return selected

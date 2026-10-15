@@ -264,10 +264,13 @@ fn repoint_artist_references(
             .optional()
             .with_context(|| format!("probe artist reference collision for item {target_id}"))?
         } else {
+            let Some(item_id) = row.item_id else {
+                continue;
+            };
             conn.query_row(
                 "SELECT id, created_at FROM artist_references
                  WHERE artist_id=? AND item_id=? AND id<>?",
-                rusqlite::params![target_id, row.item_id.unwrap(), row.id],
+                rusqlite::params![target_id, item_id, row.id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -654,64 +657,85 @@ fn merge_artist_folder_plans(
     let mut stmt = conn.prepare(&format!(
         "SELECT {select} FROM folder_rename_plans WHERE artist_id=?"
     ))?;
+    #[derive(Debug)]
+    struct FolderPlanMergeRow {
+        id: i64,
+        source_folder: String,
+        semantic: Vec<Value>,
+    }
+
     let rows = stmt
         .query_map(rusqlite::params![source_artist], |row| {
-            let mut values: Vec<Value> = Vec::with_capacity(semantic.len() + 2);
-            values.push(json!(row.get::<_, i64>(0)?));
-            values.push(json!(row.get::<_, String>(1)?));
+            let id = row.get::<_, i64>(0)?;
+            let source_folder = row.get::<_, String>(1)?;
+            let mut semantic_values = Vec::with_capacity(semantic.len());
             for index in 0..semantic.len() {
-                values.push(column_value_json(row, 2 + index)?);
+                semantic_values.push(column_value_json(row, 2 + index)?);
             }
-            Ok(values)
+            Ok(FolderPlanMergeRow {
+                id,
+                source_folder,
+                semantic: semantic_values,
+            })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for source in rows {
-        let plan_id = source[0].as_i64().unwrap();
-        let source_folder = source[1].as_str().unwrap();
-        let target: Option<Vec<Value>> = conn
+        let target: Option<FolderPlanMergeRow> = conn
             .query_row(
                 &format!(
                     "SELECT {select} FROM folder_rename_plans
                      WHERE artist_id=? AND source_folder=?"
                 ),
-                rusqlite::params![target_artist, source_folder],
+                rusqlite::params![target_artist, &source.source_folder],
                 |row| {
-                    let mut values: Vec<Value> = Vec::with_capacity(semantic.len() + 2);
-                    values.push(json!(row.get::<_, i64>(0)?));
-                    values.push(json!(row.get::<_, String>(1)?));
+                    let id = row.get::<_, i64>(0)?;
+                    let source_folder = row.get::<_, String>(1)?;
+                    let mut semantic_values = Vec::with_capacity(semantic.len());
                     for index in 0..semantic.len() {
-                        values.push(column_value_json(row, 2 + index)?);
+                        semantic_values.push(column_value_json(row, 2 + index)?);
                     }
-                    Ok(values)
+                    Ok(FolderPlanMergeRow {
+                        id,
+                        source_folder,
+                        semantic: semantic_values,
+                    })
                 },
             )
             .optional()
             .with_context(|| {
                 format!(
-                    "probe folder plan conflict of artist {target_artist} for folder {source_folder}"
+                    "probe folder plan conflict of artist {target_artist} for folder {}",
+                    source.source_folder
                 )
             })?;
         if let Some(target) = target {
-            let target_plan_id = target[0].as_i64().unwrap();
-            if source[2..] == target[2..] {
+            if source.semantic == target.semantic {
                 conn.execute(
                     "DELETE FROM folder_rename_plans WHERE id=?",
-                    rusqlite::params![plan_id],
+                    rusqlite::params![source.id],
                 )
-                .with_context(|| format!("drop duplicate folder plan {plan_id}"))?;
+                .with_context(|| format!("drop duplicate folder plan {}", source.id))?;
             } else {
                 return Err(anyhow!(
-                    "folder plan conflict: plan {plan_id} of artist {source_artist} and \
-                     plan {target_plan_id} of artist {target_artist} share source folder \
-                     {source_folder} but differ in semantic fields; refusing to merge"
+                    "folder plan conflict: plan {} of artist {source_artist} and \
+                     plan {} of artist {target_artist} share source folder \
+                     {} but differ in semantic fields; refusing to merge",
+                    source.id,
+                    target.id,
+                    source.source_folder
                 ));
             }
         } else {
             conn.execute(
                 "UPDATE folder_rename_plans SET artist_id=? WHERE id=?",
-                rusqlite::params![target_artist, plan_id],
+                rusqlite::params![target_artist, source.id],
             )
-            .with_context(|| format!("reassign folder plan {plan_id} to artist {target_artist}"))?;
+            .with_context(|| {
+                format!(
+                    "reassign folder plan {} to artist {target_artist}",
+                    source.id
+                )
+            })?;
         }
     }
     Ok(())
@@ -1192,7 +1216,10 @@ pub fn normalize_configured_media_paths(conn: &Connection, roots: &MediaRoots) -
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for (artist_id, old_path) in rows {
-                let new_path = format!("{real_n}{}", &old_path[root_n.len()..]);
+                let Some(suffix) = old_path.strip_prefix(root_n.as_str()) else {
+                    continue;
+                };
+                let new_path = format!("{real_n}{suffix}");
                 if new_path == old_path {
                     continue;
                 }
@@ -1263,10 +1290,12 @@ pub fn normalize_configured_media_paths(conn: &Connection, roots: &MediaRoots) -
                         })?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     for (item_id, file_path) in items {
-                        let mapped = if file_path == *root_n
-                            || file_path.starts_with(&format!("{root_n}/"))
-                        {
-                            format!("{real_n}{}", &file_path[root_n.len()..])
+                        let mapped = if let Some(suffix) = file_path.strip_prefix(root_n.as_str()) {
+                            if suffix.is_empty() || suffix.starts_with('/') {
+                                format!("{real_n}{suffix}")
+                            } else {
+                                roots.normalize_db_path(&file_path)
+                            }
                         } else {
                             roots.normalize_db_path(&file_path)
                         };
@@ -1433,7 +1462,10 @@ pub fn normalize_configured_media_paths(conn: &Connection, roots: &MediaRoots) -
                         })?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     for (item_id, old_path) in rows {
-                        let new_path = format!("{real_n}{}", &old_path[root_n.len()..]);
+                        let Some(suffix) = old_path.strip_prefix(root_n.as_str()) else {
+                            continue;
+                        };
+                        let new_path = format!("{real_n}{suffix}");
                         let conflict: Option<i64> = conn
                             .query_row(
                                 "SELECT id FROM items WHERE file_path=? AND id<>?",
@@ -1476,7 +1508,10 @@ pub fn normalize_configured_media_paths(conn: &Connection, roots: &MediaRoots) -
                         })?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     for (doc_id, old_path) in rows {
-                        let new_path = format!("{real_n}{}", &old_path[root_n.len()..]);
+                        let Some(suffix) = old_path.strip_prefix(root_n.as_str()) else {
+                            continue;
+                        };
+                        let new_path = format!("{real_n}{suffix}");
                         let conflict: Option<i64> = conn
                             .query_row(
                                 &format!(

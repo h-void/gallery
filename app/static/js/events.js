@@ -6,6 +6,7 @@ import { API } from './api.js';
 import { state, nextRequestSeq, isCurrentRequestSeq } from './store.js';
 import { $, $$, debounce } from './utils.js';
 import { toast, logUiAction, collectUiLogContext } from './logging.js';
+import { t } from './i18n.js';
 import {
   restoreBrowseUrl, syncBrowseUrl, browseUrlParams, saveItemSort, saveItemDates,
   getSavedTagSort, saveTagSort, loadArtists, closeArtistDropdown, updateBrowseReturnButton,
@@ -24,7 +25,7 @@ import {
 } from './views/sidebar.js';
 import { renderGrid, bindGridEvents, captureGridScrollAnchor, restoreGridScrollAnchor, isTaggableItem, scheduleJustifiedRelayout, itemsByIdMap } from './views/grid.js';
 import {
-  closeLightbox, closeLightboxInlineEditors, moveLightbox, onLightboxWheel, startLightboxPan, moveLightboxPan,
+  closeLightbox, closeLightboxInlineEditors, moveLightbox, onLightboxWheel, startLightboxPan, moveLightboxPan, consumeLightboxJustPanned,
   stopLightboxPan, onLightboxDelete, bindLightboxVideoDiagnostics, setLightboxZoom, toggleLightboxCaption,
   handleLightboxEscape, LIGHTBOX_DOUBLE_CLICK_ZOOM,
 } from './views/lightbox.js';
@@ -35,9 +36,12 @@ import {
   deleteSelectedMediaItems, removeSelectedTagsFromItems, selectAllCharacterSuggestions,
   selectCharacterSuggestionTag, closeEditTagPicker, renderEditTagPicker,
   setEditMode, syncEditModeButton, archiveCurrentFolder, bundleSelectedItems,
+  openItemMoveFolderDialog, closeItemMoveFolderDialog, setItemMoveFolderFilter,
+  selectItemMoveFolderTarget, moveItemMoveFolderActive, executeBundleSelectedItems, repeatLastBundleSelectedItems,
+  renderEditDateControl, moveEditTagPickerActive,
 } from './views/editbar.js';
 import { bindArtistLinks, bindArtistProfileLinks, renderArtistLinks, renderArtistProfileLinks, closeArtistLinksDialog } from './views/links.js';
-import { bindArchiveModal, closeArchiveModal } from './views/archive_modal.js';
+import { bindArchiveModal, closeArchiveModal, openBatchArchiveModal, bindBatchArchiveModal, closeBatchArchiveModal, isBatchArchiveExtracting, stopBatchArchiveExtraction } from './views/archive_modal.js';
 import {
   loadMoveWorkbench, refreshActiveMaintenanceView, startMaintenanceAutoRefresh,
   stopMaintenanceAutoRefresh, scheduleMaintenanceAutoRefresh, setMaintenanceView, syncMaintenanceTabsEdge, handleMaintenanceJump,
@@ -53,7 +57,7 @@ import {
   scheduleArchiveDraftPreview, switchOrganizeArtist, stepOrganizeArtist,
   toggleAllArchivePlansConfirmation, executeArchivePlans, invalidateArtistFolderMovePreview,
   previewArtistFolderMove, executeArtistFolderMove, openDirectoryPicker,
-  closeDirectoryPicker, chooseDirectoryPicker, loadDirectoryPicker, toggleArchivePlansFold,
+  closeDirectoryPicker, chooseDirectoryPicker, loadDirectoryPicker, renderDirectoryPicker, toggleArchivePlansFold,
 } from './views/maintenance/organize.js';
 import {
   rebuildCharacterIndex, importCharacterLibraryReferences, cancelCharacterImportJob,
@@ -64,28 +68,30 @@ import {
 } from './views/maintenance/characters.js';
 import {
   loadRecycleBin, restoreRecycleEntry, purgeRecycleEntry, clearRecycleBin, setOperationHistoryFilter,
-  toggleOperationHistoryFold,
+  toggleOperationHistoryFold, setRecycleViewMode, toggleRecycleSelection, selectAllRecycleEntries,
+  clearRecycleSelection, batchRestoreRecycleEntries, batchPurgeRecycleEntries, setRecycleStrategy,
 } from './views/maintenance/records.js';
 import {
   saveDownloadsSettings, resetDownloadTemplates, addDownloadSubscription, deleteDownloadSubscription,
   toggleDownloadSubscription, setDownloadSubscriptionMode, startDownloadSync,
   downloadPostByHand, insertDownloadTemplateToken, rememberDownloadTemplateInput,
   downloadTemplateInputSelector, toggleDownloadType, openDownloadArtistCombo, closeDownloadArtistCombo,
-  pickDownloadArtist, renderDownloadArtistCombo, markDownloadSettingsDirty,
+  pickDownloadArtist, renderDownloadArtistCombo, moveDownloadArtistComboActive, selectActiveDownloadArtistCombo, markDownloadSettingsDirty,
   checkDownloadMissing, refreshDownloadLog, reconcileDownloadLibrary, openDownloadDay,
   checkSubscriptionMissing, reconcileSubscriptionLibrary, renderDownloadArtistFolder,
   loadMoreDownloadDayPosts, decideDownloadPost, loadDownloadCandidates,
   bindDownloadCandidate, verifyDownloadPost, stopDownloadPost, importDownloadPost,
   openDownloadPostFiles, retryDownloadFile, applyDownloadWorksFilter,
+  openNamingMigrationPreview,
   scheduleDownloadWorksSearch, toggleDownloadWorksSelectAll, clearDownloadWorksSelection,
   loadMoreDownloadWorks, downloadWorksSelection, downloadWorksNetdiskSelection, downloadWorksPost,
   toggleDownloadWorkSelection, downloadWorksSelected,
   openDownloadWorksArtistCombo, closeDownloadWorksArtistCombo,
-  pickDownloadWorksArtist, renderDownloadWorksArtistCombo,
+  pickDownloadWorksArtist, renderDownloadWorksArtistCombo, moveDownloadWorksArtistComboActive, selectActiveDownloadWorksArtistCombo,
   jumpToDownloadWorkFolder,
   deliverPostToNetdisk,
   renderDownloadsPanel,
-  renderDownloadSubscriptions, setDownloadSubscriptionFilter, toggleDownloadSubscriptionsFold, toggleDownloadLogFold,
+  renderDownloadSubscriptions, toggleDownloadLogFold,
 } from './views/maintenance/downloads.js';
 import {
   saveNetdiskSettings, testNetdiskConnection, checkNetdiskPaths, connectNetdisk, disconnectNetdisk,
@@ -171,8 +177,8 @@ function applyItemFilterControls() {
   const dateFrom = $('#itemDateFrom');
   const dateTo = $('#itemDateTo');
   const invalid = dateFrom && dateTo && dateFrom.value && dateTo.value && dateFrom.value > dateTo.value;
-  if (dateFrom) dateFrom.setCustomValidity(invalid ? '开始日期不能晚于结束日期' : '');
-  if (dateTo) dateTo.setCustomValidity(invalid ? '结束日期不能早于开始日期' : '');
+  if (dateFrom) dateFrom.setCustomValidity(invalid ? t('开始日期不能晚于结束日期') : '');
+  if (dateTo) dateTo.setCustomValidity(invalid ? t('结束日期不能早于开始日期') : '');
   if (invalid) {
     if (dateFrom) dateFrom.reportValidity();
     return;
@@ -508,6 +514,22 @@ export function bindEvents() {
     scheduleJustifiedRelayout();
     onViewportLayoutChange();
   });
+  // Language switches re-render only the stateful widgets whose text is
+  // generated from state (counts, empty states, filter labels). Card tooltips
+  // and static shell text are patched in place by i18n itself, so the grid is
+  // deliberately not rebuilt — loaded thumbnails must survive a switch.
+  window.addEventListener('gallery:lang', () => {
+    updateEditBar();
+    renderSidebar();
+    renderFolderTree();
+    renderToolbar();
+    renderArtistLinks();
+    renderArtistProfileLinks();
+    renderLibraryEmptyState();
+    if (state.mode === 'moves') {
+      refreshActiveMaintenanceView({preserveScroll: true, reason: 'lang'}).catch(() => {});
+    }
+  });
   $('#artistSearch').addEventListener('focus', e => {
     e.target.select();
     renderArtistDropdown('');
@@ -721,6 +743,11 @@ export function bindEvents() {
   }
 
   $('#stopScanBtn').addEventListener('click', async () => {
+    if (isBatchArchiveExtracting()) {
+      stopBatchArchiveExtraction();
+      toast(t('正在停止批量解压，当前压缩包完成后将中断队列'), 'info');
+      return;
+    }
     if (isActionBusy('scan-stop')) return;
     setActionBusy('scan-stop', '', true);
     try {
@@ -865,7 +892,12 @@ export function bindEvents() {
       openDownloadArtistCombo();
     });
     downloadArtistInput.addEventListener('keydown', e => {
-      if (e.key === 'Escape') {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        moveDownloadArtistComboActive(e.key === 'ArrowDown' ? 1 : -1);
+      } else if (e.key === 'Enter' && !$('#downloadSubscriptionArtistListbox')?.hidden) {
+        if (selectActiveDownloadArtistCombo()) e.preventDefault();
+      } else if (e.key === 'Escape') {
         e.stopPropagation();
         closeDownloadArtistCombo();
       }
@@ -986,6 +1018,11 @@ export function bindEvents() {
         loadDownloadCandidates(candidates.dataset.downloadPostCandidates);
         return;
       }
+      const naming = target.closest('[data-download-post-naming]');
+      if (naming && downloadSubscriptionList.contains(naming)) {
+        openNamingMigrationPreview(naming.dataset.downloadPostNaming);
+        return;
+      }
       if (target.closest('[data-download-day-more]')) {
         loadMoreDownloadDayPosts();
         return;
@@ -1027,7 +1064,7 @@ export function bindEvents() {
       if (!target) return;
       const pick = target.closest('[data-download-works-pick]');
       if (pick && downloadWorksPanel.contains(pick)) {
-        toggleDownloadWorkSelection(pick.dataset.downloadWorksPick, pick.checked);
+        toggleDownloadWorkSelection(pick.dataset.downloadWorksPick, pick.checked, {shift: e.shiftKey});
         return;
       }
       const dayJump = target.closest('[data-download-works-jump-day]');
@@ -1072,7 +1109,12 @@ export function bindEvents() {
         openDownloadWorksArtistCombo();
       });
       downloadWorksArtistInput.addEventListener('keydown', e => {
-        if (e.key === 'Escape') {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          moveDownloadWorksArtistComboActive(e.key === 'ArrowDown' ? 1 : -1);
+        } else if (e.key === 'Enter' && !$('#downloadWorksArtistListbox')?.hidden) {
+          if (selectActiveDownloadWorksArtistCombo()) e.preventDefault();
+        } else if (e.key === 'Escape') {
           e.stopPropagation();
           closeDownloadWorksArtistCombo();
         }
@@ -1188,13 +1230,129 @@ export function bindEvents() {
     const target = event.target instanceof Element ? event.target.closest('[data-artist-folder-directory]') : null;
     if (target && artistFolderMoveDirectoryList.contains(target)) loadDirectoryPicker([state.directoryPickerPath, target.dataset.artistFolderDirectory].filter(Boolean).join('/'));
   });
+  const artistFolderMoveDirectoryPath = $('#artistFolderMoveDirectoryPath');
+  if (artistFolderMoveDirectoryPath) artistFolderMoveDirectoryPath.addEventListener('click', event => {
+    const target = event.target instanceof Element ? event.target.closest('[data-artist-folder-breadcrumb]') : null;
+    if (target && artistFolderMoveDirectoryPath.contains(target)) loadDirectoryPicker(target.dataset.artistFolderBreadcrumb || '');
+  });
+  const artistFolderMoveDirectorySearch = $('#artistFolderMoveDirectorySearch');
+  if (artistFolderMoveDirectorySearch) {
+    artistFolderMoveDirectorySearch.addEventListener('input', e => {
+      state.directoryPickerFilter = e.target.value;
+      renderDirectoryPicker();
+    });
+    artistFolderMoveDirectorySearch.addEventListener('keydown', e => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        if (e.target.value) {
+          e.target.value = '';
+          state.directoryPickerFilter = '';
+          renderDirectoryPicker();
+        } else {
+          closeDirectoryPicker();
+        }
+      }
+    });
+  }
+  const itemMoveFolderDialog = $('#itemMoveFolderDialog');
+  if (itemMoveFolderDialog) {
+    itemMoveFolderDialog.addEventListener('click', event => { if (event.target === itemMoveFolderDialog) closeItemMoveFolderDialog(); });
+  }
+  const itemMoveFolderCloseBtn = $('#itemMoveFolderCloseBtn');
+  if (itemMoveFolderCloseBtn) itemMoveFolderCloseBtn.addEventListener('click', closeItemMoveFolderDialog);
+  const itemMoveFolderCancelBtn = $('#itemMoveFolderCancelBtn');
+  if (itemMoveFolderCancelBtn) itemMoveFolderCancelBtn.addEventListener('click', closeItemMoveFolderDialog);
+  const itemMoveFolderConfirmBtn = $('#itemMoveFolderConfirmBtn');
+  if (itemMoveFolderConfirmBtn) itemMoveFolderConfirmBtn.addEventListener('click', () => {
+    const searchVal = $('#itemMoveFolderSearch')?.value?.trim();
+    const target = state.itemMoveFolderTarget || searchVal;
+    if (target) executeBundleSelectedItems(target);
+  });
+  const itemMoveFolderSearch = $('#itemMoveFolderSearch');
+  if (itemMoveFolderSearch) {
+    itemMoveFolderSearch.addEventListener('input', e => {
+      setItemMoveFolderFilter(e.target.value);
+    });
+    itemMoveFolderSearch.addEventListener('keydown', e => {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        moveItemMoveFolderActive(e.key === 'ArrowDown' ? 1 : -1);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        const searchVal = e.target.value.trim();
+        const target = state.itemMoveFolderTarget || searchVal;
+        if (target) executeBundleSelectedItems(target);
+      } else if (e.key === 'Escape') {
+        e.stopPropagation();
+        closeItemMoveFolderDialog();
+      }
+    });
+  }
+  const itemMoveRecentList = $('#itemMoveRecentList');
+  if (itemMoveRecentList) {
+    itemMoveRecentList.addEventListener('click', e => {
+      const pill = e.target instanceof Element ? e.target.closest('[data-item-move-folder]') : null;
+      if (pill && itemMoveRecentList.contains(pill)) {
+        selectItemMoveFolderTarget(pill.dataset.itemMoveFolder);
+      }
+    });
+  }
+  const itemMoveFolderTree = $('#itemMoveFolderTree');
+  if (itemMoveFolderTree) {
+    itemMoveFolderTree.addEventListener('click', e => {
+      const entry = e.target instanceof Element ? e.target.closest('[data-item-move-folder]') : null;
+      if (entry && itemMoveFolderTree.contains(entry)) {
+        selectItemMoveFolderTarget(entry.dataset.itemMoveFolder);
+      }
+    });
+    itemMoveFolderTree.addEventListener('dblclick', e => {
+      const entry = e.target instanceof Element ? e.target.closest('[data-item-move-folder]') : null;
+      if (entry && itemMoveFolderTree.contains(entry)) {
+        const target = entry.dataset.itemMoveFolder;
+        if (target) executeBundleSelectedItems(target);
+      }
+    });
+  }
+  const recycleStrategySystemBtn = $('#recycleStrategySystemBtn');
+  if (recycleStrategySystemBtn) recycleStrategySystemBtn.addEventListener('click', () => setRecycleStrategy('system'));
+  const recycleStrategyAppBtn = $('#recycleStrategyAppBtn');
+  if (recycleStrategyAppBtn) recycleStrategyAppBtn.addEventListener('click', () => setRecycleStrategy('app'));
+  const recycleViewGridBtn = $('#recycleViewGridBtn');
+  if (recycleViewGridBtn) recycleViewGridBtn.addEventListener('click', () => setRecycleViewMode('grid'));
+  const recycleViewTableBtn = $('#recycleViewTableBtn');
+  if (recycleViewTableBtn) recycleViewTableBtn.addEventListener('click', () => setRecycleViewMode('table'));
+  const recycleSelectAll = $('#recycleSelectAll');
+  if (recycleSelectAll) recycleSelectAll.addEventListener('change', e => selectAllRecycleEntries(e.target.checked));
+  const recycleBatchRestoreBtn = $('#recycleBatchRestoreBtn');
+  if (recycleBatchRestoreBtn) recycleBatchRestoreBtn.addEventListener('click', () => batchRestoreRecycleEntries());
+  const recycleBatchPurgeBtn = $('#recycleBatchPurgeBtn');
+  if (recycleBatchPurgeBtn) recycleBatchPurgeBtn.addEventListener('click', () => batchPurgeRecycleEntries());
+  const recycleBatchCancelBtn = $('#recycleBatchCancelBtn');
+  if (recycleBatchCancelBtn) recycleBatchCancelBtn.addEventListener('click', () => clearRecycleSelection());
+
   const recycleBinList = $('#recycleBinList');
   if (recycleBinList) recycleBinList.addEventListener('click', e => {
     const target = e.target instanceof Element ? e.target : null;
-    const restore = target ? target.closest('[data-recycle-restore]') : null;
+    if (!target) return;
+    const restore = target.closest('[data-recycle-restore]');
     if (restore && recycleBinList.contains(restore)) return void restoreRecycleEntry(restore.dataset.recycleRestore);
-    const purge = target ? target.closest('[data-recycle-purge]') : null;
+    const recordOnly = target.closest('[data-recycle-record-only]');
+    if (recordOnly && recycleBinList.contains(recordOnly)) return void purgeRecycleEntry(recordOnly.dataset.recycleRecordOnly, {recordOnly: true});
+    const purge = target.closest('[data-recycle-purge]');
     if (purge && recycleBinList.contains(purge)) return void purgeRecycleEntry(purge.dataset.recyclePurge);
+    const tableSelectAll = target.closest('[data-recycle-table-select-all]');
+    if (tableSelectAll && recycleBinList.contains(tableSelectAll)) {
+      return void selectAllRecycleEntries(tableSelectAll.checked);
+    }
+    const check = target.closest('[data-recycle-check]');
+    if (check && recycleBinList.contains(check)) {
+      e.stopPropagation();
+      return void toggleRecycleSelection(check.dataset.recycleCheck, {shift: e.shiftKey});
+    }
+    const row = target.closest('[data-recycle-id]');
+    if (row && recycleBinList.contains(row) && !target.closest('button, a, input, select')) {
+      return void toggleRecycleSelection(row.dataset.recycleId, {shift: e.shiftKey});
+    }
   });
   const recycleBinMore = $('#recycleBinMore');
   if (recycleBinMore) recycleBinMore.addEventListener('click', e => {
@@ -1312,17 +1470,6 @@ export function bindEvents() {
       if (characterLibrarySearchInput) characterLibrarySearchInput.focus();
     });
   }
-  const characterTagImportList = $('#characterTagImportList');
-  if (characterTagImportList) {
-    characterTagImportList.addEventListener('click', e => {
-      const target = e.target instanceof Element ? e.target : null;
-      const cancelBtn = target ? target.closest('[data-character-import-cancel]') : null;
-      if (cancelBtn && characterTagImportList.contains(cancelBtn)) {
-        cancelCharacterImportJob(cancelBtn.dataset.characterImportCancel);
-        return;
-      }
-    });
-  }
   const characterImportJobContainer = $('#characterImportJobContainer');
   if (characterImportJobContainer) {
     characterImportJobContainer.addEventListener('click', e => {
@@ -1347,12 +1494,15 @@ export function bindEvents() {
       if (searchBtn && characterList.contains(searchBtn)) {
         const query = searchBtn.dataset.characterSearch;
         if (query) {
-          applyMode('browse');
+          // Search state goes first: applyMode's browse branch loads with the
+          // current state.search, so setting it afterwards would fire one
+          // unfiltered page load before the real one.
           const searchInput = $('#searchInput');
           if (searchInput) searchInput.value = query;
           state.search = query;
           syncClearSearch();
-          loadItems();
+          applyMode('browse');
+          syncBrowseUrl('push');
         }
         return;
       }
@@ -1607,6 +1757,30 @@ export function bindEvents() {
     editBundleItemsBtn.addEventListener('click', () => bundleSelectedItems());
   }
 
+  const editExtractArchivesBtn = $('#editExtractArchivesBtn');
+  if (editExtractArchivesBtn) {
+    editExtractArchivesBtn.addEventListener('click', () => {
+      const selectedArchives = (state.allItems || []).filter(item =>
+        state.selectedIds.has(item.id) && (item.media_type === 'archive' || item.is_archive)
+      );
+      if (selectedArchives.length === 0) return;
+      openBatchArchiveModal({
+        selectedArchives,
+        artistId: state.currentArtist?.id,
+      });
+    });
+  }
+
+  const extractArtistArchivesBtn = $('#extractArtistArchivesBtn');
+  if (extractArtistArchivesBtn) {
+    extractArtistArchivesBtn.addEventListener('click', () => {
+      openBatchArchiveModal({
+        selectedArchives: [],
+        artistId: state.currentArtist?.id,
+      });
+    });
+  }
+
   $('#editDeleteSelectedBtn').addEventListener('click', () => deleteSelectedMediaItems());
 
   $('#editTagSearch').addEventListener('focus', e => {
@@ -1618,7 +1792,10 @@ export function bindEvents() {
     openEditTagPicker();
   });
   $('#editTagSearch').addEventListener('keydown', e => {
-    if (e.key === 'Enter') {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      moveEditTagPickerActive(e.key === 'ArrowDown' ? 1 : -1);
+    } else if (e.key === 'Enter') {
       e.preventDefault();
       selectFirstEditTagResult();
     } else if (e.key === 'Escape') {
@@ -1725,6 +1902,26 @@ export function bindEvents() {
         }
       }
     }
+    if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+      const activeEl = document.activeElement;
+      const tag = activeEl ? activeEl.tagName : '';
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable && !globalDeleteShortcutBlocked() && state.mode !== 'moves') {
+        const searchInput = $('#searchInput');
+        if (searchInput && !searchInput.disabled) {
+          e.preventDefault();
+          searchInput.focus();
+          searchInput.select?.();
+        }
+      }
+    }
+    if ((e.key === 'e' || e.key === 'E') && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+      const activeEl = document.activeElement;
+      const tag = activeEl ? activeEl.tagName : '';
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable && !globalDeleteShortcutBlocked() && state.mode !== 'moves') {
+        e.preventDefault();
+        setEditMode(!(state.editMode || state.selectedIds.size > 0));
+      }
+    }
     if ((e.key === 'a' || e.key === 'A') && (e.ctrlKey || e.metaKey) && !e.altKey) {
       const activeEl = document.activeElement;
       const tag = activeEl ? activeEl.tagName : '';
@@ -1743,6 +1940,26 @@ export function bindEvents() {
         if (state.selectedIds.size > 0 && !state.readOnlyMode) {
           e.preventDefault();
           deleteSelectedMediaItems();
+        }
+      }
+    }
+    if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+      const activeEl = document.activeElement;
+      const tag = activeEl ? activeEl.tagName : '';
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable && !globalDeleteShortcutBlocked()) {
+        if (state.selectedIds.size > 0 && state.currentArtist) {
+          e.preventDefault();
+          openItemMoveFolderDialog();
+        }
+      }
+    }
+    if ((e.key === 'd' || e.key === 'D') && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      const activeEl = document.activeElement;
+      const tag = activeEl ? activeEl.tagName : '';
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable && !globalDeleteShortcutBlocked()) {
+        if (state.selectedIds.size > 0 && state.currentArtist) {
+          e.preventDefault();
+          repeatLastBundleSelectedItems();
         }
       }
     }
@@ -1780,6 +1997,7 @@ export function bindEvents() {
   });
 
   $('#lightbox').addEventListener('click', e => {
+    if (consumeLightboxJustPanned()) return;
     const eventTarget = e.target;
     const closeButton = eventTarget instanceof Element ? eventTarget.closest('.close') : null;
     if (eventTarget === $('#lightbox') || eventTarget === $('#lightboxStage') || (closeButton && $('#lightbox').contains(closeButton))) {
@@ -1789,6 +2007,7 @@ export function bindEvents() {
   });
   $('#lightbox').addEventListener('wheel', onLightboxWheel, {passive: false});
   const lightboxImg = $('#lightboxImg');
+  lightboxImg.addEventListener('dragstart', e => e.preventDefault());
   lightboxImg.addEventListener('pointerdown', startLightboxPan);
   lightboxImg.addEventListener('pointermove', moveLightboxPan);
   lightboxImg.addEventListener('pointerup', stopLightboxPan);
@@ -1831,6 +2050,7 @@ export function bindEvents() {
   bindArtistLinks();
   bindArtistProfileLinks();
   bindArchiveModal();
+  bindBatchArchiveModal();
 }
 
 // Delete/Backspace may only delete the grid selection when no overlay owns the
@@ -1840,7 +2060,9 @@ export function bindEvents() {
 export function globalDeleteShortcutBlocked() {
   if ($('#lightbox')?.style.display === 'flex') return true;
   if ($('#archiveDialog')?.open) return true;
+  if ($('#batchArchiveDialog')?.open) return true;
   if ([...$$('.artist-links-dialog')].some(dialog => dialog.open)) return true;
+  if ([...$$('.artist-folder-picker-dialog')].some(dialog => dialog.open)) return true;
   if (state.filterDrawerOpen) return true;
   if ($('#editTagPicker')?.classList.contains('open')) return true;
   if ($('#artistDropdown')?.classList.contains('open')) return true;
@@ -1850,10 +2072,23 @@ export function globalDeleteShortcutBlocked() {
 }
 
 function closeTopmostOverlay() {
+  const folderPickerDialog = $('.artist-folder-picker-dialog[open]');
+  if (folderPickerDialog) {
+    if (folderPickerDialog.id === 'itemMoveFolderDialog') {
+      closeItemMoveFolderDialog();
+    } else if (folderPickerDialog.id === 'artistFolderMoveDirectoryDialog') {
+      closeDirectoryPicker();
+    } else if (typeof folderPickerDialog.close === 'function') {
+      folderPickerDialog.close();
+    }
+    return true;
+  }
   const artistLinksDialog = $('.artist-links-dialog[open]');
   if (artistLinksDialog) {
     if (artistLinksDialog.id === 'archiveDialog') {
       closeArchiveModal();
+    } else if (artistLinksDialog.id === 'batchArchiveDialog') {
+      closeBatchArchiveModal();
     } else {
       closeArtistLinksDialog(artistLinksDialog);
     }

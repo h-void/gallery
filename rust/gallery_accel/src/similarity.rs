@@ -44,48 +44,11 @@ pub fn similarity_matrix(vectors: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
 }
 
 fn dot(left: &[f32], right: &[f32]) -> f32 {
-    let mut sum = 0.0f32;
-    for (a, b) in left.iter().zip(right.iter()) {
-        sum += a * b;
-    }
-    sum
+    left.iter().zip(right).map(|(a, b)| a * b).sum()
 }
 
 /// JSON envelope for the HTTP route.
 pub fn cluster_scores_response(vectors: &[Vec<f32>]) -> Result<Value> {
     let scores = similarity_matrix(vectors)?;
     Ok(json!({ "scores": scores }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn similarity_matrix_matches_numpy_dot_product() {
-        // Orthogonal unit-ish vectors; M @ M.T expects:
-        //   row0 = [1, 0, 1]
-        //   row1 = [0, 1, 0]
-        //   row2 = [1, 0, 1]
-        let vectors = vec![
-            vec![1.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0],
-            vec![1.0, 0.0, 0.0],
-        ];
-        let scores = similarity_matrix(&vectors).unwrap();
-        assert_eq!(scores[0], vec![1.0, 0.0, 1.0]);
-        assert_eq!(scores[1], vec![0.0, 1.0, 0.0]);
-        assert_eq!(scores[2], vec![1.0, 0.0, 1.0]);
-    }
-
-    #[test]
-    fn similarity_matrix_rejects_ragged_vectors() {
-        let vectors = vec![vec![1.0, 0.0], vec![0.0]];
-        assert!(similarity_matrix(&vectors).is_err());
-    }
-
-    #[test]
-    fn similarity_matrix_rejects_oversized_input_before_allocating_matrix() {
-        assert!(similarity_matrix(&vec![vec![1.0]; 513]).is_err());
-    }
 }

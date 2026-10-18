@@ -591,20 +591,56 @@ pub fn sweep_orphaned_publish_parts(
     roots: &MediaRoots,
     min_age: Duration,
 ) -> Result<OrphanSweep> {
-    let referenced: std::collections::HashSet<String> = conn
+    let mut referenced: std::collections::HashSet<String> = conn
         .prepare(
             "SELECT private_temp_path FROM download_publish_jobs
              WHERE private_temp_path != ''",
         )?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    // The walk below runs on canonical directories while the ledger stores the
+    // path the publisher used; on Windows those differ by the verbatim prefix
+    // and case. Both spellings have to count as "the ledger names this file",
+    // or a live staging copy would be reclaimed as an orphan.
+    let canonical_refs = referenced
+        .iter()
+        .filter_map(|path| crate::fs_util::safe_canonicalize(Path::new(path)).ok())
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    referenced.extend(canonical_refs);
 
     let cutoff = SystemTime::now()
         .checked_sub(min_age)
         .unwrap_or(SystemTime::UNIX_EPOCH);
+    // The staging file is created *beside its target* (step 4), i.e. under
+    // `<root>/<artist>/<work folder>/`, never at the root itself. Reading only
+    // the roots' top level therefore found nothing in production — and on a
+    // native fnOS install even that read failed, because `roots.roots` holds
+    // the `/picturesN` aliases while the files live under the real paths.
+    //
+    // Walk the authorized roots recursively, directories only: the cost is one
+    // `read_dir` per directory (bounded by the folder count), not one stat per
+    // media file, so a library with 750k items stays cheap at startup. Hidden
+    // directories are skipped — no publish target is hidden, and this keeps the
+    // app's own recycle/staging trees out of the walk — and symlinks are not
+    // followed (`file_type` does not dereference), so a link cannot pull the
+    // sweep outside the authorized roots.
+    const MAX_PUBLISH_SWEEP_DEPTH: usize = 32;
+    let mut seen_dirs = std::collections::HashSet::new();
     let mut sweep = OrphanSweep::default();
-    for root in &roots.roots {
-        let Ok(entries) = std::fs::read_dir(root) else {
+    let mut pending: Vec<(PathBuf, usize)> = roots
+        .allowed_roots()
+        .into_iter()
+        .map(|root| (PathBuf::from(root), 0usize))
+        .collect();
+    while let Some((candidate, depth)) = pending.pop() {
+        let Ok(dir) = crate::fs_util::safe_canonicalize(&candidate) else {
+            continue;
+        };
+        if !seen_dirs.insert(dir.clone()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -612,7 +648,19 @@ pub fn sweep_orphaned_publish_parts(
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if !name.starts_with(".gallery_publish_") || !name.ends_with(".part") {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if depth < MAX_PUBLISH_SWEEP_DEPTH && !name.starts_with('.') {
+                    pending.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !file_type.is_file()
+                || !name.starts_with(".gallery_publish_")
+                || !name.ends_with(".part")
+            {
                 continue;
             }
             if referenced.contains(&path.to_string_lossy().to_string()) {
@@ -621,9 +669,6 @@ pub fn sweep_orphaned_publish_parts(
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            if !metadata.is_file() {
-                continue;
-            }
             if metadata.modified().map(|at| at > cutoff).unwrap_or(true) {
                 // Unreadable or recent mtime: leave it rather than guess.
                 continue;
@@ -1099,6 +1144,36 @@ pub fn publish_completed_file(
 /// already ingested under this item is an error. Without that, a second pass
 /// would abort on a row the first one had already advanced and leave the rest of
 /// its batch unrecorded.
+/// Mark a published job as handed to the library even though the scanner has
+/// no `items` row for it, because the file's media type is not indexed.
+///
+/// The bytes are already on disk at the target and were verified before the
+/// publish; only the index entry is impossible. Recording the handoff keeps the
+/// task's progress honest instead of retrying the same unindexable file until
+/// the retry cap drops the task.
+pub fn mark_job_delivered_unindexed(conn: &Connection, job_id: i64) -> Result<()> {
+    let updated = conn.execute(
+        "UPDATE download_publish_jobs
+            SET stage = 'ingested', item_id = NULL, updated_at = strftime('%s','now')
+          WHERE id = ?1 AND stage = 'published'",
+        params![job_id],
+    )?;
+    if updated > 0 {
+        return Ok(());
+    }
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT stage FROM download_publish_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match existing.as_deref() {
+        Some("ingested") => Ok(()),
+        _ => Err(anyhow!("publish job {job_id} is not published")),
+    }
+}
+
 pub fn mark_job_ingested(conn: &Connection, job_id: i64, item_id: i64) -> Result<()> {
     let has_error_col = conn
         .prepare("PRAGMA table_info(download_publish_jobs)")?

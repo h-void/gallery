@@ -133,10 +133,13 @@ pub(crate) fn load_character_refs(conn: &Connection, character_id: i64) -> Resul
          FROM character_references cr
          LEFT JOIN items i ON i.id = cr.item_id
          WHERE cr.character_id = ?
+           AND cr.embedding IS NOT NULL
            AND cr.embedding_dim = ?
-           AND cr.embedding_model_repo_id = ?
-           AND cr.embedding_model_variant = ?
-           AND cr.embedding_model_file = ?
+           AND (
+             (cr.embedding_model_repo_id = ? AND cr.embedding_model_variant = ? AND cr.embedding_model_file = ?)
+             OR (cr.embedding_model_variant = ? AND (cr.embedding_model_file = '' OR cr.embedding_model_file IS NULL))
+             OR (cr.embedding_model_repo_id = ? AND cr.embedding_model_variant = ?)
+           )
          ORDER BY cr.id DESC",
     )?;
     let rows = stmt.query_map(
@@ -145,13 +148,16 @@ pub(crate) fn load_character_refs(conn: &Connection, character_id: i64) -> Resul
             crate::character_ccip::CCIP_EMBEDDING_DIM as i64,
             repo,
             variant,
-            file
+            file,
+            variant,
+            repo,
+            variant
         ],
         |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Option<Vec<u8>>>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, Option<i64>>(4)?,
                 r.get::<_, Option<String>>(5)?,
@@ -161,6 +167,9 @@ pub(crate) fn load_character_refs(conn: &Connection, character_id: i64) -> Resul
     let mut out = Vec::new();
     for row in rows {
         let (id, source_type, emb, dim, artist_id, path) = row?;
+        let Some(emb) = emb else {
+            continue;
+        };
         let Some(vector) = parse_embedding(&emb, dim) else {
             continue;
         };

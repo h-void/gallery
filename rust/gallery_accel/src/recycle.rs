@@ -40,6 +40,32 @@ const ITEM_COLUMNS: &[&str] = &[
     "height",
 ];
 
+/// Default for a `NOT NULL` `items` column whose snapshot has no value.
+///
+/// Snapshots are written with an explicit `null` for every column the database
+/// did not have yet (`snapshot_recycle_row` does that deliberately), and older
+/// builds did not know `media_type`, `detected_date`, `hash_status`,
+/// `scanned_at`, `width` or `height`. An explicit NULL never triggers a column
+/// DEFAULT, so restoring such an entry failed with a NOT NULL constraint and the
+/// file bounced back to the recycle bin on every attempt.
+fn item_column_default(column: &str) -> Option<Value> {
+    Some(match column {
+        "file_name" | "folder_name" | "date" | "detected_date" | "auto_role" | "content_hash" => {
+            Value::String(String::new())
+        }
+        "tags" => Value::String("[]".to_string()),
+        "media_type" => Value::String("image".to_string()),
+        "hash_status" => Value::String("pending".to_string()),
+        "file_size" | "is_archive" | "missing" | "scanned_at" | "width" | "height" => {
+            Value::from(0)
+        }
+        "file_mtime" => Value::from(0.0),
+        // Nullable columns (manual_date, manual_role, hash_updated_at, st_dev,
+        // st_ino, missing_at) keep their null: that is their real value.
+        _ => return None,
+    })
+}
+
 /// Finalize or drop recycle rows left in the pre-commit `'moving'` state by an
 /// interrupted delete (crash or power loss between the filesystem move and the
 /// database commit). Called once at writable startup; per-row failures never
@@ -97,7 +123,16 @@ pub fn reconcile_moving_recycle_entries(conn: &Connection) -> (usize, usize, usi
     };
 
     for (id, item_id, original, recycled) in rows {
-        if !recycled.is_empty()
+        // A file back at its original path means the delete never completed or
+        // its rollback succeeded after a phase-3 failure — the item row is
+        // still live and must stay live. This has to be checked BEFORE the
+        // destination branch: a system-trash destination cannot be verified on
+        // disk, so a rolled-back delete was finalized anyway, deleting a live
+        // row whose file was intact and leaving a record that points into the
+        // trash and can never be restored.
+        let original_present = Path::new(&original).is_file();
+        if !original_present
+            && !recycled.is_empty()
             && (Path::new(&recycled).is_file()
                 || crate::media_serve::is_fnos_system_trash_path(Path::new(&recycled)))
         {
@@ -602,11 +637,20 @@ pub fn restore_recycle_entry(
     if !path_under_authorized_roots(&target, roots) {
         return Err(conflict("restore path is outside configured media roots"));
     }
-    if target.exists() {
+    // A restore that moved the file and then died before its DB transaction
+    // leaves exactly this shape: the file back at `target`, no item row, and
+    // this entry still `recycled` with a dead `recycled_path`. Every later
+    // attempt used to hit the occupancy check and answer 409 forever, so the
+    // only ways out were purge (losing the tags and the favorite) or a rescan
+    // that re-added the file as a new item. Recognize the shape and finish the
+    // database half instead of moving anything.
+    let interrupted_restore = target.is_file() && !recycled_path.exists();
+    if target.exists() && !interrupted_restore {
         return Err(conflict("original path is already occupied"));
     }
-    if !recycled_path.is_file()
-        || !recycle_source_is_trusted(&recycled_path, Path::new(&original), Some(roots))
+    if !interrupted_restore
+        && (!recycled_path.is_file()
+            || !recycle_source_is_trusted(&recycled_path, Path::new(&original), Some(roots)))
     {
         return Err(conflict("recycled file is missing or untrusted"));
     }
@@ -639,7 +683,10 @@ pub fn restore_recycle_entry(
     if active_conflict > 0 {
         return Err(conflict("an active library item already uses this record"));
     }
-    move_file_to_authorized_path_no_overwrite(&recycled_path, &target, roots).map_err(internal)?;
+    if !interrupted_restore {
+        move_file_to_authorized_path_no_overwrite(&recycled_path, &target, roots)
+            .map_err(internal)?;
+    }
     let restored = (|| -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         let columns = ITEM_COLUMNS.join(",");
@@ -648,7 +695,16 @@ pub fn restore_recycle_entry(
             .join(",");
         let values = ITEM_COLUMNS
             .iter()
-            .map(|column| snapshot.get(*column).cloned().unwrap_or(Value::Null))
+            .map(|column| {
+                let value = snapshot.get(*column).cloned().unwrap_or(Value::Null);
+                if value.is_null() {
+                    // A legacy snapshot's explicit null means "this column did
+                    // not exist yet", not "store NULL".
+                    item_column_default(column).unwrap_or(Value::Null)
+                } else {
+                    value
+                }
+            })
             .collect::<Vec<_>>();
         let mut sql_values = Vec::with_capacity(values.len());
         for (index, value) in values.into_iter().enumerate() {
@@ -696,6 +752,37 @@ pub fn restore_recycle_entry(
         }
         restore_tag_single_refs(&tx, new_id, &tag_refs_raw)?;
         reattach_non_tag_refs(&tx, new_id, &non_tag_refs_raw)?;
+        // A restored file changes the folder's contents, so a plan confirmed
+        // while the item sat in the recycle bin must be re-checked: a split
+        // plan's saved actions do not include this file, and a rename plan's
+        // target was computed without it. The delete path demotes the plan the
+        // same way; restoring has to undo that decision, not inherit it.
+        let folder_name = snapshot
+            .get("folder_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let artist_path: Option<String> = tx
+            .query_row(
+                "SELECT path FROM artists WHERE id=?",
+                params![artist_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(artist_path) = artist_path {
+            if let Some(folder) = crate::folder_archive::source_folder_for_item(
+                &artist_path,
+                &restored_path,
+                folder_name,
+            ) {
+                if !folder.is_empty() {
+                    crate::folder_archive::invalidate_plans_after_item_date_change(
+                        &tx,
+                        artist_id,
+                        &[folder],
+                    )?;
+                }
+            }
+        }
         if snapshot
             .get("favorite")
             .and_then(Value::as_bool)
@@ -992,6 +1079,13 @@ pub fn clear_recycle_entries(
             cleared_count += 1;
             if prune_sys_parents {
                 prune_empty_system_trash_parents(&recycled_path);
+            }
+        } else {
+            // The file is gone but the row survived; reporting `failed: 0` here
+            // told the UI the bin was emptied while the entry stayed listed.
+            failed += 1;
+            if failed_paths.len() < 5 {
+                failed_paths.push(format!("{}: record delete failed", recycled_path.display()));
             }
         }
     }

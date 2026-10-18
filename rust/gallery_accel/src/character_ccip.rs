@@ -817,13 +817,18 @@ fn l2_normalize(mut v: Vec<f32>) -> Result<Vec<f32>> {
 /// Prefer disk preview thumb when present; return (rgb path source label).
 fn open_rgb_for_recognition(path: &Path) -> Result<(image::RgbImage, &'static str)> {
     if let Some(cache) = crate::image_preview::existing_preview_cache_file(path) {
-        let img = image::open(&cache)
-            .with_context(|| format!("open preview cache {}", cache.display()))?
-            .to_rgb8();
-        return Ok((img, "preview_cache"));
+        if let Ok(reader) = image::ImageReader::open(&cache).and_then(|r| r.with_guessed_format()) {
+            if let Ok(img) = reader.decode() {
+                return Ok((img.to_rgb8(), "preview_cache"));
+            }
+        }
     }
-    let img = image::open(path)
+    let img = image::ImageReader::open(path)
         .with_context(|| format!("open original image {}", path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("identify image format {}", path.display()))?
+        .decode()
+        .with_context(|| format!("decode original image {}", path.display()))?
         .to_rgb8();
     Ok((img, "original"))
 }

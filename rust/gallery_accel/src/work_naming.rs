@@ -192,6 +192,11 @@ pub struct NamingTemplateSet {
     /// the *file* templates. The folder template's `{name}` keeps its
     /// cross-side meaning: the `original_name` snapshot.
     pub attachment_name: Option<String>,
+    /// The empty value a known token with nothing to say is replaced with.
+    /// The organize side reads it from the profile (`empty_value`), so the
+    /// preview must carry it or it renders a name the execution never produces.
+    /// `None` keeps the documented default ([`DEFAULT_EMPTY_VALUE`]).
+    pub empty_value: Option<String>,
 }
 
 impl NamingTemplateSet {
@@ -307,9 +312,10 @@ fn parse_compact_date(
             let year = raw.get(0..4)?.parse::<u32>().ok()?;
             let month = raw.get(5..7)?.parse::<u32>().ok()?;
             let day = raw.get(8..10)?.parse::<u32>().ok()?;
-            if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-                return None;
-            }
+            // Calendar-valid, not merely in range: 1..=31 accepted `2026-02-31`
+            // and rendered it into a folder name that the crate's chrono-based
+            // parsers (archive_format::parse_date) reject for the same work.
+            let _ = chrono::NaiveDate::from_ymd_opt(year as i32, month, day)?;
             Some((year, Some(month), Some(day)))
         }
         DatePrecision::Month => {
@@ -319,9 +325,7 @@ fn parse_compact_date(
             }
             let year = year.parse::<u32>().ok()?;
             let month = month.parse::<u32>().ok()?;
-            if !(1..=12).contains(&month) {
-                return None;
-            }
+            let _ = chrono::NaiveDate::from_ymd_opt(year as i32, month, 1)?;
             Some((year, Some(month), None))
         }
         DatePrecision::Year => {
@@ -350,7 +354,15 @@ fn time_text(ctx: &WorkNamingContext, has_minute: bool) -> Option<String> {
     {
         return None;
     }
-    Some(format!("{hour}-{}", minute.get(..2)?))
+    let minute_text = minute.get(..2)?;
+    // A wall-clock time is only a time inside its range: `99:99` used to render
+    // as `99-99` and land in a folder name.
+    let hour_value: u32 = hour.parse().ok()?;
+    let minute_value: u32 = minute_text.parse().ok()?;
+    if hour_value > 23 || minute_value > 59 {
+        return None;
+    }
+    Some(format!("{hour}-{minute_text}"))
 }
 
 fn date_parts(ctx: &WorkNamingContext) -> DateParts {
@@ -457,7 +469,10 @@ impl<'a> Renderer<'a> {
     }
 
     fn empty_value(&self) -> &str {
-        DEFAULT_EMPTY_VALUE
+        self.templates
+            .empty_value
+            .as_deref()
+            .unwrap_or(DEFAULT_EMPTY_VALUE)
     }
 
     /// Record what a token was substituted with. `raw` is the value as the
@@ -692,7 +707,11 @@ impl<'a> Renderer<'a> {
     fn render_folder(&mut self, dates: &DateParts) -> String {
         let filled = self.fill(&self.templates.folder, dates);
         let mut components = Vec::new();
-        for component in filled.split('/') {
+        // Both separators split a folder template: a literal `\\` in the
+        // template is a path separator for the organize execution path
+        // (archive_format::validate_rendered_target folds it to `/`), so the
+        // preview must not flatten it into one component with `_`.
+        for component in filled.split(['/', '\\']) {
             let component = component.split_whitespace().collect::<Vec<_>>().join(" ");
             if component.is_empty() {
                 continue;
@@ -742,22 +761,22 @@ impl<'a> Renderer<'a> {
             return out;
         }
         if append_ext {
-            // The file's own extension is appended when the rendered base does
-            // not already carry one. That keeps an index-style template
-            // (`{date} {index}` -> `… 1.jpg`) working while never turning an
-            // already-named `set-a.zip` into `set-a.zip.jpg`.
-            let already_has_extension = out
-                .rsplit('/')
-                .next()
-                .is_some_and(|name| name.contains('.'));
-            if !already_has_extension {
-                if let Some(ext) = self
-                    .ctx
-                    .ext
-                    .as_deref()
-                    .map(|ext| ext.trim_start_matches('.').trim())
-                    .filter(|ext| !ext.is_empty())
-                {
+            // The file's own extension is appended unless the rendered name
+            // already ends with it — the same test the download execution path
+            // uses (pawchive_url_naming). A dot in the middle of a name is not
+            // an extension: `{title}` with title `Vol.2` used to render `Vol.2`
+            // with no extension at all, while execution produced `Vol.2.jpg`.
+            if let Some(ext) = self
+                .ctx
+                .ext
+                .as_deref()
+                .map(|ext| ext.trim_start_matches('.').trim())
+                .filter(|ext| !ext.is_empty())
+            {
+                let already_named = out
+                    .to_lowercase()
+                    .ends_with(&format!(".{}", ext.to_lowercase()));
+                if !already_named {
                     out.push_str(&format!(".{ext}"));
                 }
             }
@@ -1015,11 +1034,15 @@ pub fn plan_naming_migration(
     let organize = read_organize_rule(conn, artist_id)?;
     let download = get_pawchive_settings(conn)?;
 
+    // The preview renders the empty value the organize profile is configured
+    // with, so a row that shows `untitled` while execution writes `unnamed`
+    // cannot happen.
     let organize_templates = NamingTemplateSet {
         folder: organize.folder_template.clone(),
         image: None,
         attachment: None,
         attachment_name: None,
+        empty_value: Some(organize.empty_value.clone()),
     };
 
     // The legacy download template is the historical download-side folder text.
@@ -1039,6 +1062,7 @@ pub fn plan_naming_migration(
         image: Some(download.image_template.clone()),
         attachment: Some(download.attachment_template.clone()),
         attachment_name: None,
+        empty_value: None,
     };
     // The new shared rule is the migrated organize Default: one folder
     // authority for download and organize (`plan §6.2`).
@@ -1350,9 +1374,6 @@ pub fn apply_naming_migration(
 
     let mut settings =
         get_pawchive_settings(conn).map_err(|e| NamingApplyError::Other(e.to_string()))?;
-    let prev_rev = current_rev;
-    let next_rev = current_rev + 1;
-
     if let Some(folder) = &req.folder_template {
         settings.folder_template = folder.clone();
     }
@@ -1363,12 +1384,36 @@ pub fn apply_naming_migration(
         settings.attachment_template = att.clone();
     }
 
-    crate::pawchive::save_pawchive_settings(conn, &settings)
+    // Both sides of the switch, the revision and the audit event are one
+    // decision: a failure anywhere must leave the previous rule fully in force,
+    // never a download template the organize side never accepted. `load` already
+    // answers the factory defaults when no row exists, so a read error is an
+    // error here — falling back would silently replace every stored profile.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| NamingApplyError::Database(e.to_string()))?;
+
+    // Re-read under the write lock. The check above ran outside the
+    // transaction, so two concurrent applies carrying the same
+    // `expected_revision` both passed it and both committed the same next
+    // revision; the later `save_pawchive_settings` then replaced the earlier
+    // one's templates while both answered success, and one admin's naming
+    // switch simply disappeared.
+    let current_rev = naming_revision(&tx).map_err(|e| NamingApplyError::Other(e.to_string()))?;
+    if req.expected_revision != current_rev {
+        return Err(NamingApplyError::RevisionConflict {
+            expected: req.expected_revision,
+            current: current_rev,
+        });
+    }
+    let prev_rev = current_rev;
+    let next_rev = current_rev + 1;
+
+    crate::pawchive::save_pawchive_settings(&tx, &settings)
         .map_err(|e| NamingApplyError::Other(e.to_string()))?;
 
     // Update Default organize profile to match folder authority
-    let mut organize_settings = crate::archive_profiles::load(conn)
-        .unwrap_or_else(|_| crate::archive_format::default_settings());
+    let mut organize_settings =
+        crate::archive_profiles::load(&tx).map_err(|e| NamingApplyError::Other(e.to_string()))?;
 
     if let Some(profiles) = organize_settings
         .get_mut("profiles")
@@ -1391,10 +1436,14 @@ pub fn apply_naming_migration(
             }
         }
     }
-    let _ =
-        crate::archive_profiles::set_folder_rename_format_settings(conn, &organize_settings, None);
+    // Save-time validation lives in here (it renders every profile), so its
+    // error is the answer that stops the switch: discarding it reported success
+    // while the organize side kept the old rule and the revision was already
+    // bumped.
+    crate::archive_profiles::set_folder_rename_format_settings(&tx, &organize_settings, None)
+        .map_err(|e| NamingApplyError::Other(e.to_string()))?;
 
-    conn.execute(
+    tx.execute(
         "INSERT INTO app_settings (key, value, updated_at) VALUES ('pawchive_naming_revision', ?1, strftime('%s','now'))
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;",
         rusqlite::params![next_rev.to_string()],
@@ -1403,7 +1452,7 @@ pub fn apply_naming_migration(
 
     let target_sem = req.semantic_version.as_deref().unwrap_or("work_v2");
     crate::pawchive::record_pawchive_event(
-        conn,
+        &tx,
         "info",
         "naming_switch",
         None,
@@ -1414,6 +1463,8 @@ pub fn apply_naming_migration(
             settings.folder_template
         ),
     );
+    tx.commit()
+        .map_err(|e| NamingApplyError::Database(e.to_string()))?;
 
     Ok(NamingApplyOutcome {
         revision: next_rev,

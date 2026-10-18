@@ -9,7 +9,7 @@ import {
 import { toast, logUiAction, collectUiLogContext, frontendErrorText } from '../logging.js';
 import { t } from '../i18n.js';
 import { syncFavoriteButtons, toggleItemFavorite, isGifItem, fileVersionParam, renderGrid } from './grid.js';
-import { renderSidebar, renderToolbar, selectFolder, isGlobalSearchActive } from './sidebar.js';
+import { renderSidebar, renderToolbar, renderFolderTree, selectFolder, isGlobalSearchActive } from './sidebar.js';
 import { selectArtist } from '../router.js';
 
 const LIGHTBOX_ZOOM_MIN = 0.5;
@@ -1328,6 +1328,26 @@ function renderLightboxDate(item) {
         item.manual_date = nextDate || null;
         item.display_date = fallbackDate || '';
       }
+      if (Array.isArray(state.allItems)) {
+        state.allItems.forEach(row => {
+          if (row && Number(row.id) === Number(item.id)) {
+            row.date = item.date;
+            row.manual_date = item.manual_date;
+            row.display_date = item.display_date;
+            if (item.detected_date !== undefined) row.detected_date = item.detected_date;
+          }
+        });
+      }
+      scheduleFolderRenamesRefresh(artistId);
+      if (state.currentArtist && Number(state.currentArtist.id) === Number(artistId)) {
+        API.get(`/api/artists/${artistId}/stats`).then(stats => {
+          if (state.currentArtist && Number(state.currentArtist.id) === Number(artistId) && stats) {
+            state.stats = stats;
+            renderSidebar();
+            renderToolbar();
+          }
+        }).catch(() => {});
+      }
       toast(nextDate ? t('已设置日期 {date}', {date: nextDate}) : '已恢复检测日期', 'success');
       if (isCurrentLightboxItem(item)) {
         renderLightboxDate(item);
@@ -1452,6 +1472,10 @@ export async function deleteMediaItem({filePath, itemId, fileName = '', button =
         });
       }
     }
+    const targetArtistId = removedItem?.artist_id || state.currentArtist?.id;
+    if (targetArtistId) {
+      scheduleFolderRenamesRefresh(targetArtistId);
+    }
     if (closeLightboxAfter) closeLightbox();
     if (renderAfter) {
       if (removedItem && state.stats) {
@@ -1459,6 +1483,20 @@ export async function deleteMediaItem({filePath, itemId, fileName = '', button =
         renderToolbar();
       }
       renderGrid();
+      if (targetArtistId && state.currentArtist && Number(state.currentArtist.id) === Number(targetArtistId)) {
+        Promise.all([
+          API.get(`/api/artists/${targetArtistId}/stats`),
+          API.get(`/api/folders?artist_id=${targetArtistId}`),
+        ]).then(([stats, folders]) => {
+          if (state.currentArtist && Number(state.currentArtist.id) === Number(targetArtistId)) {
+            if (stats) state.stats = stats;
+            if (folders) state.folders = folders;
+            renderSidebar();
+            renderToolbar();
+            renderFolderTree();
+          }
+        }).catch(() => {});
+      }
     }
     if (toastOnSuccess) toast('文件已移入回收站', 'success');
     return true;
@@ -1502,6 +1540,10 @@ export function closeLightbox() {
     toggleBtn.setAttribute('aria-pressed', 'true');
   }
   state.lightboxLoadToken += 1;
+  // 关灯箱即失去「当前作品」：迟到的加标签/改日期完成回调仍会走
+  // isCurrentLightboxItem，索引若停留在最后一项，它们会在已关闭的弹层上
+  // 重开内联编辑器并抢走刚恢复的焦点。
+  state.lightboxIndex = -1;
   clearLightboxPreloadCache();
   resetLightboxTransform();
   const img = $('#lightboxImg');

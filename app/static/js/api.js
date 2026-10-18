@@ -9,8 +9,41 @@ function requestOptionsWithTimeout(options = {}) {
   return {...rest, signal: AbortSignal.timeout(timeout)};
 }
 
+// fetch 拒绝时抛的是浏览器英文 DOMException（AbortSignal.timeout 的
+// "signal timed out"、取消的 "The operation was aborted."、断网的
+// "NetworkError when attempting to fetch resource."），toast 会把
+// error.message 原样拼接展示。在此统一转成中文终稿；取消保留
+// AbortError 身份，isAbortError 的调用方仍按静默取消处理。
+function normalizedFetchError(error) {
+  if (!error || typeof error !== 'object') return error;
+  const name = String(error.name || '');
+  const message = String(error.message || error);
+  const canceled = name === 'AbortError' || Number(error.code) === 20;
+  const timedOut = name === 'TimeoutError'
+    || (!canceled && /timed?\s*out|timeout/i.test(message));
+  const offline = error instanceof TypeError
+    || /networkerror|failed to fetch|load failed|network request failed/i.test(message);
+  let normalized = null;
+  if (timedOut) {
+    normalized = new Error('请求超时');
+    normalized.name = 'TimeoutError';
+  } else if (canceled) {
+    normalized = new Error('请求已中断');
+    normalized.name = 'AbortError';
+    normalized.code = 20;
+  } else if (offline) {
+    normalized = new Error('网络连接失败');
+    normalized.name = 'NetworkError';
+  }
+  if (!normalized) return error;
+  normalized.cause = error;
+  return normalized;
+}
+
 function fetchWithTimeout(path, options = {}) {
-  return fetch(path, requestOptionsWithTimeout(options));
+  return fetch(path, requestOptionsWithTimeout(options)).catch(error => {
+    throw normalizedFetchError(error);
+  });
 }
 
 export const API = {
@@ -57,11 +90,12 @@ export const API = {
     return this.parseResponse(r);
   },
   async postJson(path, data, options = {}) {
+    const body = JSON.stringify(data || {});
     const r = await fetchWithTimeout(path, {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(data || {}),
-      keepalive:true,
+      body,
+      keepalive: body.length < 32768,
       ...options
     });
     return this.parseResponse(r);
@@ -70,7 +104,7 @@ export const API = {
   // and the server, not a multipart boundary, decides the type from the bytes.
   // No `keepalive` either: it is capped at 64 KiB and throws on a real photo.
   async postFile(path, file, options = {}) {
-    const {timeoutMs = 60000, ...rest} = options;
+    const {timeoutMs = 300000, ...rest} = options;
     const r = await fetchWithTimeout(path, {
       method:'POST',
       headers:{'Content-Type': (file && file.type) || 'application/octet-stream'},
@@ -151,7 +185,7 @@ export function scheduleFolderRenamesRefresh(artistId, delayMs = FOLDER_RENAMES_
       return;
     }
     folderRenamesRefreshInFlight.add(key);
-    API.post(`/api/folder-renames/refresh?artist_id=${encodeURIComponent(key)}`)
+    API.post(`/api/folder-renames/refresh?artist_id=${encodeURIComponent(key)}`, undefined, {timeoutMs: 120000})
       .catch(() => {})
       .finally(() => folderRenamesRefreshInFlight.delete(key));
   }, delayMs);

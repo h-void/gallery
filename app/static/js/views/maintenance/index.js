@@ -23,18 +23,12 @@ let activeMaintenanceController = null;
 let activeMaintenanceRequest = null;
 let maintenanceConsecutiveRefreshFailures = 0;
 
-export function movePanelScrollTop() {
-  const panel = $('#movePanel');
-  return panel ? panel.scrollTop : 0;
-}
+// Scroll capture/restore stays eagerly loaded (shared.js) so artist switches
+// can read the panel offset before this lazy workbench module has loaded; the
+// functions are re-exported here for existing importers.
+import { movePanelScrollTop, restoreMovePanelScroll } from './shared.js';
 
-export function restoreMovePanelScroll(top) {
-  if (top == null) return;
-  const panel = $('#movePanel');
-  if (!panel) return;
-  panel.scrollTop = top;
-  requestAnimationFrame(() => { panel.scrollTop = top; });
-}
+export { movePanelScrollTop, restoreMovePanelScroll };
 
 export async function loadMoveWorkbench(options = {}) {
   return refreshActiveMaintenanceView(options);

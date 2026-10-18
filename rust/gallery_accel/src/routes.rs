@@ -49,7 +49,7 @@ use gallery_accel::{
     run_scan_claimed, scan_candidates_response, serve_file_response, serve_text,
     serve_transcoded_hls, serve_transcoded_hls_segment, serve_video_compatible, serve_video_hls,
     set_folder_rename_auto, set_folder_rename_format_settings, set_item_favorite_response,
-    set_recycle_target_setting, start_character_import_job_with_roots, start_video_transcode,
+    set_recycle_target_setting, spawn_character_import_job_with_roots, start_video_transcode,
     suggest_artists_native, tag_search_response, tags_response, unconfirm_all_artist_plans,
     unconfirm_plan, undo_folder_rename_plan, update_folder_tags_by_name_response,
     update_folder_tags_response, update_item_dates_response, update_item_tags_by_name_response,
@@ -754,6 +754,14 @@ fn is_media_path(path: &str) -> bool {
         || path == "/api/image-preview"
         || path == "/api/file"
         || path.starts_with("/api/file/")
+        // The recycle preview renders library images too, so a process started
+        // without --enable-media must refuse it like /api/file does instead of
+        // serving the same bytes through another path.
+        || (path.starts_with("/api/recycle/") && path.ends_with("/preview"))
+        // Archive members are library bytes too. Without this, a process
+        // started without --enable-media answered 403 on /api/file and then
+        // handed out the same full-resolution member through this GET route.
+        || path == "/api/archives/entry"
 }
 
 fn is_ml_path(path: &str) -> bool {
@@ -932,6 +940,27 @@ pub fn with_static_ui(router: Router, static_dir: PathBuf) -> Router {
         .layer(middleware::from_fn(security_headers))
 }
 
+/// Whether a stored path names `root` itself or something inside it, judged on
+/// path segments rather than on the raw string prefix.
+///
+/// A bare `str::starts_with` made `/pictures` claim `/pictures2/Alice` and
+/// `/pictures_old/Alice`, inflating the health panel's per-root artist counts
+/// for any install whose roots share a prefix. Separators are normalized first:
+/// `artists.path` keeps the platform separator, while the configured roots may
+/// spell it either way.
+fn stored_path_is_under_root(path: &str, root: &str) -> bool {
+    let path = path.replace('\\', "/");
+    let root = root.replace('\\', "/");
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return false;
+    }
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Blocking portion of `/api/health`: SQLite reads, backup-dir listing,
 /// per-root `is_dir` probes, and bounded log tails. Runs on the blocking
 /// pool so a slow NAS mount cannot stall async workers.
@@ -1002,7 +1031,10 @@ fn health_body(
                 let label = roots.labels.get(i).cloned().unwrap_or_default();
                 let count = artist_paths
                     .iter()
-                    .filter(|path| path.starts_with(virtual_root) || path.starts_with(real_root))
+                    .filter(|path| {
+                        stored_path_is_under_root(path, virtual_root)
+                            || stored_path_is_under_root(path, real_root)
+                    })
                     .count();
                 json!({
                     "root_index": i,
@@ -1223,11 +1255,23 @@ fn backup_timestamp(path: &std::path::Path, db_path: &std::path::Path) -> Option
             return Some(value);
         }
     }
+    // The directory label is written by `db_backup::create_db_backup_in` as
+    // `chrono::Local::now().format("%Y%m%d-%H%M%S")`, i.e. LOCAL wall-clock
+    // time without an offset. Reading it back as UTC (the previous
+    // `and_utc()`) shifted every snapshot without a `metadata.json` by the
+    // host offset — on a +08:00 NAS the health panel dated backups eight hours
+    // into the future. Interpret the label in the same timezone that wrote it.
+    use chrono::TimeZone;
     if let Some(value) = path
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| chrono::NaiveDateTime::parse_from_str(name, "%Y%m%d-%H%M%S").ok())
-        .map(|value| value.and_utc().timestamp() as f64)
+        .and_then(|value| {
+            chrono::Local
+                .from_local_datetime(&value)
+                .earliest()
+                .map(|local| local.timestamp() as f64)
+        })
     {
         return Some(value);
     }
@@ -1280,6 +1324,15 @@ fn backup_summary(root: &std::path::Path) -> Value {
             continue;
         }
         let db_path = path.join("gallery.db");
+        // A snapshot is a directory holding the copied database. The
+        // `db-backups/housekeeping/` subtree is a *container* for lifecycle
+        // snapshots, not one itself; listed as a backup it showed up as a
+        // 0-byte entry named "housekeeping", and because taking a lifecycle
+        // backup bumps its directory mtime it could even become "latest".
+        // Directories without a snapshot file are not backup entries at all.
+        if !db_path.is_file() && !path.join("metadata.json").is_file() {
+            continue;
+        }
         let size_bytes = std::fs::metadata(&db_path)
             .ok()
             .filter(|metadata| metadata.is_file())
@@ -1443,26 +1496,32 @@ async fn api_move_candidates(
     State(state): State<AppState>,
     Query(query): Query<CandidateQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    move_candidates_response(
-        &conn,
-        &state.roots,
-        query.status.as_deref().unwrap_or("pending"),
-        query.hide_grouped.unwrap_or(false),
-        query.limit,
-        query.offset,
-    )
-    .map(Json)
-    .map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        move_candidates_response(
+            &conn,
+            &roots,
+            query.status.as_deref().unwrap_or("pending"),
+            query.hide_grouped.unwrap_or(false),
+            query.limit,
+            query.offset,
+        )
+        .map(Json)
+        .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_scan_candidates(
     State(state): State<AppState>,
     Query(query): Query<ScanCandidateQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let status = query.status.as_deref().unwrap_or("pending");
+    let status = query.status.as_deref().unwrap_or("pending").to_string();
     if !matches!(
-        status,
+        status.as_str(),
         "pending" | "candidate" | "new" | "resolved" | "ignored"
     ) {
         return Err((
@@ -1470,51 +1529,74 @@ async fn api_scan_candidates(
             Json(json!({"error": "invalid scan candidate status"})),
         ));
     }
-    let conn = state.pool.get().map_err(to_http_error)?;
-    scan_candidates_response(&conn, status, query.limit, query.offset)
-        .map(Json)
-        .map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        scan_candidates_response(&conn, &status, query.limit, query.offset)
+            .map(Json)
+            .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_move_candidate_groups(
     State(state): State<AppState>,
     Query(query): Query<GroupQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    move_candidate_groups_response(
-        &conn,
-        &state.roots,
-        query.status.as_deref().unwrap_or("pending"),
-        query.sample_limit,
-    )
-    .map(Json)
-    .map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        move_candidate_groups_response(
+            &conn,
+            &roots,
+            query.status.as_deref().unwrap_or("pending"),
+            query.sample_limit,
+        )
+        .map(Json)
+        .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_move_history(
     State(state): State<AppState>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    move_history_response(
-        &conn,
-        &state.roots,
-        query.status.as_deref(),
-        query.limit,
-        query.offset,
-    )
-    .map(Json)
-    .map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        move_history_response(
+            &conn,
+            &roots,
+            query.status.as_deref(),
+            query.limit,
+            query.offset,
+        )
+        .map(Json)
+        .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_operation_history(
     State(state): State<AppState>,
     Query(query): Query<OperationHistoryQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
-    operation_history_response(&conn, &state.roots, query.limit)
-        .map(Json)
-        .map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        operation_history_response(&conn, &roots, query.limit)
+            .map(Json)
+            .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_operation_log(
@@ -1548,16 +1630,28 @@ async fn api_folder_rename_auto_run(
     State(state): State<AppState>,
     Query(q): Query<ArtistIdQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "write capability is disabled"})),
+        ));
+    }
     let artist_id = q.artist_id.ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "artist_id required"})),
         )
     })?;
-    let conn = state.pool.get().map_err(to_http_error)?;
-    folder_rename_auto_run(&conn, &state.roots, artist_id)
-        .map(Json)
-        .map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        folder_rename_auto_run(&conn, &roots, artist_id)
+            .map(Json)
+            .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_artists(
@@ -2006,7 +2100,11 @@ async fn api_backfill_item_dimensions(
             let processed = value.get("processed").and_then(Value::as_u64).unwrap_or(0);
             let updated = value.get("updated").and_then(Value::as_u64).unwrap_or(0);
             let failed = value.get("failed").and_then(Value::as_u64).unwrap_or(0);
-            let remaining = value.get("remaining").and_then(Value::as_u64).unwrap_or(0);
+            // `-1` only covers a response that carries no `remaining` (an
+            // error payload): `backfill_item_dimensions` measures the count on
+            // every batch, so a number that does arrive is always authoritative
+            // and writing it back can never regress the reported progress.
+            let remaining = value.get("remaining").and_then(Value::as_i64).unwrap_or(-1);
             let next_after_id = value
                 .get("next_after_id")
                 .and_then(Value::as_i64)
@@ -2020,7 +2118,9 @@ async fn api_backfill_item_dimensions(
                 current.processed += processed;
                 current.updated += updated;
                 current.failed += failed;
-                current.remaining = remaining;
+                if remaining >= 0 {
+                    current.remaining = remaining as u64;
+                }
                 current.next_after_id = next_after_id;
                 current.cursor_done = cursor_done;
             }
@@ -2154,15 +2254,20 @@ async fn api_update_item_dates(
             Json(json!({"error": "write mode not enabled"})),
         ));
     }
-    let conn = state.pool.get().map_err(to_http_error)?;
-    update_item_dates_response(
-        &conn,
-        payload.artist_id,
-        &payload.item_ids,
-        payload.manual_date.as_deref(),
-    )
-    .map(Json)
-    .map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        update_item_dates_response(
+            &conn,
+            payload.artist_id,
+            &payload.item_ids,
+            payload.manual_date.as_deref(),
+        )
+        .map(Json)
+        .map_err(to_tag_write_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 #[derive(serde::Deserialize)]
@@ -2394,16 +2499,21 @@ async fn api_update_item_tags(
             Json(json!({"error": "write mode not enabled"})),
         ));
     }
-    let conn = state.pool.get().map_err(to_http_error)?;
-    update_item_tags_response(
-        &conn,
-        payload.artist_id,
-        &payload.item_ids,
-        &payload.tag_ids,
-        &payload.mode,
-    )
-    .map(Json)
-    .map_err(to_tag_write_http_error)
+    let pool = Arc::clone(&state.pool);
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        update_item_tags_response(
+            &conn,
+            payload.artist_id,
+            &payload.item_ids,
+            &payload.tag_ids,
+            &payload.mode,
+        )
+        .map(Json)
+        .map_err(to_tag_write_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 #[derive(serde::Deserialize)]
@@ -2428,10 +2538,20 @@ async fn api_update_item_tags_by_name(
             Json(json!({"error": "write mode not enabled"})),
         ));
     }
-    let conn = state.pool.get().map_err(to_http_error)?;
-    update_item_tags_by_name_response(&conn, &payload.item_ids, &payload.tag_names, &payload.mode)
+    let pool = Arc::clone(&state.pool);
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        update_item_tags_by_name_response(
+            &conn,
+            &payload.item_ids,
+            &payload.tag_names,
+            &payload.mode,
+        )
         .map(Json)
         .map_err(to_tag_write_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 #[derive(serde::Deserialize)]
@@ -2449,7 +2569,7 @@ async fn api_update_tag(
     if !state.capabilities.allows_writes() {
         return Err((
             StatusCode::NOT_IMPLEMENTED,
-            Json(json!({"error": "read mode not enabled"})),
+            Json(json!({"error": "write mode not enabled"})),
         ));
     }
     let conn = state.pool.get().map_err(to_http_error)?;
@@ -2483,7 +2603,7 @@ async fn api_delete_tag(
     if !state.capabilities.allows_writes() {
         return Err((
             StatusCode::NOT_IMPLEMENTED,
-            Json(json!({"error": "read only mode not enabled"})),
+            Json(json!({"error": "write mode not enabled"})),
         ));
     }
     let conn = state.pool.get().map_err(to_http_error)?;
@@ -2877,16 +2997,22 @@ async fn api_recycle_entries(
             Json(json!({"error": "invalid recycle status"})),
         ));
     }
-    let conn = state.pool.get().map_err(to_http_error)?;
-    recycle_entries_response(
-        &conn,
-        &state.roots,
-        query.status.as_deref(),
-        query.limit,
-        query.offset,
-    )
-    .map(Json)
-    .map_err(to_http_error)
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        recycle_entries_response(
+            &conn,
+            &roots,
+            query.status.as_deref(),
+            query.limit,
+            query.offset,
+        )
+        .map(Json)
+        .map_err(to_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
 }
 
 async fn api_recycle_restore(
@@ -3077,6 +3203,12 @@ async fn api_recycle_settings_put(
     State(state): State<AppState>,
     Json(payload): Json<RecycleSettingsPayload>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "write mode not enabled"})),
+        ));
+    }
     let target = payload.target.trim().to_lowercase();
     if target != "system" && target != "app" {
         return Err((
@@ -3223,9 +3355,10 @@ async fn api_folder_renames_list(
     State(state): State<AppState>,
     Query(q): Query<ArtistIdQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let conn = state.pool.get().map_err(to_http_error)?;
+    let pool = Arc::clone(&state.pool);
     let roots = state.roots.clone();
     tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
         list_folder_renames(&conn, Some(&roots), q.artist_id, false)
             .map(Json)
             .map_err(to_http_error)
@@ -3247,9 +3380,10 @@ async fn api_folder_renames_refresh(
             Json(json!({"error": "write capability is disabled"})),
         ));
     }
-    let conn = state.pool.get().map_err(to_http_error)?;
+    let pool = Arc::clone(&state.pool);
     let roots = state.roots.clone();
     tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
         list_folder_renames(&conn, Some(&roots), q.artist_id, true)
             .map(Json)
             .map_err(to_http_error)
@@ -3797,6 +3931,12 @@ async fn api_ml_runtime_settings_put(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "write mode not enabled"})),
+        ));
+    }
     let conn = state.pool.get().map_err(to_http_error)?;
     gallery_accel::runtime_prepare::update_runtime_settings(&conn, &body)
         .map(Json)
@@ -3834,7 +3974,7 @@ async fn api_character_recognize(
         let conn = pool.get().map_err(to_http_error)?;
         recognize_character_native_topk_with_roots(&conn, &roots, item_id, top_k)
             .map(Json)
-            .map_err(to_http_error)
+            .map_err(to_character_recognition_http_error)
     })
     .await
     .map_err(blocking_http_error)?
@@ -3863,13 +4003,24 @@ async fn api_create_character(
             Json(json!({"error": "name required"})),
         ));
     }
-    conn.execute(
+    match conn.execute(
         "INSERT INTO characters (name) VALUES (?)",
         rusqlite::params![name],
-    )
-    .map_err(|e| to_http_error(e.into()))?;
-    let id = conn.last_insert_rowid();
-    Ok(Json(json!({"id": id, "name": name})))
+    ) {
+        Ok(_) => {
+            let id = conn.last_insert_rowid();
+            Ok(Json(json!({"id": id, "name": name})))
+        }
+        Err(rusqlite::Error::SqliteFailure(inner, _))
+            if inner.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+        {
+            Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "character already exists"})),
+            ))
+        }
+        Err(e) => Err(to_http_error(e.into())),
+    }
 }
 
 async fn api_delete_character(
@@ -3890,17 +4041,31 @@ async fn api_delete_character(
     {
         log_warn!("character delete: reference image cleanup failed: {error:#}");
     }
-    conn.execute(
-        "DELETE FROM character_references WHERE character_id=?",
-        rusqlite::params![character_id],
-    )
-    .map_err(|e| to_http_error(e.into()))?;
-    let n = conn
-        .execute(
-            "DELETE FROM characters WHERE id=?",
-            rusqlite::params![character_id],
-        )
-        .map_err(|e| to_http_error(e.into()))?;
+    let n = (|| -> anyhow::Result<usize> {
+        conn.execute("BEGIN IMMEDIATE", [])?;
+        let res = (|| -> anyhow::Result<usize> {
+            conn.execute(
+                "DELETE FROM character_references WHERE character_id=?",
+                rusqlite::params![character_id],
+            )?;
+            let n = conn.execute(
+                "DELETE FROM characters WHERE id=?",
+                rusqlite::params![character_id],
+            )?;
+            Ok(n)
+        })();
+        match res {
+            Ok(count) => {
+                conn.execute("COMMIT", [])?;
+                Ok(count)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    })()
+    .map_err(to_http_error)?;
     Ok(Json(json!({"ok": n > 0, "id": character_id})))
 }
 
@@ -4079,6 +4244,12 @@ async fn api_character_import_job_start(
     State(state): State<AppState>,
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "write capability is disabled"})),
+        ));
+    }
     // A malformed body must not silently fall back to `{}`: that maps to the
     // most expensive scope ("all" — full-library import).
     let payload = body.map(|j| j.0).map_err(|err| {
@@ -4087,16 +4258,11 @@ async fn api_character_import_job_start(
             Json(json!({"error": format!("invalid JSON body: {err}")})),
         )
     })?;
-    let pool = Arc::clone(&state.pool);
+    let db_path = state.db_path.clone();
     let roots = state.roots.clone();
-    tokio::task::spawn_blocking(move || {
-        let conn = pool.get().map_err(to_http_error)?;
-        start_character_import_job_with_roots(&conn, &roots, &payload)
-            .map(Json)
-            .map_err(to_http_error)
-    })
-    .await
-    .map_err(blocking_http_error)?
+    spawn_character_import_job_with_roots(db_path, roots, payload)
+        .map(Json)
+        .map_err(to_http_error)
 }
 
 async fn api_character_import_job_cancel(Path(job_id): Path<String>) -> Json<Value> {
@@ -4379,6 +4545,7 @@ fn to_tag_write_http_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {
             | "too many item_ids"
     ) || message.starts_with("invalid date: ")
         || message.starts_with("target name exhausted")
+        || message.ends_with("item(s) do not exist or belong to this artist")
     {
         StatusCode::BAD_REQUEST
     } else {
@@ -4391,6 +4558,24 @@ fn to_artist_suggestion_http_error(error: anyhow::Error) -> (StatusCode, Json<Va
     let message = error.to_string();
     if message == "item not found" {
         return (StatusCode::NOT_FOUND, Json(json!({"error": message})));
+    }
+    to_http_error(error)
+}
+
+/// Character recognition answers 404 for a missing item and 400 for an item
+/// whose media cannot be recognized. Both used to become a generic 500, so the
+/// editor showed "识别不可用" and the log said "request failed" instead of the
+/// actual reason (deleted/moved row, unsupported media type, file outside the
+/// authorized roots).
+fn to_character_recognition_http_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {
+    let message = error.to_string();
+    if message == "item not found" {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": message})));
+    }
+    if message == "Item media type is not supported for character recognition"
+        || message == "item media path is not allowed"
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": message})));
     }
     to_http_error(error)
 }
@@ -4637,15 +4822,23 @@ async fn api_archive_entry(
     .map_err(blocking_http_error)?
     .map_err(to_archive_http_error)?;
 
-    let mime = mime_guess::from_path(&query.entry)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string();
-
-    Ok(Response::builder()
+    // Same inline policy as /api/file: an archive downloaded from the net is
+    // untrusted input, so an .html/.svg member must not render on this origin.
+    // Only media types that the browser cannot execute as script stay inline;
+    // everything else is an attachment.
+    let entry_path = std::path::Path::new(&query.entry);
+    let (content_type, attachment) = gallery_accel::media_serve::inline_media_headers(entry_path);
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime)
-        .header(header::CACHE_CONTROL, "private, max-age=3600")
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "private, max-age=3600");
+    if let Some(name) = attachment {
+        builder = builder.header(
+            header::CONTENT_DISPOSITION,
+            gallery_accel::media_serve::attachment_disposition(&name),
+        );
+    }
+    Ok(builder
         .body(Body::from(bytes))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
@@ -4658,6 +4851,8 @@ struct ArchiveExtractRequest {
     target_mode: Option<String>, // "current_folder" or "new_folder"
     custom_folder_name: Option<String>,
     recycle_source: Option<bool>,
+    #[serde(default)]
+    skip_scan: Option<bool>,
 }
 
 async fn api_archive_extract(
@@ -4719,53 +4914,98 @@ async fn api_archive_extract(
 
     let pool = state.pool.clone();
     let roots_clone = roots.clone();
+    let scan_control = state.scan.clone();
     let target_mode = payload
         .target_mode
         .unwrap_or_else(|| "current_folder".to_string());
     let custom_name = payload.custom_folder_name;
     let recycle_source = payload.recycle_source.unwrap_or(false);
+    let skip_scan = payload.skip_scan.unwrap_or(false);
     let pwd = payload.password;
 
-    let res = tokio::task::spawn_blocking(move || {
-        let _guard = guard;
-        let conn = pool.get()?;
-        gallery_accel::archive_ops::extract_archive(
-            &conn,
-            &roots_clone,
-            &full_path,
-            pwd.as_deref(),
-            &target_mode,
-            custom_name.as_deref(),
-            recycle_source,
-        )
-    })
+    let res = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<gallery_accel::archive_ops::ExtractResponse> {
+            let _guard = guard;
+            let conn = pool.get()?;
+            let res = gallery_accel::archive_ops::extract_archive(
+                &conn,
+                &roots_clone,
+                &full_path,
+                pwd.as_deref(),
+                &target_mode,
+                custom_name.as_deref(),
+                recycle_source,
+            )?;
+            // Run the scoped artist scan synchronously under the already-claimed
+            // operation slot (`_guard`) unless the caller is in the middle of a
+            // multi-archive batch (`skip_scan = true`): that way extracted files
+            // are indexed before the response returns AND a detached scan never
+            // re-claims `state.scan` behind the caller's back (which caused 409
+            // conflicts on subsequent archives in a batch).
+            let target_str = res.target_dir.replace('\\', "/");
+            let scan_artist_id = artist_id.or_else(|| {
+                // Byte-exact prefix match, never LIKE: SQLite's LIKE is ASCII
+                // case-insensitive and treats `_`/`%` in a legal artist path as
+                // wildcards, and `path || '%'` has no '/' boundary, so an artist
+                // `Art` also matched a target under `Artist2`. Both sides are
+                // slash-normalized because `artists.path` keeps the platform
+                // separator while the extract target is always normalized.
+                conn.query_row(
+                    "SELECT id FROM artists
+                 WHERE COALESCE(missing, 0) = 0
+                   AND (
+                     replace(path, '\\', '/') = ?1
+                     OR substr(?1, 1, length(replace(path, '\\', '/')) + 1)
+                        = replace(path, '\\', '/') || '/'
+                   )
+                 ORDER BY length(path) DESC
+                 LIMIT 1",
+                    [&target_str],
+                    |r| r.get(0),
+                )
+                .ok()
+            });
+            if let Some(aid) = scan_artist_id {
+                // Demote stale folder rename plans whose source folder is the
+                // extract target directory. `source_folder_for_item` derives the
+                // *parent* of an item file, so handing it the target directory
+                // demoted nothing for a top-level folder (relative depth 1 returns
+                // "") and demoted the parent for a nested one;
+                // `source_folder_for_dir` keys the directory on itself instead.
+                if let Ok(artist_path) =
+                    conn.query_row("SELECT path FROM artists WHERE id = ?", [aid], |r| {
+                        r.get::<_, String>(0)
+                    })
+                {
+                    if let Some(folder) = gallery_accel::folder_archive::source_folder_for_dir(
+                        &artist_path,
+                        &target_str,
+                    ) {
+                        let _ =
+                            gallery_accel::folder_archive::invalidate_plans_after_item_date_change(
+                                &conn,
+                                aid,
+                                &[folder],
+                            );
+                    }
+                }
+
+                if !skip_scan {
+                    let _ = gallery_accel::scan::run_scan_claimed(
+                        &conn,
+                        &roots_clone,
+                        &scan_control,
+                        Some(aid),
+                        None,
+                    );
+                }
+            }
+            Ok(res)
+        },
+    )
     .await
     .map_err(blocking_http_error)?
     .map_err(to_archive_http_error)?;
-
-    // Trigger instant scoped scan on the artist so extracted images appear immediately.
-    // If artist_id was not provided, resolve it from the target directory so an
-    // accidental full-library scan with (None, None) is never triggered.
-    let scan_artist_id = artist_id.or_else(|| {
-        let conn = state.pool.get().ok()?;
-        let target_str = res.target_dir.replace('\\', "/");
-        conn.query_row(
-            "SELECT id FROM artists WHERE ? LIKE path || '%' AND COALESCE(missing, 0) = 0 ORDER BY length(path) DESC LIMIT 1",
-            [&target_str],
-            |r| r.get(0),
-        ).ok()
-    });
-    if let Some(aid) = scan_artist_id {
-        let scan_roots = state.roots.clone();
-        let scan_control = state.scan.clone();
-        let scan_pool = state.pool.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Ok(c) = scan_pool.get() {
-                let _ =
-                    gallery_accel::scan::run_scan(&c, &scan_roots, &scan_control, Some(aid), None);
-            }
-        });
-    }
 
     Ok(Json(res))
 }

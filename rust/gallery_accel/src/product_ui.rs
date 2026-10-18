@@ -104,6 +104,22 @@ fn is_error_log_line(line: &str) -> bool {
         || lower.contains("frontend_rejection")
 }
 
+/// A line that belongs to the payload of the error line before it.
+///
+/// Log messages can be multi-line (a stack trace, a chained Caused by), and
+/// only the first line carries the timestamp and the level marker. Treating
+/// every continuation as an ordinary line dropped the whole payload from the
+/// health endpoint; treating every undated line as a continuation would
+/// swallow the legacy lines that follow an old error. Indentation and the
+/// standard continuation prefixes distinguish the two shapes.
+fn is_error_log_continuation(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.len() != line.len()
+        || trimmed.starts_with("Caused by:")
+        || trimmed.starts_with("note:")
+        || trimmed.starts_with("thread '")
+}
+
 /// Parse a persisted log stamp into epoch millis.
 ///
 /// Every writer (`logging::log_timestamp`, the Python-era logger, the fnOS
@@ -167,11 +183,22 @@ pub fn recent_log_errors(log_dir: &Path, limit: usize) -> Vec<Value> {
             .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
             .map(|value| value.as_millis().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
+        let mut in_error_block = false;
         for line in lines {
-            if let Some(value) = log_line_timestamp_millis(&line) {
+            let stamped = log_line_timestamp_millis(&line);
+            if let Some(value) = stamped {
                 timestamp = value;
+                // A new timestamped record ends the previous payload block.
+                in_error_block = false;
             }
-            if !is_error_log_line(&line) {
+            let continuation = in_error_block && is_error_log_continuation(&line);
+            let is_error = is_error_log_line(&line) || continuation;
+            if is_error {
+                in_error_block = true;
+            } else if !is_error_log_continuation(&line) {
+                in_error_block = false;
+            }
+            if !is_error {
                 continue;
             }
             if timestamp < cutoff {
@@ -1568,6 +1595,13 @@ struct ImportJobRunGuard<'a> {
 
 impl Drop for ImportJobRunGuard<'_> {
     fn drop(&mut self) {
+        // The runner is finished, so its cancel flag has no reader left. Taken
+        // in its own scope, before the slot lock, to keep the lock order.
+        {
+            let registry = cancelled_import_job_ids();
+            let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+            guard.remove(&self.job_id);
+        }
         {
             let mut guard = import_job_slot().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(job) = guard.as_mut().filter(|job| {
@@ -1599,6 +1633,18 @@ impl Drop for ImportJobRunGuard<'_> {
 fn import_job_slot() -> &'static Mutex<Option<ImportJob>> {
     static SLOT: OnceLock<Mutex<Option<ImportJob>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Job ids whose cancel was requested, kept outside the job slot.
+///
+/// The runner reads `cancel_requested(job_id)` against the slot, but a cancel
+/// frees the slot (status leaves `pending`/`running`), so a job started right
+/// after it replaces the entry and the still-running runner could no longer see
+/// its own flag — it kept indexing in parallel with the new job. The id stays
+/// here until that runner drops its guard.
+fn cancelled_import_job_ids() -> &'static Mutex<HashSet<String>> {
+    static SLOT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn idle_import_job() -> Value {
@@ -1670,6 +1716,13 @@ fn import_job_status_is_active(job: Option<&ImportJob>) -> bool {
 }
 
 pub fn cancel_character_import_job(job_id: &str) -> Value {
+    // Recorded before the slot lock, and in its own scope, so the two mutexes
+    // are always taken in the same order as `cancel_requested`.
+    {
+        let registry = cancelled_import_job_ids();
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(job_id.to_string());
+    }
     let mut guard = import_job_slot().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(job) = guard.as_mut() {
         if job.value.get("job_id").and_then(|v| v.as_str()) == Some(job_id) {
@@ -1689,10 +1742,27 @@ pub fn cancel_character_import_job(job_id: &str) -> Value {
             return job.value.clone();
         }
     }
+    // Nothing matched: do not leave a permanent flag behind for an id that was
+    // never cancelled.
+    {
+        let registry = cancelled_import_job_ids();
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(job_id);
+    }
     json!({"ok": false, "error": "job_not_found", "job_id": job_id})
 }
 
 fn cancel_requested(job_id: &str) -> bool {
+    // Registry first, and in its own scope: `cancel_character_import_job` takes
+    // the same two locks in the same order, so this cannot invert.
+    let recorded = {
+        let registry = cancelled_import_job_ids();
+        let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        guard.contains(job_id)
+    };
+    if recorded {
+        return true;
+    }
     let guard = import_job_slot().lock().unwrap_or_else(|e| e.into_inner());
     guard
         .as_ref()
@@ -1845,11 +1915,14 @@ pub fn start_character_import_job_with_roots(
     start_character_import_job_with_index_changes(conn, roots, body, false)
 }
 
-fn start_character_import_job_with_index_changes(
-    conn: &Connection,
-    roots: &crate::media_roots::MediaRoots,
-    body: &Value,
-    prior_index_changes: bool,
+/// Claim the import job slot synchronously and run the import on a dedicated
+/// background thread with its own writable SQLite connection so the HTTP start
+/// request returns immediately (`status = "running"`) instead of blocking past
+/// browser timeouts or holding a request-pool connection during ONNX inference.
+pub fn spawn_character_import_job_with_roots(
+    db_path: std::path::PathBuf,
+    roots: crate::media_roots::MediaRoots,
+    body: Value,
 ) -> Result<Value> {
     if !character_recognition_enabled() {
         return Ok(json!({
@@ -1861,7 +1934,128 @@ fn start_character_import_job_with_index_changes(
             "added_references": 0,
         }));
     }
+    let job = build_initial_import_job(&body);
+    if let Some(busy) = claim_import_job_or_busy(job.clone()) {
+        return Ok(busy);
+    }
+    let job_id = job
+        .get("job_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let worker_job = job.clone();
+    let worker_job_id = job_id.clone();
+    if let Err(err) = std::thread::Builder::new()
+        .name("character-import-job".into())
+        .spawn(move || match crate::db::open_writable_db(&db_path) {
+            Ok(conn) => {
+                if let Err(err) =
+                    run_claimed_character_import_job(&conn, &roots, &body, worker_job, false)
+                {
+                    log_error!("character import job {worker_job_id} failed: {err:#}");
+                }
+            }
+            Err(err) => {
+                log_error!("character import job {worker_job_id} open db failed: {err:#}");
+                mark_import_job_failed(&worker_job_id, &err.to_string());
+            }
+        })
+    {
+        mark_import_job_failed(&job_id, &err.to_string());
+        return Err(err.into());
+    }
+    Ok(job)
+}
 
+fn mark_import_job_failed(job_id: &str, reason: &str) {
+    let mut guard = import_job_slot().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = guard
+        .as_mut()
+        .filter(|j| j.value.get("job_id").and_then(Value::as_str) == Some(job_id))
+    {
+        if let Some(obj) = slot.value.as_object_mut() {
+            obj.insert("status".into(), json!("failed"));
+            obj.insert("failed".into(), json!(1));
+            obj.insert("failures".into(), json!([{"error": reason}]));
+            obj.insert("first_failure_reason".into(), json!(reason));
+            obj.insert("finished_at".into(), json!(now()));
+            obj.insert("busy".into(), json!(false));
+            obj.insert("ok".into(), json!(false));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_import_job_progress(
+    job_id: &str,
+    total: i64,
+    processed: i64,
+    added: i64,
+    skipped_existing: i64,
+    skipped_low_similarity: i64,
+    skipped_duplicate: i64,
+    skipped_max: i64,
+    failed: i64,
+    current_tag: &str,
+    failures: &[Value],
+    imported_character_ids: &[i64],
+) {
+    let mut guard = import_job_slot().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = guard
+        .as_mut()
+        .filter(|j| j.value.get("job_id").and_then(Value::as_str) == Some(job_id))
+    {
+        if let Some(obj) = slot.value.as_object_mut() {
+            obj.insert("total".into(), json!(total.max(processed)));
+            obj.insert("processed".into(), json!(processed));
+            obj.insert("added".into(), json!(added));
+            obj.insert("added_references".into(), json!(added));
+            obj.insert("skipped_existing".into(), json!(skipped_existing));
+            obj.insert(
+                "skipped_low_similarity".into(),
+                json!(skipped_low_similarity),
+            );
+            obj.insert("skipped_duplicate".into(), json!(skipped_duplicate));
+            obj.insert("skipped_max_references".into(), json!(skipped_max));
+            obj.insert("failed".into(), json!(failed));
+            obj.insert("current_tag".into(), json!(current_tag));
+            obj.insert("failures".into(), json!(failures));
+            if let Some(first) = failures.first() {
+                obj.insert(
+                    "first_failure_reason".into(),
+                    first.get("error").cloned().unwrap_or_else(|| json!("")),
+                );
+            }
+            obj.insert(
+                "imported_character_ids".into(),
+                json!(imported_character_ids),
+            );
+        }
+    }
+}
+
+fn ensure_character_id_for_tag(
+    conn: &Connection,
+    cached_id: &mut Option<i64>,
+    tag_name: &str,
+) -> Result<i64> {
+    if let Some(id) = *cached_id {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO characters (name) VALUES (?)",
+        params![tag_name],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM characters WHERE name=?",
+        params![tag_name],
+        |r| r.get(0),
+    )?;
+    *cached_id = Some(id);
+    Ok(id)
+}
+
+fn build_initial_import_job(body: &Value) -> Value {
     let job_id = format!("{:x}", (now() * 1000.0) as u64);
     let artist_id = body.get("artist_id").and_then(|v| v.as_i64());
     let tag_ids: Vec<i64> = body
@@ -1879,18 +2073,15 @@ fn start_character_import_job_with_index_changes(
                 .collect()
         })
         .unwrap_or_default();
-    // 0 = no per-tag-per-job throttle (default). Positive = pacing only.
     let limit_per_tag = body
         .get("limit_per_tag")
         .and_then(|v| v.as_i64())
         .unwrap_or_else(import_limit_per_tag_default)
         .max(0);
-    // Explicit UI import without filter: still prefer unreferenced unless false.
     let unreferenced_only = body
         .get("unreferenced_only")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    // 0 = unlimited refs per character (default). Never force a low seed.
     let hard_max = body
         .get("max_references_per_character")
         .and_then(|v| v.as_i64())
@@ -1915,7 +2106,7 @@ fn start_character_import_job_with_index_changes(
         "all"
     };
 
-    let mut job = json!({
+    json!({
         "job_id": job_id,
         "status": "running",
         "scope": scope,
@@ -1943,10 +2134,85 @@ fn start_character_import_job_with_index_changes(
         "unreferenced_only": unreferenced_only,
         "max_references_per_character": hard_max,
         "candidate_limit": candidate_limit,
-    });
+    })
+}
+
+fn start_character_import_job_with_index_changes(
+    conn: &Connection,
+    roots: &crate::media_roots::MediaRoots,
+    body: &Value,
+    prior_index_changes: bool,
+) -> Result<Value> {
+    if !character_recognition_enabled() {
+        return Ok(json!({
+            "job_id": "",
+            "status": "skipped",
+            "reason": "character_recognition_disabled",
+            "busy": false,
+            "added": 0,
+            "added_references": 0,
+        }));
+    }
+    let job = build_initial_import_job(body);
     if let Some(busy) = claim_import_job_or_busy(job.clone()) {
         return Ok(busy);
     }
+    run_claimed_character_import_job(conn, roots, body, job, prior_index_changes)
+}
+
+fn run_claimed_character_import_job(
+    conn: &Connection,
+    roots: &crate::media_roots::MediaRoots,
+    body: &Value,
+    mut job: Value,
+    prior_index_changes: bool,
+) -> Result<Value> {
+    let job_id = job
+        .get("job_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let artist_id = body.get("artist_id").and_then(|v| v.as_i64());
+    let tag_ids: Vec<i64> = body
+        .get("tag_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+        .unwrap_or_default();
+    let tag_names: Vec<String> = body
+        .get("tag_names")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let limit_per_tag = body
+        .get("limit_per_tag")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(import_limit_per_tag_default)
+        .max(0);
+    let unreferenced_only = body
+        .get("unreferenced_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let hard_max = body
+        .get("max_references_per_character")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            body.get("seed_references_per_character")
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or_else(import_max_refs_per_character)
+        .max(0);
+    let candidate_limit = body
+        .get("candidate_limit")
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(import_job_candidate_limit)
+        .clamp(50, 20_000);
+
     let mut run_guard = ImportJobRunGuard {
         conn,
         job_id: job_id.clone(),
@@ -1979,13 +2245,14 @@ fn start_character_import_job_with_index_changes(
         .map_or(0, Vec::len);
     run_guard.changed |= cleanup_deleted > 0;
 
-    // Single-tag image candidates; prefer items with no character_reference yet.
+    // Single-tag image/video candidates; exclude archives and prefer items with no reference yet.
     let mut sql = String::from(
         "SELECT i.id, i.file_path, i.artist_id, t.id AS tag_id, t.name AS tag_name
          FROM items i
          JOIN item_tags it ON it.item_id = i.id
          JOIN tags t ON t.id = it.tag_id
          WHERE i.missing = 0
+           AND COALESCE(i.is_archive, 0) = 0
            AND (i.media_type IN ('image', 'video') OR i.media_type IS NULL OR i.media_type = '')
            AND i.id IN (
              SELECT item_id FROM item_tags GROUP BY item_id HAVING COUNT(*) = 1
@@ -2054,6 +2321,7 @@ fn start_character_import_job_with_index_changes(
         })?
         .collect::<rusqlite::Result<_>>()?;
 
+    let mut total = rows.len() as i64;
     let mut added = 0i64;
     let mut skipped_existing = 0i64;
     let mut skipped_low_similarity = 0i64;
@@ -2064,6 +2332,21 @@ fn start_character_import_job_with_index_changes(
     let mut imported_character_ids = Vec::new();
     let mut failures: Vec<Value> = Vec::new();
     let mut cancelled = false;
+
+    sync_import_job_progress(
+        &job_id,
+        total,
+        processed,
+        added,
+        skipped_existing,
+        skipped_low_similarity,
+        skipped_duplicate,
+        skipped_max,
+        failed,
+        "",
+        &failures,
+        &imported_character_ids,
+    );
 
     let mut row_index = 0usize;
     'tags: while row_index < rows.len() {
@@ -2076,37 +2359,63 @@ fn start_character_import_job_with_index_changes(
         while row_index < rows.len() && rows[row_index].4 == tag_name {
             row_index += 1;
         }
+        let group_len = row_index - group_start;
+        let mut visited_in_group = 0usize;
 
-        let char_id: i64 = match conn.query_row(
-            "SELECT id FROM characters WHERE name=?",
-            params![tag_name],
-            |r| r.get(0),
-        ) {
-            Ok(id) => id,
-            Err(_) => {
-                conn.execute(
-                    "INSERT INTO characters (name) VALUES (?)",
-                    params![tag_name],
-                )?;
-                conn.last_insert_rowid()
-            }
+        sync_import_job_progress(
+            &job_id,
+            total,
+            processed,
+            added,
+            skipped_existing,
+            skipped_low_similarity,
+            skipped_duplicate,
+            skipped_max,
+            failed,
+            &tag_name,
+            &failures,
+            &imported_character_ids,
+        );
+
+        let mut char_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM characters WHERE name=?",
+                params![tag_name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut reference_records = match char_id {
+            Some(id) => crate::character_cleanup::load_character_refs(conn, id)?,
+            None => Vec::new(),
         };
-        let mut reference_records = crate::character_cleanup::load_character_refs(conn, char_id)?;
         let mut voting_core = crate::character_cleanup::stable_core_records(&reference_records);
         let seed_size = crate::character_cleanup::seed_core_size();
-        let group_end = if reference_records.len() < seed_size {
+        let raw_seed_needed = seed_size.saturating_sub(reference_records.len());
+        let seed_window_target = if limit_per_tag > 0 {
+            raw_seed_needed.min(limit_per_tag as usize)
+        } else {
+            raw_seed_needed
+        };
+        // Only pre-embed a small pool (at most 10 items) when seed diversity
+        // selection is needed; when the character already has a stable seed
+        // core (`seed_window_target == 0`), embed lazily in the post-seed loop
+        // so `limit_per_tag` stops immediately without embedding hundreds of
+        // extra images for that tag.
+        let seed_window_end = if seed_window_target > 0 {
             row_index.min(group_start + 10)
         } else {
-            row_index
+            group_start
         };
         let mut candidates: Vec<(i64, crate::character_cleanup::RefRec)> = Vec::new();
 
-        for (item_id, path, candidate_artist_id, _tag_id, _) in &rows[group_start..group_end] {
+        for (item_id, path, candidate_artist_id, _tag_id, _) in &rows[group_start..seed_window_end]
+        {
             if cancel_requested(&job_id) {
                 cancelled = true;
                 break 'tags;
             }
             processed += 1;
+            visited_in_group += 1;
             let exists = conn
                 .query_row(
                     "SELECT 1 FROM character_references WHERE item_id=? LIMIT 1",
@@ -2119,7 +2428,9 @@ fn start_character_import_job_with_index_changes(
                 skipped_existing += 1;
                 continue;
             }
-            if hard_max > 0 && character_tag_single_count(conn, char_id) >= hard_max {
+            if hard_max > 0
+                && char_id.is_some_and(|id| character_tag_single_count(conn, id) >= hard_max)
+            {
                 skipped_max += 1;
                 continue;
             }
@@ -2142,8 +2453,41 @@ fn start_character_import_job_with_index_changes(
                             "error": err.to_string(),
                         }));
                     }
+                    sync_import_job_progress(
+                        &job_id,
+                        total,
+                        processed,
+                        added,
+                        skipped_existing,
+                        skipped_low_similarity,
+                        skipped_duplicate,
+                        skipped_max,
+                        failed,
+                        &tag_name,
+                        &failures,
+                        &imported_character_ids,
+                    );
+                    if !fake_import_embedding_enabled()
+                        && manual_reference_embedding_blocker().is_some()
+                    {
+                        break 'tags;
+                    }
                 }
             }
+            sync_import_job_progress(
+                &job_id,
+                total,
+                processed,
+                added,
+                skipped_existing,
+                skipped_low_similarity,
+                skipped_duplicate,
+                skipped_max,
+                failed,
+                &tag_name,
+                &failures,
+                &imported_character_ids,
+            );
         }
 
         let mut added_for_tag = 0i64;
@@ -2191,11 +2535,14 @@ fn start_character_import_job_with_index_changes(
                     continue;
                 }
             }
-            if hard_max > 0 && character_tag_single_count(conn, char_id) >= hard_max {
+            if hard_max > 0
+                && char_id.is_some_and(|id| character_tag_single_count(conn, id) >= hard_max)
+            {
                 skipped_max += 1;
                 continue;
             }
-            match insert_tag_single_reference(conn, char_id, candidate.0, &candidate.1.vector) {
+            let cid = ensure_character_id_for_tag(conn, &mut char_id, &tag_name)?;
+            match insert_tag_single_reference(conn, cid, candidate.0, &candidate.1.vector) {
                 Ok(()) => {
                     added += 1;
                     added_for_tag += 1;
@@ -2203,15 +2550,15 @@ fn start_character_import_job_with_index_changes(
                     run_guard.changed = true;
                     reference_records.push(candidate.1.clone());
                     voting_core = crate::character_cleanup::stable_core_records(&reference_records);
-                    if !imported_character_ids.contains(&char_id) {
-                        imported_character_ids.push(char_id);
+                    if !imported_character_ids.contains(&cid) {
+                        imported_character_ids.push(cid);
                     }
                 }
                 Err(err) => {
                     failed += 1;
                     if failures.len() < 20 {
                         failures.push(json!({
-                                "item_id": candidate.0,
+                            "item_id": candidate.0,
                             "tag": tag_name,
                             "error": err.to_string(),
                         }));
@@ -2237,26 +2584,29 @@ fn start_character_import_job_with_index_changes(
                 skipped_low_similarity += 1;
                 continue;
             }
-            if hard_max > 0 && character_tag_single_count(conn, char_id) >= hard_max {
+            if hard_max > 0
+                && char_id.is_some_and(|id| character_tag_single_count(conn, id) >= hard_max)
+            {
                 skipped_max += 1;
                 continue;
             }
-            match insert_tag_single_reference(conn, char_id, candidate.0, &candidate.1.vector) {
+            let cid = ensure_character_id_for_tag(conn, &mut char_id, &tag_name)?;
+            match insert_tag_single_reference(conn, cid, candidate.0, &candidate.1.vector) {
                 Ok(()) => {
                     added += 1;
                     added_for_tag += 1;
                     run_guard.changed = true;
                     reference_records.push(candidate.1.clone());
                     voting_core = crate::character_cleanup::stable_core_records(&reference_records);
-                    if !imported_character_ids.contains(&char_id) {
-                        imported_character_ids.push(char_id);
+                    if !imported_character_ids.contains(&cid) {
+                        imported_character_ids.push(cid);
                     }
                 }
                 Err(err) => {
                     failed += 1;
                     if failures.len() < 20 {
                         failures.push(json!({
-                                "item_id": candidate.0,
+                            "item_id": candidate.0,
                             "tag": tag_name,
                             "error": err.to_string(),
                         }));
@@ -2264,9 +2614,159 @@ fn start_character_import_job_with_index_changes(
                 }
             }
         }
+
+        // Lazy post-seed evaluation for remaining rows in this tag group:
+        // stops immediately once `limit_per_tag` or `hard_max` is satisfied.
+        for (item_id, path, candidate_artist_id, _tag_id, _) in &rows[seed_window_end..row_index] {
+            if cancel_requested(&job_id) {
+                cancelled = true;
+                break 'tags;
+            }
+            if limit_per_tag > 0 && added_for_tag >= limit_per_tag {
+                break;
+            }
+            if hard_max > 0
+                && char_id.is_some_and(|id| character_tag_single_count(conn, id) >= hard_max)
+            {
+                skipped_max += 1;
+                break;
+            }
+            processed += 1;
+            visited_in_group += 1;
+            let exists = conn
+                .query_row(
+                    "SELECT 1 FROM character_references WHERE item_id=? LIMIT 1",
+                    params![item_id],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if exists {
+                skipped_existing += 1;
+                continue;
+            }
+            match embed_for_import_with_roots(conn, roots, *item_id) {
+                Ok(vector) => {
+                    let candidate_rec = crate::character_cleanup::RefRec::candidate(
+                        *item_id,
+                        vector,
+                        *candidate_artist_id,
+                        path,
+                    );
+                    let vote = crate::character_cleanup::core_vote_records(
+                        &candidate_rec.vector,
+                        &voting_core,
+                    );
+                    if vote.duplicate {
+                        skipped_duplicate += 1;
+                    } else if !vote.supported {
+                        skipped_low_similarity += 1;
+                    } else {
+                        let cid = ensure_character_id_for_tag(conn, &mut char_id, &tag_name)?;
+                        match insert_tag_single_reference(
+                            conn,
+                            cid,
+                            *item_id,
+                            &candidate_rec.vector,
+                        ) {
+                            Ok(()) => {
+                                added += 1;
+                                added_for_tag += 1;
+                                run_guard.changed = true;
+                                reference_records.push(candidate_rec);
+                                voting_core = crate::character_cleanup::stable_core_records(
+                                    &reference_records,
+                                );
+                                if !imported_character_ids.contains(&cid) {
+                                    imported_character_ids.push(cid);
+                                }
+                            }
+                            Err(err) => {
+                                failed += 1;
+                                if failures.len() < 20 {
+                                    failures.push(json!({
+                                        "item_id": item_id,
+                                        "tag": tag_name,
+                                        "error": err.to_string(),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    failed += 1;
+                    if failures.len() < 20 {
+                        failures.push(json!({
+                            "item_id": item_id,
+                            "tag": tag_name,
+                            "error": err.to_string(),
+                        }));
+                    }
+                    sync_import_job_progress(
+                        &job_id,
+                        total,
+                        processed,
+                        added,
+                        skipped_existing,
+                        skipped_low_similarity,
+                        skipped_duplicate,
+                        skipped_max,
+                        failed,
+                        &tag_name,
+                        &failures,
+                        &imported_character_ids,
+                    );
+                    if !fake_import_embedding_enabled()
+                        && manual_reference_embedding_blocker().is_some()
+                    {
+                        break 'tags;
+                    }
+                }
+            }
+            sync_import_job_progress(
+                &job_id,
+                total,
+                processed,
+                added,
+                skipped_existing,
+                skipped_low_similarity,
+                skipped_duplicate,
+                skipped_max,
+                failed,
+                &tag_name,
+                &failures,
+                &imported_character_ids,
+            );
+        }
+
+        let unvisited = group_len.saturating_sub(visited_in_group) as i64;
+        if unvisited > 0 {
+            total = (total - unvisited).max(processed);
+        }
+        sync_import_job_progress(
+            &job_id,
+            total,
+            processed,
+            added,
+            skipped_existing,
+            skipped_low_similarity,
+            skipped_duplicate,
+            skipped_max,
+            failed,
+            &tag_name,
+            &failures,
+            &imported_character_ids,
+        );
     }
 
-    let status = if cancelled { "cancelled" } else { "completed" };
+    let status = if cancelled {
+        "cancelled"
+    } else if added == 0 && failed > 0 {
+        "failed"
+    } else {
+        "completed"
+    };
     if run_guard.changed {
         rebuild_character_index(conn)?;
         run_guard.changed = false;
@@ -2285,6 +2785,7 @@ fn start_character_import_job_with_index_changes(
         obj.insert("skipped_duplicate".into(), json!(skipped_duplicate));
         obj.insert("skipped_max_references".into(), json!(skipped_max));
         obj.insert("failed".into(), json!(failed));
+        obj.insert("current_tag".into(), json!(""));
         obj.insert("failures".into(), json!(failures));
         if let Some(first) = failures.first() {
             obj.insert(

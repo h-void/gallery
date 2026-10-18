@@ -15,7 +15,8 @@ import {
 } from './views/sidebar.js';
 import { updateEditBar, resetCharacterTagSuggestions, renderEditTagPicker } from './views/editbar.js';
 import { resetArtistLinks, resetArtistProfileLinks, loadArtistLinks, loadArtistProfileLinks } from './views/links.js';
-import { loadMoveWorkbench, movePanelScrollTop, restoreMovePanelScroll, setMaintenanceView } from './views/maintenance/index.js';
+import { movePanelScrollTop, restoreMovePanelScroll } from './views/maintenance/shared.js';
+import { loadMoveWorkbench, setMaintenanceView } from './views/maintenance/lazy.js';
 
 const BROWSE_KINDS = {
   untagged: '__untagged__',
@@ -119,7 +120,12 @@ export function getArtistHistory(knownArtists = null) {
     return [];
   }
   const source = Array.isArray(parsed) ? parsed : [];
-  const artists = knownArtists || (state.artistsLoaded ? state.artists : null);
+  // A failed artist load is not evidence that an artist is gone: the catch path
+  // leaves `state.artists` empty and `artistsLoaded` true, so filtering against
+  // it dropped every row and wrote the empty list back over localStorage — one
+  // transient /api/artists failure erased 最近访问 for good.
+  const artists = knownArtists
+    || (state.artistsLoaded && !state.artistsLoadError ? state.artists : null);
   const knownIds = artists
     ? new Set(artists.map(artist => artistIdNumber(artist.id)).filter(Boolean))
     : null;

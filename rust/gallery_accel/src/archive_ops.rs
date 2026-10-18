@@ -378,12 +378,24 @@ pub fn stream_archive_entry(
     }
 
     let status = child.wait().context("wait for 7z extraction")?;
-    if !status.success() && buffer.is_empty() {
+    let exit_code = status.code();
+    // 7-Zip documents its exit codes: 0 success, 1 warning (the stream is
+    // still complete, e.g. "There are data after the end of archive"), 2
+    // fatal error, 7 command line, 8 out of memory, 255 user stopped. A
+    // warning is served; every other non-zero code fails the request, and an
+    // empty body after a non-zero one is never a real file (an empty entry
+    // exits 0). Deciding from stderr wording instead served a partial body —
+    // under a one-hour cache header — whenever a fatal message used text this
+    // code did not list.
+    if !matches!(exit_code, Some(0) | Some(1)) || (buffer.is_empty() && exit_code != Some(0)) {
         let mut stderr = String::new();
         if let Some(mut err_pipe) = child.stderr.take() {
             let _ = std::io::Read::read_to_string(&mut err_pipe, &mut stderr);
         }
-        bail!("failed to stream entry: {stderr}");
+        let code = exit_code
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        bail!("failed to stream entry (7z exit {code}): {stderr}");
     }
 
     Ok(buffer)
@@ -505,28 +517,27 @@ pub fn extract_archive(
     // Fast path: if final_target_dir does not exist yet (e.g. unpacking to a new folder),
     // atomically rename the staging directory directly to avoid iterating and moving thousands
     // of individual files and checking existence one-by-one.
-    let extracted_count = if !final_target_dir.exists() {
-        let count = match std::fs::read_dir(&staging_dir) {
-            Ok(read) => read.flatten().count(),
-            Err(_) => 0,
-        };
-        if std::fs::rename(&staging_dir, &final_target_dir).is_ok() {
-            count
-        } else {
-            std::fs::create_dir_all(&final_target_dir).with_context(|| {
-                format!("create final target dir: {}", final_target_dir.display())
-            })?;
-            let moved = move_staging_to_target(&staging_dir, &final_target_dir)?;
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            moved
+    // Files, not top-level entries: an archive holding two folders with 500
+    // files each reported `extracted_count: 2`, and the UI shows this number.
+    let extracted_files = count_staged_files(&staging_dir);
+    let published = (|| -> Result<()> {
+        if !final_target_dir.exists() && std::fs::rename(&staging_dir, &final_target_dir).is_ok() {
+            return Ok(());
         }
-    } else {
         std::fs::create_dir_all(&final_target_dir)
             .with_context(|| format!("create final target dir: {}", final_target_dir.display()))?;
-        let moved = move_staging_to_target(&staging_dir, &final_target_dir)?;
+        move_staging_to_target(&staging_dir, &final_target_dir)?;
+        Ok(())
+    })();
+    if let Err(error) = published {
+        // A failure here used to return with `.extracting_<uuid>` left in the
+        // media folder: the dot prefix hides it from the scanner, so every
+        // failed extraction silently kept its staging bytes forever.
         let _ = std::fs::remove_dir_all(&staging_dir);
-        moved
-    };
+        return Err(error);
+    }
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    let extracted_count = extracted_files;
 
     // Recycle source archive if requested
     let mut recycled = false;
@@ -613,6 +624,25 @@ fn flatten_single_wrapper(staging_dir: &Path) {
             let _ = std::fs::remove_dir(&single_dir);
         }
     }
+}
+
+/// Regular files under `root`, recursively.
+fn count_staged_files(root: &Path) -> usize {
+    let mut count = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => stack.push(entry.path()),
+                Ok(kind) if kind.is_file() => count += 1,
+                _ => {}
+            }
+        }
+    }
+    count
 }
 
 fn move_staging_to_target(staging_dir: &Path, target_dir: &Path) -> Result<usize> {

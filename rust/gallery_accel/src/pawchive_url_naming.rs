@@ -426,9 +426,13 @@ pub fn format_post_datetime_display(
         } else if offset_secs == 8 * 3600 {
             "UTC+8".to_string()
         } else {
-            let hours = offset_secs / 3600;
-            let minutes = (offset_secs.abs() % 3600) / 60;
-            format!("UTC{:+03}:{:02}", hours, minutes)
+            // Take the sign from the offset itself: integer division
+            // truncates toward zero, so -1800s would render as "UTC+00:30".
+            let sign = if offset_secs < 0 { '-' } else { '+' };
+            let abs_secs = offset_secs.abs();
+            let hours = abs_secs / 3600;
+            let minutes = (abs_secs % 3600) / 60;
+            format!("UTC{sign}{hours:02}:{minutes:02}")
         };
         let orig_str = format!("{} ({})", dt.format("%Y-%m-%d %H:%M:%S"), tz_label);
         return (Some(local_str), Some(orig_str));

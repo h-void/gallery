@@ -42,14 +42,14 @@
   - **Automatic move reconciliation**: Relinks renamed or moved files via BLAKE3 hash and inode; unambiguous same-artist moves keep their tags automatically, while cross-artist conflicts route to Maintenance review.
 - **Standardized Folder Archiving & Safe Recycle Bin**
   - **Rule engine & in-place actions**: Uses an editable `Default` template (default `{year}/{date} {tags}`, falling back to Twitter/X snowflake posting dates when unrecognized). Fill missing character tags or manual dates directly from the folder sidebar, archive the current folder in one click, bundle selected files into a target folder with automatic rollback on failure, and preview naming rule migrations with explicit CAS version switching.
-  - **Data safety guarantees**: Takes an automatic SQLite online backup and revalidates paths before any move, never overwrites occupied targets, and supports optional auto-archiving after completed full-library scans.
+  - **Data safety**: Takes an automatic SQLite online backup and revalidates paths before any move, keeps existing targets untouched, and supports optional auto-archiving after completed full-library scans.
   - **Selectable recycle bin strategy**: Choose between native fnOS system trash and internal app trash from the Maintenance panel (with pros and cons comparison cards); supports folder-level deletion, grid/table view toggle, one-click batch restore, permanent purge, and bin emptying.
 - **Download Subscriptions & Netdisk Dispatch**
   - **Scheduled discovery & coverage calendar**: Subscribe to creator profiles with fair per-artist round scheduling and a 53-week coverage calendar on each subscription card.
-  - **All Works & JDownloader bridge**: Filter across all subscriptions, freeze filter-wide download snapshots, and dispatch external cloud links to JDownloader via the local Event Scripter bridge with automatic import and handshake hardening.
+  - **All Works & JDownloader bridge**: Filter across all subscriptions, freeze filter-wide download snapshots, and dispatch external cloud links to JDownloader via the local Event Scripter bridge with automatic import and handshake verification.
 
 > [!WARNING]
-> **Network Security Notice**: Gallery listens on port `8899` by default and **includes no built-in user authentication**. It is designed strictly for trusted local area networks (LAN). Before exposing it to public networks, configure authentication through fnOS or an upstream reverse proxy (Nginx / Caddy).
+> **Network security**: Gallery listens on port `8899` and ships without built-in user authentication, so it fits a home or trusted LAN. For public access, add authentication through fnOS or an upstream reverse proxy (Nginx / Caddy).
 
 ---
 
@@ -115,7 +115,7 @@ Requires Docker (with Docker Compose) and Python 3.10+ (standard library only):
 
 > [!IMPORTANT]
 > **Docker Data Safety & Permissions**
-> - **Preserve the data volume**: Database, logs, backups, caches, and AI models live in the `gallery-storage` volume (offline model path: `models/character/ccip-caformer_b36-24/model_feat.onnx`). **Never run `docker compose down -v`**. Script users should also keep `.gallery-launcher` to preserve `/mediaN` directory slot mappings.
+> - **Keep the data volume**: Database, logs, backups, caches, and AI models live in the `gallery-storage` volume (offline model path: `models/character/ccip-caformer_b36-24/model_feat.onnx`). Do not run `docker compose down -v` when upgrading or switching modes. Script users should also keep `.gallery-launcher` to preserve `/mediaN` directory slot mappings.
 > - **Read-only media default**: Media folders mount read-only (`:ro`) by default. Remove `:ro` in Compose or pass `--writable` to the launcher script to enable recycle-bin and archive operations.
 > - **7-Zip in Docker**: To inspect or extract archives in Docker, ensure `7zz` / `p7zip-full` is available in the container or set `GALLERY_7Z_PATH`.
 

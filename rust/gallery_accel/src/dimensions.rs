@@ -81,6 +81,10 @@ pub fn backfill_item_dimensions(
     }
     transaction.commit()?;
 
+    // Exact on every batch: the route publishes it as progress and only the
+    // final batch may conclude `complete`. (Skipping it on intermediate batches
+    // would be cheaper — there is no index over media_type/width/height — but
+    // the reported number is part of the response contract.)
     let remaining: i64 = conn.query_row(
         "SELECT COUNT(*) FROM items
          WHERE missing=0

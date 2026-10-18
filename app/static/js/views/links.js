@@ -8,7 +8,7 @@ import {
 import { toast } from '../logging.js';
 import { t } from '../i18n.js';
 import { selectFolder } from './sidebar.js';
-import { ensureNetdiskDispatchReady } from './maintenance/netdisk.js';
+import { ensureNetdiskDispatchReady } from './maintenance/lazy.js';
 
 const artistLinksDialogOpeners = new WeakMap();
 let artistLinksDialogChromeBound = false;
@@ -361,7 +361,7 @@ export function renderArtistLinks() {
             return res;
           } catch (err) {
             if (err.status === 409 || err.message?.includes('409') || err.message?.includes('已有活跃投递任务') || err.message?.includes('进行中')) {
-              const retry = window.confirm('该链接已有投递任务正在进行中，是否重新投递？');
+              const retry = window.confirm(t('该链接已有投递任务正在进行中，是否重新投递？'));
               if (retry) {
                 return doDeliver({ force: true });
               }
@@ -538,7 +538,7 @@ function bindArtistProfileLinkDeletes() {
       if (!artist || !Number.isSafeInteger(linkId) || isActionBusy('artist-profile-link-delete', linkId)) return;
       const artistId = artist.id;
       const artistSeq = state.artistLoadSeq;
-      if (!window.confirm('确定删除该链接？')) return;
+      if (!window.confirm(t('确定删除该链接？'))) return;
       if (!isCurrentArtistLinkRequest(artistId, artistSeq)) return;
       setActionBusy('artist-profile-link-delete', linkId, true);
       button.disabled = true;

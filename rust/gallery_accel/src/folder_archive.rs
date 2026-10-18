@@ -109,12 +109,21 @@ fn update_folder_item_paths(
 ) -> Result<i64> {
     let logical_prefix = format!("{}/", logical_source.trim_end_matches('/'));
     let real_prefix = format!("{}/", real_source.trim_end_matches('/'));
+    // `folder_name` is the leaf folder a card and the search read, not the
+    // relative path. Updating only `file_path` left it naming the folder the
+    // rename just moved away: searching the new name missed the items and the
+    // old name kept matching until the next scan rewrote the rows.
+    let folder_name = Path::new(real_target)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
     Ok(tx.execute(
         "UPDATE items SET file_path=CASE
            WHEN file_path=?1 OR instr(file_path, ?2)=1
              THEN ?3 || substr(file_path, length(?1) + 1)
            ELSE ?4 || substr(file_path, length(?5) + 1)
-         END
+         END,
+         folder_name=?8
          WHERE artist_id=?6 AND (
            file_path=?1 OR instr(file_path, ?2)=1 OR
            file_path=?5 OR instr(file_path, ?7)=1
@@ -127,6 +136,7 @@ fn update_folder_item_paths(
             logical_source,
             artist_id,
             logical_prefix,
+            folder_name,
         ],
     )? as i64)
 }
@@ -858,6 +868,22 @@ impl ItemDatesByFolder {
     }
 }
 
+/// Effective item dates and tag names for a single plan folder, used by
+/// template preview so nested folders and item-level dates resolve identically
+/// to `recompute_artist_plan_targets`.
+pub(crate) fn plan_effective_dates_and_tags(
+    conn: &Connection,
+    artist_id: i64,
+    source_folder: &str,
+    selected_json: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let dates = ItemDatesByFolder::build(conn, artist_id)
+        .map(|by_folder| by_folder.get(source_folder))
+        .unwrap_or_default();
+    let tags = plan_tag_names(conn, artist_id, source_folder, selected_json).unwrap_or_default();
+    Ok((dates, tags))
+}
+
 /// Tag names for a plan: the stored `selected_tag_ids` order when present,
 /// otherwise the distinct artist folder tag names ordered by name.
 fn plan_tag_names(
@@ -975,21 +1001,49 @@ fn validate_fixed_target(value: &str) -> Result<String> {
 /// The item's parent directory relative to the artist root. Older databases
 /// only have the final path component in `folder_name`, so use it solely when
 /// the stored file path cannot be safely made relative to the artist path.
-fn source_folder_for_item(artist_path: &str, file_path: &str, folder_name: &str) -> Option<String> {
-    let artist_root = artist_path
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string();
-    let file_path = file_path.replace('\\', "/");
-    let from_path = if artist_root.is_empty() {
+///
+/// This is the `folder_rename_plans.source_folder` key: every invalidation path
+/// (item date batches, tag writes) must derive its folder the same way, or a
+/// plan keyed through the `folder_name` fallback stays invisible to them.
+pub(crate) fn source_folder_for_item(
+    artist_path: &str,
+    file_path: &str,
+    folder_name: &str,
+) -> Option<String> {
+    // One derivation for the relative parent (depth-based, so a subdirectory
+    // that shares the artist's own name is not mistaken for the artist root).
+    let from_path = crate::item_dates::item_date_folder_name(artist_path, file_path);
+    let from_path = if from_path.is_empty() {
         None
     } else {
-        file_path
-            .strip_prefix(&format!("{artist_root}/"))
-            .and_then(|relative| relative.rsplit_once('/').map(|(folder, _)| folder))
-            .and_then(|folder| validate_relative_folder(folder).ok())
+        validate_relative_folder(&from_path).ok()
     };
     from_path.or_else(|| validate_relative_folder(folder_name).ok())
+}
+
+/// The plan key for an artist-relative *directory*, as opposed to
+/// [`source_folder_for_item`], which takes an item file and derives its parent.
+///
+/// The extract route knows the directory it just wrote into, so it must not
+/// pretend that directory is a file: doing so demoted nothing for a top-level
+/// folder (a one-segment relative path has no parent) and demoted the *parent*
+/// for a nested one. The `/` boundary keeps `/a` from claiming `/ab/...`.
+pub fn source_folder_for_dir(artist_path: &str, dir_path: &str) -> Option<String> {
+    let artist_norm = artist_path.replace('\\', "/");
+    let artist_base = artist_norm.trim_end_matches('/');
+    if artist_base.is_empty() {
+        return None;
+    }
+    let dir_norm = dir_path.replace('\\', "/");
+    let rest = dir_norm
+        .trim_end_matches('/')
+        .strip_prefix(artist_base)?
+        .strip_prefix('/')?;
+    let rest = rest.trim_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+    validate_relative_folder(rest).ok()
 }
 
 fn artist_plan_path(conn: &Connection, artist_id: i64) -> Result<String> {
@@ -1984,8 +2038,15 @@ pub fn recompute_artist_plan_targets(
             } else {
                 match evaluate_plan_paths(roots, artist_id, &artist_path, &source_folder, &target) {
                     Ok(check) if source_folder == target && check.source_exists => "aligned",
+                    // Only `bad_folder_path` has to be excluded here: it also
+                    // reports both sides absent, so an invalid legacy path was
+                    // filed as `stale` (hidden from the plan list) instead of
+                    // `manual_review` (visible and fixable). A genuine
+                    // `source_missing` stays `stale` — that is the normal
+                    // "folder is gone" case, not a path problem.
                     Ok(check)
-                        if !check.source_exists
+                        if check.reason.as_deref() != Some("bad_folder_path")
+                            && !check.source_exists
                             && !check.target_exists
                             && roots
                                 .map_to_real(&artist_path)
@@ -2089,27 +2150,23 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
 
     for folder in folders.keys().filter(|folder| folder.contains('/')) {
         let legacy_folder = folder.rsplit('/').next().unwrap_or(folder);
-        // Legacy plans stored a bare folder name, and this cleanup used to match
-        // `source_folder=legacy_folder` alone. With both `pack` and
-        // `incoming/pack` in the library that also deleted the *top-level*
-        // `pack` plan, which the insert below then recreated as a bare draft —
-        // losing its chosen target, its status and its execution_log on every
-        // discovery. The boundary keeps the top-level name out of it.
+        // A legacy plan stored the bare folder name, and the upsert below keys
+        // the same folder by its full relative path; only that exact legacy key
+        // may be replaced. The old predicate had two arms that both overreached:
+        // `source_folder=?2` (the bare leaf) also matched the *top-level* plan of
+        // that name, and `LIKE '%/leaf'` matched every nested `x/leaf`, so two
+        // nested folders deleted each other's plan on every discovery and the
+        // insert recreated it as a bare draft — losing the chosen target, the
+        // status and the execution_log.
+        if folders.contains_key(legacy_folder) {
+            // A top-level folder of that name exists and owns the bare key.
+            continue;
+        }
         conn.execute(
             "DELETE FROM folder_rename_plans
              WHERE artist_id=?1 AND status NOT IN ('confirmed', 'executed', 'reverted')
-               AND (source_folder=?2 OR source_folder LIKE ?3 ESCAPE '\\')",
-            params![
-                artist_id,
-                legacy_folder,
-                format!(
-                    "%/{}",
-                    legacy_folder
-                        .replace('\\', "\\\\")
-                        .replace('%', "\\%")
-                        .replace('_', "\\_")
-                )
-            ],
+               AND source_folder=?2",
+            params![artist_id, legacy_folder],
         )?;
     }
 
@@ -2258,7 +2315,11 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
                 );
             }
             Some((plan_id, status, old_date, _old_tags, _old_count, _old_target, _)) => {
-                if status != "confirmed" && status != "executed" {
+                // `reverted` is terminal: undo recorded it, and the recompute and
+                // delete paths both exclude it. Rewriting it to a draft here let
+                // the very next auto-run re-confirm and re-execute the rename the
+                // user had just undone.
+                if !matches!(status.as_str(), "confirmed" | "executed" | "reverted") {
                     let final_date = if old_date.is_empty() {
                         parsed_date
                     } else {
@@ -3005,7 +3066,12 @@ pub fn execute_folder_renames_with_backup(
         // normal execution further down, so a target directory that the ledger
         // never pointed at — one the user filled by hand and re-scanned — is
         // refused exactly as it was before.
-        let adopted_rename = !dry_run && !src.is_dir() && dst.is_dir();
+        // The shape is a fact about the filesystem; whether this pass may act
+        // on it is decided further down, and a dry run has already returned by
+        // then. Folding `!dry_run` in here made a dry run report
+        // `source_missing`/`target_exists` for exactly the interrupted-rename
+        // state the real run recovers by adoption.
+        let adopted_rename = !src.is_dir() && dst.is_dir();
         if !src.is_dir() && !adopted_rename {
             if !dry_run {
                 record_plan_failure_or_log(conn, id, "source_missing", &source, &target, None);
@@ -3165,6 +3231,21 @@ pub fn execute_folder_renames_with_backup(
             if updated_items == 0 && file_count > 0 {
                 bail!("path rewrite matched no items for a non-empty plan");
             }
+            // Recycled entries whose original path is inside the renamed folder
+            // have to follow it in the same transaction. Left behind, a restore
+            // would write the file back into the directory this rename just
+            // vacated and recreate it outside the archive layout. Both spellings
+            // are remapped: stored item paths are real paths, but legacy rows may
+            // still carry the virtual alias.
+            crate::artist_folder_move::update_recycle_entries_for_move(
+                &tx, artist_id, &src_s, &dst_s,
+            )?;
+            crate::artist_folder_move::update_recycle_entries_for_move(
+                &tx,
+                artist_id,
+                &src_logical,
+                &dst_logical,
+            )?;
             // The work's location has to follow the rename in this same
             // transaction: the plan row is deleted right after, and without a
             // persistent location the group ledger would still name the old
@@ -3392,6 +3473,18 @@ pub fn undo_folder_rename_plan(
         if updated_items == 0 {
             bail!("path rewrite matched no items for a non-empty plan");
         }
+        // Undo moves the folder back, so entries recycled from the archived
+        // location have to move back with it; otherwise restoring one would
+        // recreate the archived directory the user just undid.
+        crate::artist_folder_move::update_recycle_entries_for_move(
+            &tx, artist_id, &target_db, &source_db,
+        )?;
+        crate::artist_folder_move::update_recycle_entries_for_move(
+            &tx,
+            artist_id,
+            &target_logical,
+            &source_logical,
+        )?;
         // Undoing a rename is a move too, and the ledger has to follow it back:
         // recording only the forward direction would leave the group named at
         // the directory that no longer exists.

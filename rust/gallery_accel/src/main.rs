@@ -101,8 +101,16 @@ async fn main() -> anyhow::Result<()> {
         // differently-configured peer on the same WAL file.
         match rusqlite::Connection::open(&db_path) {
             Ok(conn) => {
+                // `foreign_keys` is part of the alignment too, and it is the
+                // one that matters most here: the reconciliation below deletes
+                // `items` rows and relies on ON DELETE CASCADE / SET NULL for
+                // item_tags, item_favorites, move_candidates, move_history,
+                // link_index and character_references. With FKs off those rows
+                // were left behind — and character_references stayed pointing at
+                // a deleted item instead of becoming NULL, so a later restore's
+                // reattach pass (which matches `item_id IS NULL`) found nothing.
                 let _ = conn.execute_batch(&format!(
-                    "PRAGMA busy_timeout={}; PRAGMA journal_mode=WAL;",
+                    "PRAGMA busy_timeout={}; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
                     gallery_accel::DEFAULT_SQLITE_BUSY_TIMEOUT_MS
                 ));
                 match gallery_accel::ensure_recycle_schema(&conn) {

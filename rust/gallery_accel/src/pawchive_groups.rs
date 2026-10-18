@@ -1292,10 +1292,33 @@ pub fn apply_grouping(
         .unchecked_transaction()
         .context("begin content group apply")?;
     let existing = load_stored_groups(&tx, artist_root)?;
+    // `group_id` is the hash of `(artist_root, root_relative)`, but
+    // `relocate_groups_in_tx` moves `root_relative` without rekeying it, so the
+    // stored id no longer hashes to the pair. Adopt the id already recorded for
+    // a root instead of deriving a fresh one: a derived id misses `existing`,
+    // takes the INSERT branch, and collides with UNIQUE(artist_root,
+    // root_relative) — which rolls back the whole apply and makes grouping fail
+    // on every later run for that artist.
+    let stored_ids_by_root: BTreeMap<String, String> = {
+        let mut stmt = tx
+            .prepare("SELECT root_relative, group_id FROM content_groups WHERE artist_root = ?1")?;
+        let rows = stmt.query_map(params![artist_root], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut map = BTreeMap::new();
+        for row in rows {
+            let (root, id) = row?;
+            map.insert(root, id);
+        }
+        map
+    };
     let mut observed: BTreeSet<String> = BTreeSet::new();
 
     for group in &result.groups {
-        let group_id = group_id_for(artist_root, &group.root_relative);
+        let group_id = stored_ids_by_root
+            .get(&group.root_relative)
+            .cloned()
+            .unwrap_or_else(|| group_id_for(artist_root, &group.root_relative));
         observed.insert(group_id.clone());
 
         // The observation, in the canonical form both sides of the comparison

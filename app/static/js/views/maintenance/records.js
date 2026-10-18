@@ -76,7 +76,7 @@ export async function setRecycleStrategy(strategy) {
     await API.putJson('/api/recycle/settings', { target: strategy });
     toast(strategy === 'system' ? '已切换为飞牛系统回收站' : '已切换为画廊应用回收站', 'success');
   } catch (err) {
-    toast(`设置保存失败: ${err.message || err}`, 'error');
+    toast(t('设置保存失败：{error}', {error: err.message || err}), 'error');
   }
 }
 
@@ -126,19 +126,19 @@ export function renderRecycleStrategy() {
   }
   if (cardTitle) {
     cardTitle.innerHTML = strategy === 'system'
-      ? `${t('当前回收策略：')}<strong>${t('飞牛系统回收站')}</strong>`
-      : `${t('当前回收策略：')}<strong>${t('画廊应用回收站')}</strong>`;
+      ? `<span>${t('当前回收策略：')}</span><strong>${t('飞牛系统回收站')}</strong>`
+      : `<span>${t('当前回收策略：')}</span><strong>${t('画廊应用回收站')}</strong>`;
   }
   if (cardBody) {
     if (strategy === 'system') {
       cardBody.innerHTML = `
-        <div><span class="recycle-strategy-tag-pro">${t('优点：')}</span>${t('与飞牛桌面及手机 App 的系统「回收站」完全打通，支持系统自动清理；受 root 隔离保护，防止外部误改。')}</div>
-        <div><span class="recycle-strategy-tag-con">${t('缺点：')}</span>${t('受权限保护画廊内无法直接预览缩略图；如需恢复文件，请在飞牛系统桌面回收站中操作还原。')}</div>
+        <div><span class="recycle-strategy-tag-pro">${t('优点：')}</span><span>${t('与飞牛桌面及手机 App 的系统「回收站」完全打通，支持系统自动清理；受 root 隔离保护，防止外部误改。')}</span></div>
+        <div><span class="recycle-strategy-tag-con">${t('缺点：')}</span><span>${t('受权限保护画廊内无法直接预览缩略图；如需恢复文件，请在飞牛系统桌面回收站中操作还原。')}</span></div>
       `;
     } else {
       cardBody.innerHTML = `
-        <div><span class="recycle-strategy-tag-pro">${t('优点：')}</span>${t('画廊维护页内完整支持缩略图网格预览；支持在画廊内一键还原并保留画师与标签元数据；支持批量还原。')}</div>
-        <div><span class="recycle-strategy-tag-con">${t('缺点：')}</span>${t('飞牛系统桌面的回收站中不可见；需在画廊维护页面内手动管理清空；占用画廊应用数据空间。')}</div>
+        <div><span class="recycle-strategy-tag-pro">${t('优点：')}</span><span>${t('画廊维护页内完整支持缩略图网格预览；支持在画廊内一键还原并保留画师与标签元数据；支持批量还原。')}</span></div>
+        <div><span class="recycle-strategy-tag-con">${t('缺点：')}</span><span>${t('飞牛系统桌面的回收站中不可见；需在画廊维护页面内手动管理清空；占用画廊应用数据空间。')}</span></div>
       `;
     }
   }
@@ -637,16 +637,17 @@ export async function restoreRecycleEntry(entryId) {
   renderRecycleBin();
   try {
     const result = await API.post(`/api/recycle/${id}/restore`);
+    state.recycleSelectedIds.delete(id);
+    syncRecycleSelectionUi();
     try {
       await refreshCurrentView({reason: 'recycle_restore'});
-    } catch (_) {
-      await Promise.all([
-        loadRecycleBin({render: false}),
-        loadOperationLog({render: false}),
-      ]);
-      renderRecycleBin();
-      renderOperationLog();
-    }
+    } catch (_) {}
+    await Promise.all([
+      loadRecycleBin({render: false}),
+      loadOperationLog({render: false}),
+    ]);
+    renderRecycleBin();
+    renderOperationLog();
     toast(t('文件已恢复到原始路径'), 'success');
   } catch (e) {
     if (e.status === 409 || e.status === 404) await loadRecycleBin();
@@ -671,6 +672,8 @@ export async function purgeRecycleEntry(entryId, options = {}) {
   renderRecycleBin();
   try {
     const result = await API.del(`/api/recycle/${id}${recordOnly ? '?record_only=1' : ''}`);
+    state.recycleSelectedIds.delete(id);
+    syncRecycleSelectionUi();
     // A permanent-delete toast is only honest when the backend reports the file
     // gone; `file_removed: false` means the record went and no file was there to
     // remove, which is still a success but not "彻底删除".
@@ -701,7 +704,7 @@ export async function clearRecycleBin() {
   const clearBtn = $('#recycleClearBtn');
   if (clearBtn) clearBtn.disabled = true;
   try {
-    const result = await API.post('/api/recycle/clear');
+    const result = await API.post('/api/recycle/clear', undefined, {timeoutMs: 300000});
     // Report what the backend actually did: fnOS system-trash entries cannot be
     // removed from here, so they stay listed (and are counted separately), and a
     // failed removal keeps its record instead of vanishing from the UI.

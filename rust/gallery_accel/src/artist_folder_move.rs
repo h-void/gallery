@@ -95,6 +95,18 @@ fn source_prefix(path: &str) -> String {
     path.trim_end_matches(['/', '\\']).to_string()
 }
 
+/// Whether `path` is `root` itself or lies inside it, on a path boundary.
+fn path_is_under_root(path: &str, root: &str) -> bool {
+    let path = normalize_slashes(path);
+    let root = normalize_slashes(root);
+    let root = root.trim_end_matches('/');
+    !root.is_empty()
+        && (path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/')))
+}
+
 fn remap_path(path: &str, source: &str, target: &str) -> Option<String> {
     let path = normalize_slashes(path);
     let source = source_prefix(&normalize_slashes(source));
@@ -467,7 +479,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
 /// whole-artist move: `original_path` and the snapshot's `file_path` both
 /// move from source prefix to target prefix, so a later restore lands inside
 /// the moved tree instead of resurrecting the abandoned source directory.
-fn update_recycle_entries_for_move(
+pub(crate) fn update_recycle_entries_for_move(
     conn: &Connection,
     artist_id: i64,
     source: &str,
@@ -831,29 +843,40 @@ fn apply_artist_move_db_updates(
     // Pair aliases by root index, not by list position: the source and target
     // roots can be declared with different alias counts, and zipping two
     // independent alias lists would pair the wrong virtual root with the target.
-    let source_real = roots.real_root_for(source_text);
-    let target_real = roots.real_root_for(target_text);
+    //
+    // `source_text` is the artist *directory*, not a root, so the owning root has
+    // to be found by containment. Comparing it for equality with each real root
+    // (the old code) never matched a normal artist path: legacy rows stored under
+    // `/picturesN` stayed on the abandoned tree and the next full scan rewrote
+    // them to a path that no longer existed.
     let mut prefixes: Vec<(&str, &str)> = vec![(source_text, target_text)];
     let mut logical_pairs: Vec<(String, String)> = Vec::new();
     for index in 0..roots.roots.len() {
         let Some(real) = roots.real_root_at(index) else {
             continue;
         };
-        if real != source_real {
+        if !path_is_under_root(source_text, real) {
             continue;
         }
-        let alias = roots.roots[index].trim_end_matches(['/', '\\']).to_string();
-        if alias.is_empty() || alias == source_text {
+        let alias_root = roots.roots[index].trim_end_matches(['/', '\\']).to_string();
+        if alias_root.is_empty() {
             continue;
         }
-        // A virtual alias only maps onto the moved tree when this root is the
-        // one that is moving; otherwise the alias keeps pointing at its own root.
-        let target_alias = if target_real == source_real {
-            alias.clone()
+        let Some(alias_source) = remap_path(source_text, real, &alias_root) else {
+            continue;
+        };
+        if alias_source == source_text {
+            continue;
+        }
+        // Same root: the alias keeps naming the root, only the artist suffix
+        // moves. Cross-root move: the alias cannot address the target, so the
+        // real target path is the only correct value.
+        let alias_target = if path_is_under_root(target_text, real) {
+            remap_path(target_text, real, &alias_root).unwrap_or_else(|| target_text.to_string())
         } else {
             target_text.to_string()
         };
-        logical_pairs.push((alias, target_alias));
+        logical_pairs.push((alias_source, alias_target));
     }
     for (logical_source, logical_target) in &logical_pairs {
         prefixes.push((logical_source.as_str(), logical_target.as_str()));
@@ -988,6 +1011,17 @@ fn apply_artist_move_db_updates(
     // Active recycle entries follow the move so a later restore lands in the
     // new directory instead of rebuilding the abandoned source path.
     updated += update_recycle_entries_for_move(&transaction, artist_id, source_text, target_text)?;
+    if table_has_column(&transaction, "folder_rename_plans", "artist_id")? {
+        transaction.execute(
+            "UPDATE folder_rename_plans
+             SET confirmed_at=NULL, confirmation_source='',
+                 status=CASE WHEN status='confirmed' THEN 'ready' ELSE status END,
+                 target_folder=CASE WHEN status='confirmed' THEN '' ELSE target_folder END,
+                 updated_at=strftime('%s','now')
+             WHERE artist_id=? AND status NOT IN ('executed','reverted')",
+            params![artist_id],
+        )?;
+    }
     transaction.commit()?;
     Ok(updated)
 }

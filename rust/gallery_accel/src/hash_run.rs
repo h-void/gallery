@@ -5,6 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,13 @@ use crate::link_index::{is_link_source_file, reindex_scanned_items_links};
 use crate::media_roots::{authorized_media_path, MediaRoots};
 use crate::product_ui::auto_resolve_move_candidates_with_roots;
 use crate::scan_candidates_write::resolve_scan_candidate_response_with_roots;
+
+/// Rotation point for the historical-candidate resolution phase.
+///
+/// That phase selects rows that are already hashed but not yet resolved, and a
+/// row it leaves in `waiting_hash` stays selectable. Without a cursor the
+/// lowest ids were retried on every tick and everything behind them starved.
+static HISTORY_CURSOR: AtomicI64 = AtomicI64::new(0);
 
 /// The queue used to select its batch with
 /// `ORDER BY (hash_status = 'error') ASC, id LIMIT ?`. That expression cannot be
@@ -736,21 +744,38 @@ pub fn run_hash_batch_with_budget(
     // batch). The two phases still share the caller's batch bound.
     let history_limit = (limit / 2).max(1);
     if history_limit > 0 {
-        let ready_ids: Vec<i64> = conn
-            .prepare(
-                "
-                SELECT sc.id FROM scan_candidates sc
-                WHERE sc.status IN ('pending','candidate')
-                  AND sc.hash_status = 'done'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM move_candidates mc
-                      WHERE mc.scan_candidate_id = sc.id AND mc.status = 'pending'
-                  )
-                ORDER BY sc.id LIMIT ?
-                ",
-            )?
-            .query_map(params![history_limit], |row| row.get(0))?
+        // An id cursor, because the set is not self-draining: a candidate that
+        // resolves to `waiting_hash` keeps `status='pending'` and
+        // `hash_status='done'`, so it matches the predicate again next tick. If
+        // it can never be hashed (the same-size missing item is unreadable or
+        // gone, so its hash stays `error`), it held the `ORDER BY id` head slot
+        // forever and every higher id behind it was never resolved.
+        let history_sql = "
+            SELECT sc.id FROM scan_candidates sc
+            WHERE sc.status IN ('pending','candidate')
+              AND sc.hash_status = 'done'
+              AND sc.id > ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM move_candidates mc
+                  WHERE mc.scan_candidate_id = sc.id AND mc.status = 'pending'
+              )
+            ORDER BY sc.id LIMIT ?";
+        let after_id = HISTORY_CURSOR.load(Ordering::Relaxed);
+        let mut ready_ids: Vec<i64> = conn
+            .prepare(history_sql)?
+            .query_map(params![after_id, history_limit], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        if ready_ids.is_empty() && after_id != 0 {
+            // Reached the end: wrap around so a backlog added behind the cursor
+            // is still reached, and the rows skipped this pass get their turn.
+            ready_ids = conn
+                .prepare(history_sql)?
+                .query_map(params![0_i64, history_limit], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+        }
+        if let Some(last) = ready_ids.last() {
+            HISTORY_CURSOR.store(*last, Ordering::Relaxed);
+        }
         for id in ready_ids {
             match resolve_scan_candidate_response_with_roots(conn, roots, id) {
                 Ok(v) => {
@@ -1055,9 +1080,13 @@ fn record_resolution(
     response: &Value,
     link_items: &mut BTreeMap<i64, BTreeSet<i64>>,
 ) -> Result<bool> {
+    // `candidate` means the candidate was parked as a move candidate for a
+    // human to decide — nothing was resolved. It carries no `item_id`, so it
+    // used to fall through to the `else` below and be counted as resolved,
+    // reporting a tick that only queued review rows as progress.
     if matches!(
         response.get("action").and_then(|action| action.as_str()),
-        Some("missing") | Some("waiting_hash") | Some("no_match")
+        Some("missing") | Some("waiting_hash") | Some("no_match") | Some("candidate")
     ) {
         return Ok(false);
     }

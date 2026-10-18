@@ -1141,11 +1141,17 @@ fn backfill_published_local_date(conn: &Connection) -> Result<()> {
     // the missing column keeps those rows on the reader's `created_at`
     // fallback, which is where they already were.
     let source_date = post_source_date_column(conn);
+    // An id cursor, not an offset. Rows the write below refuses — an empty
+    // `published_at`, or a schema whose source column is gone so `source_date`
+    // is the literal `''` — keep `published_local_date = ''` and would be
+    // selected again from the same offset forever. Advancing past the last id
+    // read makes the loop terminate even when an entire batch is unfillable.
     let rows_sql = format!(
         "SELECT p.id, {source_date}, s.service
          FROM kemono_posts p
          JOIN kemono_subscriptions s ON s.id = p.subscription_id
          WHERE p.published_local_date = ''
+           AND p.id > ?2
          ORDER BY p.id ASC
          LIMIT ?1"
     );
@@ -1174,11 +1180,12 @@ fn backfill_published_local_date(conn: &Connection) -> Result<()> {
         }
     }
 
+    let mut after_id = 0_i64;
     loop {
         let rows: Vec<(i64, Option<String>, String)> = {
             let mut stmt = conn.prepare(&rows_sql)?;
             let mapped = stmt
-                .query_map(params![BATCH], |row| {
+                .query_map(params![BATCH, after_id], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1189,6 +1196,7 @@ fn backfill_published_local_date(conn: &Connection) -> Result<()> {
         }
         let filled = rows.len();
         for (id, published_at, service) in rows {
+            after_id = id;
             // A post whose `published_at` is empty keeps an empty derived date:
             // the SQL readers fall back to `created_at` for exactly that case,
             // and writing a value derived from nothing would freeze the wrong
@@ -4797,9 +4805,14 @@ pub fn delete_subscription(conn: &Connection, id: i64) -> Result<bool> {
         // Only subscriptions bound to an artist have a profile link to clean.
         if let (Some(artist_id), service, creator_path) = creator {
             let _ = tx.execute(
+                // `instr`, not `LIKE '%' || ?2 || '%'`: the creator path
+                // (`?2`) is an identifier that may legally contain `%` or
+                // `_`. Bound into a LIKE pattern those are wildcards, so
+                // deleting the subscription for creator `a_b` also deleted the
+                // link for `axb`. `instr` compares the substring literally.
                 "DELETE FROM artist_profile_links
                  WHERE artist_id = ?1 AND kind = 'subscription'
-                   AND (url LIKE '%' || ?2 || '%' OR platform = ?3)",
+                   AND (instr(url, ?2) > 0 OR platform = ?3)",
                 params![artist_id, creator_path, service],
             );
         }

@@ -7,18 +7,25 @@ use serde_json::{json, Value};
 pub fn hash_status_response(conn: &Connection) -> Result<Value> {
     // Product UI expects blake3_available / workers-style fields; native path
     // always has blake3 (crate dependency). Worker knobs come from env for parity.
+    // These mirror what `workers::spawn_hash_loop` actually runs: the batch size
+    // defaults to `MAX_PAGINATION_LIMIT` and is clamped the same way, the
+    // interval is whole seconds, and an unset `HASH_INTERVAL` means the loop is
+    // disabled. The old values (batch 32, interval 1.0, "worker not running")
+    // described a configuration nothing in the process used.
     let workers = std::env::var("HASH_WORKERS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(1);
-    let interval = std::env::var("HASH_INTERVAL")
+    let interval_secs = std::env::var("HASH_INTERVAL")
         .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(1.0);
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0);
+    let interval = interval_secs.map(|seconds| seconds as f64).unwrap_or(0.0);
     let batch_size = std::env::var("HASH_BATCH_SIZE")
         .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(32);
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(crate::MAX_PAGINATION_LIMIT)
+        .clamp(1, crate::MAX_PAGINATION_LIMIT);
     Ok(json!({
         "blake3_available": true,
         "workers": workers,
@@ -26,7 +33,16 @@ pub fn hash_status_response(conn: &Connection) -> Result<Value> {
         "interval": interval,
         "batch_size": batch_size,
         "resolve_batch_size": batch_size,
-        "worker": {"running": false, "note": "in-process hash batches via POST /api/hash/run"},
+        "worker": {
+            // `thread_alive` is what the maintenance UI reads: the status copy
+            // (正在检查 vs 等待检查), the 待判断 panel's short tick, and the
+            // duplicates auto-refresh all key off it, so a missing field kept
+            // every one of them on the idle path while hashing was under way.
+            // `running` stays for callers that already read it.
+            "running": interval_secs.is_some(),
+            "thread_alive": interval_secs.is_some(),
+            "note": "in-process hash batches via POST /api/hash/run",
+        },
         "items": hash_status_counts(conn, "items", "missing=0", false)?,
         "scan_candidates": hash_status_counts(
             conn,

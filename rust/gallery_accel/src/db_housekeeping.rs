@@ -1,3 +1,6 @@
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -31,23 +34,49 @@ pub fn run_housekeeping_batch(
     scan_candidate_cutoff: f64,
     batch_size: i64,
 ) -> Result<HousekeepingResult> {
-    run_housekeeping_batch_with_backup(
+    run_housekeeping_batch_inner(
         conn,
         missing_item_cutoff,
         scan_seen_cutoff,
         scan_candidate_cutoff,
         batch_size,
         &create_housekeeping_db_backup,
+        missing_sweep_due(),
     )
 }
 
-pub fn run_housekeeping_batch_with_backup(
+/// The expired-missing sweep takes a whole online database backup before it
+/// deletes anything, and the hash loop calls this every `HASH_INTERVAL` (30s by
+/// default). A backlog of N expired rows therefore produced ceil(N/10 000)
+/// full copies of a multi-gigabyte database within minutes, keeping
+/// `DB_BACKUP_RETENTION` of them. Throttled to one sweep per hour: the backlog
+/// still drains (24 × batch per day) and the backup count stays bounded.
+const MISSING_SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(3600);
+
+static LAST_MISSING_SWEEP: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn missing_sweep_due() -> bool {
+    let mut last = LAST_MISSING_SWEEP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match *last {
+        Some(at) if at.elapsed() < MISSING_SWEEP_MIN_INTERVAL => false,
+        _ => {
+            *last = Some(Instant::now());
+            true
+        }
+    }
+}
+
+
+fn run_housekeeping_batch_inner(
     conn: &Connection,
     missing_item_cutoff: f64,
     scan_seen_cutoff: f64,
     scan_candidate_cutoff: f64,
     batch_size: i64,
     backup: &dyn Fn(&Connection) -> Result<String>,
+    missing_sweep: bool,
 ) -> Result<HousekeepingResult> {
     let batch_size = batch_size.clamp(1, 50_000);
     // One bounded probe, because this runs on every hash tick. The predicate
@@ -58,7 +87,7 @@ pub fn run_housekeeping_batch_with_backup(
     // as soon as `idx_items_missing_at` finds a row, so an empty backlog costs
     // a lookup and a non-empty one costs one row. `idx_move_candidates_item_status`
     // covers the `NOT EXISTS` subquery, which the delete below repeats.
-    let anything_expired = {
+    let anything_expired = missing_sweep && {
         let mut probe = conn.prepare_cached(
             "SELECT 1 FROM items i
              WHERE i.missing=1
@@ -80,23 +109,30 @@ pub fn run_housekeeping_batch_with_backup(
         );
     }
     let tx = conn.unchecked_transaction()?;
-    let missing_items_deleted = tx.execute(
-        "DELETE FROM items
-         WHERE id IN (
-             SELECT i.id
-             FROM items i
-             WHERE i.missing=1
-               AND i.missing_at IS NOT NULL
-               AND i.missing_at <= ?
-               AND NOT EXISTS (
-                   SELECT 1 FROM move_candidates mc
-                   WHERE mc.item_id=i.id AND mc.status='pending'
-               )
-             ORDER BY i.id
-             LIMIT ?
-         )",
-        params![missing_item_cutoff, batch_size],
-    )?;
+    // The delete is gated on the same flag as the backup: deleting expired rows
+    // without the safety snapshot this function promises would be worse than
+    // waiting for the next throttled sweep.
+    let missing_items_deleted = if missing_sweep {
+        tx.execute(
+            "DELETE FROM items
+             WHERE id IN (
+                 SELECT i.id
+                 FROM items i
+                 WHERE i.missing=1
+                   AND i.missing_at IS NOT NULL
+                   AND i.missing_at <= ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM move_candidates mc
+                       WHERE mc.item_id=i.id AND mc.status='pending'
+                   )
+                 ORDER BY i.id
+                 LIMIT ?
+             )",
+            params![missing_item_cutoff, batch_size],
+        )?
+    } else {
+        0
+    };
     let scan_seen_deleted = tx.execute(
         "DELETE FROM scan_seen
              WHERE id IN (
@@ -116,9 +152,15 @@ pub fn run_housekeeping_batch_with_backup(
                  FROM scan_candidates
                  WHERE status IN ({TERMINAL_SCAN_CANDIDATE_STATUSES})
                    AND COALESCE(resolved_at, created_at) <= ?
+                   -- Only a *pending* candidate move is still owed an answer.
+                   -- Nothing deletes move_candidates rows, so excluding every
+                   -- reference stranded terminal candidates past the 30-day
+                   -- retention forever — the same over-broad predicate
+                   -- hash_run's queue had to narrow.
                    AND NOT EXISTS (
                        SELECT 1 FROM move_candidates mc
                        WHERE mc.scan_candidate_id=scan_candidates.id
+                         AND mc.status='pending'
                    )
                  ORDER BY id
                  LIMIT ?

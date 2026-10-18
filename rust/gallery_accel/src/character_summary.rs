@@ -23,6 +23,23 @@ pub fn character_summary_response(
     model_variant: &str,
     model_file: &str,
 ) -> Result<Value> {
+    let (default_repo, default_variant, default_file) =
+        crate::character_ccip::embedding_model_meta();
+    let model_repo_id = if model_repo_id.trim().is_empty() {
+        default_repo.as_str()
+    } else {
+        model_repo_id
+    };
+    let model_variant = if model_variant.trim().is_empty() {
+        default_variant.as_str()
+    } else {
+        model_variant
+    };
+    let model_file = if model_file.trim().is_empty() {
+        default_file.as_str()
+    } else {
+        model_file
+    };
     let characters =
         list_character_summary_characters(conn, model_repo_id, model_variant, model_file)?;
     let tags = list_character_summary_tags(conn, artist_id, &characters)?;
@@ -148,7 +165,12 @@ fn character_summary_totals(
     let character_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM characters", [], |row| row.get(0))?;
     let candidate_items: i64 = tags.iter().map(|tag| tag.single_tag_image_count).sum();
+    let importable_tags: usize = tags
+        .iter()
+        .filter(|tag| tag.single_tag_image_count > 0)
+        .count();
     Ok(json!({
+        "tags": importable_tags,
         "characters": character_count,
         "references": reference_row.0,
         "current_model_references": reference_row.1,

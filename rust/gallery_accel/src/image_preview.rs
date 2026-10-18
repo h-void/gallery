@@ -284,7 +284,10 @@ fn scan_jpeg_exif_orientation(data: &[u8]) -> ExifScan {
                     None => ExifScan::Missing,
                 };
             }
-            return ExifScan::Missing;
+            // Not EXIF (XMP and some phone/editor writers put their own APP1
+            // first). Keep scanning: returning here skipped a later Exif
+            // segment, so the orientation was never applied and the preview
+            // came out rotated.
         }
         pos = segment_end;
     }
@@ -364,10 +367,14 @@ fn apply_orientation(img: DynamicImage, orientation: u8) -> DynamicImage {
 /// using the same key layout as Python so recognition can reuse thumbs.
 pub fn image_preview_bytes(path: &str, max_edge: u32) -> Result<Vec<u8>> {
     let path = Path::new(path);
-    if let Some(cache) = preview_cache_path_for_source(path, max_edge) {
+    // Derived once and reused for the write below: the key hashes the source's
+    // (mtime, size), so recomputing it after the decode published the pixels we
+    // read under the version key of a file that replaced it in the meantime.
+    let cache = preview_cache_path_for_source(path, max_edge);
+    if let Some(cache) = cache.as_ref() {
         if cache.is_file() {
-            if let Ok(bytes) = std::fs::read(&cache) {
-                if !bytes.is_empty() {
+            if let Ok(bytes) = std::fs::read(cache) {
+                if looks_like_jpeg(&bytes) {
                     return Ok(bytes);
                 }
             }
@@ -385,7 +392,22 @@ pub fn image_preview_bytes(path: &str, max_edge: u32) -> Result<Vec<u8>> {
     if source_limit > 0 && (width as u64) * (height as u64) > source_limit {
         anyhow::bail!("image is too large for preview");
     }
-    let img = image::open(path)
+    // The pixel cap above was measured on a *first* open, and the decode
+    // re-opens the path: a file replaced in between (media roots are
+    // user-writable) would decode with no bound at all. Enforce the ceiling in
+    // the decoder as well — 4 bytes per pixel covers the RGBA8 buffer the
+    // resize path can need for these inputs.
+    let mut decode_reader = image::ImageReader::open(path)
+        .with_context(|| format!("open image for preview: {}", path.display()))?
+        .with_guessed_format()
+        .context("identify image format")?;
+    if source_limit > 0 {
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(source_limit.saturating_mul(4));
+        decode_reader.limits(limits);
+    }
+    let img = decode_reader
+        .decode()
         .with_context(|| format!("decode image for preview: {}", path.display()))?;
 
     let oriented = apply_orientation(img, exif_orientation(path));
@@ -417,8 +439,8 @@ pub fn image_preview_bytes(path: &str, max_edge: u32) -> Result<Vec<u8>> {
             .context("encode jpeg preview")?;
     }
     let bytes = out.into_inner();
-    if let Some(cache) = preview_cache_path_for_source(path, max_edge) {
-        write_preview_cache(&cache, &bytes);
+    if let Some(cache) = cache.as_ref() {
+        write_preview_cache(cache, &bytes);
     }
     Ok(bytes)
 }
@@ -464,10 +486,12 @@ fn cleanup_preview_cache(
         if !entry.file_type().is_file() {
             continue;
         }
-        let extension = entry.path().extension().and_then(|ext| ext.to_str());
-        if extension == Some("part") {
-            // Crash leftovers from interrupted `*.jpg.part` writes never
-            // become cache entries; reclaim them once clearly stale.
+        // Crash leftovers are named `<name>.part-<pid>-<seq>`, so
+        // `extension()` yields `part-<pid>-<seq>` and the old
+        // `extension == Some("part")` test never matched: they were neither
+        // reclaimed nor counted, and the cache could grow past its budget.
+        let part_name = entry.file_name().to_string_lossy().into_owned();
+        if part_name.ends_with(".part") || part_name.contains(".part-") {
             let stale = entry
                 .metadata()
                 .ok()
@@ -480,7 +504,7 @@ fn cleanup_preview_cache(
             }
             continue;
         }
-        if extension != Some("jpg") {
+        if entry.path().extension().and_then(|ext| ext.to_str()) != Some("jpg") {
             continue;
         }
         let metadata = entry.metadata()?;

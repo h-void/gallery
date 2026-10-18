@@ -21,7 +21,7 @@ import {
   renderToolbar, loadItems, loadItemsPreservingDepth, updateDuplicateFilesButton,
   updateScanFolderButton, isDuplicateFilesScopeActive, scrollToItemsTop,
   onViewportLayoutChange, renderLibraryEmptyState, isMobileViewport, syncClearSearch,
-  syncArchiveTriageToggle,
+  syncArchiveTriageToggle, isGlobalSearchActive,
 } from './views/sidebar.js';
 import { renderGrid, bindGridEvents, captureGridScrollAnchor, restoreGridScrollAnchor, isTaggableItem, scheduleJustifiedRelayout, itemsByIdMap } from './views/grid.js';
 import {
@@ -42,63 +42,50 @@ import {
 } from './views/editbar.js';
 import { bindArtistLinks, bindArtistProfileLinks, renderArtistLinks, renderArtistProfileLinks, closeArtistLinksDialog } from './views/links.js';
 import { bindArchiveModal, closeArchiveModal, openBatchArchiveModal, bindBatchArchiveModal, closeBatchArchiveModal, isBatchArchiveExtracting, stopBatchArchiveExtraction } from './views/archive_modal.js';
+import { downloadTemplateInputSelector } from './views/maintenance/shared.js';
+// Maintenance views load lazily: browse-mode startup must not download the
+// maintenance workbench. Every name below forwards through lazy.js.
 import {
   loadMoveWorkbench, refreshActiveMaintenanceView, startMaintenanceAutoRefresh,
-  stopMaintenanceAutoRefresh, scheduleMaintenanceAutoRefresh, setMaintenanceView, syncMaintenanceTabsEdge, handleMaintenanceJump,
-} from './views/maintenance/index.js';
-import {
-  runFolderRenameAllNow, saveMlDownloadSource, retryMlRuntime,
-  loadHealthSummary, setFolderRenameAutoEnabled, startFullScan, backfillItemDimensions, openErrorArtistsDialog, closeErrorArtistsDialog,
-  loadErrorArtistsPage, jumpToErrorArtist,
-} from './views/maintenance/overview.js';
-import { autoResolveMoveCandidates } from './views/maintenance/paths.js';
-import {
-  saveArchiveSettings, refreshArchivePlans, previewArchivePlans, applyArchiveTemplate, syncArchiveRuleDirtyState,
-  scheduleArchiveDraftPreview, switchOrganizeArtist, stepOrganizeArtist,
-  toggleAllArchivePlansConfirmation, executeArchivePlans, invalidateArtistFolderMovePreview,
-  previewArtistFolderMove, executeArtistFolderMove, openDirectoryPicker,
-  closeDirectoryPicker, chooseDirectoryPicker, loadDirectoryPicker, renderDirectoryPicker, toggleArchivePlansFold,
-} from './views/maintenance/organize.js';
-import {
-  rebuildCharacterIndex, importCharacterLibraryReferences, cancelCharacterImportJob,
-  deleteCharacter, deleteCharacterReference, loadCharacterLibrary, renderCharacterLibrary,
+  stopMaintenanceAutoRefresh, scheduleMaintenanceAutoRefresh, setMaintenanceView,
+  syncMaintenanceTabsEdge, handleMaintenanceJump, runFolderRenameAllNow, saveMlDownloadSource,
+  retryMlRuntime, loadHealthSummary, setFolderRenameAutoEnabled, startFullScan, backfillItemDimensions,
+  openErrorArtistsDialog, closeErrorArtistsDialog, loadErrorArtistsPage, jumpToErrorArtist,
+  autoResolveMoveCandidates, saveArchiveSettings, refreshArchivePlans, previewArchivePlans,
+  applyArchiveTemplate, syncArchiveRuleDirtyState, scheduleArchiveDraftPreview, switchOrganizeArtist,
+  stepOrganizeArtist, toggleAllArchivePlansConfirmation, executeArchivePlans,
+  invalidateArtistFolderMovePreview, previewArtistFolderMove, executeArtistFolderMove,
+  openDirectoryPicker, closeDirectoryPicker, chooseDirectoryPicker, loadDirectoryPicker,
+  renderDirectoryPicker, toggleArchivePlansFold, rebuildCharacterIndex,
+  importCharacterLibraryReferences, cancelCharacterImportJob, deleteCharacter,
+  deleteCharacterReference, loadCharacterLibrary, renderCharacterLibrary,
   setCharacterLibraryMobileView, gotoCharacterLibraryPanel, openCharacterReferences,
-  applyCharacterLibraryMobileView,
-  uploadCharacterReference, createCharacter,
-} from './views/maintenance/characters.js';
-import {
-  loadRecycleBin, restoreRecycleEntry, purgeRecycleEntry, clearRecycleBin, setOperationHistoryFilter,
+  applyCharacterLibraryMobileView, uploadCharacterReference, createCharacter, loadRecycleBin,
+  restoreRecycleEntry, purgeRecycleEntry, clearRecycleBin, setOperationHistoryFilter,
   toggleOperationHistoryFold, setRecycleViewMode, toggleRecycleSelection, selectAllRecycleEntries,
   clearRecycleSelection, batchRestoreRecycleEntries, batchPurgeRecycleEntries, setRecycleStrategy,
-} from './views/maintenance/records.js';
-import {
   saveDownloadsSettings, resetDownloadTemplates, addDownloadSubscription, deleteDownloadSubscription,
-  toggleDownloadSubscription, setDownloadSubscriptionMode, startDownloadSync,
-  downloadPostByHand, insertDownloadTemplateToken, rememberDownloadTemplateInput,
-  downloadTemplateInputSelector, toggleDownloadType, openDownloadArtistCombo, closeDownloadArtistCombo,
-  pickDownloadArtist, renderDownloadArtistCombo, moveDownloadArtistComboActive, selectActiveDownloadArtistCombo, markDownloadSettingsDirty,
+  toggleDownloadSubscription, setDownloadSubscriptionMode, startDownloadSync, downloadPostByHand,
+  insertDownloadTemplateToken, rememberDownloadTemplateInput, toggleDownloadType,
+  openDownloadArtistCombo, closeDownloadArtistCombo, pickDownloadArtist, renderDownloadArtistCombo,
+  moveDownloadArtistComboActive, selectActiveDownloadArtistCombo, markDownloadSettingsDirty,
   checkDownloadMissing, refreshDownloadLog, reconcileDownloadLibrary, openDownloadDay,
   checkSubscriptionMissing, reconcileSubscriptionLibrary, renderDownloadArtistFolder,
-  loadMoreDownloadDayPosts, decideDownloadPost, loadDownloadCandidates,
-  bindDownloadCandidate, verifyDownloadPost, stopDownloadPost, importDownloadPost,
-  openDownloadPostFiles, retryDownloadFile, applyDownloadWorksFilter,
-  openNamingMigrationPreview,
-  scheduleDownloadWorksSearch, toggleDownloadWorksSelectAll, clearDownloadWorksSelection,
-  loadMoreDownloadWorks, downloadWorksSelection, downloadWorksNetdiskSelection, downloadWorksPost,
-  toggleDownloadWorkSelection, downloadWorksSelected,
-  openDownloadWorksArtistCombo, closeDownloadWorksArtistCombo,
-  pickDownloadWorksArtist, renderDownloadWorksArtistCombo, moveDownloadWorksArtistComboActive, selectActiveDownloadWorksArtistCombo,
-  jumpToDownloadWorkFolder,
-  deliverPostToNetdisk,
-  renderDownloadsPanel,
-  renderDownloadSubscriptions, toggleDownloadLogFold,
-} from './views/maintenance/downloads.js';
-import {
+  loadMoreDownloadDayPosts, decideDownloadPost, loadDownloadCandidates, bindDownloadCandidate,
+  verifyDownloadPost, stopDownloadPost, importDownloadPost, openDownloadPostFiles, retryDownloadFile,
+  applyDownloadWorksFilter, openNamingMigrationPreview, scheduleDownloadWorksSearch,
+  toggleDownloadWorksSelectAll, clearDownloadWorksSelection, loadMoreDownloadWorks,
+  downloadWorksSelection, downloadWorksNetdiskSelection, downloadWorksPost,
+  toggleDownloadWorkSelection, downloadWorksSelected, openDownloadWorksArtistCombo,
+  closeDownloadWorksArtistCombo, pickDownloadWorksArtist, renderDownloadWorksArtistCombo,
+  moveDownloadWorksArtistComboActive, selectActiveDownloadWorksArtistCombo, jumpToDownloadWorkFolder,
+  deliverPostToNetdisk, renderDownloadsPanel, renderDownloadSubscriptions, toggleDownloadLogFold,
   saveNetdiskSettings, testNetdiskConnection, checkNetdiskPaths, connectNetdisk, disconnectNetdisk,
-  generateNetdiskScript, resetNetdiskPairing, copyNetdiskScript, runNetdiskJobAction, markNetdiskSettingsDirty,
-  resolveNetdiskDispatchPost, submitNetdiskDispatch,
-  setNetdiskJobFilter, toggleNetdiskJobsFold,
-} from './views/maintenance/netdisk.js';
+  generateNetdiskScript, resetNetdiskPairing, copyNetdiskScript, runNetdiskJobAction,
+  markNetdiskSettingsDirty, resolveNetdiskDispatchPost, submitNetdiskDispatch, setNetdiskJobFilter,
+  toggleNetdiskJobsFold, toggleArchivePlanConfirmation, undoArchivePlan, jumpToArchivePlanFolder,
+  annotateArchivePlan,
+} from './views/maintenance/lazy.js';
 import { toggleTheme, setThemeMode } from './views/theme.js';
 
 const DUPLICATES_VIEW_ACTIVE_REFRESH_MS = 10000;
@@ -282,6 +269,14 @@ export async function refreshCurrentView({reason = 'manual'} = {}) {
       state.itemSortExplicit = true;
       syncItemFilterControls();
     }
+    await loadItemsPreservingDepth();
+    if (artistChanged()) return seq;
+    restoreGridScrollAnchor(gridScrollAnchor);
+  } else if (isGlobalSearchActive()) {
+    // A global search renders a grid with no artist selected, so a finished
+    // scan has to reload it too. Without this the 扫描完成 toast fired and the
+    // new or renamed files never appeared until the search changed or the page
+    // was reloaded.
     await loadItemsPreservingDepth();
     if (artistChanged()) return seq;
     restoreGridScrollAnchor(gridScrollAnchor);
@@ -495,6 +490,13 @@ export function bindEvents() {
       state.itemDateFrom = '';
       state.itemDateTo = '';
       saveItemDates('', '');
+      // A range error reported earlier otherwise stays on the inputs: the
+      // fields are cleared here rather than through `applyItemFilterControls`,
+      // so its `setCustomValidity('')` never runs and both stay `:invalid`.
+      for (const id of ['#itemDateFrom', '#itemDateTo']) {
+        const el = $(id);
+        if (el) el.setCustomValidity('');
+      }
       syncItemFilterControls();
       state.selectedIds.clear();
       updateEditBar();
@@ -1172,11 +1174,11 @@ export function bindEvents() {
   }
   const downloadWorksDownloadBtn = $('#downloadWorksDownloadBtn');
   if (downloadWorksDownloadBtn) {
-    downloadWorksDownloadBtn.addEventListener('click', () => downloadWorksSelection(downloadWorksSelected()));
+    downloadWorksDownloadBtn.addEventListener('click', async () => downloadWorksSelection(await downloadWorksSelected()));
   }
   const downloadWorksNetdiskBtn = $('#downloadWorksNetdiskBtn');
   if (downloadWorksNetdiskBtn) {
-    downloadWorksNetdiskBtn.addEventListener('click', () => downloadWorksNetdiskSelection(downloadWorksSelected()));
+    downloadWorksNetdiskBtn.addEventListener('click', async () => downloadWorksNetdiskSelection(await downloadWorksSelected()));
   }
   const recycleRefreshBtn = $('#recycleRefreshBtn');
   if (recycleRefreshBtn) recycleRefreshBtn.addEventListener('click', () => loadRecycleBin());
@@ -1598,7 +1600,11 @@ export function bindEvents() {
       if (!btn || !maintenanceTabs.contains(btn)) return;
       setMaintenanceView(btn.dataset.maintenanceView);
       if (state.mode === 'moves') {
-        refreshActiveMaintenanceView({preserveScroll: true, reason: 'tab'});
+        // `refreshActiveMaintenanceView` rethrows non-abort errors, and every
+        // other call site catches. Without this a failing tab loader surfaced
+        // as an unhandled rejection while the panel silently kept its old
+        // content and the user saw no error at all.
+        refreshActiveMaintenanceView({preserveScroll: true, reason: 'tab'}).catch(() => {});
       }
     });
   }
@@ -1856,11 +1862,16 @@ export function bindEvents() {
   // read as an outside click and slammed the picker shut. Capture the
   // containment verdict first: capture runs before the panel handler.
   let clickInsideEditTagPicker = false;
+  // `Node.contains` throws for a non-node target (a synthetic event, or a
+  // detached text node), and this runs in a capture listener ahead of every
+  // other handler. Compare defensively so one odd event cannot break the whole
+  // click pipeline.
+  const clickWithin = (el, target) => Boolean(el && target && typeof el.contains === 'function' && el.contains(target));
   document.addEventListener('click', e => {
-    clickInsideEditTagPicker = $('#editTagPicker').contains(e.target);
+    clickInsideEditTagPicker = clickWithin($('#editTagPicker'), e.target);
   }, true);
   document.addEventListener('click', e => {
-    if (!clickInsideEditTagPicker && !$('#editTagPicker').contains(e.target)) {
+    if (!clickInsideEditTagPicker && !clickWithin($('#editTagPicker'), e.target)) {
       closeEditTagPicker();
     }
     const artistPicker = $('#artistPicker');
@@ -2089,6 +2100,12 @@ function closeTopmostOverlay() {
       closeArchiveModal();
     } else if (artistLinksDialog.id === 'batchArchiveDialog') {
       closeBatchArchiveModal();
+    } else if (artistLinksDialog.id === 'errorArtistsDialog') {
+      // This dialog shares the class but owns its close routine, which is the
+      // only place that saves `state.errorArtistsScrollTop`. The document
+      // handler preventDefaults Escape, so the dialog's own `cancel` listener
+      // never ran and Escape left a stale scroll offset behind.
+      closeErrorArtistsDialog();
     } else {
       closeArtistLinksDialog(artistLinksDialog);
     }
@@ -2133,7 +2150,4 @@ import { focusArtistPicker, renderArtistDropdown, moveArtistDropdownActive, sele
 import {
   openEditTagPicker, selectFirstEditTagResult, classifyItems, classifyFolder, currentEditArtistId,
 } from './views/editbar.js';
-import {
-  toggleArchivePlanConfirmation, undoArchivePlan, jumpToArchivePlanFolder, annotateArchivePlan,
-} from './views/maintenance/organize.js';
 import { isActionBusy, setActionBusy } from './store.js';

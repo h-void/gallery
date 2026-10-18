@@ -10,6 +10,12 @@ import { refreshCurrentView, applyMode } from '../events.js';
 let currentItemId = null;
 let currentArchiveData = null;
 let archiveDialogOpener = null;
+// Bumped whenever the dialog opens, closes, or re-inspects. The inspect request
+// can take a minute (its own timeout is 120s), so a response for archive A that
+// lands after the user opened B must be dropped: rendering it wrote A's entries
+// and name into B's dialog, and extraction then used B's item id with A's
+// listing on screen.
+let inspectionToken = 0;
 
 export function bindArchiveModal() {
   bindBatchArchiveModal();
@@ -40,7 +46,7 @@ export function bindArchiveModal() {
   if (retryBtn) {
     retryBtn.addEventListener('click', () => {
       const pwd = $('#archivePasswordInput')?.value || '';
-      if (currentItemId) loadArchiveInspection(currentItemId, pwd);
+      if (currentItemId) loadArchiveInspection(currentItemId, pwd, inspectionToken);
     });
   }
 
@@ -50,7 +56,7 @@ export function bindArchiveModal() {
       if (e.key === 'Enter') {
         e.preventDefault();
         const pwd = pwdInput.value || '';
-        if (currentItemId) loadArchiveInspection(currentItemId, pwd);
+        if (currentItemId) loadArchiveInspection(currentItemId, pwd, inspectionToken);
       }
     });
   }
@@ -139,7 +145,8 @@ export function openArchiveModal(itemId, opener = null) {
   if (summary) summary.innerHTML = '';
 
   dialog.showModal();
-  loadArchiveInspection(itemId, '');
+  inspectionToken += 1;
+  loadArchiveInspection(itemId, '', inspectionToken);
 }
 
 export function closeArchiveModal() {
@@ -153,9 +160,12 @@ export function closeArchiveModal() {
   archiveDialogOpener = null;
   currentItemId = null;
   currentArchiveData = null;
+  // Invalidate an inspect request still in flight: its response must not
+  // repopulate a dialog the user has already closed.
+  inspectionToken += 1;
 }
 
-async function loadArchiveInspection(itemId, password = '') {
+async function loadArchiveInspection(itemId, password = '', token = null) {
   const summary = $('#archiveInfoSummary');
   const tree = $('#archiveEntriesTree');
   const pwdRow = $('#archivePasswordRow');
@@ -168,11 +178,15 @@ async function loadArchiveInspection(itemId, password = '') {
     const data = await API.postJson('/api/archives/inspect', {
       item_id: itemId,
       password: password || undefined,
-    });
+    }, {timeoutMs: 120000});
 
+    // A response for another archive, or for a dialog already closed, is not
+    // about what the user is looking at any more.
+    if (token !== null && (token !== inspectionToken || currentItemId !== itemId)) return;
     currentArchiveData = data;
     renderArchiveInspection(data, password);
   } catch (err) {
+    if (token !== null && token !== inspectionToken) return;
     const msg = err.message || String(err);
     if (tree) tree.innerHTML = '';
     if (statusMsg) {
@@ -204,7 +218,7 @@ function renderArchiveInspection(data, currentPassword) {
     if (pwdRow) pwdRow.style.display = 'flex';
     $('#archivePasswordInput')?.focus?.();
     if (summary) {
-      summary.innerHTML = `<div class="archive-meta-line"><b>${escHtml(data.archive_name)}</b> (${t(formatSize(data.archive_size))}) \u00b7 <span>${t('压缩包已加密')}</span></div>`;
+      summary.innerHTML = `<div class="archive-meta-line"><b>${escHtml(data.archive_name)}</b> (${formatSize(data.archive_size)}) \u00b7 <span>${t('压缩包已加密')}</span></div>`;
     }
     if (tree) {
       tree.innerHTML = '<div class="archive-notice">文件名已加密，请输入密码后点击“解锁预览”。</div>';
@@ -414,7 +428,7 @@ async function executeArchiveExtraction() {
       target_mode: targetMode,
       custom_folder_name: customFolderName || undefined,
       recycle_source: recycleSource,
-    });
+    }, {timeoutMs: 600000});
 
     toast(res.recycled_source
       ? t('已解压 {count} 项文件，原压缩包已移入回收站', {count: res.extracted_count || 0})
@@ -636,13 +650,15 @@ export async function executeBatchArchiveExtraction() {
         currentFile: fileName,
       });
 
+      const isLastArchive = i === total - 1;
       try {
         await API.postJson('/api/archives/extract', {
           item_id: archive.id,
           password: password || undefined,
           target_mode: targetMode,
           recycle_source: recycleSource,
-        });
+          skip_scan: !isLastArchive,
+        }, {timeoutMs: 600000});
         succeeded += 1;
       } catch (err) {
         const msg = String(err.message || err);
@@ -651,11 +667,17 @@ export async function executeBatchArchiveExtraction() {
         } else {
           failed += 1;
         }
+        if (isLastArchive && succeeded > 0 && artistId) {
+          await API.post(`/api/scan/folder?artist_id=${encodeURIComponent(artistId)}`).catch(() => {});
+        }
       }
+    }
+    if (batchExtractCancelled && succeeded > 0 && artistId) {
+      await API.post(`/api/scan/folder?artist_id=${encodeURIComponent(artistId)}`).catch(() => {});
     }
   } finally {
     isBatchExtracting = false;
-    if (stopBtn && !state.scanning) stopBtn.style.display = 'none';
+    if (stopBtn && !state.scanRunning) stopBtn.style.display = 'none';
     hideExtractionProgress();
   }
 
@@ -670,6 +692,10 @@ export async function executeBatchArchiveExtraction() {
 
   if (batchExtractCancelled) {
     toast(t('批量解压已停止：已完成 {succeeded} / {total} 个', {succeeded, total}), 'info');
+  } else if (failed > 0 && succeeded === 0 && skippedPwd === 0) {
+    toast(t('批量解压失败：{failed} 个压缩包解压出错', {failed}), 'error');
+  } else if (failed > 0) {
+    toast(t('批量解压完成：成功 {succeeded} 个，失败 {failed} 个', {succeeded, failed}), 'warn');
   } else if (skippedPwd > 0) {
     toast(recycleSource
       ? t('批量解压完成：成功 {succeeded} 个，跳过 {skipped} 个需密码，原文件已移入回收站', {succeeded, skipped: skippedPwd})

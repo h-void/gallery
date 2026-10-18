@@ -1005,8 +1005,18 @@ pub(crate) fn run_scan_inner(
         }))
     })();
 
+    // The trailing `scan_seen` sweep is housekeeping, not part of the scan's
+    // result. Promoting its failure overwrote `phase='complete'` with
+    // `phase='error'`, marked `worker_scan` degraded and made
+    // `run_full_library_scan_claimed` skip the post-scan auto-archive — for a
+    // walk that had already reconciled the whole library.
     let result = match result {
-        Ok(value) => cleanup_scan_seen(conn, &scan_id).map(|_| value),
+        Ok(value) => {
+            if let Err(error) = cleanup_scan_seen(conn, &scan_id) {
+                log_warn!("scan {scan_id}: scan_seen cleanup failed: {error:#}");
+            }
+            Ok(value)
+        }
         Err(err) => {
             let _ = cleanup_scan_seen(conn, &scan_id);
             Err(err)
@@ -2089,6 +2099,10 @@ fn walk_artist(
         .to_string();
     let is_scoped = scan_norm != artist_norm;
 
+    // A failed count must not read as "this artist has no rows": that is
+    // exactly the shape of an artist whose files were all deleted or renamed
+    // away, so the walk would declare itself clean and skip missing
+    // reconciliation, leaving dead `missing=0` rows behind.
     let (db_active, db_missing): (i64, i64) = conn
         .query_row(
             "SELECT COUNT(CASE WHEN COALESCE(missing,0)=0 THEN 1 END),
@@ -2097,7 +2111,7 @@ fn walk_artist(
             params![artist_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .unwrap_or((0, 0));
+        .context("count artist items")?;
 
     let mut new_candidates = 0i64;
     let mut updated = 0i64;
@@ -2112,11 +2126,17 @@ fn walk_artist(
     delete_scan_seen_chunked(conn, None, Some(artist_id))
         .context("clean baseline scan_seen for artist")?;
 
+    // Depth 0 is the scan root itself. `filter_entry` runs for the root too,
+    // so filtering it out when its own name starts with a dot skipped every
+    // descendant: the walk produced no entries, `matched_active` stayed 0, the
+    // run still counted as "clean", and reconciliation marked every item of
+    // that artist missing. Only descendants are filtered.
     for entry in WalkDir::new(scan_root).into_iter().filter_entry(|e| {
-        e.file_name()
-            .to_str()
-            .map(|n| !n.starts_with('.'))
-            .unwrap_or(true)
+        e.depth() == 0
+            || e.file_name()
+                .to_str()
+                .map(|n| !n.starts_with('.'))
+                .unwrap_or(true)
     }) {
         let entry = match entry {
             Ok(entry) => entry,

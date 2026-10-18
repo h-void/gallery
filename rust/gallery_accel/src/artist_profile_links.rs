@@ -90,6 +90,12 @@ pub fn delete_artist_profile_link(
     artist_id: i64,
     link_id: i64,
 ) -> Result<Value> {
+    // An old database without the table has nothing to delete. Running the
+    // DELETE anyway answered 500 ("no such table") where the list endpoint
+    // reports an empty set.
+    if !profile_links_schema_exists(conn)? {
+        return Ok(json!({"deleted": false, "id": link_id}));
+    }
     let deleted = conn.execute(
         "DELETE FROM artist_profile_links WHERE id=? AND artist_id=?",
         params![link_id, artist_id],
@@ -133,7 +139,10 @@ fn normalize_kind(kind: &str) -> Result<&'static str> {
 
 fn normalize_url(value: &str) -> Result<(String, String)> {
     let value = value.trim();
-    if value.is_empty() || value.chars().count() > MAX_URL_CHARS {
+    if value.is_empty() {
+        return Err(anyhow!("URL must not be empty"));
+    }
+    if value.chars().count() > MAX_URL_CHARS {
         return Err(anyhow!(
             "URL must contain at most {MAX_URL_CHARS} characters"
         ));

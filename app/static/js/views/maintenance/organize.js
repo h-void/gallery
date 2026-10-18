@@ -179,7 +179,14 @@ export function renderOrganizeScopeArtist() {
   const scopeArtist = $('#organizeScopeArtist');
   if (scopeArtist) {
     const artist = state.currentArtist;
-    scopeArtist.textContent = artist && artist.name ? String(artist.name) : '未选择画师';
+    const name = artist && artist.name ? String(artist.name) : '';
+    // The artist name is user data, so the i18n auto pass must not rewrite it
+    // (an artist named "All" would show as 全部 in an English session). The
+    // empty-state copy is the app's own text and stays translatable, so the
+    // marker follows the value rather than sitting on the element.
+    scopeArtist.textContent = name || '未选择画师';
+    if (name) scopeArtist.setAttribute('data-i18n-skip', '');
+    else scopeArtist.removeAttribute('data-i18n-skip');
   }
   renderOrganizeArtistSelect();
 }
@@ -195,7 +202,8 @@ export function renderOrganizeArtistSelect() {
 
   const options = [
     '<option value="">选择画师...</option>',
-    ...artists.map(a => `<option value="${Number(a.id)}"${currentId === Number(a.id) ? ' selected' : ''}>${escHtml(a.name || a.path || t('画师 #{id}', {id: a.id}))}</option>`),
+    // `data-i18n-skip`: the option label is the artist name (user data).
+    ...artists.map(a => `<option value="${Number(a.id)}"${currentId === Number(a.id) ? ' selected' : ''} data-i18n-skip>${escHtml(a.name || a.path || t('画师 #{id}', {id: a.id}))}</option>`),
   ];
   select.innerHTML = options.join('');
   if (currentId != null) select.value = String(currentId);
@@ -259,7 +267,9 @@ export function renderArtistFolderMove() {
     : String(rootSelect?.value ?? state.artistFolderMovePreview?.target_root_index ?? '');
   if (rootSelect) {
     rootSelect.innerHTML = state.artistFolderMoveRoots.map(root => (
-      `<option value="${Number(root.index)}">${escHtml(root.label || root.path || t('目录 {index}', {index: +root.index + 1}))}</option>`
+      // Media-root labels are operator data; the `目录 N` fallback is already
+      // translated here, so skipping the auto pass keeps both intact.
+      `<option value="${Number(root.index)}" data-i18n-skip>${escHtml(root.label || root.path || t('目录 {index}', {index: +root.index + 1}))}</option>`
     )).join('');
     if (selectedRoot && state.artistFolderMoveRoots.some(root => String(root.index) === selectedRoot)) {
       rootSelect.value = selectedRoot;
@@ -548,7 +558,7 @@ export async function applyArchiveTemplate() {
     const result = await API.postJson('/api/folder-renames/apply-template', {
       artist_id: artistId,
       profile_id: archiveSelectedProfileId(),
-    });
+    }, {timeoutMs: 120000});
     state.archivePreview = result.preview || result;
     await loadArchiveWorkbench({keepRun: true});
     const updated = Number(result.updated || result.applied || 0);
@@ -613,7 +623,7 @@ export async function refreshArchivePlans() {
   }
   let refreshFailed = false;
   try {
-    await API.post(`/api/folder-renames/refresh?artist_id=${encodeURIComponent(artistId)}`);
+    await API.post(`/api/folder-renames/refresh?artist_id=${encodeURIComponent(artistId)}`, undefined, {timeoutMs: 120000});
   } catch (e) {
     // S8: a failed refresh must be visible; the list below stays as-is.
     if (!isAbortError(e)) refreshFailed = true;
@@ -981,7 +991,7 @@ export async function undoArchivePlan(planId) {
   setActionBusy('archive-plan-undo', String(id), true);
   renderArchiveWorkbench();
   try {
-    const result = await API.post(`/api/folder-renames/plans/${id}/undo`);
+    const result = await API.post(`/api/folder-renames/plans/${id}/undo`, undefined, {timeoutMs: 600000});
     if (result?.ok === false) throw new Error(archiveUndoFailureLabel(result.message || result.reason));
     await Promise.all([
       loadArchiveWorkbench({render: false}),

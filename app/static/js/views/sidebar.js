@@ -2,7 +2,7 @@
 // tree, duplicate-folder warnings, display preferences, item loading with
 // infinite scroll, and the empty-state renderer.
 
-import { API } from '../api.js';
+import { API, scheduleFolderRenamesRefresh } from '../api.js';
 import { state, nextRequestSeq, isCurrentRequestSeq } from '../store.js';
 import {
   $, $$, escHtml, mergeTagsByNameCollator, buttonIcon, searchableTextMatches,
@@ -689,7 +689,7 @@ export function renderDuplicateFolders() {
   $('#duplicateCount').textContent = t('{count}组', {count: groups.length});
   $('#duplicateList').innerHTML = groups.map(group => `
     <div class="duplicate-group">
-      <div class="duplicate-name">${escHtml(group.name)} <span>${group.count}</span></div>
+      <div class="duplicate-name"><span data-i18n-skip>${escHtml(group.name)}</span> <span>${group.count}</span></div>
       ${group.paths.map(path => `
         <button class="duplicate-path" type="button" data-artist-id="${path.id}" title="${escHtml(path.path)}">
           <span>${escHtml(path.display_path || path.path)}</span>
@@ -733,8 +733,11 @@ export function renderSidebar() {
 
   sortSidebarTags(tags).forEach(r => {
     const active = state.activeRole === String(r.id) ? ' active' : '';
+    // `data-i18n-skip`: a character name is user data, so the i18n auto pass
+    // must not rewrite it (a character named 全部 would otherwise show as "All",
+    // exactly like the tag chips on cards).
     html += `<div class="sidebar-item${active}" data-role="${r.id}" role="button" tabindex="0">
-      <span>${escHtml(r.name)}</span><span class="count">${r.count}</span></div>`;
+      <span data-i18n-skip>${escHtml(r.name)}</span><span class="count">${r.count}</span></div>`;
   });
   $('#sidebarList').innerHTML = html || '<div class="sidebar-list-empty sidebar-empty-state">没有角色</div>';
 
@@ -925,11 +928,17 @@ function findFolderNode(node, path) {
 export async function deleteArtistFolder(folder) {
   const artist = state.currentArtist;
   if (!artist || !folder) return;
+  const artistId = artist.id;
+  // 删除可以跑几分钟（请求超时上限 300s）。响应落地前用户可能已切到别的
+  // 画师，与 classifyFolder / archiveCurrentFolder 一样，await 之后的每个
+  // 状态写入都要确认仍在同一画师上下文，否则旧画师的 stats/folders 会盖掉
+  // 新画师的侧栏与文件夹树。
+  const sameArtist = () => state.currentArtist && Number(state.currentArtist.id) === Number(artistId);
   const node = findFolderNode(state.folders, folder);
   const name = node && node.name ? node.name : folder;
   if (!confirm(t('确定将文件夹「{name}」移入回收站吗？文件夹内全部文件会一并移入回收站，可在回收站恢复。', {name}))) return;
   try {
-    const result = await API.postJson('/api/folders/delete', {artist_id: artist.id, folder});
+    const result = await API.postJson('/api/folders/delete', {artist_id: artist.id, folder}, {timeoutMs: 300000});
     const recycled = Number(result.recycled_items || 0) + Number(result.recycled_loose_files || 0);
     const failed = Number(result.failed || 0);
     if (failed > 0) {
@@ -945,16 +954,19 @@ export async function deleteArtistFolder(folder) {
     } else {
       toast(t('文件夹已移入回收站：{count} 个文件', {count: recycled}), 'success');
     }
-    if (state.activeFolder && (state.activeFolder === folder || state.activeFolder.startsWith(`${folder}/`))) {
+    if (sameArtist() && state.activeFolder && (state.activeFolder === folder || state.activeFolder.startsWith(`${folder}/`))) {
       state.activeFolder = null;
     }
+    scheduleFolderRenamesRefresh(artistId);
     const [stats, folders] = await Promise.all([
-      API.get(`/api/artists/${artist.id}/stats`),
-      API.get(`/api/folders?artist_id=${artist.id}`),
+      API.get(`/api/artists/${artistId}/stats`),
+      API.get(`/api/folders?artist_id=${artistId}`),
     ]);
+    if (!sameArtist()) return;
     state.stats = stats;
     state.folders = folders;
     renderSidebar();
+    renderToolbar();
     renderFolderTree();
     syncBrowseUrl('replace');
     loadItems();

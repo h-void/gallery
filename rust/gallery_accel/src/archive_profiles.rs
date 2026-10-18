@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::archive_format::{self, RenderContext};
-use crate::folder_archive::{recompute_artist_plan_targets, validate_relative_folder};
+use crate::folder_archive::{
+    plan_effective_dates_and_tags, recompute_artist_plan_targets, validate_relative_folder,
+};
 use crate::fs_util::safe_canonicalize;
 use crate::media_roots::{path_under_authorized_roots, MediaRoots};
 
@@ -95,7 +97,7 @@ pub fn preview_folder_rename_template(
     plan_ids: Option<&[i64]>,
     profile_id: Option<&str>,
     template: Option<&str>,
-    index_start: Option<usize>,
+    _index_start: Option<usize>,
 ) -> Result<Value> {
     let settings = load(conn)?;
     let artist_path: String =
@@ -157,42 +159,37 @@ pub fn preview_folder_rename_template(
     let mut conflicts = Vec::new();
     let suffix_collisions = profile["collision_strategy"].as_str() == Some("suffix");
     let merge_targets = profile["collision_strategy"].as_str() == Some("merge");
-    let mut index = index_start.unwrap_or(1).max(1);
+    // `{index}` renders from the plan id, exactly like the executor re-renders
+    // it (`folder_archive.rs` passes `id as usize`). A preview that numbered
+    // rows 1, 2, 3… produced a different target for any template containing
+    // `{index}`, so apply-template followed by execute always ended in
+    // `stale_target` and renamed nothing.
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let folder: String = row.get(1)?;
         let title: String = row.get(2)?;
         let mut date: String = row.get(3)?;
         let artist: String = row.get(4)?;
-        let mut tags: Vec<String> = row
-            .get::<_, String>(5)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Vec<i64>>(&raw).ok())
+        let selected_raw = row.get::<_, String>(5).unwrap_or_default();
+        let mut tags: Vec<String> = serde_json::from_str::<Vec<i64>>(&selected_raw)
             .unwrap_or_default()
             .into_iter()
             .filter_map(|id| tag_names.get(&id).cloned())
             .filter(|name: &String| !name.is_empty())
             .collect();
         let plan_status: String = row.get(6)?;
+        if date.is_empty() || tags.is_empty() {
+            let (item_dates, folder_tags) =
+                plan_effective_dates_and_tags(conn, artist_id, &folder, &selected_raw)?;
+            if date.is_empty() && item_dates.len() == 1 {
+                date = item_dates[0].clone();
+            }
+            if tags.is_empty() {
+                tags = folder_tags;
+            }
+        }
         if date.is_empty() {
             date = crate::media_type::extract_date_from_folder(&folder);
-        }
-        if tags.is_empty() {
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT DISTINCT t.name FROM items i
-                 JOIN item_tags it ON it.item_id=i.id JOIN tags t ON t.id=it.tag_id
-                 WHERE i.artist_id=? AND i.folder_name=? AND COALESCE(i.missing, 0)=0
-                 ORDER BY t.name",
-            ) {
-                if let Ok(item_tags) = stmt.query_map(params![artist_id, folder], |r| r.get(0)) {
-                    // The failed prepare above is tolerated because the schema
-                    // may simply not exist yet, which is a real "no tags" answer.
-                    // A *row* that cannot be read is not that: the query ran and
-                    // returned something undecodable, and dropping it would show
-                    // a folder holding fewer tags than it has.
-                    tags = item_tags.collect::<rusqlite::Result<Vec<_>>>()?;
-                }
-            }
         }
         let rendered = match archive_format::render_profile(
             &profile,
@@ -202,7 +199,7 @@ pub fn preview_folder_rename_template(
                 tags,
                 title,
                 folder: folder.clone(),
-                index,
+                index: id as usize,
                 user_id: Some(artist_id.to_string()),
                 id: Some(id.to_string()),
                 ext: None,
@@ -225,7 +222,6 @@ pub fn preview_folder_rename_template(
                     }),
                 }));
                 previews.push(json!({"id": id, "source_folder": folder, "target_folder": "", "tokens": {}, "format_source": source, "status": plan_status, "will_apply": false, "conflicts": [{"code": "render_failed"}], "can_apply": false}));
-                index += 1;
                 continue;
             }
         };
@@ -271,7 +267,6 @@ pub fn preview_folder_rename_template(
             "confirmed" | "executed" | "inconsistent_tags"
         );
         previews.push(json!({"id": id, "source_folder": folder, "target_folder": target, "tokens": rendered.tokens, "format_source": source, "status": plan_status, "will_apply": will_apply, "conflicts": row_conflicts, "can_apply": false}));
-        index += 1;
     }
     let can_apply = conflicts.is_empty();
     for row in &mut previews {

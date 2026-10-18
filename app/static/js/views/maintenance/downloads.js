@@ -69,15 +69,13 @@ export function markDownloadSettingsDirty() {
   state.downloadSettingsDirty = true;
 }
 
-const TEMPLATE_INPUTS = {
-  folder: '#downloadFolderTemplateInput',
-  image: '#downloadImageTemplateInput',
-  attachment: '#downloadAttachmentTemplateInput',
-};
+// The template-input selector map is tiny and must stay eagerly available:
+// browse-mode startup wires the variable chips before any maintenance panel
+// loads. Its definition lives in shared.js and is re-exported here so existing
+// importers keep working unchanged.
+import { downloadTemplateInputSelector, TEMPLATE_INPUTS } from './shared.js';
 
-export function downloadTemplateInputSelector(inputId) {
-  return TEMPLATE_INPUTS[inputId] || '';
-}
+export { downloadTemplateInputSelector };
 
 function downloadTemplateInput(inputId) {
   const selector = downloadTemplateInputSelector(inputId);
@@ -2112,6 +2110,18 @@ export function openDownloadAllWorks() {
 export function toggleDownloadWorkSelection(postId, selected, options = {}) {
   const id = Number(postId);
   if (!Number.isFinite(id)) return;
+  // "All works of this filter" is one statement about the filter, not a set of
+  // ids: the rows on screen may be only the first page. Toggling a row used to
+  // clear the flag and keep the (empty) explicit set, so unticking one row
+  // silently deselected everything. Keep the filter selection until the user
+  // clears the master checkbox, then tick rows.
+  if (state.downloadAllSelectAll) {
+    if (!selected) {
+      toast('已全选当前筛选；如需排除个别作品，请先取消「全选当前筛选」再逐项勾选', 'info');
+    }
+    renderDownloadAllWorks();
+    return;
+  }
   const next = new Set(selectedDownloadWorks());
   const posts = state.downloadAllWorks?.posts || [];
   if (options.shift && state.lastDownloadWorkSelectedId != null && posts.length > 0) {
@@ -2153,6 +2163,15 @@ export function toggleDownloadWorksSelectAll(selected) {
     const loaded = state.downloadAllWorks?.posts?.length || 0;
     if (!loaded) {
       toast('当前筛选下没有可选择的作品', 'warn');
+      return;
+    }
+    // Selecting "all of this filter" with no filter means "every work in the
+    // library", which `downloadWorksSelection` refuses on purpose (an
+    // accidental click must not queue the whole library). Offer the two real
+    // ways to proceed instead of showing a selection the download button then
+    // rejects.
+    if (!downloadWorksFilterActive()) {
+      toast('先按画师、日期、状态筛选，或逐项勾选作品', 'warn');
       return;
     }
     state.downloadAllSelectAll = true;
@@ -2308,6 +2327,7 @@ export async function deliverPostToNetdisk(postId, options = {}) {
   if (!options.force && isActionBusy('netdisk-deliver', busyKey)) return null;
   if (!(await ensureNetdiskDispatchReady())) return null;
   setActionBusy('netdisk-deliver', busyKey, true);
+  let willRetry = false;
   try {
     const payload = { post_id: id, ...options };
     const res = await API.postJson('/api/netdisk/jobs', payload);
@@ -2321,14 +2341,22 @@ export async function deliverPostToNetdisk(postId, options = {}) {
     return res;
   } catch (err) {
     const retryResult = confirmNetdiskForceRetry(err, () => {
-      setActionBusy('netdisk-deliver', busyKey, false);
       return deliverPostToNetdisk(id, { ...options, force: true });
     });
-    if (retryResult !== undefined) return retryResult;
+    if (retryResult !== undefined) {
+      // Three-valued helper: undefined = not a 409, null = the operator
+      // declined the retry, Promise = a retry is running. Only a running retry
+      // keeps the busy key (the nested call owns and releases it); declining
+      // must release it here, or the row's button stays dead until a reload.
+      willRetry = Boolean(retryResult);
+      return retryResult;
+    }
     toast('投递网盘失败：' + (err.message || err), 'error');
     return null;
   } finally {
-    setActionBusy('netdisk-deliver', busyKey, false);
+    if (!willRetry) {
+      setActionBusy('netdisk-deliver', busyKey, false);
+    }
   }
 }
 
@@ -2687,6 +2715,10 @@ export async function downloadWorksNetdiskSelection(frozen) {
 // while a folder archive operation is in progress.
 
 let namingMigration = {workKey: null, preview: null, selected: -1};
+// The preview read is per work and can be slow. Without a generation counter a
+// late response for work A rewrote the dialog the user had already reopened for
+// work B, and "应用共享规则" then applied A's templates.
+let namingMigrationRequestSeq = 0;
 
 export function namingMigrationPreviewHtml(preview, selected) {
   const rows = (preview?.previews || []).map((row, i) => {
@@ -2756,18 +2788,22 @@ export function closeNamingMigration() {
   const dialog = $('#namingMigrationDialog');
   if (dialog && typeof dialog.close === 'function' && dialog.open) dialog.close();
   namingMigration = {workKey: null, preview: null, selected: -1};
+  namingMigrationRequestSeq += 1;
 }
 
 export async function openNamingMigrationPreview(postId) {
   const workKey = Number(postId);
   if (!Number.isFinite(workKey)) return null;
   const dialog = namingMigrationDialog();
+  const requestSeq = ++namingMigrationRequestSeq;
   namingMigration = {workKey, preview: null, selected: -1};
   dialog.innerHTML = `<div class="naming-migration-body">${t('读取中')}</div>`;
   bindNamingMigrationDialog(dialog);
   if (typeof dialog.showModal === 'function' && !dialog.open) dialog.showModal();
   try {
     const result = await API.get(`/api/pawchive/naming/preview?work_key=${workKey}`);
+    // Closed, or reopened for another work, while this read was in flight.
+    if (requestSeq !== namingMigrationRequestSeq) return null;
     const preview = result?.preview || {};
     namingMigration.preview = preview;
     // No preselection: picking the rule source is the decision this dialog
@@ -2776,6 +2812,7 @@ export async function openNamingMigrationPreview(postId) {
     bindNamingMigrationDialog(dialog);
     return preview;
   } catch (error) {
+    if (requestSeq !== namingMigrationRequestSeq) return null;
     toast(t('命名预览失败：{detail}', {detail: String(error.message || error)}), 'error');
     closeNamingMigration();
     return null;

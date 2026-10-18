@@ -215,7 +215,12 @@ fn items_page_query_response_inner(
     cursor: Option<&ItemCursor>,
     cursor_mode: bool,
 ) -> Result<Value> {
-    let page_limit = limit.unwrap_or(DEFAULT_LIMIT);
+    // Clamped here as well as at the route: `LIMIT` is a raw i64 in SQL, and a
+    // negative one means "no limit" — an unclamped caller could pull the whole
+    // table in one response (and `page_limit + 1` would overflow at i64::MAX).
+    let page_limit = limit
+        .unwrap_or(DEFAULT_LIMIT)
+        .clamp(1, crate::MAX_PAGINATION_LIMIT);
     let page_offset = if cursor_mode {
         0
     } else {
@@ -239,14 +244,39 @@ fn items_page_query_response_inner(
         inbox,
         cursor,
     )?;
+    // The count is the size of the filtered set, not of the page's remainder.
+    // `item_page_where` ANDs the cursor predicate in after everything else, so
+    // reusing `where_sql` here made `total` the number of rows *after* the
+    // cursor: it shrank with every page and disagreed with the offset mode,
+    // where the same field is the whole filtered count. The two modes have to
+    // answer the same question, or a client that reads `total` in one and then
+    // the other gets two different numbers for one search.
+    let (count_sql, count_params) = item_page_where(
+        conn,
+        artist_id,
+        media_type,
+        folder,
+        date_from,
+        date_to,
+        image_only,
+        untagged,
+        tag_id,
+        duplicates_only,
+        tag_names,
+        search,
+        search_tags_only,
+        favorite_only,
+        inbox,
+        None,
+    )?;
     let total = conn.query_row(
-        &format!("SELECT COUNT(*) FROM items i WHERE {where_sql}"),
-        params_from_iter(params.iter()),
+        &format!("SELECT COUNT(*) FROM items i WHERE {count_sql}"),
+        params_from_iter(count_params.iter()),
         |row| row.get::<_, i64>(0),
     )?;
     let mut page_params = params;
     page_params.push(SqlValue::Integer(if cursor_mode {
-        page_limit + 1
+        page_limit.saturating_add(1)
     } else {
         page_limit
     }));

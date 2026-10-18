@@ -3131,7 +3131,14 @@ body.mode-browse .toolbar{
 .batch-archive-scope-toggle{display:flex;flex-wrap:wrap;gap:12px;padding:8px 12px;background:var(--bg-raised);border-radius:var(--radius-sm);border:1px solid var(--border-subtle)}
 .batch-archive-password-wrap{display:flex;flex-direction:column;gap:6px;margin:4px 0}
 .batch-archive-password-wrap span{font-size:var(--fs-small);color:var(--text-2)}
-.batch-archive-password-wrap input{width:100%;max-width:320px}
+.batch-archive-password-wrap input{
+  width:100%;max-width:340px;height:var(--control-height);min-height:var(--control-height);
+  box-sizing:border-box;padding:0 10px;
+  border:1px solid var(--border-subtle);border-radius:var(--radius);
+  background:var(--bg-canvas);color:var(--text-1);font:inherit;font-size:var(--fs-small);outline:none;
+}
+.batch-archive-password-wrap input:focus{border-color:var(--accent);box-shadow:var(--focus-ring)}
+.archive-radio-label input,.archive-checkbox-label input{accent-color:var(--vermilion)}
 
 
 /* Maintenance panel layout polish: clean collapsible headers, scope bar & section dividers */
@@ -3156,7 +3163,11 @@ body.mode-browse .toolbar{
 .netdisk-panel > .maintenance-section-head .move-section-title,
 .download-template-panel > .maintenance-section-head .move-section-title,
 .download-works-panel > .maintenance-section-head .move-section-title,
-.download-log-panel > .maintenance-section-head .move-section-title{
+.download-log-panel > .maintenance-section-head .move-section-title,
+.character-library-panel > .maintenance-section-head .move-section-title,
+.recycle-bin-panel > .maintenance-section-head .move-section-title,
+.operation-log-panel > .maintenance-section-head .move-section-title,
+.archive-workbench-panel > .archive-plan-head .operation-log-title{
   display:none;
 }
 .download-subscription-panel > .maintenance-section-head .health-subtitle,
@@ -3164,7 +3175,10 @@ body.mode-browse .toolbar{
 .netdisk-panel > .maintenance-section-head .health-subtitle,
 .download-template-panel > .maintenance-section-head .health-subtitle,
 .download-works-panel > .maintenance-section-head .health-subtitle,
-.download-log-panel > .maintenance-section-head .health-subtitle{
+.download-log-panel > .maintenance-section-head .health-subtitle,
+.character-library-panel > .maintenance-section-head .health-subtitle,
+.recycle-bin-panel > .maintenance-section-head .health-subtitle,
+.operation-log-panel > .maintenance-section-head .health-subtitle{
   margin-top:0;
 }
 .organize-scope-head{
@@ -3254,4 +3268,33 @@ body.mode-browse .toolbar{
   height:22px;min-height:22px;padding:0 7px;
   font-size:var(--fs-micro);font-weight:600;font-variant-numeric:tabular-nums;
   border-radius:var(--radius-pill);background:var(--accent-soft);color:var(--vermilion-deep);
+}
+
+/* Typography & layout polish: sidebar date fit, 1440px single-row toolbar, ML runtime inset card */
+.item-filter-dates{gap:6px}
+.item-filter-dates input[type="date"]{padding:0 6px;font-size:var(--fs-micro)}
+.item-filter-dates input[type="date"]::-webkit-calendar-picker-indicator{margin-left:2px;padding:0;cursor:pointer;opacity:.65}
+.btn-ops:disabled,.btn-soft-primary:disabled{border-color:var(--border-subtle);background:var(--bg-canvas)}
+.maintenance-advanced-collapsible > details > summary .ml-runtime-summary-status{margin-left:auto;margin-right:6px}
+.ml-runtime-detail .maintenance-advanced-detail{
+  border:1px solid var(--border-subtle);border-radius:var(--radius);
+  background:var(--bg-canvas);overflow:hidden;
+}
+.ml-runtime-detail .maintenance-advanced-detail > summary{
+  padding:9px 12px;font-size:var(--fs-small);color:var(--text-2);
+  display:flex;align-items:center;justify-content:space-between;
+}
+.ml-runtime-detail .maintenance-advanced-detail > summary::after{float:none;font-size:var(--fs-small)}
+.ml-runtime-detail .maintenance-advanced-detail[open] > summary{border-bottom:1px solid var(--border-subtle)}
+.ml-runtime-detail .maintenance-advanced-detail > .maintenance-advanced-hint{
+  display:block;padding:10px 12px 4px;
+}
+.ml-runtime-detail .maintenance-advanced-detail > .ml-runtime-status{
+  padding:4px 12px 10px;
+}
+.artist-links-summary{flex-shrink:0}
+@media(min-width:769px) and (max-width:1600px){
+  .toolbar .media-filter-select{min-width:104px}
+  .toolbar #extractArtistArchivesBtn{padding:0 10px}
+  .toolbar .artist-links-launcher .artist-links-entry{flex-basis:176px;width:176px;padding:0 10px}
 }

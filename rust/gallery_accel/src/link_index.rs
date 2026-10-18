@@ -913,9 +913,18 @@ fn extract_html_links(text: &str) -> Vec<ExtractedLink> {
         let close_start = if self_closing {
             tag_end + 1
         } else {
-            find_ascii_case_insensitive(&text[tag_end + 1..], "</a")
-                .map(|offset| tag_end + 1 + offset)
-                .unwrap_or(tag_end + 1)
+            // Bound the search at the next opening `<a`: an unclosed anchor
+            // otherwise took the next `</a>` anywhere in the document as its
+            // close, and `cursor` then jumped past it, so every anchor in
+            // between was never parsed and its href silently vanished from the
+            // index.
+            let rest = &text[tag_end + 1..];
+            let close_rel = find_ascii_case_insensitive(rest, "</a");
+            let next_open_rel = find_ascii_case_insensitive(rest, "<a");
+            match close_rel {
+                Some(close) if next_open_rel.is_none_or(|next| close < next) => tag_end + 1 + close,
+                _ => tag_end + 1,
+            }
         };
         let label = if close_start > tag_end + 1 {
             compact_text(

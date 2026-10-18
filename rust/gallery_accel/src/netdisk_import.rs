@@ -40,10 +40,18 @@ pub fn import_error(conn: &Connection, task_id: &str) -> Result<Option<String>> 
         .flatten())
 }
 
+/// `(delivered, total)` for one task.
+///
+/// `item_id` is deliberately not part of the predicate. A package routinely
+/// carries a file the scanner has no media type for (PDF, ISO, …); such a file
+/// can never gain an `items` row, so requiring one kept the task one short of
+/// `total` forever — it retried until the queue dropped it and left its staging
+/// copy behind. Those rows keep `item_id` NULL, so "delivered" and "indexed"
+/// stay distinguishable.
 pub fn task_import_state(conn: &Connection, task: &BridgeTask) -> Result<(i64, i64)> {
     let linked: i64 = conn.query_row(
         "SELECT COUNT(*) FROM download_publish_jobs WHERE engine='netdisk'
-         AND source_job_id=?1 AND manifest_version=?2 AND stage='ingested' AND item_id IS NOT NULL",
+         AND source_job_id=?1 AND manifest_version=?2 AND stage='ingested'",
         params![task.task_id, task.manifest_version],
         |r| r.get(0),
     )?;
@@ -78,7 +86,13 @@ pub fn pending_auto_imports(conn: &Connection, bridge_id: &str) -> Result<Vec<St
             )
             OR (
                 COALESCE(json_array_length(t.expected), 0) > 0
-                AND (SELECT COUNT(*) FROM download_publish_jobs WHERE engine='netdisk' AND source_job_id=t.task_id AND manifest_version=t.manifest_version AND stage='ingested' AND item_id IS NOT NULL) < json_array_length(t.expected)
+                -- Delivered, not indexed: a file the scanner has no media
+                -- type for is recorded with stage='ingested' and item_id NULL,
+                -- and task_import_state counts it as done. Requiring item_id
+                -- here made that same task both complete and pending, so its
+                -- completion reset retry_count and it re-entered this queue
+                -- forever.
+                AND (SELECT COUNT(*) FROM download_publish_jobs WHERE engine='netdisk' AND source_job_id=t.task_id AND manifest_version=t.manifest_version AND stage='ingested') < json_array_length(t.expected)
                 AND (
                     s.error = ''
                     AND COALESCE(s.retry_count, 0) < 5
@@ -585,7 +599,21 @@ pub(crate) fn index_published_files(
                 item = response.get("item_id").and_then(|v| v.as_i64());
             }
         }
-        let item = item.ok_or_else(|| anyhow!("文件已归位，等待媒体索引：{target}"))?;
+        let Some(item) = item else {
+            // A file the scanner has no media type for (PDF, ISO, …) can never
+            // gain an `items` row. Record the handoff and keep going with the
+            // rest of the batch; bailing here aborted every later file in the
+            // same task and left it stuck at 待入库 forever.
+            let name = path
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if crate::media_type::media_type_for_file(&name).is_none() {
+                crate::ingest_publish::mark_job_delivered_unindexed(conn, job_id)?;
+                continue;
+            }
+            bail!("文件已归位，等待媒体索引：{target}");
+        };
         mark_job_ingested(conn, job_id, item)?;
     }
     Ok(())
@@ -634,9 +662,14 @@ pub fn cleanup_imported_task(
 
     // 3. Query all successfully ingested files for this task.
     let mut stmt = conn.prepare(
+        // Delivered rows include the ones marked ingested without an item row
+        // (a PDF/ISO the scanner cannot index): their staging copy was still
+        // copied into the library, so it must be cleaned up too. The checks
+        // below verify the source is under the staging directory and differs
+        // from the published target, which is what actually keeps this safe.
         "SELECT source_identity, target_path FROM download_publish_jobs
          WHERE engine='netdisk' AND source_job_id=?1 AND manifest_version=?2
-           AND stage='ingested' AND item_id IS NOT NULL",
+           AND stage='ingested'",
     )?;
     let jobs = stmt
         .query_map(params![task.task_id, task.manifest_version], |row| {

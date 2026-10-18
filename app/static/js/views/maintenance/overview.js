@@ -89,7 +89,9 @@ async function pollDimensionBackfillStatus() {
         failed: Number(status.failed || 0),
         remaining: Number(status.remaining || 0),
         complete: Boolean(status.complete),
-        first_error: status.first_error || '',
+        // The backend publishes the error text as `error`; `first_error` never
+        // existed, so this diagnostic field was always an empty string.
+        first_error: status.first_error || status.error || '',
       });
       if (status.error) toast('媒体尺寸补全失败', 'error');
       else if (status.complete) {
@@ -476,7 +478,7 @@ export async function setFolderRenameAutoEnabled(enabled) {
 
 export async function runFolderRenameAllNow() {
   if (isActionBusy('archive-run-all')) return;
-  const confirmed = window.confirm('确定立即整理所有画师吗？\n系统会先备份数据库，并重新检查所有待整理项及之前的失败项。');
+  const confirmed = window.confirm(t('确定立即整理所有画师吗？\n系统会先备份数据库，并重新检查所有待整理项及之前的失败项。'));
   logUiAction('archive_run_all_confirm', {confirmed});
   if (!confirmed) return;
   setActionBusy('archive-run-all', '', true);

@@ -135,6 +135,10 @@ function selectedMediaItemsForDelete() {
 
 function resetEditDeleteSelectedButton(btn = $('#editDeleteSelectedBtn')) {
   if (!btn) return;
+  // 批量删除期间任何选择变化都会走到这里；把按钮恢复成可点的「删除所选」
+  // 只会让下一次点击被 isActionBusy 静默吞掉。忙碌中保持忙碌，由 finally
+  // 在 setActionBusy(..., false) 之后复位。
+  if (isActionBusy('edit-delete-selected')) return;
   btn.disabled = false;
   btn.classList.remove('deleting');
   btn.textContent = '删除所选';
@@ -181,6 +185,21 @@ export async function deleteSelectedMediaItems() {
       renderSidebar();
       renderToolbar();
       renderGrid();
+      const aid = state.currentArtist?.id;
+      if (aid) {
+        Promise.all([
+          API.get(`/api/artists/${aid}/stats`),
+          API.get(`/api/folders?artist_id=${aid}`),
+        ]).then(([stats, folders]) => {
+          if (state.currentArtist && Number(state.currentArtist.id) === Number(aid)) {
+            if (stats) state.stats = stats;
+            if (folders) state.folders = folders;
+            renderSidebar();
+            renderToolbar();
+            renderFolderTree();
+          }
+        }).catch(() => {});
+      }
     }
     applySelectionChange([], {reason: 'delete_selected', log: false});
     logUiAction('edit_delete_selected_result', {
@@ -196,8 +215,8 @@ export async function deleteSelectedMediaItems() {
       toast(t('已成功将 {count} 项移入回收站', {count: deletedItemIds.length}), 'success');
     }
   } finally {
-    resetEditDeleteSelectedButton(btn);
     setActionBusy('edit-delete-selected', '', false);
+    resetEditDeleteSelectedButton(btn);
   }
 }
 
@@ -408,6 +427,15 @@ export async function applyItemDateBatch(manualDate) {
     });
     toast(manualDate ? t('已设置日期 {manualDate}（{updated} 项）', {manualDate, updated: result.updated}) : t('已恢复检测日期（{updated} 项）', {updated: result.updated}), 'success');
     renderEditDateControl();
+    if (state.currentArtist && Number(state.currentArtist.id) === Number(artistId)) {
+      API.get(`/api/artists/${artistId}/stats`).then(stats => {
+        if (state.currentArtist && Number(state.currentArtist.id) === Number(artistId) && stats) {
+          state.stats = stats;
+          renderSidebar();
+          renderToolbar();
+        }
+      }).catch(() => {});
+    }
     await loadItemsPreservingDepth();
     restoreGridScrollAnchor(gridScrollAnchor);
     scheduleFolderRenamesRefresh(artistId);
@@ -431,9 +459,10 @@ export async function applyItemDateBatch(manualDate) {
   }
 }
 
-// Late import that closes the editbar <-> organize cycle; applyItemDateBatch
-// only refreshes an open workbench after a successful date write.
-import { loadArchiveWorkbench } from './maintenance/organize.js';
+// Lazy import through the maintenance facade: applyItemDateBatch only refreshes
+// an open workbench after a successful date write, and the facade keeps the
+// organize module out of the browse bundle until then.
+import { loadArchiveWorkbench } from './maintenance/lazy.js';
 
 function tagMatchesEditQuery(tag, query) {
   const needle = (query || '').trim();
@@ -442,8 +471,10 @@ function tagMatchesEditQuery(tag, query) {
   return searchableTextMatches(query, tag.name, tag.search_text);
 }
 
+// 角色名是大小写敏感的身份（`tags.name` 全程按 BINARY 比较）：`Swim` 与
+// `swim` 是两个名字，所以名称键只做 trim，不做小写化。
 function tagNameKey(name) {
-  return (name || '').trim().toLowerCase();
+  return (name || '').trim();
 }
 
 function numericTagId(value) {
@@ -1059,9 +1090,11 @@ function pruneSelectedEditTags() {
 }
 
 function exactEditTagMatch(query) {
-  const q = (query || '').trim().toLowerCase();
+  // 精确匹配即身份匹配：大小写不同就不是同一个角色，输入 `swim` 不能命中
+  // 已有的 `Swim`（那会悄悄用错标签），而是作为待创建角色处理。
+  const q = (query || '').trim();
   if (!q) return null;
-  return editAvailableTags().find(tag => (tag.name || '').trim().toLowerCase() === q) || null;
+  return editAvailableTags().find(tag => (tag.name || '').trim() === q) || null;
 }
 
 function selectedEditTagNameKeys() {
@@ -1264,7 +1297,15 @@ function toggleEditTagSelection(tagId, tagName = '') {
     selected_count: state.selectedIds.size,
     artist_ids: selectedEditArtistIds(),
   });
+  // 点选行即消费输入框文本，与 selectEditTag / addVirtualEditTag 一致：
+  // 残留查询（点「锦木千束」建议后剩下的「锦」）不能作为待创建角色
+  // 在点击应用时被静默一并提交。
+  clearEditTagQuery();
   renderEditTagPicker();
+  // 被消费查询的搜索结果要一起换掉：全局/角色库列表仍是「锦」的命中，
+  // 而空查询下 tagMatchesEditQuery 全通过，旧结果会一直挂在「其他角色」，
+  // 直到输入框重新获得焦点才刷新。回车路径经 openEditTagPicker 已经如此。
+  loadGlobalEditTagResults('');
   ensureEditTagContext();
 }
 
@@ -1346,7 +1387,7 @@ async function createOrSelectEditTag(name = '') {
   }
   const artistId = currentEditArtistId();
   if (!artistId) return addVirtualEditTag(tagName);
-  const busyId = tagName.toLowerCase();
+  const busyId = tagName;
   if (isActionBusy('edit-create-tag', busyId)) return null;
   setActionBusy('edit-create-tag', busyId, true);
   // Both awaits below must not clobber a different artist's tag list when
@@ -1989,7 +2030,7 @@ export async function executeBundleSelectedItems(targetFolder) {
       artist_id: artist.id,
       item_ids: [...state.selectedIds],
       target_folder: trimmedTarget,
-    });
+    }, {timeoutMs: 300000});
     if (!artistRequestIsCurrent()) return;
     const moved = Number(res?.moved_count ?? 0);
     const unmoved = selectedCount - moved;

@@ -561,7 +561,7 @@ export async function generateNetdiskScript() {
 
 export async function resetNetdiskPairing() {
   if (isActionBusy('netdiskResetPairing') || isActionBusy('netdiskScript')) return;
-  if (!window.confirm('重置配对？旧脚本将失效，需要在 JD 中替换连接脚本。')) return;
+  if (!window.confirm(t('重置配对？旧脚本将失效，需要在 JD 中替换连接脚本。'))) return;
   setActionBusy('netdiskResetPairing', '', true);
   renderNetdiskPanel();
   try {
@@ -738,6 +738,9 @@ export async function submitNetdiskDispatch() {
       if (submitBtn) submitBtn.disabled = false;
       return null;
     }
+    // Set when a 409 confirmation started a forced retry: that nested call owns
+    // the busy key and the button, so this frame must not release them.
+    let retried = false;
     try {
       const res = await API.postJson('/api/netdisk/jobs', { ...payload, ...extra });
       if (res.auto_start) {
@@ -757,12 +760,20 @@ export async function submitNetdiskDispatch() {
       return res;
     } catch (err) {
       const retryResult = confirmNetdiskForceRetry(err, () => doSubmit({ force: true }));
-      if (retryResult !== undefined) return retryResult;
+      if (retryResult !== undefined) {
+        // null means the operator declined the retry: release normally. A
+        // Promise means the forced submit is still in flight, so the outer
+        // finally must leave the busy key and the disabled button to it.
+        retried = Boolean(retryResult);
+        return retryResult;
+      }
       toast('投递失败：' + (err.message || err), 'error');
       return null;
     } finally {
-      setActionBusy('netdiskDispatchSubmit', '', false);
-      if (submitBtn) submitBtn.disabled = false;
+      if (!retried) {
+        setActionBusy('netdiskDispatchSubmit', '', false);
+        if (submitBtn) submitBtn.disabled = false;
+      }
     }
   }
 
@@ -771,7 +782,7 @@ export async function submitNetdiskDispatch() {
 
 export function confirmNetdiskForceRetry(err, onRetry) {
   if (err && (err.status === 409 || err.message?.includes('409') || err.message?.includes('已有活跃投递任务') || err.message?.includes('进行中'))) {
-    const retry = window.confirm('该作品已有投递任务正在进行中，是否重新投递？');
+    const retry = window.confirm(t('该作品已有投递任务正在进行中，是否重新投递？'));
     if (retry && typeof onRetry === 'function') {
       return onRetry();
     }

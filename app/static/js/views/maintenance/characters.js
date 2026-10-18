@@ -207,7 +207,7 @@ function characterLibrarySummaryText(library) {
     `${t('{totals} 张参考图', {totals: totals.references || 0})}`,
   ];
   if (status.available === false) {
-    parts.push(status.reason || '角色识别未启用');
+    parts.push(t(status.reason || '角色识别未启用'));
   } else if (status.backend) {
     parts.push(status.backend);
   }
@@ -235,12 +235,14 @@ function characterIdFromImportResult(result) {
 }
 
 function characterImportFailureText(result) {
-  const firstReason = result && result.first_failure_reason ? String(result.first_failure_reason) : '';
+  const firstReason = result && (result.first_failure_reason || result.reason)
+    ? String(result.first_failure_reason || result.reason)
+    : '';
   const failures = result && Array.isArray(result.failures) ? result.failures : [];
   const failureReasons = failures
     .map(failure => failure && (failure.reason || failure.error || failure.message))
     .filter(Boolean);
-  const reason = firstReason || failureReasons[0] || '未返回失败原因';
+  const reason = t(firstReason || failureReasons[0] || '未返回失败原因');
   return `${t('导入失败：{reason}', {reason: reason})}`;
 }
 
@@ -259,7 +261,7 @@ function characterImportJobSummary(job) {
     cancelled: '已取消',
   };
   return joinUiMeta([
-    labels[job.status] || job.status || '导入任务',
+    t(labels[job.status] || job.status || '导入任务'),
     `${job.processed || 0} / ${job.total || 0}`,
     `${t('新增 {job}', {job: job.added || job.added_references || 0})}`,
     `${t('跳过 {job}', {job: job.skipped_existing || job.skipped_existing_references || 0})}`,
@@ -275,7 +277,7 @@ function characterImportJobMarkup(job) {
   const pct = total > 0 ? Math.min(100, Math.round(processed / total * 100)) : 0;
   const busy = ['pending', 'running'].includes(job.status);
   const failures = Array.isArray(job.failures) ? job.failures : [];
-  const failureText = job.first_failure_reason || (failures[0] && (failures[0].reason || failures[0].message)) || '';
+  const failureText = job.first_failure_reason || (failures[0] && (failures[0].reason || failures[0].error || failures[0].message)) || '';
   return `
     <div class="character-import-job">
       <div class="character-import-job-head">
@@ -285,7 +287,7 @@ function characterImportJobMarkup(job) {
       <div class="character-import-progress" aria-label="${t('角色库导入进度')}">
         <span style="width:${pct}%"></span>
       </div>
-      ${failureText ? `<div class="character-import-failures">${t('失败：{escHtml}', {escHtml: escHtml(failureText)})}</div>` : ''}
+      ${failureText ? `<div class="character-import-failures">${t('失败：{escHtml}', {escHtml: escHtml(t(failureText))})}</div>` : ''}
     </div>
   `;
 }
@@ -384,16 +386,16 @@ export function renderCharacterLibrary() {
         </div>
       </div>
     `;
-  }).join('') : `<div class="character-library-empty">${query ? `未找到匹配的角色 "${escHtml(query)}"` : '暂无角色'}<button class="btn character-library-empty-action" type="button" data-character-import-trigger>导入角色</button><button class="btn character-library-empty-action" type="button" data-character-create-trigger>新建角色</button></div>`;
+  }).join('') : `<div class="character-library-empty"><span>${query ? t('未找到匹配的角色 "{query}"', {query: escHtml(query)}) : t('暂无角色')}</span><button class="btn character-library-empty-action" type="button" data-character-import-trigger>${t('导入角色')}</button><button class="btn character-library-empty-action" type="button" data-character-create-trigger>${t('新建角色')}</button></div>`;
   const referenceCards = references.length ? references.map(reference => {
-    const pathText = reference.file_path || reference.file_name || '未绑定文件';
+    const pathText = reference.file_path || reference.file_name || t('未绑定文件');
     const previewUrl = reference.has_image
       ? `/api/characters/${reference.character_id}/references/${reference.id}/image`
       : (reference.file_path ? API.previewUrl(reference.file_path, characterReferencePreviewVersion(reference), 256) : '');
     const SOURCE_LABELS = {tag_single: '来自单角色作品', manual: '手动添加'};
     const MEDIA_LABELS = {image: '图片', video: '视频', text: '文本'};
-    const sourceLabel = SOURCE_LABELS[reference.source_type] || reference.source_type || '未知来源';
-    const mediaLabel = MEDIA_LABELS[reference.media_type] || reference.media_type || '';
+    const sourceLabel = t(SOURCE_LABELS[reference.source_type] || reference.source_type || '未知来源');
+    const mediaLabel = MEDIA_LABELS[reference.media_type] ? t(MEDIA_LABELS[reference.media_type]) : (reference.media_type || '');
     const rawDetail = `source_type=${reference.source_type || ''} media_type=${reference.media_type || ''}`;
     const detail = joinUiMeta([
       sourceLabel,
@@ -501,11 +503,10 @@ async function pollCharacterImportJob() {
     }
   } catch (e) {
     if (isAbortError(e)) return;
-    // One transient poll failure must not freeze the progress bar while the
-    // import keeps running server-side; give up only after several in a row.
+    // 单次轮询失败不能让进度条冻结（导入仍在服务端跑）；保持轮询、
+    // 每串失败只提示一次。永久停表会让 busy 状态过期，导入按钮变死键。
     state.characterImportPollFailures = (state.characterImportPollFailures || 0) + 1;
-    if (state.characterImportPollFailures >= 5) {
-      stopCharacterImportPolling();
+    if (state.characterImportPollFailures === 5) {
       toast('读取角色库导入进度失败：' + (e.message || e), 'error');
     }
   }
@@ -517,6 +518,8 @@ async function finishCharacterImportJob(result) {
   if (result.job_id) state.characterImportFinishedJobId = result.job_id;
   state.characterSuggestionCache?.clear();
   if (Number(result.added || result.added_references || 0) === 0 && Number(result.failed || 0) > 0) {
+    toast(characterImportFailureText(result), 'error');
+  } else if (result.status === 'skipped') {
     toast(characterImportFailureText(result), 'error');
   } else if (result.status === 'cancelled') {
     toast('角色库导入已取消', 'error');
@@ -532,17 +535,33 @@ async function finishCharacterImportJob(result) {
 export async function importCharacterLibraryReferences(payload) {
   const busyScope = payload.scope || '';
   if (isActionBusy('character-library-import', busyScope)) return;
-  if (characterImportJobBusy()) return;
+  if (characterImportJobBusy()) {
+    // 轮询可能已中断（切页、定时器丢失）而任务在服务端已跑完或仍在跑：
+    // 先重读任务状态再决定，避免用过期 busy 把按钮永久锁死。
+    try {
+      rememberCharacterImportJob(await API.get('/api/characters/import-from-tags/jobs/current'));
+    } catch (e) {
+      if (isAbortError(e)) return;
+    }
+  }
+  if (characterImportJobBusy()) {
+    toast('已有角色库导入任务在运行', 'error');
+    startCharacterImportPolling();
+    return;
+  }
   setActionBusy('character-library-import', busyScope, true);
   try {
-    const result = await API.postJson('/api/characters/import-from-tags/jobs', payload.body || {});
+    const result = await API.postJson('/api/characters/import-from-tags/jobs', payload.body || {}, {timeoutMs: 600000});
     rememberCharacterImportJob(result);
-    if (result.busy) {
+    if (result && result.busy) {
       toast('已有角色库导入任务在运行', 'error');
+      startCharacterImportPolling();
+    } else if (result && result.status && !['pending', 'running'].includes(result.status)) {
+      await finishCharacterImportJob(result);
     } else {
       toast('角色库导入已开始', 'success');
+      startCharacterImportPolling();
     }
-    startCharacterImportPolling();
   } catch (e) {
     toast('导入角色失败：' + (e.message || e), 'error');
   } finally {
@@ -566,7 +585,7 @@ export async function cancelCharacterImportJob(jobId) {
 export async function deleteCharacterReference(characterId, referenceId) {
   if (!characterId || !referenceId) return;
   if (isActionBusy('character-library-delete', `${characterId}:${referenceId}`)) return;
-  if (!confirm('确定要移除此参考图片吗？')) return;
+  if (!confirm(t('确定要移除此参考图片吗？'))) return;
   setActionBusy('character-library-delete', `${characterId}:${referenceId}`, true);
   try {
     await API.del(`/api/characters/${characterId}/references/${referenceId}`);
@@ -605,7 +624,7 @@ export async function uploadCharacterReference(characterId, file) {
 export async function deleteCharacter(characterId) {
   if (!characterId) return;
   if (isActionBusy('character-library-character-delete', characterId)) return;
-  if (!confirm('确定删除该角色及其全部参考图记录？不会删除原图片。再次导入，或启用后台导入后，可能重新建立。')) return;
+  if (!confirm(t('确定删除该角色及其全部参考图记录？不会删除原图片。再次导入，或启用后台导入后，可能重新建立。'))) return;
   setActionBusy('character-library-character-delete', characterId, true);
   try {
     await API.del(`/api/characters/${characterId}`);

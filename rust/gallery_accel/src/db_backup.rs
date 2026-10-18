@@ -44,6 +44,12 @@ pub(crate) fn prune_backup_root(root: &Path, retention: usize) -> Result<usize> 
         })
         .filter_map(|path| safe_canonicalize(path).ok())
         .filter(|path| path.starts_with(&root))
+        // The lifecycle container is not a snapshot. Counting
+        // `db-backups/housekeeping/` spent a retention slot on a directory that
+        // can never age out as a normal backup, so one real snapshot fewer was
+        // kept than configured. Every other directory still counts: legacy and
+        // synthetic snapshots keep the pre-existing pruning behavior.
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) != Some("housekeeping"))
         .collect::<Vec<_>>();
     entries.sort();
     let remove_count = entries.len().saturating_sub(retention.max(1));

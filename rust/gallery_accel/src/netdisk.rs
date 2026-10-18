@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1142,13 +1142,27 @@ pub fn submit_bridge_task(
             params["packagePassword"] = serde_json::json!(pwd.trim());
         }
     }
-    let command_id =
-        queue_bridge_command(conn, &task.bridge_id, &task.task_id, "add_links", &params)?;
-    conn.execute(
+    // The guarded UPDATE is the gate, and it runs before the command is queued.
+    // Two concurrent 开始 requests both pass the in-memory state checks above
+    // (each route loads the task before either writes), and the old order —
+    // queue first, update second, ignore the affected count — delivered two
+    // `add_links` commands for one package name, which JDownloader turns into
+    // two packages: either the frozen identity set never matches the snapshot
+    // again, or both settle and the files are imported twice.
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin netdisk task submission")?;
+    let changed = tx.execute(
         "UPDATE netdisk_bridge_tasks SET state = ?1, updated_at = strftime('%s','now')
          WHERE task_id = ?2 AND state = ?3",
         params![BRIDGE_TASK_SUBMITTED, task.task_id, BRIDGE_TASK_REGISTERED],
     )?;
+    if changed != 1 {
+        return Err(anyhow!("任务状态已变化，请刷新后重试"));
+    }
+    let command_id =
+        queue_bridge_command(&tx, &task.bridge_id, &task.task_id, "add_links", &params)?;
+    tx.commit().context("commit netdisk task submission")?;
     Ok(command_id)
 }
 
@@ -1615,10 +1629,17 @@ fn evaluate_settlement(
         if record.bytes_total_verified > 0 && metadata.len() != record.bytes_total_verified {
             return Ok(refuse("输出长度与下载器报告不符"));
         }
-        if let Some((_, expected_length, digest)) = expectations
+        // A manifest can carry the same basename under two remote paths
+        // (`a/cover.png` and `b/cover.png`). The record names the downloaded
+        // file by basename only, so it cannot be attributed to one entry;
+        // comparing it against the first one refused a correct download on
+        // every tick and the task could never settle. Only an unambiguous name
+        // is checked.
+        let mut same_name = expectations
             .iter()
-            .find(|(name, _, _)| !name.is_empty() && name == &record.name)
-        {
+            .filter(|(name, _, _)| !name.is_empty() && name == &record.name);
+        if let (Some(entry), None) = (same_name.next(), same_name.next()) {
+            let (_, expected_length, digest) = entry;
             if let Some(expected_length) = expected_length {
                 if *expected_length > 0 && metadata.len() != *expected_length {
                     return Ok(refuse("输出长度与清单不符"));
@@ -1853,10 +1874,18 @@ fn adopt_bridge_tasks(conn: &Connection, bridge_id: &str, session_id: &str) -> R
 /// the command to `uncertain`: Gallery no longer knows whether the first copy
 /// landed, and pretending otherwise is how a link gets added twice.
 fn dispatch_bridge_commands(conn: &Connection, bridge_id: &str) -> Result<Vec<BridgeCommand>> {
+    // The attempt cap belongs in the query, not only in the loop below: an
+    // exhausted command was rewritten to `uncertain` and left in the window,
+    // and nothing ever deletes `netdisk_bridge_commands` rows. Fifty such
+    // commands (oldest first, ordered by id) filled the LIMIT forever, so every
+    // later command — including a plain `remove` — was never dispatched while
+    // the panel kept answering 202. Filtering here lets exhausted rows age out
+    // of the window instead of starving live ones.
     let mut stmt = conn.prepare(
         "SELECT id, command_id, job_id, action, params, status, attempts
          FROM netdisk_bridge_commands
          WHERE bridge_id = ?1 AND status IN (?2, ?3, ?4)
+           AND attempts < ?5
          ORDER BY id ASC
          LIMIT 50",
     )?;
@@ -1866,7 +1895,8 @@ fn dispatch_bridge_commands(conn: &Connection, bridge_id: &str) -> Result<Vec<Br
                 bridge_id,
                 BRIDGE_COMMAND_QUEUED,
                 BRIDGE_COMMAND_ISSUED,
-                BRIDGE_COMMAND_UNCERTAIN
+                BRIDGE_COMMAND_UNCERTAIN,
+                BRIDGE_COMMAND_ATTEMPT_CAP
             ],
             |row| {
                 Ok((

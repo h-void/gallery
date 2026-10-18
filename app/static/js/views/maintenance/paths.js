@@ -264,7 +264,7 @@ export async function applyMoveCandidateGroup(oldArtistId, newArtistId) {
   if (isActionBusy('move-group-action', busyKey)) return;
   setActionBusy('move-group-action', busyKey, true);
   try {
-    const result = await API.post(`/api/move-candidates/groups/${oldArtistId}/${newArtistId}/merge`);
+    const result = await API.post(`/api/move-candidates/groups/${oldArtistId}/${newArtistId}/merge`, undefined, {timeoutMs: 300000});
     const resolved = Number(result.resolved_existing || 0);
     const applied = Number(result.applied || 0);
     const stale = Number(result.stale || 0);
@@ -292,7 +292,7 @@ export async function autoResolveMoveCandidates(options = {}) {
     btn.textContent = '处理中';
   }
   try {
-    const result = await API.post('/api/move-candidates/auto-resolve');
+    const result = await API.post('/api/move-candidates/auto-resolve', undefined, {timeoutMs: 300000});
     const resolved = Number(result.resolved_existing || 0);
     const applied = Number(result.applied || 0);
     const addedAsNew = Number(result.added_as_new || 0);

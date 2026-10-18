@@ -26,9 +26,9 @@ pub fn canonical_of_raw(raw: &str) -> String {
     }
 }
 
-/// The immediate parent folder name of an item (the value `scan.rs` writes to
-/// `items.folder_name`, which keys `folder_rename_plans.source_folder`), or
-/// empty for items directly inside the artist root.
+/// The artist-relative parent folder path of an item (matching the
+/// `folder_rename_plans.source_folder` key produced by `source_folder_for_item`),
+/// or empty for items directly inside the artist root.
 ///
 /// Hierarchy is decided by relative-path DEPTH, not by comparing directory
 /// names: a subdirectory may legitimately share the artist's name, and name
@@ -54,7 +54,7 @@ pub(crate) fn item_date_folder_name(artist_path: &str, file_path: &str) -> Strin
         // Directly inside the artist root.
         return String::new();
     }
-    segments[segments.len() - 2].to_string()
+    segments[..segments.len() - 1].join("/")
 }
 
 /// Apply a manual recognized-date override to a batch of items belonging to
@@ -109,7 +109,7 @@ pub fn update_item_dates_response(
         .context("look up artist root")?;
     let rows = conn
         .prepare(&format!(
-            "SELECT id, detected_date, date, file_path FROM items WHERE id IN ({placeholders}) AND artist_id=?"
+            "SELECT id, detected_date, date, file_path, folder_name, COALESCE(manual_date, '') FROM items WHERE id IN ({placeholders}) AND artist_id=?"
         ))?
         .query_map(rusqlite::params_from_iter(lookup_params.iter()), |row| {
             Ok((
@@ -117,6 +117,8 @@ pub fn update_item_dates_response(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -132,7 +134,7 @@ pub fn update_item_dates_response(
         .context("begin item date update")?;
     let mut updated: Vec<Value> = Vec::with_capacity(rows.len());
     let mut changed_folders: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (item_id, detected_date, legacy_date, file_path) in rows {
+    for (item_id, detected_date, legacy_date, file_path, folder_name, previous_manual) in rows {
         let (new_manual, new_date): (Option<String>, String) = match &parsed {
             Some(raw) => {
                 let canonical = canonical_of_raw(raw);
@@ -148,8 +150,24 @@ pub fn update_item_dates_response(
                 (None, effective)
             }
         };
-        if new_date != legacy_date {
-            let folder = item_date_folder_name(&artist_path, &file_path);
+        // Precision matters, not just the canonical value: a rewrite that keeps
+        // `date` in place but changes `manual_date` precision (e.g. `2026-07`
+        // -> `2026-07-01`) re-renders the plan target, so the plan key must still
+        // be collected. Otherwise the row keeps a manually overridden date that
+        // no confirmed plan was ever re-checked against.
+        let date_changed = new_date != legacy_date;
+        let precision_changed = new_manual.as_deref().unwrap_or_default() != previous_manual;
+        if date_changed || precision_changed {
+            // The plan key, not a hand-rolled folder path: `source_folder_for_item`
+            // is what plan discovery stores in `folder_rename_plans.source_folder`,
+            // including its legacy `folder_name` fallback, so invalidation finds
+            // every plan that a stale target could execute.
+            let folder = crate::folder_archive::source_folder_for_item(
+                &artist_path,
+                &file_path,
+                &folder_name,
+            )
+            .unwrap_or_default();
             if !folder.is_empty() {
                 changed_folders.insert(folder);
             }

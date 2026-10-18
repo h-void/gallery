@@ -26,14 +26,17 @@
 </script>
 <title>画廊</title>
 <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%23F4ECDD"/><circle cx="24" cy="24" r="7" fill="%23C04B3A"/><path d="M12 48l14-18 10 12 6-7 10 13z" fill="%23C04B3A"/></svg>'>
-<link rel="stylesheet" href="/static/styles/tokens.css?v=1.1.7">
-<link rel="stylesheet" href="/static/styles/base.css?v=1.1.7">
-<link rel="stylesheet" href="/static/styles/layout.css?v=1.1.7">
-<link rel="stylesheet" href="/static/styles/views.css?v=1.1.7">
+<link rel="stylesheet" href="/static/styles/tokens.css?v=1.1.8">
+<link rel="stylesheet" href="/static/styles/base.css?v=1.1.8">
+<link rel="stylesheet" href="/static/styles/layout.css?v=1.1.8">
+<link rel="stylesheet" href="/static/styles/views.css?v=1.1.8">
 <!-- Boot module graph, preloaded without ?v= so the hrefs match the import
      specifiers exactly (./store.js from main.js resolves to /static/js/store.js).
      Without these the browser discovers each module depth-by-depth from the
-     import statements — a fetch waterfall across ~20 files before init() runs. -->
+     import statements — a fetch waterfall before init() runs. Only the static
+     boot graph is listed: demand-loaded modules (the maintenance views behind
+     views/maintenance/lazy.js and the English dictionary in i18n_dict.js) stay
+     out so a cold browse start never downloads them. -->
 <link rel="modulepreload" href="/static/js/api.js">
 <link rel="modulepreload" href="/static/js/store.js">
 <link rel="modulepreload" href="/static/js/utils.js">
@@ -49,14 +52,8 @@
 <link rel="modulepreload" href="/static/js/views/editbar.js">
 <link rel="modulepreload" href="/static/js/views/links.js">
 <link rel="modulepreload" href="/static/js/views/archive_modal.js">
-<link rel="modulepreload" href="/static/js/views/maintenance/index.js">
-<link rel="modulepreload" href="/static/js/views/maintenance/overview.js">
-<link rel="modulepreload" href="/static/js/views/maintenance/paths.js">
-<link rel="modulepreload" href="/static/js/views/maintenance/organize.js">
-<link rel="modulepreload" href="/static/js/views/maintenance/characters.js">
-<link rel="modulepreload" href="/static/js/views/maintenance/records.js">
-<link rel="modulepreload" href="/static/js/views/maintenance/downloads.js">
-<link rel="modulepreload" href="/static/js/views/maintenance/netdisk.js">
+<link rel="modulepreload" href="/static/js/views/maintenance/lazy.js">
+<link rel="modulepreload" href="/static/js/views/maintenance/shared.js">
 </head>
 <body>
 
@@ -1576,7 +1573,7 @@
   </div>
 </div>
 
-<script type="module" src="/static/js/main.js?v=1.1.7"></script>
+<script type="module" src="/static/js/main.js?v=1.1.8"></script>
 
 </body>
 </html>

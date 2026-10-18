@@ -92,11 +92,18 @@ pub fn update_tag(
         if n.is_empty() {
             return Err(anyhow!("tag name must not be empty"));
         }
+        // A folder-rename target is rendered from item tag names, so renaming a
+        // tag stales every confirmed plan over its items — exactly what item-tag
+        // writes do through `invalidate_plans_for_changed_items`.
+        let affected_items = tag_item_ids(&tx, tag_id)?;
         tx.execute(
             "UPDATE tags SET name = ?1 WHERE id = ?2",
             rusqlite::params![n, tag_id],
         )
         .context("update tag name")?;
+        if !affected_items.is_empty() {
+            invalidate_plans_for_changed_items(&tx, &affected_items)?;
+        }
     }
     if let Some(o) = sort_order {
         tx.execute(
@@ -155,6 +162,10 @@ pub fn delete_tag(conn: &Connection, artist_id: i64, tag_id: i64) -> Result<Opti
         )
         .unwrap_or(0);
 
+    // Dropping the tag changes the names its items' folder-rename targets were
+    // rendered from: demote those plans in this transaction too, or auto-run
+    // renames a folder to a target built from a tag that no longer exists.
+    let affected_items = tag_item_ids(&tx, tag_id)?;
     tx.execute(
         "DELETE FROM item_tags WHERE tag_id = ?1",
         rusqlite::params![tag_id],
@@ -162,6 +173,9 @@ pub fn delete_tag(conn: &Connection, artist_id: i64, tag_id: i64) -> Result<Opti
     .context("delete item_tags for tag")?;
     tx.execute("DELETE FROM tags WHERE id = ?1", rusqlite::params![tag_id])
         .context("delete tag")?;
+    if !affected_items.is_empty() {
+        invalidate_plans_for_changed_items(&tx, &affected_items)?;
+    }
 
     let mut result = tag_row;
     if let Some(obj) = result.as_object_mut() {
@@ -291,6 +305,23 @@ fn update_item_tags_in_tx(
 ) -> Result<Value> {
     let before_by_item = item_tag_sets(tx, ids)?;
 
+    // A `set` replaces the tag set, so the tags it drops have to leave the
+    // same-hash group as well. The union propagation below rebuilds the group
+    // from every member's tags, and the twins still carried the dropped ones —
+    // the replacement was silently undone on the next propagation.
+    let set_removed: Vec<i64> = if mode == "set" {
+        let mut removed = BTreeSet::new();
+        for tags in before_by_item.values() {
+            removed.extend(tags.iter().copied());
+        }
+        removed
+            .into_iter()
+            .filter(|tag| !valid_tags.contains(tag))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     if mode == "set" {
         let placeholders = placeholders(ids.len());
         tx.execute(
@@ -333,10 +364,27 @@ fn update_item_tags_in_tx(
         .collect();
 
     let mut propagated = 0usize;
+    if mode == "set" && !set_removed.is_empty() {
+        let removal = propagate_hash_tag_removals(tx, ids, &set_removed)?;
+        propagated += removal.0;
+        changed_item_ids.extend(removal.1);
+    }
     if matches!(mode, "set" | "add") && !valid_tags.is_empty() {
         let propagation = propagate_hash_tags_for_items(tx, ids)?;
-        propagated = propagation.0;
+        propagated += propagation.0;
         changed_item_ids.extend(propagation.1);
+    } else if mode == "remove" && !valid_tags.is_empty() {
+        // Same-hash items carry one shared tag set, so a removal has to reach the
+        // whole group exactly like an add does. Removing only from the requested
+        // items left the twins tagged, and the next add/set on any member rebuilt
+        // the group union — silently resurrecting the tag the user just removed.
+        let removal = propagate_hash_tag_removals(tx, ids, valid_tags)?;
+        propagated = removal.0;
+        changed_item_ids.extend(removal.1);
+    }
+
+    if !changed_item_ids.is_empty() {
+        invalidate_plans_for_changed_items(tx, &changed_item_ids)?;
     }
 
     Ok(json!({
@@ -354,6 +402,9 @@ pub fn propagate_hash_tags_response(conn: &Connection, item_ids: &[i64]) -> Resu
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("begin hash tag propagation")?;
     let (inserted, changed_item_ids) = propagate_hash_tags_for_items(&tx, &requested_items)?;
+    if !changed_item_ids.is_empty() {
+        invalidate_plans_for_changed_items(&tx, &changed_item_ids)?;
+    }
     tx.commit().context("commit hash tag propagation")?;
     Ok(json!({
         "inserted": inserted,
@@ -378,9 +429,14 @@ fn normalize_tag_names(tag_names: &[String]) -> Vec<String> {
         if clean.is_empty() {
             continue;
         }
-        let key = clean.to_lowercase();
-        if seen.insert(key) {
-            names.push(clean.to_string());
+        // Tag names are case-sensitive identities: `tags.name` is compared with
+        // the BINARY collation in both `create_tag_in_tx` and `tag_ids_for_names`.
+        // Dedupe on the exact spelling, so `Swim` and `swim` stay two names — a
+        // lowered key here merged them while the lookups kept them apart, and a
+        // `remove` of the second spelling then silently matched nothing.
+        let key = clean.to_string();
+        if seen.insert(key.clone()) {
+            names.push(key);
         }
     }
     names
@@ -528,6 +584,45 @@ fn propagate_hash_tags_for_items(
     Ok((inserted, changed_item_ids))
 }
 
+/// Mirror of [`propagate_hash_tags_for_items`] for removals: the same-hash
+/// group shares one tag set, so the tags dropped from `item_ids` are dropped
+/// from every group member. Returns the number of removed pairs and the items
+/// whose tag set actually changed.
+fn propagate_hash_tag_removals(
+    conn: &Connection,
+    item_ids: &[i64],
+    tag_ids: &[i64],
+) -> Result<(usize, BTreeSet<i64>)> {
+    let mut removed = 0usize;
+    let mut changed_item_ids = BTreeSet::new();
+    if item_ids.is_empty() || tag_ids.is_empty() {
+        return Ok((removed, changed_item_ids));
+    }
+    for (artist_id, content_hash) in active_hash_groups_for_items(conn, item_ids)? {
+        let group_item_ids = group_item_ids(conn, artist_id, &content_hash)?;
+        let existing = existing_pairs(conn, &group_item_ids, tag_ids)?;
+        if existing.is_empty() {
+            continue;
+        }
+        let item_placeholders = placeholders(group_item_ids.len());
+        let tag_placeholders = placeholders(tag_ids.len());
+        let mut params = group_item_ids.clone();
+        params.extend_from_slice(tag_ids);
+        removed += conn
+            .execute(
+                &format!(
+                    "DELETE FROM item_tags WHERE item_id IN ({item_placeholders}) AND tag_id IN ({tag_placeholders})"
+                ),
+                rusqlite::params_from_iter(params.iter()),
+            )
+            .context("remove propagated item tags")?;
+        for (item_id, _) in existing {
+            changed_item_ids.insert(item_id);
+        }
+    }
+    Ok((removed, changed_item_ids))
+}
+
 fn active_hash_groups_for_items(conn: &Connection, item_ids: &[i64]) -> Result<Vec<(i64, String)>> {
     if item_ids.is_empty() {
         return Ok(Vec::new());
@@ -628,6 +723,71 @@ fn existing_pairs(
         pairs.insert(row?);
     }
     Ok(pairs)
+}
+
+/// Items currently carrying `tag_id`, collected before the association rows
+/// change so a rename/delete can demote their folder plans.
+fn tag_item_ids(conn: &Connection, tag_id: i64) -> Result<BTreeSet<i64>> {
+    let mut stmt = conn.prepare("SELECT item_id FROM item_tags WHERE tag_id=?")?;
+    let rows = stmt.query_map(rusqlite::params![tag_id], |row| row.get(0))?;
+    let mut ids = BTreeSet::new();
+    for row in rows {
+        ids.insert(row?);
+    }
+    Ok(ids)
+}
+
+fn invalidate_plans_for_changed_items(
+    tx: &Transaction,
+    changed_item_ids: &BTreeSet<i64>,
+) -> Result<()> {
+    let has_plans: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='folder_rename_plans')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !has_plans || changed_item_ids.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i64> = changed_item_ids.iter().copied().collect();
+    let item_placeholders = placeholders(ids.len());
+    let mut stmt = tx.prepare(&format!(
+        "SELECT i.artist_id, a.path, i.file_path, i.folder_name
+         FROM items i
+         JOIN artists a ON a.id = i.artist_id
+         WHERE i.id IN ({item_placeholders})"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut by_artist: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+    for row in rows {
+        let (artist_id, artist_path, file_path, folder_name) = row?;
+        // Same key plan discovery stores in `folder_rename_plans.source_folder`,
+        // fallback included, so every plan this change can stale is matched.
+        let folder =
+            crate::folder_archive::source_folder_for_item(&artist_path, &file_path, &folder_name)
+                .unwrap_or_default();
+        if !folder.is_empty() {
+            by_artist.entry(artist_id).or_default().insert(folder);
+        }
+    }
+    for (artist_id, folders) in by_artist {
+        let folder_list: Vec<String> = folders.into_iter().collect();
+        let _ = crate::folder_archive::invalidate_plans_after_item_date_change(
+            tx,
+            artist_id,
+            &folder_list,
+        )?;
+    }
+    Ok(())
 }
 
 fn collect_i64(

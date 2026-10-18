@@ -60,13 +60,13 @@ pub fn audit_evidence_bindings(conn: &Connection, limit: usize) -> Result<Eviden
     let has_target_path = cols.iter().any(|c| c == "target_path");
 
     let jobs_info = conn.prepare("PRAGMA table_info(download_publish_jobs)");
-    let (has_jobs_table, has_artifact_blake3) = match jobs_info {
+    let (has_jobs_table, has_expected_blake3) = match jobs_info {
         Ok(mut stmt) => {
             let cols: Vec<String> = stmt
                 .query_map([], |row| row.get::<_, String>(1))
                 .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
                 .unwrap_or_default();
-            let has_hash = cols.iter().any(|c| c == "artifact_blake3");
+            let has_hash = cols.iter().any(|c| c == "expected_blake3");
             (true, has_hash)
         }
         Err(_) => (false, false),
@@ -184,11 +184,11 @@ pub fn audit_evidence_bindings(conn: &Connection, limit: usize) -> Result<Eviden
         }
 
         let mut job_hash: Option<String> = None;
-        if has_jobs_table && has_artifact_blake3 {
+        if has_jobs_table && has_expected_blake3 {
             if let Some(job_id) = publish_job_id {
                 job_hash = conn
                     .query_row(
-                        "SELECT artifact_blake3 FROM download_publish_jobs WHERE id = ?1",
+                        "SELECT expected_blake3 FROM download_publish_jobs WHERE id = ?1",
                         params![job_id],
                         |r| r.get(0),
                     )

@@ -121,7 +121,8 @@ pub fn spawn_configured_workers(
     // routes share this same gate for the same reason — a manual run is the work
     // the loop would otherwise have done, so it must refresh on the same budget
     // rather than analyze again on every click.
-    if let Some(interval) = interval_env("SCAN_INTERVAL") {
+    let scan_interval = interval_env("SCAN_INTERVAL");
+    if let Some(interval) = scan_interval {
         spawn_scan_loop(
             pool.clone(),
             roots.clone(),
@@ -132,6 +133,20 @@ pub fn spawn_configured_workers(
         );
     } else {
         status.record("scan", false, json!({"status": "disabled"}), None);
+    }
+    // `SCAN_ON_START` is exported by both Dockerfiles and the compose files with a
+    // default of "0", but nothing read it: setting it to 1 was silently ignored
+    // and a fresh install stayed empty until the `SCAN_INTERVAL` tick or a manual
+    // 扫描全库. It now schedules one full-library scan after boot.
+    if enabled_env("SCAN_ON_START") {
+        spawn_startup_scan(
+            pool.clone(),
+            roots.clone(),
+            scan.clone(),
+            status.clone(),
+            stats_gate.clone(),
+            scan_interval.is_none(),
+        );
     }
 
     if let Some(interval) = interval_env("HASH_INTERVAL") {
@@ -318,6 +333,56 @@ fn spawn_scan_loop(
                 true,
                 result.unwrap_or_else(|error| json!({"ok": false, "error": error.to_string()})),
                 Some(next_at),
+            );
+        }
+    });
+}
+
+/// One full-library scan shortly after boot, for `SCAN_ON_START=1`.
+///
+/// Records its own status only when no interval loop owns the `scan` entry, so
+/// a scheduled loop's `next_at` is never cleared by the one-shot.
+fn spawn_startup_scan(
+    pool: Arc<DbPool>,
+    roots: MediaRoots,
+    scan: Arc<ScanControl>,
+    status: WorkerStatus,
+    stats_gate: Arc<StatsRefreshGate>,
+    record_status: bool,
+) {
+    let delay = std::env::var("SCAN_ON_START_DELAY")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_default();
+    tokio::spawn(async move {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if scan.is_shutting_down() {
+            return;
+        }
+        // Another operation already owns the slot at boot: the scheduled loop
+        // (or the user) picks the work up instead of queueing a second scan.
+        let Some(guard) = scan.try_claim() else {
+            return;
+        };
+        let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+            let _slot = guard;
+            let conn = pool.get()?;
+            let result = run_full_library_scan_claimed(&conn, &roots, &scan);
+            stats_gate.refresh_after_work(&conn);
+            result
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        if record_status {
+            status.record(
+                "scan",
+                true,
+                result.unwrap_or_else(|error| json!({"ok": false, "error": error.to_string()})),
+                None,
             );
         }
     });

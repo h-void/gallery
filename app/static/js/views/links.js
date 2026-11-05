@@ -590,12 +590,14 @@ export function renderArtistProfileLinks() {
   const links = Array.isArray(data.links) ? data.links : [];
   const counts = data.summary || {};
   if (state.artistProfileLinksLoading) {
+    summary.hidden = false;
     summary.textContent = '读取中';
     status.textContent = '正在读取社交主页与订阅链接';
     list.innerHTML = '';
     return;
   }
   if (data.error) {
+    summary.hidden = false;
     summary.textContent = '读取失败';
     status.textContent = data.error;
     list.innerHTML = '';
@@ -603,7 +605,6 @@ export function renderArtistProfileLinks() {
   }
   const totalLinks = Math.max(links.length, Number(counts.social || 0) + Number(counts.subscription || 0));
   // Entry title stays fixed at the dialog name; the link count lives in the summary row.
-  const entryTitle = opener.querySelector('.artist-links-entry-title');
   summary.hidden = !totalLinks;
   if (totalLinks) summary.textContent = t('{social} 个社交主页 \u00b7 {sub} 个赞助订阅', {social: counts.social || 0, sub: counts.subscription || 0});
   status.textContent = links.length ? '' : '尚未添加任何主页或订阅链接';

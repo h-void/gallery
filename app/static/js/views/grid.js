@@ -928,14 +928,14 @@ function resolveDragItemIds(selection) {
   if (selection.cardId && selection.baseSelectedIds.has(selection.cardId)) {
     return new Set(selection.baseSelectedIds);
   }
-  if (selection.baseSelectedIds.size > 0 && (!selection.boxedIds || selection.boxedIds.length <= 1)) {
-    return new Set(selection.baseSelectedIds);
-  }
-  if (selection.boxedIds && selection.boxedIds.length > 0) {
+  if (selection.boxedIds && selection.boxedIds.length > 1) {
     return new Set(selection.boxedIds);
   }
   if (selection.cardId > 0) {
     return new Set([selection.cardId]);
+  }
+  if (selection.boxedIds && selection.boxedIds.length > 0) {
+    return new Set(selection.boxedIds);
   }
   return new Set(selection.baseSelectedIds);
 }
@@ -1045,6 +1045,11 @@ function finishSelectionMarquee(e) {
       }
       return;
     }
+    if (dropTarget && dropTarget.type === 'sidebar-idle') {
+      applySelectionChange(selection.baseSelectedIds, {reason: 'drag_cancel', schedule: false, log: false});
+      cleanupSelectionMarquee(e);
+      return;
+    }
     logUiAction('selection_box_apply', collectSelectionLayoutLogContext({
       modifier: selection.modifier,
       boxed_count: selection.boxedCount || 0,
@@ -1059,6 +1064,9 @@ function finishSelectionMarquee(e) {
 
 function cancelSelectionMarquee(e) {
   if (!state.selectionMarquee || e.pointerId !== state.selectionMarquee.pointerId) return;
+  if (state.selectionMarquee.active && state.selectionMarquee.baseSelectedIds) {
+    applySelectionChange(state.selectionMarquee.baseSelectedIds, {reason: 'drag_cancel', schedule: false, log: false});
+  }
   cleanupSelectionMarquee(e);
 }
 
@@ -1408,7 +1416,7 @@ function observeVideoPreviews() {
   }
 
   $$('#grid .video-thumb[data-preview-src]').forEach(video => {
-    if (video.dataset.previewObserved === '1') return;
+    if (video.dataset.previewObserved === '1' || video.dataset.loading === '1' || video.dataset.loaded === '1') return;
     video.dataset.previewObserved = '1';
     videoPreviewObserver.observe(video);
   });
@@ -1480,14 +1488,15 @@ function finishVideoPreview(video, loaded, clearSource = false) {
   pumpVideoPreviewQueue();
 }
 
-export function releaseAllVideoPreviewLoads() {
+export function releaseAllVideoPreviewLoads(includeLoaded = false) {
   if (videoPreviewObserver) {
     videoPreviewObserver.disconnect();
     videoPreviewObserver = null;
   }
+  const selector = includeLoaded ? '#grid .video-thumb' : '#grid .video-thumb:not([data-loaded="1"])';
   const videos = new Set([
     ...pendingVideoPreviews,
-    ...$$('#grid .video-thumb'),
+    ...$$(selector),
   ]);
   pendingVideoPreviews.splice(0);
   activeVideoPreviewLoads = 0;
@@ -1507,7 +1516,7 @@ export function releaseAllVideoPreviewLoads() {
 }
 
 export function releaseAllVideoPreviews() {
-  releaseAllVideoPreviewLoads();
+  releaseAllVideoPreviewLoads(true);
 }
 
 // An anchored reload needs the first visible card id plus its pixel offset so

@@ -7,9 +7,15 @@
 // module promise, so sequential calls keep their order. Tiny synchronous
 // helpers live in shared.js instead (see that file for why).
 
-import { downloadTemplateInputSelector, movePanelScrollTop, restoreMovePanelScroll } from './shared.js';
+import {
+  downloadTemplateInputSelector, movePanelScrollTop, restoreMovePanelScroll,
+  DOWNLOAD_CALENDAR_OPEN_STORAGE_KEY, readDownloadCalendarOpen, saveDownloadCalendarOpen,
+} from './shared.js';
 
-export { downloadTemplateInputSelector, movePanelScrollTop, restoreMovePanelScroll };
+export {
+  downloadTemplateInputSelector, movePanelScrollTop, restoreMovePanelScroll,
+  DOWNLOAD_CALENDAR_OPEN_STORAGE_KEY, readDownloadCalendarOpen, saveDownloadCalendarOpen,
+};
 
 const moduleLoads = new Map();
 function load(spec) {

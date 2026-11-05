@@ -35,7 +35,7 @@ use gallery_accel::{
     folder_error_artists, folder_paths_response, folder_rename_auto_response,
     folder_rename_auto_run, folder_rename_format_settings, folders_response,
     get_character_import_job, get_recycle_target_setting, get_scan_state, hash_status_response,
-    health_summary, ignore_move_candidate_response, item_detail_response,
+    health_summary, ignore_move_candidate_response, invalidate_artists_cache, item_detail_response,
     items_page_cursor_query_response_ext, items_page_query_response_ext, list_folder_renames,
     list_media_root_directories, log_error, log_warn, mark_move_candidate_new_response,
     merge_move_candidate_group_with_roots, move_candidate_groups_response,
@@ -476,6 +476,14 @@ pub fn router(state: AppState) -> Router {
             post(api_confirm_artist_suggestion),
         )
         .route("/api/characters", post(api_create_character))
+        .route(
+            "/api/characters/clusters/discover",
+            post(api_character_clusters_discover),
+        )
+        .route(
+            "/api/characters/clusters/commit",
+            post(api_character_clusters_commit),
+        )
         .route(
             "/api/characters/{character_id}",
             delete(api_delete_character),
@@ -934,10 +942,110 @@ async fn management_gate(State(state): State<AppState>, request: Request, next: 
 pub fn with_static_ui(router: Router, static_dir: PathBuf) -> Router {
     let index = static_dir.join("index.html");
     router
+        .route("/favicon.ico", get(api_favicon))
         .route_service("/", ServeFile::new(index.clone()))
         .nest_service("/static", ServeDir::new(static_dir))
         .route_service("/{artist_path}", ServeFile::new(index))
         .layer(middleware::from_fn(security_headers))
+}
+
+/// The fully-built application router, published to the boot gate the moment
+/// startup finishes.
+pub type SharedRealRouter = Arc<std::sync::OnceLock<axum::routing::RouterIntoService<Body>>>;
+
+/// Everything the boot gate answers with while the heavyweight startup (pool,
+/// crash reconciliation, workers) runs after the listener is already bound.
+///
+/// The listener used to bind only after that work, so an update's first boot
+/// read as "connection refused" for as long as the initialization took — and
+/// forever when it hung. With the gate, the port answers immediately: health
+/// reports the startup phase, the UI shell loads, and every other route says
+/// `initializing` until the real router takes over.
+#[derive(Clone)]
+pub struct BootGate {
+    real: SharedRealRouter,
+    started: std::time::Instant,
+    phase: Arc<Mutex<String>>,
+}
+
+impl BootGate {
+    pub fn new() -> Self {
+        Self {
+            real: Arc::new(std::sync::OnceLock::new()),
+            started: std::time::Instant::now(),
+            phase: Arc::new(Mutex::new("opening the database".to_string())),
+        }
+    }
+
+    /// Where the shared router is published when startup completes.
+    pub fn real_slot(&self) -> SharedRealRouter {
+        Arc::clone(&self.real)
+    }
+
+    pub fn set_phase(&self, phase: &str) {
+        if let Ok(mut guard) = self.phase.lock() {
+            *guard = phase.to_string();
+        }
+    }
+
+    pub fn phase(&self) -> String {
+        self.phase
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn elapsed_seconds(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    pub fn ready(&self) -> bool {
+        self.real.get().is_some()
+    }
+}
+
+/// The bind-ready application: static shell plus a fallback that either
+/// delegates to the real router (startup done) or answers "initializing".
+pub fn boot_gate_router(gate: BootGate, static_dir: Option<PathBuf>) -> Router {
+    let mut app = Router::new()
+        .fallback(boot_gate_fallback)
+        .layer(axum::Extension(gate));
+    if let Some(dir) = static_dir {
+        app = with_static_ui(app, dir);
+    }
+    app
+}
+
+async fn boot_gate_fallback(
+    axum::Extension(gate): axum::Extension<BootGate>,
+    request: Request,
+) -> Response {
+    if let Some(service) = gate.real.get() {
+        // Startup is done: the request belongs to the real application.
+        let service = service.clone();
+        return match tower::ServiceExt::oneshot(service, request).await {
+            Ok(response) => response,
+            Err(error) => match error {},
+        };
+    }
+    if request.uri().path() == "/api/health" {
+        return Json(json!({
+            "status": "initializing",
+            "initializing": true,
+            "phase": gate.phase(),
+            "elapsed_seconds": gate.elapsed_seconds(),
+        }))
+        .into_response();
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "initializing",
+            "phase": gate.phase(),
+            "elapsed_seconds": gate.elapsed_seconds(),
+        })),
+    )
+        .into_response()
 }
 
 /// Whether a stored path names `root` itself or something inside it, judged on
@@ -1432,9 +1540,15 @@ async fn api_image_preview(
 }
 
 /// Public product path used by the static UI (`API.previewUrl` → `/api/file/preview`).
+/// `path` and `item_id` are mutually exclusive: `item_id` lets external agents
+/// (character cluster pipeline, RFC chapter 5.1) preview library items without
+/// ever seeing media paths.
 #[derive(serde::Deserialize)]
 struct FilePreviewQuery {
-    path: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    item_id: Option<i64>,
     #[serde(default)]
     max: Option<u32>,
     #[serde(default)]
@@ -1449,9 +1563,46 @@ async fn api_file_preview(
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     if state.capabilities.media || state.primary {
         let roots = state.roots.clone();
+        let pool = Arc::clone(&state.pool);
         let versioned = query.v.is_some();
         let result = tokio::task::spawn_blocking(move || {
-            preview_jpeg_allowed(&query.path, &roots, query.max.or(query.max_edge))
+            let path: String = match query.path.as_deref().map(str::trim) {
+                Some(path) if !path.is_empty() => path.to_string(),
+                _ => {
+                    let Some(item_id) = query.item_id else {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            json!({"error": "path or item_id is required"}),
+                        ));
+                    };
+                    let conn = pool.get().map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({"error": e.to_string()}),
+                        )
+                    })?;
+                    let row: Option<(String, i64)> = conn
+                        .query_row(
+                            "SELECT file_path, COALESCE(missing, 0) FROM items WHERE id = ?",
+                            rusqlite::params![item_id],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()
+                        .map_err(|e| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                json!({"error": e.to_string()}),
+                            )
+                        })?;
+                    match row {
+                        Some((file_path, 0)) => file_path,
+                        _ => {
+                            return Err((StatusCode::NOT_FOUND, json!({"error": "item not found"})))
+                        }
+                    }
+                }
+            };
+            preview_jpeg_allowed(&path, &roots, query.max.or(query.max_edge))
         })
         .await
         .map_err(blocking_http_error)?;
@@ -1777,9 +1928,17 @@ async fn api_artist_folder_move_execute(
     let result = tokio::task::spawn_blocking(move || {
         let _guard = guard;
         let conn = pool.get().map_err(to_http_error)?;
-        execute_artist_folder_move(&conn, &roots, artist_id, body.root_index, &body.destination)
-            .map(Json)
-            .map_err(to_artist_folder_move_http_error)
+        let res = execute_artist_folder_move(
+            &conn,
+            &roots,
+            artist_id,
+            body.root_index,
+            &body.destination,
+        );
+        if res.is_ok() {
+            invalidate_artists_cache();
+        }
+        res.map(Json).map_err(to_artist_folder_move_http_error)
     })
     .await;
     result.map_err(|error| {
@@ -3981,6 +4140,69 @@ async fn api_character_recognize(
 }
 
 #[derive(serde::Deserialize)]
+struct CharacterClusterDiscoverRequest {
+    artist_id: i64,
+    #[serde(default)]
+    min_similarity: Option<f32>,
+    #[serde(default)]
+    max_clusters: Option<usize>,
+}
+
+/// RFC-2026-AUTONOMOUS-ORGANIZE chapter 5.1: pre-filter + complete-linkage
+/// clustering over one artist's unorganized items.
+async fn api_character_clusters_discover(
+    State(state): State<AppState>,
+    Json(request): Json<CharacterClusterDiscoverRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        gallery_accel::character_organize::discover_character_clusters(
+            &conn,
+            &roots,
+            request.artist_id,
+            request.min_similarity,
+            request.max_clusters,
+        )
+        .map(Json)
+        .map_err(to_character_cluster_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
+}
+
+#[derive(serde::Deserialize)]
+struct CharacterClusterCommitRequest {
+    artist_id: i64,
+    #[serde(default)]
+    decisions: Vec<serde_json::Value>,
+}
+
+/// RFC-2026-AUTONOMOUS-ORGANIZE chapter 5.2: batch atomic tagging plus
+/// anti-poisoning-gated prototype enrollment.
+async fn api_character_clusters_commit(
+    State(state): State<AppState>,
+    Json(request): Json<CharacterClusterCommitRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(to_http_error)?;
+        gallery_accel::character_organize::commit_cluster_decisions(
+            &conn,
+            &roots,
+            request.artist_id,
+            &request.decisions,
+        )
+        .map(Json)
+        .map_err(to_character_cluster_http_error)
+    })
+    .await
+    .map_err(blocking_http_error)?
+}
+
+#[derive(serde::Deserialize)]
 struct CreateCharacterBody {
     name: String,
 }
@@ -4576,6 +4798,23 @@ fn to_character_recognition_http_error(error: anyhow::Error) -> (StatusCode, Jso
         || message == "item media path is not allowed"
     {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": message})));
+    }
+    to_http_error(error)
+}
+
+fn to_character_cluster_http_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {
+    let message = error.to_string();
+    if message == "artist not found" {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": message})));
+    }
+    if message == "decisions must not be empty"
+        || message.starts_with("invalid decision:")
+        || message == "min_similarity must be within 0.0..=1.0"
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": message})),
+        );
     }
     to_http_error(error)
 }

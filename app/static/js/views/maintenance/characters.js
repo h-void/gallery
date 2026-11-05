@@ -391,7 +391,11 @@ export function renderCharacterLibrary() {
     const pathText = reference.file_path || reference.file_name || t('未绑定文件');
     const previewUrl = reference.has_image
       ? `/api/characters/${reference.character_id}/references/${reference.id}/image`
-      : (reference.file_path ? API.previewUrl(reference.file_path, characterReferencePreviewVersion(reference), 256) : '');
+      : (reference.file_path
+          ? (reference.media_type === 'video'
+              ? API.videoFrameUrl(reference.file_path, characterReferencePreviewVersion(reference))
+              : API.previewUrl(reference.file_path, characterReferencePreviewVersion(reference), 256))
+          : '');
     const SOURCE_LABELS = {tag_single: '来自单角色作品', manual: '手动添加'};
     const MEDIA_LABELS = {image: '图片', video: '视频', text: '文本'};
     const sourceLabel = t(SOURCE_LABELS[reference.source_type] || reference.source_type || '未知来源');

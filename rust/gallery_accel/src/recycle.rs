@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use axum::http::StatusCode;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -384,14 +384,26 @@ pub fn capture_item_snapshot(conn: &Connection, item_id: i64) -> Result<(Value, 
         .prepare("SELECT tag_id FROM item_tags WHERE item_id=? ORDER BY tag_id")?
         .query_map([item_id], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<i64>>>()?;
-    let favorite: i64 = conn
+    // Pre-favorites schemas have no relationship to capture. Distinguish that
+    // known legacy case from a failed read of an existing favorites table.
+    let has_favorites: bool = conn
         .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='item_favorites')",
+            [],
+            |row| row.get(0),
+        )
+        .context("check favorites schema for recycle snapshot")?;
+    let favorite: bool = if has_favorites {
+        conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM item_favorites WHERE item_id=?)",
             [item_id],
             |row| row.get(0),
         )
-        .unwrap_or(0);
-    Ok((snapshot, tags, favorite != 0))
+        .context("read favorite for recycle snapshot")?
+    } else {
+        false
+    };
+    Ok((snapshot, tags, favorite))
 }
 
 pub fn recycle_entries_response(
@@ -526,14 +538,31 @@ fn insert_restored_reference(
     }
 }
 
-fn restore_tag_single_refs(conn: &Connection, item_id: i64, raw: &str) -> Result<i64> {
-    let refs: Vec<Value> = serde_json::from_str(raw).unwrap_or_default();
+#[derive(serde::Deserialize)]
+struct RecycledTagReference {
+    character_id: i64,
+    embedding: Vec<u8>,
+    #[serde(default)]
+    embedding_dim: i64,
+    #[serde(default)]
+    embedding_model_repo_id: String,
+    #[serde(default)]
+    embedding_model_variant: String,
+    #[serde(default)]
+    embedding_model_file: String,
+    embedding_updated_at: Option<f64>,
+    #[serde(default)]
+    created_at: f64,
+}
+
+fn restore_tag_single_refs(
+    conn: &Connection,
+    item_id: i64,
+    refs: &[RecycledTagReference],
+) -> Result<i64> {
     let mut restored = 0;
     for reference in refs {
-        let character_id = reference
-            .get("character_id")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        let character_id = reference.character_id;
         if character_id <= 0
             || conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM characters WHERE id=?)",
@@ -543,18 +572,7 @@ fn restore_tag_single_refs(conn: &Connection, item_id: i64, raw: &str) -> Result
         {
             continue;
         }
-        let embedding = reference
-            .get("embedding")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_u64)
-                    .map(|value| value as u8)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if embedding.is_empty() {
+        if reference.embedding.is_empty() {
             continue;
         }
         conn.execute(
@@ -565,21 +583,15 @@ fn restore_tag_single_refs(conn: &Connection, item_id: i64, raw: &str) -> Result
              VALUES (?,?,?,?,?,?,?,?,?,?)",
             params![
                 character_id,
-                embedding,
-                reference["embedding_dim"].as_i64().unwrap_or(0),
-                reference["embedding_model_repo_id"]
-                    .as_str()
-                    .unwrap_or_default(),
-                reference["embedding_model_variant"]
-                    .as_str()
-                    .unwrap_or_default(),
-                reference["embedding_model_file"]
-                    .as_str()
-                    .unwrap_or_default(),
-                reference["embedding_updated_at"].as_f64(),
+                reference.embedding,
+                reference.embedding_dim,
+                reference.embedding_model_repo_id,
+                reference.embedding_model_variant,
+                reference.embedding_model_file,
+                reference.embedding_updated_at,
                 "tag_single",
                 item_id,
-                reference["created_at"].as_f64().unwrap_or(0.0),
+                reference.created_at,
             ],
         )?;
         restored += 1;
@@ -587,8 +599,7 @@ fn restore_tag_single_refs(conn: &Connection, item_id: i64, raw: &str) -> Result
     Ok(restored)
 }
 
-fn reattach_non_tag_refs(conn: &Connection, item_id: i64, raw: &str) -> Result<i64> {
-    let ids: Vec<i64> = serde_json::from_str(raw).unwrap_or_default();
+fn reattach_non_tag_refs(conn: &Connection, item_id: i64, ids: &[i64]) -> Result<i64> {
     let mut restored = 0;
     for id in ids {
         restored += conn.execute(
@@ -668,7 +679,17 @@ pub fn restore_recycle_entry(
     {
         return Err(conflict("recycle item snapshot does not match its record"));
     }
-    let tags: Vec<i64> = serde_json::from_str(&tags_raw).unwrap_or_default();
+    // Decode every relationship before moving the file. Treating a damaged
+    // snapshot as an empty list would commit a successful but incomplete restore.
+    let tags: Vec<i64> = serde_json::from_str(&tags_raw)
+        .context("decode recycle tag IDs")
+        .map_err(internal)?;
+    let tag_refs: Vec<RecycledTagReference> = serde_json::from_str(&tag_refs_raw)
+        .context("decode recycle character references")
+        .map_err(internal)?;
+    let non_tag_refs: Vec<i64> = serde_json::from_str(&non_tag_refs_raw)
+        .context("decode recycle reference IDs")
+        .map_err(internal)?;
     // The restored row stores the resolved real authorized path, never a
     // legacy virtual alias: `original_path` above stays as historical audit
     // data, and the snapshot path mapping was already validated.
@@ -750,8 +771,8 @@ pub fn restore_recycle_entry(
                 params![new_id, tag_id],
             )?;
         }
-        restore_tag_single_refs(&tx, new_id, &tag_refs_raw)?;
-        reattach_non_tag_refs(&tx, new_id, &non_tag_refs_raw)?;
+        restore_tag_single_refs(&tx, new_id, &tag_refs)?;
+        reattach_non_tag_refs(&tx, new_id, &non_tag_refs)?;
         // A restored file changes the folder's contents, so a plan confirmed
         // while the item sat in the recycle bin must be re-checked: a split
         // plan's saved actions do not include this file, and a rename plan's
@@ -1137,8 +1158,126 @@ pub fn recycle_entry_preview(
         ));
     }
     let edge = crate::image_preview::clamp_max_edge(max_edge);
+
+    let cache = crate::image_preview::preview_cache_path_for_source(&recycled_path, edge);
+    if let Some(cache_p) = cache.as_ref() {
+        if cache_p.is_file() {
+            if let Ok(bytes) = std::fs::read(cache_p) {
+                if crate::image_preview::looks_like_jpeg(&bytes) {
+                    return Ok(bytes);
+                }
+            }
+        }
+    }
+
+    let ext = recycled_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let is_archive = matches!(
+        ext.as_str(),
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz"
+    );
+    let is_video = matches!(
+        ext.as_str(),
+        "mp4" | "mkv" | "webm" | "mov" | "avi" | "flv" | "wmv"
+    );
+
+    if is_archive {
+        match generate_archive_recycle_preview(&recycled_path, edge) {
+            Ok(bytes) => {
+                if let Some(cache_p) = cache.as_ref() {
+                    crate::image_preview::write_preview_cache(cache_p, &bytes);
+                }
+                return Ok(bytes);
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": format!("archive preview failed: {e}")}),
+                ));
+            }
+        }
+    }
+
+    if is_video {
+        match crate::media_serve::extract_video_frame_jpeg_blocking(&recycled_path, 0.1) {
+            Ok(jpeg) => match crate::image_preview::image_preview_bytes_from_memory(&jpeg, edge) {
+                Ok(bytes) => {
+                    if let Some(cache_p) = cache.as_ref() {
+                        crate::image_preview::write_preview_cache(cache_p, &bytes);
+                    }
+                    return Ok(bytes);
+                }
+                Err(e) => {
+                    return Err((StatusCode::BAD_REQUEST, json!({"error": e.to_string()})));
+                }
+            },
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": format!("video preview failed: {e}")}),
+                ));
+            }
+        }
+    }
+
     crate::image_preview::image_preview_bytes(&path, edge)
         .map_err(|e| (StatusCode::BAD_REQUEST, json!({"error": e.to_string()})))
+}
+
+fn is_previewable_image_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "avif"
+    )
+}
+
+fn generate_archive_recycle_preview(archive_path: &Path, edge: u32) -> Result<Vec<u8>> {
+    let inspect = crate::archive_ops::inspect_archive(archive_path, None)?;
+    if inspect.is_encrypted {
+        anyhow::bail!("archive is encrypted");
+    }
+
+    let mut image_entries: Vec<_> = inspect
+        .entries
+        .iter()
+        .filter(|e| {
+            if e.is_dir || e.size == 0 || e.encrypted {
+                return false;
+            }
+            let p = e.path.replace('\\', "/");
+            if p.contains("__MACOSX/") || p.split('/').any(|seg| seg.starts_with("._")) {
+                return false;
+            }
+            Path::new(&p)
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(is_previewable_image_extension)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if image_entries.is_empty() {
+        anyhow::bail!("no previewable image entry in archive");
+    }
+
+    image_entries.sort_by(|a, b| {
+        let a_cover = a.path.to_ascii_lowercase().contains("cover");
+        let b_cover = b.path.to_ascii_lowercase().contains("cover");
+        match (a_cover, b_cover) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.path.cmp(&b.path),
+        }
+    });
+
+    let best_entry = image_entries[0];
+    let image_bytes =
+        crate::archive_ops::stream_archive_entry(archive_path, &best_entry.path, None)?;
+    crate::image_preview::image_preview_bytes_from_memory(&image_bytes, edge)
 }
 
 fn conflict(message: impl Into<String>) -> (StatusCode, Value) {

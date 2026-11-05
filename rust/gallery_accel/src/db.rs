@@ -378,6 +378,7 @@ fn ensure_product_schema(conn: &Connection, create_indexes: bool) -> Result<()> 
         CREATE TABLE IF NOT EXISTS characters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
+            series TEXT,
             created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
         );
         CREATE TABLE IF NOT EXISTS character_references (
@@ -463,6 +464,7 @@ fn ensure_product_schema(conn: &Connection, create_indexes: bool) -> Result<()> 
     )
     .context("initialize product schema")?;
     ensure_character_reference_columns(conn)?;
+    ensure_characters_columns(conn)?;
     ensure_item_date_columns(conn)?;
     ensure_item_dimension_columns(conn)?;
     // Folder-archive schema (including its repair UPDATE) belongs to writable
@@ -485,6 +487,12 @@ fn ensure_product_schema(conn: &Connection, create_indexes: bool) -> Result<()> 
             ON items(missing, missing_at) WHERE missing_at IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_move_candidates_item_status
             ON move_candidates(item_id, status);
+        CREATE INDEX IF NOT EXISTS idx_items_content_hash_global
+            ON items(content_hash, missing, artist_id, id)
+            WHERE hash_status='done' AND content_hash != '';
+        CREATE INDEX IF NOT EXISTS idx_items_active_date
+            ON items(date DESC, id DESC)
+            WHERE missing = 0;
         "#,
     )?;
     if create_indexes {
@@ -500,6 +508,12 @@ fn ensure_product_schema(conn: &Connection, create_indexes: bool) -> Result<()> 
             CREATE INDEX IF NOT EXISTS idx_items_missing ON items(artist_id, missing);
             CREATE INDEX IF NOT EXISTS idx_items_hash_missing
                 ON items(artist_id, content_hash, missing);
+            CREATE INDEX IF NOT EXISTS idx_items_content_hash_global
+                ON items(content_hash, missing, artist_id, id)
+                WHERE hash_status='done' AND content_hash != '';
+            CREATE INDEX IF NOT EXISTS idx_items_active_date
+                ON items(date DESC, id DESC)
+                WHERE missing = 0;
             CREATE INDEX IF NOT EXISTS idx_items_inode_missing
                 ON items(artist_id, st_dev, st_ino, missing);
             CREATE INDEX IF NOT EXISTS idx_items_media
@@ -821,6 +835,13 @@ fn ensure_character_reference_columns(conn: &Connection) -> Result<()> {
         // Server-side path of a manually uploaded reference photo. NULL for
         // tag_single rows, which preview through their library item instead.
         ("image_path", "TEXT"),
+        // Autonomous organization pipeline (RFC-2026-AUTONOMOUS-ORGANIZE v2):
+        // which cluster sample the vector represents, and whether it belongs
+        // to the verified retrieval library (0 = staging pool awaiting
+        // confirmation). Legacy rows keep their exact pre-migration semantics
+        // through the DEFAULTs.
+        ("prototype_role", "TEXT NOT NULL DEFAULT 'manual'"),
+        ("verified", "INTEGER NOT NULL DEFAULT 1"),
     ] {
         if !columns.iter().any(|column| column == name) {
             conn.execute(
@@ -828,6 +849,24 @@ fn ensure_character_reference_columns(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
+    }
+    // Created here rather than in the schema batch so legacy databases have
+    // the `verified` column by the time the index is built.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_char_ref_verified
+         ON character_references(verified, character_id)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn ensure_characters_columns(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(characters)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|column| column == "series") {
+        conn.execute("ALTER TABLE characters ADD COLUMN series TEXT", [])?;
     }
     Ok(())
 }
@@ -1026,7 +1065,11 @@ fn configure_connection(conn: &Connection, read_only: bool) -> Result<()> {
     let mmap_size = env::var("SQLITE_MMAP_SIZE")
         .ok()
         .and_then(|value| value.trim().parse::<i64>().ok())
-        .unwrap_or(268_435_456);
+        .unwrap_or(33_554_432);
+    let cache_size = env::var("SQLITE_CACHE_SIZE")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(-16_000);
 
     conn.create_collation("NATURAL_NOCASE", |left: &str, right: &str| {
         natural_compare(left, right)
@@ -1043,6 +1086,7 @@ fn configure_connection(conn: &Connection, read_only: bool) -> Result<()> {
     }
     conn.pragma_update(None, "busy_timeout", busy_timeout as i64)?;
     conn.pragma_update(None, "mmap_size", mmap_size)?;
+    conn.pragma_update(None, "cache_size", cache_size)?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(())
 }

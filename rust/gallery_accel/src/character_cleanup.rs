@@ -135,6 +135,7 @@ pub(crate) fn load_character_refs(conn: &Connection, character_id: i64) -> Resul
          WHERE cr.character_id = ?
            AND cr.embedding IS NOT NULL
            AND cr.embedding_dim = ?
+           AND COALESCE(cr.verified, 1) = 1
            AND (
              (cr.embedding_model_repo_id = ? AND cr.embedding_model_variant = ? AND cr.embedding_model_file = ?)
              OR (cr.embedding_model_variant = ? AND (cr.embedding_model_file = '' OR cr.embedding_model_file IS NULL))
@@ -258,13 +259,27 @@ pub(crate) fn select_diverse_indices(refs: &[RefRec], desired: usize) -> Vec<usi
         }
     };
 
+    let dup_s = duplicate_similarity();
+    let min_s = min_similarity();
+    let is_dup_of_selected = |selected: &[usize], idx: usize| -> bool {
+        selected
+            .iter()
+            .any(|&s| sim_at_least(dot(&refs[idx].vector, &refs[s].vector), dup_s))
+    };
+    let is_supported_by_selected = |selected: &[usize], idx: usize| -> bool {
+        selected.is_empty()
+            || selected
+                .iter()
+                .any(|&s| sim_at_least(dot(&refs[idx].vector, &refs[s].vector), min_s))
+    };
+
     if multi_artist {
         for &idx in &order {
             if selected.len() >= desired {
                 break;
             }
             if let Some(a) = refs[idx].artist_id {
-                if !used_artists.contains(&a) {
+                if !used_artists.contains(&a) && !is_dup_of_selected(&selected, idx) {
                     push(
                         &mut selected,
                         &mut used_artists,
@@ -282,7 +297,7 @@ pub(crate) fn select_diverse_indices(refs: &[RefRec], desired: usize) -> Vec<usi
                 break;
             }
             let f = refs[idx].folder.clone();
-            if !f.is_empty() && !used_folders.contains(&f) {
+            if !f.is_empty() && !used_folders.contains(&f) && !is_dup_of_selected(&selected, idx) {
                 push(
                     &mut selected,
                     &mut used_artists,
@@ -291,6 +306,22 @@ pub(crate) fn select_diverse_indices(refs: &[RefRec], desired: usize) -> Vec<usi
                     idx,
                 );
             }
+        }
+    }
+    // Prefer non-duplicate candidates that share at least min_similarity with
+    // the already-chosen seeds before falling back to near-duplicates.
+    for &idx in &order {
+        if selected.len() >= desired {
+            break;
+        }
+        if !is_dup_of_selected(&selected, idx) && is_supported_by_selected(&selected, idx) {
+            push(
+                &mut selected,
+                &mut used_artists,
+                &mut used_folders,
+                refs,
+                idx,
+            );
         }
     }
     for &idx in &order {
@@ -310,16 +341,26 @@ pub(crate) fn select_diverse_indices(refs: &[RefRec], desired: usize) -> Vec<usi
 
 fn stable_core(refs: &[RefRec]) -> Vec<usize> {
     let desired = seed_core_size();
-    let mut core_indices = Vec::new();
-    // Protected first
-    for (i, r) in refs.iter().enumerate() {
-        if r.source_type != "tag_single" {
-            core_indices.push(i);
-            if core_indices.len() >= desired {
-                return core_indices;
-            }
-        }
+    // All verified non-`tag_single` references (`manual`, `cluster_verified`)
+    // are trusted ground-truth prototypes: keep all of them in the voting core
+    // (ordered by artist/folder diversity and density) rather than truncating
+    // at `desired` in insertion order.
+    let protected_indices: Vec<usize> = refs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.source_type != "tag_single")
+        .map(|(i, _)| i)
+        .collect();
+    if protected_indices.len() >= desired {
+        let protected_refs: Vec<RefRec> =
+            protected_indices.iter().map(|&i| refs[i].clone()).collect();
+        let ordered = select_diverse_indices(&protected_refs, protected_refs.len());
+        return ordered
+            .into_iter()
+            .map(|li| protected_indices[li])
+            .collect();
     }
+    let mut core_indices = protected_indices;
     let auto_indices: Vec<usize> = refs
         .iter()
         .enumerate()
@@ -427,6 +468,15 @@ pub(crate) fn core_vote_records(vector: &[f32], core: &[RefRec]) -> CoreVote {
     core_vote(vector, &core)
 }
 
+/// True when `vector` is within the near-duplicate threshold (`>= 0.95` by
+/// default) of any reference in `existing`, including non-core kept references.
+pub(crate) fn is_near_duplicate_of_any(vector: &[f32], existing: &[RefRec]) -> bool {
+    let dup_s = duplicate_similarity();
+    existing
+        .iter()
+        .any(|r| sim_at_least(dot(vector, &r.vector), dup_s))
+}
+
 /// Vector quality cleanup for the whole library (or no-op when disabled / no vectors).
 pub fn cleanup_character_references(conn: &Connection) -> Result<Value> {
     if !auto_cleanup_enabled() {
@@ -480,6 +530,13 @@ pub fn cleanup_character_references(conn: &Connection) -> Result<Value> {
         let core_idx = stable_core(&refs);
         let core: Vec<&RefRec> = core_idx.iter().map(|&i| &refs[i]).collect();
         let keep_ids: std::collections::HashSet<i64> = core.iter().map(|r| r.id).collect();
+        let dup_s = duplicate_similarity();
+        let mut kept_vectors: Vec<&[f32]> = core.iter().map(|r| r.vector.as_slice()).collect();
+        for r in &protected {
+            if !keep_ids.contains(&r.id) {
+                kept_vectors.push(r.vector.as_slice());
+            }
+        }
 
         let mut remaining = refs.len();
         for r in &auto_refs {
@@ -490,7 +547,10 @@ pub fn cleanup_character_references(conn: &Connection) -> Result<Value> {
                 break;
             }
             let vote = core_vote(&r.vector, &core);
-            if vote.duplicate {
+            let dup_of_kept = kept_vectors
+                .iter()
+                .any(|k| sim_at_least(dot(&r.vector, k), dup_s));
+            if vote.duplicate || dup_of_kept {
                 duplicate_ids.push(r.id);
                 remaining -= 1;
                 continue;
@@ -498,7 +558,9 @@ pub fn cleanup_character_references(conn: &Connection) -> Result<Value> {
             if !vote.supported {
                 low_similarity_ids.push(r.id);
                 remaining -= 1;
+                continue;
             }
+            kept_vectors.push(r.vector.as_slice());
         }
     }
 

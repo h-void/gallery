@@ -24,9 +24,9 @@ use gallery_accel::{
     BridgeInvalid, BridgeTask, CancelOutcome, DatePrecision, DecisionOutcome, ExternalReceipt,
     LegacyScopeOutcome, MediaRoots, NamingApplyError, NamingApplyRequest, NetdiskSettings,
     PawchiveSettings, PostDecisionAction, PostListFilter, ReceiptOutcome, ScanControl,
-    SelectionError, SubscriptionMode, SyncTrigger, WorkNamingContext, BRIDGE_TASK_SETTLED,
-    BRIDGE_TASK_SUBMITTED, LEDGER_REASON_UNKNOWN_WORK, MAX_ITEM_PAGE_LIMIT, MAX_PAGINATION_LIMIT,
-    NETDISK_BRIDGE_PAYLOAD_MAX_BYTES, NETDISK_PROTOCOL_VERSION,
+    SelectionError, SubscriptionMode, SyncTrigger, WorkNamingContext, BRIDGE_TASK_REGISTERED,
+    BRIDGE_TASK_SETTLED, BRIDGE_TASK_SUBMITTED, LEDGER_REASON_UNKNOWN_WORK, MAX_ITEM_PAGE_LIMIT,
+    MAX_PAGINATION_LIMIT, NETDISK_BRIDGE_PAYLOAD_MAX_BYTES, NETDISK_PROTOCOL_VERSION,
     PAWCHIVE_FILTER_SELECTION_MAX_POSTS,
 };
 
@@ -306,10 +306,18 @@ pub(super) async fn api_pawchive_external_receipt(
     }
     let conn = state.pool.get().map_err(to_http_error)?;
     match record_external_receipt(&conn, &receipt, &state.roots, None) {
-        Ok(ReceiptOutcome::Recorded) => Ok((
-            StatusCode::OK,
-            Json(json!({"recorded": true, "settled": true})),
-        )),
+        Ok(ReceiptOutcome::Recorded) => {
+            // A recorded `completed` receipt settled the delivery; a recorded
+            // `failed` report is only kept as a fact and settles nothing
+            // (see `record_external_receipt`). Answering `settled: true` for
+            // the failure case used to tell the bridge a failure report had
+            // delivered the work.
+            let settled = receipt.result == "completed";
+            Ok((
+                StatusCode::OK,
+                Json(json!({"recorded": true, "settled": settled})),
+            ))
+        }
         Ok(ReceiptOutcome::Duplicate) => Ok((
             StatusCode::OK,
             Json(json!({"recorded": false, "duplicate": true})),
@@ -1603,6 +1611,17 @@ pub(super) async fn api_netdisk_create_job(
             Json(json!({"error": "缺少作品 ID 或分享链接"})),
         ));
     }
+    if target_post_ids.len() > PAWCHIVE_FILTER_SELECTION_MAX_POSTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "一次最多投递 {} 篇作品",
+                    PAWCHIVE_FILTER_SELECTION_MAX_POSTS
+                )
+            })),
+        ));
+    }
 
     let should_auto_start = req.auto_start.unwrap_or(settings.auto_start);
     let effective_staging_dir = if !settings.staging_dir.trim().is_empty() {
@@ -1619,9 +1638,9 @@ pub(super) async fn api_netdisk_create_job(
             let active: Option<(String, String)> = conn
                 .query_row(
                     "SELECT task_id, state FROM netdisk_bridge_tasks
-                     WHERE post_id = ?1 AND state NOT IN ('settled', 'cancelled', 'failed')
+                     WHERE post_id = ?1 AND state IN (?2, ?3)
                      ORDER BY created_at DESC LIMIT 1",
-                    rusqlite::params![pid],
+                    rusqlite::params![pid, BRIDGE_TASK_REGISTERED, BRIDGE_TASK_SUBMITTED],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
@@ -1704,9 +1723,9 @@ pub(super) async fn api_netdisk_create_job(
             let active: Option<String> = conn
                 .query_row(
                     "SELECT task_id FROM netdisk_bridge_tasks
-                     WHERE post_id = ?1 AND state NOT IN ('settled', 'cancelled', 'failed')
+                     WHERE post_id = ?1 AND state IN (?2, ?3)
                      ORDER BY created_at DESC LIMIT 1",
-                    rusqlite::params![pid],
+                    rusqlite::params![pid, BRIDGE_TASK_REGISTERED, BRIDGE_TASK_SUBMITTED],
                     |row| row.get(0),
                 )
                 .optional()

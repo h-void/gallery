@@ -41,7 +41,13 @@ function selectionSetsEqual(a, b) {
 }
 
 export function applySelectionChange(ids, options = {}) {
-  const gridScrollAnchor = captureGridScrollAnchor();
+  // A marquee drag never scrolls the grid and selection classes never reflow
+  // cards, so the per-frame anchor capture — a getBoundingClientRect walk over
+  // every card above the viewport — only burns the frame budget; its restore
+  // calls no-op on a null anchor. The drag-end update takes the full path.
+  const gridScrollAnchor = options.reason === 'selection_box'
+    ? null
+    : captureGridScrollAnchor();
   const restoreSeq = nextRequestSeq('selectionRestoreSeq');
   const nextIds = normalizeSelectionIds(ids instanceof Set ? ids : new Set(ids || []));
   const changed = !selectionSetsEqual(state.selectedIds, nextIds);
@@ -1028,6 +1034,10 @@ export async function ensureEditTagContext() {
     // A zero-tag artist caches an empty list too: without this early return
     // every updateEditBar (each pointermove during drag-select) would re-hit
     // /api/tags.
+    // Returning to this cached context also supersedes a pending load for a
+    // different artist; otherwise that response replaces the cached tags.
+    editTagContextLoadToken++;
+    editTagContextInFlight = null;
     state.editTagContextLoading = false;
     pruneSelectedEditTags();
     renderEditTagPicker();
@@ -1208,27 +1218,61 @@ function bindEditTagPickerPanel(panel) {
 }
 
 function updateEditTagPickerSummary() {
-  const count = selectedEditTagNames().length;
+  const names = selectedEditTagNames();
+  const count = names.length;
   const summary = $('#editTagPickerSummary');
-  if (summary) summary.textContent = count ? t('已选 {count} 个角色', {count}) : '未选角色';
+  if (summary) {
+    summary.textContent = count ? t('已选 {count} 个角色', {count}) : '未选角色';
+    summary.title = count ? names.join('、') : '';
+    summary.classList.toggle('has-selection', count > 0);
+  }
   const input = $('#editTagSearch');
   if (input) input.placeholder = count ? '继续搜索角色' : '选择或搜索角色';
 }
 
+let editGlobalTagSearchTimer = null;
+
+export function cancelGlobalEditTagSearch() {
+  // Invalidate requests already sent as well as the debounce timer. A newer
+  // query owns the results immediately, even before its request starts.
+  editGlobalTagSearchToken++;
+  state.editGlobalTagSearchLoading = false;
+  if (editGlobalTagSearchTimer) {
+    clearTimeout(editGlobalTagSearchTimer);
+    editGlobalTagSearchTimer = null;
+  }
+}
+
+export function scheduleGlobalEditTagSearch(query = state.editTagQuery, delay = 250) {
+  cancelGlobalEditTagSearch();
+  editGlobalTagSearchTimer = setTimeout(() => {
+    editGlobalTagSearchTimer = null;
+    loadGlobalEditTagResults(query);
+  }, delay);
+}
+
 function clearEditTagQuery() {
+  cancelGlobalEditTagSearch();
   state.editTagQuery = '';
   const input = $('#editTagSearch');
   if (input) input.value = '';
 }
 
-export function openEditTagPicker() {
+export function openEditTagPicker(options = {}) {
+  const immediate = options.immediate !== false;
   $('#editTagPicker').classList.add('open');
   renderEditTagPicker();
   ensureEditTagContext();
-  loadGlobalEditTagResults(state.editTagQuery);
+  if (immediate) {
+    cancelGlobalEditTagSearch();
+    loadGlobalEditTagResults(state.editTagQuery);
+  } else {
+    scheduleGlobalEditTagSearch(state.editTagQuery, 250);
+  }
 }
 
 export function closeEditTagPicker() {
+  cancelGlobalEditTagSearch();
   $('#editTagPicker').classList.remove('open');
   clearEditTagQuery();
   renderEditTagPicker();

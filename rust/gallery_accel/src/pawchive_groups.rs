@@ -1840,9 +1840,16 @@ pub fn verified_location_for_post(
         return Ok(VerifiedLocation::NoGroup);
     };
     let groups: Vec<String> = {
+        // Only live groups count towards ambiguity. A link to a group that
+        // later went 'gone' is history, not a second claim on the work:
+        // counting it froze the post behind an Ambiguous verdict whose only
+        // resolution was manually revoking a pairing to a directory that no
+        // longer exists.
         let mut statement = conn.prepare(
-            "SELECT group_id FROM work_group_links
-              WHERE work_id = ?1 AND revoked_at = '' ORDER BY id",
+            "SELECT wgl.group_id FROM work_group_links wgl
+              JOIN content_groups cg ON cg.group_id = wgl.group_id
+              WHERE wgl.work_id = ?1 AND wgl.revoked_at = '' AND cg.state != 'gone'
+              ORDER BY wgl.id",
         )?;
         let rows = statement.query_map(params![work_id], |row| row.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -2188,9 +2195,16 @@ pub fn owning_group_for_path(conn: &Connection, path: &str) -> Result<Option<Own
                 )
                 .optional()?;
             if let Some((group_id, generation)) = found {
+                // Depth is compared on the *absolute* path (root + relative):
+                // the candidates come from different roots, and a long
+                // relative name under a shallow root is not deeper than a
+                // short one under a nested root. Comparing relatives across
+                // roots pinned the fence on the wrong group when roots
+                // overlapped.
+                let absolute_depth = root.len() + candidate.len();
                 let deeper = best
                     .as_ref()
-                    .map(|held| candidate.len() > held.root_relative.len())
+                    .map(|held| absolute_depth > held.artist_root.len() + held.root_relative.len())
                     .unwrap_or(true);
                 if deeper {
                     best = Some(OwnedGroup {
@@ -2522,6 +2536,10 @@ pub fn relocate_groups_in_tx(
         return Ok(0);
     }
     let root = artist_root.to_string();
+    // The scoping comparisons below run against this key: the ledger stores
+    // forward slashes, and the artist root arrives in the platform's own path
+    // spelling.
+    let root_key = root.replace('\\', "/");
     let now = Utc::now().to_rfc3339();
     let mut touched: Vec<(String, String)> = Vec::new();
 
@@ -2542,6 +2560,12 @@ pub fn relocate_groups_in_tx(
         // A directory rewrite keeps every file name; only an exact match means
         // the file itself moved, and only then can its name have changed.
         let new_file_name = new.rsplit('/').next().unwrap_or("").to_string();
+        // Members are scoped to this artist root's groups before anything is
+        // rewritten. The member table carries no root of its own, and relative
+        // paths are only unique *within* a root: two creators with the same
+        // folder name used to have each other's members rewritten by this
+        // UPDATE, leaving the other artist's ledger describing paths that never
+        // existed on disk.
         tx.execute(
             "UPDATE content_group_members
                 SET relative_path = CASE
@@ -2549,16 +2573,19 @@ pub fn relocate_groups_in_tx(
                       ELSE ?2 || substr(relative_path, length(?1) + 1)
                     END,
                     file_name = CASE WHEN relative_path = ?1 THEN ?4 ELSE file_name END
-              WHERE relative_path = ?1 OR instr(relative_path, ?3) = 1",
-            params![old, new, old_prefix, new_file_name],
+              WHERE (relative_path = ?1 OR instr(relative_path, ?3) = 1)
+                AND group_id IN (SELECT group_id FROM content_groups
+                                  WHERE replace(artist_root, char(92), '/') = ?5)",
+            params![old, new, old_prefix, new_file_name, root_key],
         )?;
 
         let mut stmt = tx.prepare(
             "SELECT group_id, root_relative FROM content_groups
-              WHERE root_relative = ?1 OR instr(root_relative, ?2) = 1",
+              WHERE (root_relative = ?1 OR instr(root_relative, ?2) = 1)
+                AND replace(artist_root, char(92), '/') = ?3",
         )?;
         let groups = stmt
-            .query_map(params![old, old_prefix], |row| {
+            .query_map(params![old, old_prefix, root_key], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2576,6 +2603,64 @@ pub fn relocate_groups_in_tx(
                 params![group_id, next, now],
             )?;
             touched.push((group_id, next));
+        }
+
+        // The delivery ledger points resources at absolute paths, so a group
+        // rename has to reach it too or the group mapping above is only half
+        // the fix: a retry with the stale reserved target rebuilds the
+        // pre-rename directory (a second tree for the same work), and
+        // reconcile looks for an already-published job at a path that no
+        // longer exists and re-downloads forever. The artist-folder move has
+        // remapped these two columns all along; group-level moves did not.
+        let old_abs = old_raw.replace('\\', "/");
+        let new_abs = new_raw.replace('\\', "/");
+        let old_abs_prefix = format!("{}/", old_abs.trim_end_matches('/'));
+        let remap_sql = |table: &str, column: &str| {
+            format!(
+                "UPDATE {table}
+                 SET {column} = CASE
+                       WHEN {column} = ?1 THEN ?2
+                       ELSE ?2 || substr({column}, length(?1) + 1)
+                     END
+                 WHERE {column} = ?1
+                    OR substr({column}, 1, length(?3)) = ?3"
+            )
+        };
+        let remap_params = params![old_abs, new_abs, old_abs_prefix];
+        // Both tables are guarded: a database that runs the tidy flows
+        // without the pawchive ledger (minimal installs, most test schemas)
+        // must not have its move fail here.
+        for table in ["kemono_files", "download_publish_jobs"] {
+            // A stub of the publish-jobs table (its pairing creates one with
+            // only `id`) is not a delivery ledger; the column check keeps the
+            // move from failing on a schema that never recorded targets.
+            let has_target_column: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)
+                     AND EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'target_path')",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if has_target_column {
+                tx.execute(&remap_sql(table, "target_path"), remap_params)?;
+            }
+            // The staged `.part` of a mid-publish job sits beside its target
+            // and moves with the directory; leaving its recorded path behind
+            // made the retry's cleanup a silent no-op and the file an
+            // unreferenced orphan in the new location.
+            if table == "download_publish_jobs" {
+                let has_temp_column: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'private_temp_path')",
+                        params![table],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+                if has_temp_column {
+                    tx.execute(&remap_sql(table, "private_temp_path"), remap_params)?;
+                }
+            }
         }
     }
 
@@ -2599,6 +2684,46 @@ pub fn relocate_groups_in_tx(
                 |row| row.get(0),
             )
             .unwrap_or(0);
+        // Clear the row that would collide with the new path before the move:
+        // a group can hold several historical location rows, and rewriting all
+        // of them to one path hit UNIQUE(group_id, relative_path) whenever the
+        // target was one the group had used before (a rename back), failing the
+        // whole tidy transaction.
+        let override_at_target: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM content_group_locations
+              WHERE group_id = ?1 AND relative_path = ?2 AND manual_override != 0",
+            params![group_id, relative_path],
+            |row| row.get(0),
+        )?;
+        if override_at_target > 0 {
+            // The user has pinned this group at the destination; the automatic
+            // rows are superseded rather than moved beside it.
+            tx.execute(
+                "DELETE FROM content_group_locations
+                  WHERE group_id = ?1 AND manual_override = 0",
+                params![group_id],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM content_group_locations
+                  WHERE group_id = ?1 AND relative_path = ?2 AND manual_override = 0",
+                params![group_id, relative_path],
+            )?;
+        }
+        // Collapse the group's automatic location rows to one before the
+        // rewrite: the ledger legitimately holds several non-override rows at
+        // distinct paths, and the UPDATE below moves all of them onto one
+        // path — the second row then violates UNIQUE(group_id, relative_path)
+        // mid-statement and failed the whole tidy transaction. Keeping the
+        // oldest row preserves the anchor the readers fold by.
+        tx.execute(
+            "DELETE FROM content_group_locations
+              WHERE group_id = ?1 AND manual_override = 0
+                AND rowid NOT IN (
+                    SELECT MIN(rowid) FROM content_group_locations
+                     WHERE group_id = ?1 AND manual_override = 0)",
+            params![group_id],
+        )?;
         let changed = tx.execute(
             "UPDATE content_group_locations
                 SET relative_path = ?2, generation = ?3, updated_at = ?4

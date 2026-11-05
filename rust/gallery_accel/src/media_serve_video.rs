@@ -110,6 +110,26 @@ pub(crate) fn extract_video_frame_jpeg_blocking(
     }
 }
 
+/// Read a cached video frame JPEG for `(full_path, t)` when present, or extract
+/// via `ffmpeg` and populate the disk cache.
+pub(crate) fn cached_or_extract_video_frame_jpeg_blocking(
+    full_path: &Path,
+    t: f64,
+) -> std::result::Result<(Vec<u8>, bool), VideoFrameExtractError> {
+    let cache_path = video_frame_cache_path(full_path, t);
+    if let Some(bytes) = cache_path
+        .as_ref()
+        .and_then(|cache| std::fs::read(cache).ok().filter(|bytes| !bytes.is_empty()))
+    {
+        return Ok((bytes, true));
+    }
+    let buf = extract_video_frame_jpeg_blocking(full_path, t)?;
+    if let Some(cache) = cache_path {
+        write_video_frame_cache(&cache, &buf);
+    }
+    Ok((buf, false))
+}
+
 pub async fn video_frame_jpeg(
     path: &str,
     roots: &MediaRoots,

@@ -1055,6 +1055,7 @@ pub fn run_full_library_scan_claimed(
         ticket: control.active_ticket.load(Ordering::SeqCst),
     };
     let scan = run_scan_inner(conn, roots, control, None, None)?;
+    crate::artists::invalidate_artists_cache();
     let scanned = scan.get("scanned").and_then(Value::as_i64).unwrap_or(0);
     // A scan that covered zero artists or was partial/failed must never start real file moves:
     // only a scan that actually walked content completely may trigger auto archive.

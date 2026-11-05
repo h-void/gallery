@@ -115,8 +115,11 @@ export function toast(msg, type) {
   // active language. t() is idempotent, so call sites that already pass
   // translated text translate again to themselves.
   logUiAction('toast', {message: String(msg ?? ''), type: String(type || '')});
+  const normalizedType = type === 'warning' ? 'warn' : (type || 'info');
   const el = document.createElement('div');
-  el.className = `toast ${type}`;
+  // Untyped call sites used to render `toast undefined`, leaving the status
+  // dot colorless; `info` is the neutral style they mean.
+  el.className = `toast ${normalizedType}`;
   el.textContent = t(msg);
   // 错误提示立即播报（alert），其余礼貌播报（status），保证辅助技术能收到。
   el.setAttribute('role', type === 'error' ? 'alert' : 'status');

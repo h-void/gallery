@@ -2,13 +2,26 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// Shared-surface note (parallel BootGate batch, 2026-10-24): the startup path
+// below is the one place the boot-gate work and the pawchive work touch. The
+// orphaned publish-staging sweep was moved out of `startup_initialization`
+// into a detached thread after the router is published (see
+// `run_deferred_publish_sweep`): on a large library the recursive directory
+// walk costs minutes, and nothing in the serving path needs it first — a
+// restart used to answer `initializing` for that whole window. If you need to
+// reorder the startup sequence, change this note in the same commit.
+
 use clap::Parser;
 use gallery_accel::{env_db_path, log_error, log_info, spawn_configured_workers};
+
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod route_params;
 mod routes;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 struct Args {
     #[arg(long)]
     db: Option<PathBuf>,
@@ -20,7 +33,7 @@ struct Args {
     /// value is always honoured.
     #[arg(long)]
     port: Option<u16>,
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 6)]
     pool_size: usize,
     /// Open the database read-only (default). Implied off when writes are enabled.
     #[arg(long, default_value_t = true)]
@@ -46,6 +59,11 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
+    if let Ok(pool_env) = std::env::var("DB_POOL_SIZE") {
+        if let Ok(parsed) = pool_env.trim().parse::<usize>() {
+            args.pool_size = parsed;
+        }
+    }
     if args.primary {
         // Capability defaults only: an explicit --host/--port is never
         // rewritten, otherwise a primary-mode smoke test could not restrict
@@ -74,9 +92,118 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let db_path = args.db.unwrap_or_else(env_db_path);
+    let db_path = args.db.clone().unwrap_or_else(env_db_path);
+    // Bind before anything heavy: the port has to answer from the first
+    // moment, because "connection refused" during a post-update first boot
+    // read as the app being down — and stayed that way for as long as the
+    // initialization took, forever when it hung. The gate answers health with
+    // the startup phase and every other route with `initializing` until the
+    // real application is published.
+    let gate = routes::BootGate::new();
+    let static_dir = if args.primary {
+        Some(args.static_dir.clone().unwrap_or_else(default_static_dir))
+    } else {
+        None
+    };
+    let app = routes::boot_gate_router(gate.clone(), static_dir);
+
+    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    log_info!(
+        "gallery_accel listening on http://{} primary={} writes={} (startup initialization follows; /api/health reports progress)",
+        addr,
+        args.primary,
+        args.enable_writes
+    );
+
+    // The heavyweight startup, off the accept loop. Everything here is the
+    // synchronous work that used to run before the bind: pool construction
+    // (schema, WAL), crash reconciliations, workers. The phase label feeds
+    // the gate's health answer and the watchdog below, so a future hang names
+    // its step in the log instead of looking like a dead process.
+    let shutdown_control_slot: Arc<std::sync::OnceLock<Arc<gallery_accel::ScanControl>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let init_shutdown_slot = Arc::clone(&shutdown_control_slot);
+    let init_gate = gate.clone();
+    let init_args = args.clone();
+    let init_db_path = db_path.clone();
+    let init_handle = tokio::task::spawn_blocking(move || {
+        startup_initialization(init_gate, init_args, init_db_path, init_shutdown_slot)
+    });
+    let init_abort_handle = init_handle.abort_handle();
+    tokio::spawn(async move {
+        if let Err(error) = init_handle.await {
+            if error.is_panic() {
+                log_error!("startup initialization task panicked; aborting: {error}");
+                std::process::exit(101);
+            }
+        }
+    });
+
+    // A startup that outlasts a minute says so, with the phase it is in: the
+    // difference between "hung on the GPU" and "still migrating" is exactly
+    // what the log was missing while the port refused connections.
+    {
+        let watchdog_gate = gate.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.tick().await;
+            while !watchdog_gate.ready() {
+                interval.tick().await;
+                if watchdog_gate.ready() {
+                    break;
+                }
+                log_info!(
+                    "startup still initializing: {} ({}s elapsed)",
+                    watchdog_gate.phase(),
+                    watchdog_gate.elapsed_seconds()
+                );
+            }
+        });
+    }
+
+    // The peer address is published to the handlers, so a route that is only
+    // meant for a local companion (the downloader bridge) can say so.
+    //
+    // Shutdown: the package is stopped with SIGTERM and killed one second
+    // later, so the default disposition would cut whatever is running. The
+    // signal now ends the accept loop, tells the workers to stop between units
+    // of work, and gives the in-flight work a short window to finish. What is
+    // still running after that window is cut anyway — this narrows the window
+    // the startup reconciliation has to repair, it does not remove it.
+    let serve = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    );
+    tokio::select! {
+        result = serve => {
+            result?;
+        }
+        _ = shutdown_signal() => {
+            log_info!("shutdown requested; finishing in-flight work");
+            if let Some(control) = shutdown_control_slot.get() {
+                control.begin_shutdown();
+            }
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            log_info!("shutdown grace period elapsed");
+        }
+    }
+    init_abort_handle.abort();
+    Ok(())
+}
+
+/// The pre-listener work of old, run behind the boot gate on the blocking
+/// pool. Publishing the finished router into the gate slot is the "ready"
+/// transition; until then the gate answers on its own.
+fn startup_initialization(
+    gate: routes::BootGate,
+    args: Args,
+    db_path: PathBuf,
+    shutdown_control_slot: Arc<std::sync::OnceLock<Arc<gallery_accel::ScanControl>>>,
+) {
     let read_only = args.read_only && !args.enable_writes;
-    let state = routes::AppState::with_options(
+    gate.set_phase("opening the database");
+    let state = match routes::AppState::with_options(
         db_path.clone(),
         gallery_accel::DbConfig {
             read_only,
@@ -89,15 +216,22 @@ async fn main() -> anyhow::Result<()> {
             ml: args.enable_ml,
         },
         args.primary,
-    )?;
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            log_error!("startup failed while opening the database: {error}");
+            std::process::exit(1);
+        }
+    };
 
     // Finish or discard deletes interrupted by crash/power loss before any
     // request can observe the half-state ('moving' recycle rows).
     if !read_only {
+        gate.set_phase("reconciling interrupted operations");
         // Deliberately a dedicated short-lived connection, not the pool:
-        // this must run before the listener binds and before AppState (and
-        // its DbPool) exist. Keep journal_mode/busy_timeout aligned with
-        // configure_connection so pool connections never meet a
+        // this must run before the shared pool serves requests and before
+        // AppState (and its DbPool) are used. Keep journal_mode/busy_timeout
+        // aligned with configure_connection so pool connections never meet a
         // differently-configured peer on the same WAL file.
         match rusqlite::Connection::open(&db_path) {
             Ok(conn) => {
@@ -139,23 +273,12 @@ async fn main() -> anyhow::Result<()> {
                     Ok(_) => {}
                     Err(error) => log_error!("scan state reconciliation failed: {error}"),
                 }
-                // A publish interrupted between creating its staging file and
-                // recording it leaves a file the size of the finished download
-                // that nothing else can find: the scanner skips dot-files and
-                // the ledger never learned the path.
-                match gallery_accel::ingest_publish::sweep_orphaned_publish_parts(
-                    &conn,
-                    &gallery_accel::env_media_roots(),
-                    gallery_accel::ingest_publish::ORPHANED_PART_MIN_AGE,
-                ) {
-                    Ok(sweep) if sweep.files > 0 => log_info!(
-                        "reclaimed {} orphaned publish staging files ({} bytes)",
-                        sweep.files,
-                        sweep.bytes
-                    ),
-                    Ok(_) => {}
-                    Err(error) => log_error!("orphaned publish staging sweep failed: {error}"),
-                }
+                // The orphaned publish-staging sweep used to run here, but it
+                // walks every directory under the authorized roots — minutes
+                // of `read_dir` on a large library, with the whole serving
+                // surface answering `initializing` meanwhile. It runs
+                // detached after the router is published instead (see
+                // `run_deferred_publish_sweep`).
             }
             Err(error) => log_error!("recycle reconciliation open failed: {error}"),
         }
@@ -165,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
     // The worker opens SQLite itself so a busy database cannot delay listener
     // readiness.
     if args.enable_ml {
+        gate.set_phase("starting runtime preparation");
         let _ = gallery_accel::runtime_prepare::prepare_runtime_at(&db_path);
     }
 
@@ -173,11 +297,11 @@ async fn main() -> anyhow::Result<()> {
     // The scan control is cloned out of the worker inputs so the shutdown path
     // can tell every worker loop that the process is leaving, whether or not
     // the workers were started in this process.
-    let mut shutdown_control: Option<Arc<gallery_accel::ScanControl>> = None;
     if args.primary && !read_only {
+        gate.set_phase("starting background workers");
         let (worker_pool, worker_roots, worker_scan, worker_status, stats_gate) =
             state.worker_inputs();
-        shutdown_control = Some(Arc::clone(&worker_scan));
+        let _ = shutdown_control_slot.set(Arc::clone(&worker_scan));
         spawn_configured_workers(
             worker_pool,
             worker_roots,
@@ -192,51 +316,67 @@ async fn main() -> anyhow::Result<()> {
                 pool_size: 1,
             },
         ) {
-            gallery_accel::spawn_character_import_idle_worker(std::sync::Arc::new(idle_pool));
+            gallery_accel::spawn_character_import_idle_worker(Arc::new(idle_pool));
         }
     }
 
-    let mut app = routes::router(state);
-    if args.primary {
-        let static_dir = args.static_dir.unwrap_or_else(default_static_dir);
-        app = routes::with_static_ui(app, static_dir);
+    gate.set_phase("publishing the application");
+    let real = routes::router(state);
+    if let Err(previous) = gate.real_slot().set(real.into_service()) {
+        // Only a double initialization can land here; the loser keeps quiet.
+        let _ = previous;
     }
-
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     log_info!(
-        "gallery_accel listening on http://{} primary={} writes={}",
-        addr,
-        args.primary,
-        args.enable_writes
+        "startup complete in {}s: application published",
+        gate.elapsed_seconds()
     );
-    // The peer address is published to the handlers, so a route that is only
-    // meant for a local companion (the downloader bridge) can say so.
-    //
-    // Shutdown: the package is stopped with SIGTERM and killed one second
-    // later, so the default disposition would cut whatever is running. The
-    // signal now ends the accept loop, tells the workers to stop between units
-    // of work, and gives the in-flight work a short window to finish. What is
-    // still running after that window is cut anyway — this narrows the window
-    // the startup reconciliation has to repair, it does not remove it.
-    let serve = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    );
-    tokio::select! {
-        result = serve => {
-            result?;
-        }
-        _ = shutdown_signal() => {
-            log_info!("shutdown requested; finishing in-flight work");
-            if let Some(control) = shutdown_control.as_ref() {
-                control.begin_shutdown();
-            }
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
-            log_info!("shutdown grace period elapsed");
+
+    // The orphaned-staging sweep is a reclaim of `.gallery_publish_*.part`
+    // files older than `ORPHANED_PART_MIN_AGE`, not a precondition of
+    // serving: the scanner skips dot-files and every later boot retries it.
+    // It walks every directory under the authorized roots — minutes on a
+    // large library — so it runs detached here; a shutdown mid-sweep simply
+    // leaves the work to the next boot.
+    if !read_only {
+        let sweep_db_path = db_path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("publish-part-sweep".to_string())
+            .spawn(move || run_deferred_publish_sweep(&sweep_db_path));
+        if let Err(error) = spawned {
+            log_error!("could not start the publish staging sweep thread: {error}");
         }
     }
-    Ok(())
+}
+
+/// The orphaned publish-staging sweep, detached from the startup path (see
+/// the spawn site in `startup_initialization`). The connection's pragmas
+/// mirror the startup reconciliation's so pool connections never meet a
+/// differently-configured peer on the same WAL file.
+fn run_deferred_publish_sweep(db_path: &std::path::Path) {
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(conn) => conn,
+        Err(error) => {
+            log_error!("orphaned publish staging sweep open failed: {error}");
+            return;
+        }
+    };
+    let _ = conn.execute_batch(&format!(
+        "PRAGMA busy_timeout={}; PRAGMA journal_mode=WAL;",
+        gallery_accel::DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    ));
+    match gallery_accel::ingest_publish::sweep_orphaned_publish_parts(
+        &conn,
+        &gallery_accel::env_media_roots(),
+        gallery_accel::ingest_publish::ORPHANED_PART_MIN_AGE,
+    ) {
+        Ok(sweep) if sweep.files > 0 => log_info!(
+            "reclaimed {} orphaned publish staging files ({} bytes)",
+            sweep.files,
+            sweep.bytes
+        ),
+        Ok(_) => {}
+        Err(error) => log_error!("orphaned publish staging sweep failed: {error}"),
+    }
 }
 
 /// How long in-flight work may run after a stop request before the process

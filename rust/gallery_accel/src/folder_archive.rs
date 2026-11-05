@@ -112,8 +112,14 @@ fn update_folder_item_paths(
     // `folder_name` is the leaf folder a card and the search read, not the
     // relative path. Updating only `file_path` left it naming the folder the
     // rename just moved away: searching the new name missed the items and the
-    // old name kept matching until the next scan rewrote the rows.
+    // old name kept matching until the next scan rewrote the rows. Only rows
+    // whose immediate parent *is* the renamed folder change leaf — a top-level
+    // rename never touches the parents of deeper rows, so their leaf must stay.
     let folder_name = Path::new(real_target)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let logical_folder_name = Path::new(logical_target)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
@@ -123,7 +129,13 @@ fn update_folder_item_paths(
              THEN ?3 || substr(file_path, length(?1) + 1)
            ELSE ?4 || substr(file_path, length(?5) + 1)
          END,
-         folder_name=?8
+         folder_name=CASE
+           WHEN (file_path=?1 OR instr(file_path, ?2)=1)
+                AND instr(substr(file_path, length(?2) + 1), '/') = 0 THEN ?8
+           WHEN (file_path=?5 OR instr(file_path, ?7)=1)
+                AND instr(substr(file_path, length(?7) + 1), '/') = 0 THEN ?9
+           ELSE folder_name
+         END
          WHERE artist_id=?6 AND (
            file_path=?1 OR instr(file_path, ?2)=1 OR
            file_path=?5 OR instr(file_path, ?7)=1
@@ -137,6 +149,7 @@ fn update_folder_item_paths(
             artist_id,
             logical_prefix,
             folder_name,
+            logical_folder_name,
         ],
     )? as i64)
 }
@@ -298,6 +311,14 @@ pub fn ensure_folder_schema(conn: &Connection) -> Result<()> {
            )",
         params![now()],
     )?;
+    conn.execute(
+        "UPDATE folder_rename_plans
+         SET execution_log='[]', updated_at=?
+         WHERE status IN ('needs_tags', 'aligned', 'stale')
+           AND execution_log != '[]'
+           AND execution_log NOT LIKE '%\"reason\":\"rollback_failed\"%'",
+        params![now()],
+    )?;
     // Drop obsolete auto-archive summary only; plans and media paths stay untouched.
     purge_folder_rename_auto_last_run(conn)?;
     Ok(())
@@ -380,6 +401,9 @@ fn failure_reason(raw: &str) -> Option<String> {
 fn plan_failure(status: &str, execution_log: &str) -> Option<String> {
     if RESOLVED_PLAN_STATUSES.contains(&status) {
         return None;
+    }
+    if status == "needs_tags" {
+        return failure_reason(execution_log).filter(|reason| reason == "rollback_failed");
     }
     if status == "manual_review" {
         return Some(failure_reason(execution_log).unwrap_or_else(|| "manual_review".to_string()));
@@ -2068,9 +2092,23 @@ pub fn recompute_artist_plan_targets(
         let n = conn.execute(
             "UPDATE folder_rename_plans
              SET target_folder=?, status=?, confirmed_at=NULL, confirmation_source='',
-                 format_snapshot=?, updated_at=?
+                 format_snapshot=?,
+                 execution_log=CASE
+                     WHEN ? IN ('needs_tags','aligned','stale')
+                      AND execution_log NOT LIKE '%\"reason\":\"rollback_failed\"%'
+                     THEN '[]'
+                     ELSE execution_log
+                 END,
+                 updated_at=?
              WHERE id=? AND status NOT IN ('confirmed','executed','reverted')",
-            params![target, new_status, row_format_snapshot, now(), plan_id],
+            params![
+                target,
+                new_status,
+                row_format_snapshot,
+                new_status,
+                now(),
+                plan_id
+            ],
         )?;
         changed += n as usize;
     }
@@ -2328,7 +2366,14 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
                     let _ = conn.execute(
                         "UPDATE folder_rename_plans
                          SET selected_tag_ids=?, parsed_date=?, file_count=?, status=?, target_folder='',
-                             plan_kind=?, split_actions=?, updated_at=?
+                             plan_kind=?, split_actions=?,
+                             execution_log=CASE
+                                 WHEN ?='needs_tags'
+                                  AND execution_log NOT LIKE '%\"reason\":\"rollback_failed\"%'
+                                 THEN '[]'
+                                 ELSE execution_log
+                             END,
+                             updated_at=?
                          WHERE id=?",
                         params![
                             selected_tag_ids_json,
@@ -2337,6 +2382,7 @@ pub fn auto_discover_artist_folder_plans(conn: &Connection, artist_id: i64) -> R
                             initial_status,
                             plan_kind,
                             split_actions,
+                            initial_status,
                             now(),
                             plan_id,
                         ],
@@ -2804,7 +2850,9 @@ pub fn execute_folder_renames_with_backup(
     // Lazily built per-artist item-date grouping; executed plans rewrite item
     // paths, so the cache is dropped after every plan that moved files.
     let mut item_dates_cache: Option<ItemDatesByFolder> = None;
-    for (id, source_raw, target_raw, plan_kind, split_actions, file_count) in plans {
+    // The commit gate now decides on leftover rows, not the plan's stored
+    // `file_count` (manual upserts carry the schema default 0).
+    for (id, source_raw, target_raw, plan_kind, split_actions, _file_count) in plans {
         if plan_kind == "split_by_tag" {
             if dry_run {
                 match prepare_split_file_moves(
@@ -3228,7 +3276,29 @@ pub fn execute_folder_renames_with_backup(
             // The folder was already renamed on disk; if the stored item paths
             // match neither prefix, committing would leave every row pointing
             // at the old location (next scan: mass missing + duplicates).
-            if updated_items == 0 && file_count > 0 {
+            // Decide on the rows themselves rather than the plan's `file_count`:
+            // plans confirmed through the manual upsert carry the schema
+            // default 0, which let exactly this state commit. Zero leftovers
+            // means either every row was rewritten or the folder was empty —
+            // both are safe to commit; a leftover row is not.
+            let src_prefix = format!("{}/", src_s.trim_end_matches('/'));
+            let src_logical_prefix = format!("{}/", src_logical.trim_end_matches('/'));
+            let leftovers: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM items
+                 WHERE artist_id=?1 AND (
+                   file_path=?2 OR instr(file_path, ?3)=1 OR
+                   file_path=?4 OR instr(file_path, ?5)=1
+                 )",
+                params![
+                    artist_id,
+                    &src_s,
+                    &src_prefix,
+                    &src_logical,
+                    &src_logical_prefix
+                ],
+                |row| row.get(0),
+            )?;
+            if leftovers > 0 {
                 bail!("path rewrite matched no items for a non-empty plan");
             }
             // Recycled entries whose original path is inside the renamed folder

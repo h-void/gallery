@@ -1008,6 +1008,32 @@ fn apply_artist_move_db_updates(
             }
         }
     }
+    // The group ledger's anchor is the artist directory, and a whole-artist
+    // move preserves the internal layout — members and locations stay
+    // artist-root-relative, so only `artist_root` follows the tree. Leaving it
+    // behind made the next attachment re-derive its group from the template
+    // (the old root no longer exists), build a second tree for the same work,
+    // and — once the user re-paired the new rows — turn the stale link into an
+    // ambiguity that refused publishing outright. `group_id` is untouched so
+    // `work_group_links` survive the move.
+    if table_has_column(&transaction, "content_groups", "artist_root")? {
+        let mut stmt = transaction.prepare("SELECT id, artist_root FROM content_groups")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (id, artist_root) in rows {
+            if let Some(next) = remap_any(&artist_root) {
+                transaction.execute(
+                    "UPDATE content_groups SET artist_root=?1, updated_at=?2 WHERE id=?3",
+                    params![next, chrono::Utc::now().to_rfc3339(), id],
+                )?;
+                updated += 1;
+            }
+        }
+    }
     // Active recycle entries follow the move so a later restore lands in the
     // new directory instead of rebuilding the abandoned source path.
     updated += update_recycle_entries_for_move(&transaction, artist_id, source_text, target_text)?;
@@ -1060,19 +1086,35 @@ pub fn reconcile_pending_artist_move(conn: &Connection) -> Value {
     let source_dir = PathBuf::from(source);
     let target_dir = PathBuf::from(target);
     let outcome = if !source_dir.is_dir() && target_dir.is_dir() {
-        match apply_artist_move_db_updates(conn, &roots, artist_id, source, target) {
-            Ok(updated) => {
-                clear_pending_move_intent();
-                log_info!(
-                    "artist move rolled forward for artist {artist_id}: {updated} db rows updated"
-                );
-                "rolled_forward"
+        // Same fence as the interactive move: startup reconciliation rewrites
+        // the group ledger and must not interleave with a group operation
+        // that woke up earlier. A held lock keeps the intent for the next
+        // boot instead of racing it.
+        match crate::pawchive_groups::lock_group_operations(conn, true) {
+            Ok(fence) => {
+                match apply_artist_move_db_updates(conn, &roots, artist_id, source, target) {
+                    Ok(updated) => {
+                        drop(fence);
+                        clear_pending_move_intent();
+                        log_info!(
+                        "artist move rolled forward for artist {artist_id}: {updated} db rows updated"
+                    );
+                        "rolled_forward"
+                    }
+                    Err(error) => {
+                        drop(fence);
+                        log_error!(
+                        "artist move roll-forward failed for artist {artist_id}: {error:#}; intent kept"
+                    );
+                        "roll_forward_failed"
+                    }
+                }
             }
             Err(error) => {
                 log_error!(
-                    "artist move roll-forward failed for artist {artist_id}: {error:#}; intent kept"
+                    "artist move roll-forward deferred (group operations busy): {error}; intent kept"
                 );
-                "roll_forward_failed"
+                "roll_forward_deferred"
             }
         }
     } else if source_dir.is_dir() && !target_dir.is_dir() {
@@ -1113,6 +1155,12 @@ pub fn execute_artist_folder_move(
             });
     let source_text = path_text(&source);
     let target_text = path_text(&target);
+    // The move rewrites the group ledger inside its own transaction, so a
+    // group tidy or a publish running against the same artist would either
+    // read a half-moved ledger or commit rows (a fresh publish-job target,
+    // a group location) that the rewrite never saw. The tidy executor takes
+    // this same fence; publishing and group reads hold it shared.
+    let _group_fence = crate::pawchive_groups::lock_group_operations(conn, true)?;
     let backup = create_db_backup(conn)?;
 
     // Record the intent before the first irreversible filesystem step so a

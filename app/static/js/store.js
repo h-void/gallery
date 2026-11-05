@@ -282,6 +282,7 @@ const maintenance = createStore({
   downloadOpenDay: null,
   downloadDayPosts: null,
   downloadDayPostsRequest: null,
+  downloadCalendarOpen: {},
   // Candidate lists the panel has asked for, keyed by post id. Cleared for a
   // post once its candidate is bound.
   downloadCandidates: {},

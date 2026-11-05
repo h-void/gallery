@@ -61,6 +61,11 @@ pub struct WorkNamingContext {
     pub artist: String,
     pub title: String,
     pub tags: Vec<String>,
+    /// What `{tags}` joins its values with. The organize profile carries its
+    /// own `tag_separator`; the shared renderer used to hardcode `&`, so a
+    /// profile saved with another separator previewed one folder name and
+    /// execution created another.
+    pub tag_separator: String,
 
     // --- dates ---
     /// Canonical `YYYY-MM-DD`, `YYYY-MM`, or `YYYY`; empty when unknown.
@@ -113,6 +118,7 @@ impl Default for WorkNamingContext {
             artist: String::new(),
             title: String::new(),
             tags: Vec::new(),
+            tag_separator: "&".to_string(),
             date: String::new(),
             date_precision: DatePrecision::Unknown,
             date_basis: String::new(),
@@ -520,7 +526,7 @@ impl<'a> Renderer<'a> {
                 },
             ),
             "title" => (self.ctx.title.clone(), "context.title"),
-            "tags" => (self.ctx.tags.join("&"), "context.tags"),
+            "tags" => (self.ctx.tags.join(&self.ctx.tag_separator), "context.tags"),
             "site" => (self.ctx.site.clone(), "context.site"),
             "service" => (self.ctx.service.clone(), "context.service"),
             "creator" | "creator_id" => (self.ctx.creator_id.clone(), "context.creator_id"),
@@ -1033,6 +1039,17 @@ pub fn plan_naming_migration(
     let mut notes = Vec::new();
     let organize = read_organize_rule(conn, artist_id)?;
     let download = get_pawchive_settings(conn)?;
+
+    // `{tags}` renders with the organize profile's separator in execution
+    // (`render_profile`); the preview must join with the same separator, or a
+    // profile saved with something other than `&` previews one folder name
+    // while execution creates another.
+    let mut preview_context = context.clone();
+    let separator = organize.tag_separator.trim();
+    if !separator.is_empty() {
+        preview_context.tag_separator = separator.to_string();
+    }
+    let context = &preview_context;
 
     // The preview renders the empty value the organize profile is configured
     // with, so a row that shows `untitled` while execution writes `unnamed`

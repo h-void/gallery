@@ -29,7 +29,7 @@ pub const KEY_NETDISK_DISCONNECTED: &str = "netdisk_disconnected";
 /// value, and a script that reports a different one is not trusted for the
 /// capabilities this version relies on.
 pub const NETDISK_PROTOCOL_VERSION: &str = "2";
-pub const NETDISK_SCRIPT_VERSION: &str = "2.4";
+pub const NETDISK_SCRIPT_VERSION: &str = "2.5";
 /// Allow several missed ten-second ticks before declaring the script offline.
 pub const NETDISK_HEARTBEAT_TIMEOUT_SECS: i64 = 60;
 
@@ -510,7 +510,7 @@ pub struct BridgeCapabilities {
     pub supports_snapshot: bool,
     pub max_page_size: u32,
     /// The request budget the script reports for one exchange, in
-    /// milliseconds. 0 means "no hard timeout", not "bounded". Script 2.4
+    /// milliseconds. 0 means "no hard timeout", not "bounded". Script 2.5
     /// reports 5000 when JD's Java runtime backs the request, and 0 when it
     /// cannot. Gallery records what the handshake said instead of assuming a
     /// budget it never saw.
@@ -1381,6 +1381,22 @@ fn merge_snapshot_page(
         .collect();
 
     pages_seen.insert(page.page_index);
+    // Bound the cursor memory by the page count the snapshot's current
+    // `total_count` implies. The script recomputes its pagination from the
+    // links the package holds *now*; when links are removed mid-download the
+    // page count shrinks, and page indices the new layout can never re-send
+    // would otherwise stay in `pages_seen` forever — `contiguous`, which
+    // needs every index up to the maximum ever seen, could then never return
+    // to true and an otherwise-delivered task would never settle.
+    //
+    // The constant mirrors `GALLERY_PAGE_SIZE` in `netdisk_bridge_template.js`.
+    // If the script's page size ever grows past this bound, pruning a seen
+    // page only delays settlement until it re-arrives — it cannot complete a
+    // snapshot that is not actually whole.
+    const BRIDGE_SNAPSHOT_PAGE_SIZE: u64 = 100;
+    let highest_needed = ((page.total_count.max(0) as u64) + BRIDGE_SNAPSHOT_PAGE_SIZE - 1)
+        / BRIDGE_SNAPSHOT_PAGE_SIZE;
+    pages_seen.retain(|index| (*index as u64) < highest_needed.max(1));
     let mut changed = Vec::new();
     for record in &page.records {
         let key = record_key(record);
@@ -1424,7 +1440,10 @@ fn merge_snapshot_page(
          ON CONFLICT(bridge_id, task_id, snapshot_id) DO UPDATE SET
              pages_seen = excluded.pages_seen,
              records = excluded.records,
-             complete = excluded.complete,
+             -- The page cursor rotates, so a non-final page arriving after the
+             -- final one must not flip a complete snapshot back to incomplete.
+             complete = CASE WHEN excluded.complete = 1 THEN 1
+                             ELSE netdisk_bridge_snapshots.complete END,
              updated_at = excluded.updated_at",
         params![
             bridge_id,
@@ -1459,6 +1478,11 @@ fn record_status_changed(previous: &BridgeLinkStatus, current: &BridgeLinkStatus
     previous.status != current.status
         || previous.finished != current.finished
         || previous.download_path != current.download_path
+        // A failure that only adds an error (or an extraction verdict) is a
+        // change worth an event: without these the transition was silent and
+        // the panel never learned why a link stopped.
+        || previous.error != current.error
+        || previous.extraction_status != current.extraction_status
 }
 
 /// The manifest members a post still requires, as `(file name, length, digest)`.
@@ -1854,16 +1878,63 @@ pub fn default_bridge_identity() -> &'static str {
 
 /// Hand a restarted bridge the tasks its previous session owned.
 ///
-/// Only tasks that were merely issued move across. A task in `uncertain` is
-/// deliberately left alone: its command may already have had an effect, and
-/// re-adopting it without a reconciliation is exactly the guess this protocol
-/// refuses to make.
+/// Both `issued` (never submitted) and `submitted` (delivered to the
+/// downloader) tasks move across: JDownloader persists its link list across
+/// restarts — only the script's session property is volatile — so a
+/// `submitted` task's package survives and the new session's snapshots must be
+/// allowed to settle it. Leaving it on the old session refused every later
+/// report with "尚未对账" and the task could never confirm.
+///
+/// A `submitted` task also has its outstanding `add_links` command superseded
+/// here: re-sending it to the fresh session would bypass the script's dedup
+/// memory (also volatile) and download the whole package a second time. The
+/// package itself is the reconciliation — if it truly is gone, the panel's
+/// retry path queues a fresh command.
+///
+/// Only commands the old session may have actually received are superseded.
+/// A command still `queued` was never dispatched to anyone (dispatch stamps
+/// `issued` the moment it is sent), so the fresh session's empty dedup memory
+/// is exactly right for it: confirming it here would silently drop the only
+/// copy of the delivery and strand the task at 待核对 forever.
 fn adopt_bridge_tasks(conn: &Connection, bridge_id: &str, session_id: &str) -> Result<usize> {
+    let submitted_tasks: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT task_id FROM netdisk_bridge_tasks
+             WHERE bridge_id = ?1 AND session_id != ?2 AND state = ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![bridge_id, session_id, BRIDGE_TASK_SUBMITTED],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
     let changed = conn.execute(
         "UPDATE netdisk_bridge_tasks SET session_id = ?1, updated_at = strftime('%s','now')
-         WHERE bridge_id = ?2 AND session_id != ?1 AND state = ?3",
-        params![session_id, bridge_id, BRIDGE_COMMAND_ISSUED],
+         WHERE bridge_id = ?2 AND session_id != ?1 AND state IN (?3, ?4)",
+        params![
+            session_id,
+            bridge_id,
+            BRIDGE_TASK_REGISTERED,
+            BRIDGE_TASK_SUBMITTED
+        ],
     )?;
+    for task_id in submitted_tasks {
+        conn.execute(
+            "UPDATE netdisk_bridge_commands
+             SET status = ?1, dispatched_at = strftime('%s','now')
+             WHERE bridge_id = ?2 AND job_id = ?3 AND action = 'add_links'
+               AND status IN (?4, ?5)",
+            params![
+                BRIDGE_COMMAND_CONFIRMED,
+                bridge_id,
+                task_id,
+                BRIDGE_COMMAND_ISSUED,
+                BRIDGE_COMMAND_UNCERTAIN
+            ],
+        )?;
+    }
     Ok(changed)
 }
 
@@ -1958,40 +2029,67 @@ fn dispatch_bridge_commands(conn: &Connection, bridge_id: &str) -> Result<Vec<Br
 /// An acknowledgement is the only thing that completes a command. A transport
 /// sequence number is not one, and neither is a later heartbeat: `uncertain`
 /// stays until the bridge actually reports the outcome.
+///
+/// Two shapes of completion arrive, and they carry different authority:
+/// `command_results` speak for an execution, while a bare `command_acks`
+/// entry only says "I saw this command" — the template sends both for every
+/// result. An ack may therefore never overwrite a recorded failure: when the
+/// results loop has already re-queued the command with its error, the ack
+/// that travels with the same report must not confirm it. A `duplicate`
+/// result answers from the script's executed memory instead of running
+/// anything; when that memory's last execution is known to have failed, the
+/// command goes `uncertain` with the original error instead of being
+/// confirmed with the real reason overwritten by the word "duplicate".
 fn settle_bridge_command(
     conn: &Connection,
     bridge_id: &str,
     command_id: &str,
     ok: bool,
     detail: &str,
+    from_ack: bool,
 ) -> Result<()> {
     let trimmed = command_id.trim();
     if trimmed.is_empty() {
         return Ok(());
     }
-    let attempts: Option<i64> = conn
+    let previous: Option<(i64, String)> = conn
         .query_row(
-            "SELECT attempts FROM netdisk_bridge_commands WHERE bridge_id = ?1 AND command_id = ?2",
+            "SELECT attempts, COALESCE(last_error, '') FROM netdisk_bridge_commands
+             WHERE bridge_id = ?1 AND command_id = ?2",
             params![bridge_id, trimmed],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(attempts) = attempts else {
+    let Some((attempts, last_error)) = previous else {
         return Ok(());
     };
-    let next = if ok {
-        BRIDGE_COMMAND_CONFIRMED
+    let recorded_failure = !last_error.trim().is_empty();
+    if from_ack && recorded_failure {
+        return Ok(());
+    }
+    let (next, error_to_store) = if ok {
+        if detail == "duplicate" && recorded_failure {
+            (BRIDGE_COMMAND_UNCERTAIN, last_error)
+        } else {
+            (BRIDGE_COMMAND_CONFIRMED, detail.to_string())
+        }
     } else if attempts >= BRIDGE_COMMAND_ATTEMPT_CAP {
-        BRIDGE_COMMAND_UNCERTAIN
+        (BRIDGE_COMMAND_UNCERTAIN, detail.to_string())
     } else {
-        BRIDGE_COMMAND_QUEUED
+        (BRIDGE_COMMAND_QUEUED, detail.to_string())
     };
     conn.execute(
         "UPDATE netdisk_bridge_commands
          SET status = ?1, last_error = ?2,
              completed_at = CASE WHEN ?1 = ?3 THEN strftime('%s','now') ELSE completed_at END
          WHERE bridge_id = ?4 AND command_id = ?5",
-        params![next, detail, BRIDGE_COMMAND_CONFIRMED, bridge_id, trimmed],
+        params![
+            next,
+            error_to_store,
+            BRIDGE_COMMAND_CONFIRMED,
+            bridge_id,
+            trimmed
+        ],
     )?;
     Ok(())
 }
@@ -2035,6 +2133,16 @@ pub fn process_bridge_exchange(
             "seq starts at 1".to_string(),
         )));
     }
+    // The envelope names the protocol it speaks; trusting a payload of an
+    // unknown version means guessing at fields that may not mean what this
+    // reader assumes. The capabilities check below is about what the bridge
+    // can do — this one is about what the payload is.
+    if payload.version != NETDISK_PROTOCOL_VERSION {
+        return Err(anyhow::Error::new(BridgeInvalid(format!(
+            "unsupported bridge payload version {} (this build speaks {})",
+            payload.version, NETDISK_PROTOCOL_VERSION
+        ))));
+    }
 
     let digest = request_digest(payload)?;
     if let Some((stored_digest, stored_response)) =
@@ -2069,9 +2177,9 @@ pub fn process_bridge_exchange(
     {
         let tx = conn.unchecked_transaction()?;
 
-        for command_id in &payload.command_acks {
-            settle_bridge_command(&tx, &payload.bridge_id, command_id, true, "")?;
-        }
+        // Outcomes before receipts: the results loop is the only writer that
+        // may record a failure, and the acks loop must see it so the ack that
+        // travels with the same report cannot confirm over it.
         for result in &payload.command_results {
             settle_bridge_command(
                 &tx,
@@ -2079,7 +2187,11 @@ pub fn process_bridge_exchange(
                 &result.command_id,
                 result.ok,
                 &result.detail,
+                false,
             )?;
+        }
+        for command_id in &payload.command_acks {
+            settle_bridge_command(&tx, &payload.bridge_id, command_id, true, "", true)?;
         }
 
         for page in &payload.pages {
@@ -2131,6 +2243,16 @@ pub fn process_bridge_exchange(
                     );
                     continue;
                 }
+            }
+            if task.state == BRIDGE_TASK_SETTLED {
+                // The script reports every package it still holds on every
+                // tick, and with cleanup-after-import off a settled package
+                // never leaves JD. Re-running settlement would re-stat and
+                // re-hash the outputs each tick only to arrive at the
+                // "duplicate" verdict the task already has. The identity
+                // freeze above still runs first, so a package that changed
+                // after delivery keeps its warn event.
+                continue;
             }
             let state = merge_snapshot_page(&tx, &payload.bridge_id, page)?;
             for record in &state.changed {
@@ -2214,7 +2336,7 @@ pub fn process_bridge_exchange(
                         "UPDATE netdisk_bridge_tasks
                          SET state = ?1, updated_at = strftime('%s','now')
                          WHERE task_id = ?2",
-                        params![BRIDGE_COMMAND_CONFIRMED, task.task_id],
+                        params![BRIDGE_TASK_SETTLED, task.task_id],
                     )?;
                 }
                 Ok(ReceiptOutcome::Duplicate) => {
@@ -2222,7 +2344,7 @@ pub fn process_bridge_exchange(
                         "UPDATE netdisk_bridge_tasks
                          SET state = ?1, updated_at = strftime('%s','now')
                          WHERE task_id = ?2",
-                        params![BRIDGE_COMMAND_CONFIRMED, task.task_id],
+                        params![BRIDGE_TASK_SETTLED, task.task_id],
                     )?;
                 }
                 Ok(ReceiptOutcome::Stale) => {
@@ -2270,11 +2392,17 @@ pub fn process_bridge_exchange(
             "UPDATE netdisk_bridge_snapshots SET settled = 1
              WHERE bridge_id = ?1 AND settled = 0 AND complete = 1
                AND task_id IN (SELECT task_id FROM netdisk_bridge_tasks WHERE state = ?2)",
-            params![payload.bridge_id, BRIDGE_COMMAND_CONFIRMED],
+            params![payload.bridge_id, BRIDGE_TASK_SETTLED],
         )?;
 
         let response = BridgeExchangeResponse {
-            ok: errors == 0,
+            // `ok` answers the exchange, not the report content: the script
+            // drops every pending command for a tick it reads as rejected, so
+            // coupling it to `errors` (routine failed-link reports, refused
+            // receipts) made command delivery hostage to unrelated download
+            // noise while each refusal still burned an attempt. The counts
+            // below carry the diagnostics; `errors` stays for that reason.
+            ok: true,
             ack: payload.seq,
             settled_receipts,
             errors,

@@ -722,7 +722,8 @@ pub fn run_hash_batch_with_budget(
                 } else {
                     conn.execute(
                         "UPDATE scan_candidates SET hash_status='error'
-                         WHERE id=? AND COALESCE(hash_status,'') <> 'error'",
+                         WHERE id=? AND status IN ('pending','candidate')
+                           AND COALESCE(hash_status,'') <> 'error'",
                         params![id],
                     )?;
                     if let Some(ledger) = ledger {
@@ -933,7 +934,7 @@ pub fn run_hash_batch_with_budget(
                 } else {
                     conn.execute(
                         "UPDATE items SET hash_status='error'
-                         WHERE id=? AND COALESCE(hash_status,'') <> 'error'",
+                         WHERE id=? AND missing=0 AND COALESCE(hash_status,'') <> 'error'",
                         params![id],
                     )?;
                     if let Some(ledger) = ledger {

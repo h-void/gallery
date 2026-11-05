@@ -174,18 +174,36 @@ var GALLERY_REQUEST_BUDGET_MS = 5000;
 
     function loadState() {
         var raw = String(prop("gallery_bridge_executed", ""));
+        var failed = {};
+        try {
+            var parsedFailures = JSON.parse(String(prop("gallery_bridge_failed", "{}")));
+            if (parsedFailures && typeof parsedFailures === "object") {
+                failed = parsedFailures;
+            }
+        } catch (ignored) {}
         return {
             seq: readCount("gallery_bridge_seq", 0),
             handshaked: String(prop("gallery_bridge_handshaked", "")) === "1",
-            executed: raw ? raw.split(",") : []
+            executed: raw ? raw.split(",") : [],
+            failed: failed
         };
     }
 
     function saveState(state) {
         setProp("gallery_bridge_seq", String(state.seq));
         setProp("gallery_bridge_handshaked", state.handshaked ? "1" : "0");
-        setProp("gallery_bridge_executed",
-            state.executed.slice(-GALLERY_EXECUTED_MEMORY).join(","));
+        var failures = state.failed || {};
+        var kept = {};
+        var executed = state.executed.slice(-GALLERY_EXECUTED_MEMORY);
+        for (var i = 0; i < executed.length; i++) {
+            if (failures[executed[i]]) {
+                kept[executed[i]] = failures[executed[i]];
+            }
+        }
+        setProp("gallery_bridge_executed", executed.join(","));
+        try {
+            setProp("gallery_bridge_failed", JSON.stringify(kept));
+        } catch (ignored) {}
     }
 
     // Ask for exactly the fields this protocol needs. A field that is not
@@ -556,22 +574,43 @@ var GALLERY_REQUEST_BUDGET_MS = 5000;
         for (var i = 0; i < commands.length; i++) {
             var command = commands[i];
             var key = str(command.command_id);
-            if (!key || state.executed.indexOf(key) >= 0) {
-                // Same command_id delivered twice: JD acknowledges it without
-                // running it again, which is what makes a retransmit safe.
-                results.push({command_id: key, ok: true, detail: "duplicate"});
+            if (!key) {
+                continue;
+            }
+            if (state.executed.indexOf(key) >= 0) {
+                // Same command_id delivered twice: the script answers from its
+                // executed memory without running it again, which is what
+                // makes a retransmit safe. A recorded failure is re-reported
+                // as the failure it was — answering "duplicate ok" here would
+                // let Gallery confirm a command that never worked and bury
+                // the real error.
+                var priorFailure = state.failed ? state.failed[key] : null;
+                if (priorFailure) {
+                    results.push({command_id: key, ok: false, detail: priorFailure});
+                } else {
+                    results.push({command_id: key, ok: true, detail: "duplicate"});
+                }
                 continue;
             }
             state.executed.push(key);
+            var result;
             try {
-                results.push(execute(command));
+                result = execute(command);
             } catch (e) {
-                results.push({
-                    command_id: key,
-                    ok: false,
-                    detail: String(e)
-                });
+                result = {command_id: key, ok: false, detail: String(e)};
             }
+            if (!result) {
+                result = {command_id: key, ok: false, detail: "no result"};
+            }
+            if (!state.failed) {
+                state.failed = {};
+            }
+            if (result.ok === false) {
+                state.failed[key] = str(result.detail);
+            } else {
+                delete state.failed[key];
+            }
+            results.push(result);
         }
         return results;
     }

@@ -42,7 +42,7 @@ import {
 } from './views/editbar.js';
 import { bindArtistLinks, bindArtistProfileLinks, renderArtistLinks, renderArtistProfileLinks, closeArtistLinksDialog } from './views/links.js';
 import { bindArchiveModal, closeArchiveModal, openBatchArchiveModal, bindBatchArchiveModal, closeBatchArchiveModal, isBatchArchiveExtracting, stopBatchArchiveExtraction } from './views/archive_modal.js';
-import { downloadTemplateInputSelector } from './views/maintenance/shared.js';
+import { downloadTemplateInputSelector, saveDownloadCalendarOpen } from './views/maintenance/shared.js';
 // Maintenance views load lazily: browse-mode startup must not download the
 // maintenance workbench. Every name below forwards through lazy.js.
 import {
@@ -112,6 +112,13 @@ export function applyMode(mode) {
   if (isMoves) requestAnimationFrame(syncMaintenanceTabsEdge);
   $('#gridContainer').style.display = isMoves ? 'none' : '';
   $('.toolbar').style.display = isMoves ? 'none' : '';
+  const scrollTopBtn = $('#scrollTopBtn');
+  if (scrollTopBtn) {
+    const activeScroller = isMoves ? $('#movePanel') : $('#gridContainer');
+    const showScrollTop = Boolean(activeScroller && activeScroller.scrollTop > 360);
+    scrollTopBtn.hidden = !showScrollTop;
+    scrollTopBtn.classList.toggle('visible', showScrollTop);
+  }
   $('#searchInput').disabled = isMoves;
   $('#searchOptionsBtn').disabled = isMoves;
   if (isMoves) closeSearchOptions();
@@ -553,6 +560,9 @@ export function bindEvents() {
   });
   $('#searchInput').addEventListener('input', syncClearSearch);
   $('#searchInput').addEventListener('input', debounce(e => {
+    // A clear that landed while this debounce was pending (Escape, the clear
+    // button) already loaded the empty query; a same-value run is a duplicate.
+    if (e.target.value === state.search) return;
     state.search = e.target.value;
     logUiAction('search_change', {search: state.search, scope: state.searchScope, target: state.searchTarget});
     state.selectedIds.clear();
@@ -647,15 +657,23 @@ export function bindEvents() {
   if (gridContainer) {
     gridContainer.addEventListener('scroll', maybeLoadMoreOnScroll, {passive: true});
     if (scrollTopBtn) {
-      gridContainer.addEventListener('scroll', () => {
-        const show = gridContainer.scrollTop > 360;
+      const activeScrollTarget = () => state.mode === 'moves' ? $('#movePanel') : gridContainer;
+      const syncScrollTopVisibility = () => {
+        const scroller = activeScrollTarget();
+        const show = Boolean(scroller && scroller.scrollTop > 360);
         if (scrollTopBtn.hidden === show) {
           scrollTopBtn.hidden = !show;
           scrollTopBtn.classList.toggle('visible', show);
         }
-      }, {passive: true});
+      };
+      gridContainer.addEventListener('scroll', syncScrollTopVisibility, {passive: true});
+      const movePanel = $('#movePanel');
+      if (movePanel) {
+        movePanel.addEventListener('scroll', syncScrollTopVisibility, {passive: true});
+      }
       scrollTopBtn.addEventListener('click', () => {
-        gridContainer.scrollTo({top: 0, behavior: 'smooth'});
+        const scroller = activeScrollTarget();
+        if (scroller) scroller.scrollTo({top: 0, behavior: 'smooth'});
       });
     }
   }
@@ -959,6 +977,16 @@ export function bindEvents() {
       openDownloadDay(item.dataset.downloadSubscription, day.dataset.downloadDay);
       return true;
     };
+    downloadSubscriptionList.addEventListener('toggle', e => {
+      const details = e.target?.closest ? e.target.closest('.download-subscription-calendar-details') : null;
+      if (!details) return;
+      const item = details.closest('[data-download-subscription]');
+      if (!item) return;
+      const subId = Number(item.dataset?.downloadSubscription);
+      if (Number.isFinite(subId)) {
+        saveDownloadCalendarOpen(subId, Boolean(details.open));
+      }
+    }, true);
     downloadSubscriptionList.addEventListener('click', e => {
       const target = e.target instanceof Element ? e.target : null;
       if (!target) return;
@@ -1793,9 +1821,17 @@ export function bindEvents() {
     state.editTagQuery = e.target.value;
     openEditTagPicker();
   });
+  const editTagPickerSummary = $('#editTagPickerSummary');
+  if (editTagPickerSummary) {
+    editTagPickerSummary.addEventListener('click', () => {
+      openEditTagPicker();
+      const input = $('#editTagSearch');
+      if (input && typeof input.focus === 'function') input.focus();
+    });
+  }
   $('#editTagSearch').addEventListener('input', e => {
     state.editTagQuery = e.target.value;
-    openEditTagPicker();
+    openEditTagPicker({immediate: false});
   });
   $('#editTagSearch').addEventListener('keydown', e => {
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -1868,10 +1904,10 @@ export function bindEvents() {
   // click pipeline.
   const clickWithin = (el, target) => Boolean(el && target && typeof el.contains === 'function' && el.contains(target));
   document.addEventListener('click', e => {
-    clickInsideEditTagPicker = clickWithin($('#editTagPicker'), e.target);
+    clickInsideEditTagPicker = clickWithin($('#editTagPicker'), e.target) || clickWithin($('#editTagPickerSummary'), e.target);
   }, true);
   document.addEventListener('click', e => {
-    if (!clickInsideEditTagPicker && !clickWithin($('#editTagPicker'), e.target)) {
+    if (!clickInsideEditTagPicker && !clickWithin($('#editTagPicker'), e.target) && !clickWithin($('#editTagPickerSummary'), e.target)) {
       closeEditTagPicker();
     }
     const artistPicker = $('#artistPicker');
@@ -1904,10 +1940,10 @@ export function bindEvents() {
     if ((e.key === 'k' || e.key === 'K') && (e.ctrlKey || e.metaKey) && !e.altKey) {
       const activeEl = document.activeElement;
       const tag = activeEl ? activeEl.tagName : '';
-      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable && $('#lightbox')?.style.display !== 'flex') {
-        e.preventDefault();
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable && $('#lightbox')?.style.display !== 'flex' && !globalDeleteShortcutBlocked()) {
         const searchInput = $('#searchInput');
-        if (searchInput) {
+        if (searchInput && !searchInput.disabled) {
+          e.preventDefault();
           searchInput.focus();
           searchInput.select?.();
         }

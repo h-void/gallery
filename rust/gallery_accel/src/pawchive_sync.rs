@@ -51,7 +51,8 @@ pub struct PawchivePostPage {
     pub next_cursor: Option<i64>,
 }
 
-/// Posts of a subscription, newest first, optionally limited to one day.
+/// Posts of a subscription in ledger order (oldest discovery first), optionally
+/// limited to one day.
 pub fn list_subscription_posts(
     conn: &Connection,
     subscription_id: i64,
@@ -848,6 +849,38 @@ pub fn run_pawchive_reconcile(
     Ok(summary)
 }
 
+/// One paced read from the Pawchive API.
+///
+/// Every page and detail read goes through here so the spacing and the
+/// rate-limit stand-down are applied in one place. A `429` stops the whole
+/// round rather than only this request: the next read would be refused for the
+/// same reason.
+async fn paced_api_get(client: &reqwest::Client, url: &str) -> Result<reqwest::Response> {
+    crate::pawchive_throttle::pawchive_throttle().wait().await;
+    let resp = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, PAWCHIVE_USER_AGENT)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .context("failed to send request to pawchive api")?;
+    if resp.status().is_success() {
+        crate::pawchive_throttle::pawchive_throttle().note_success();
+    } else if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<i64>().ok());
+        crate::pawchive_throttle::pawchive_throttle().note_rate_limit(retry_after);
+    } else if resp.status() == reqwest::StatusCode::FORBIDDEN
+        || resp.status() == reqwest::StatusCode::UNAUTHORIZED
+    {
+        crate::pawchive_throttle::pawchive_throttle().note_access_denied();
+    }
+    Ok(resp)
+}
+
 /// Fetch posts directly from the Pawchive API.
 pub async fn fetch_creator_posts_api(
     client: &reqwest::Client,
@@ -866,13 +899,7 @@ async fn fetch_creator_posts_api_at(
     offset: u64,
 ) -> Result<Vec<PawchivePost>> {
     let url = format!("{base}/{service}/user/{user_id}?o={offset}");
-    let resp = client
-        .get(&url)
-        .header(reqwest::header::USER_AGENT, "Gallery/1.0 (NAS; Pure-Rust)")
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await
-        .context("failed to send request to pawchive api")?;
+    let resp = paced_api_get(client, &url).await?;
 
     if !resp.status().is_success() {
         return Err(anyhow!(
@@ -917,13 +944,7 @@ pub(super) async fn fetch_post_detail_at(
     post_id: &str,
 ) -> Result<PawchivePost> {
     let url = format!("{base}/{service}/user/{user_id}/post/{post_id}");
-    let resp = client
-        .get(&url)
-        .header(reqwest::header::USER_AGENT, "Gallery/1.0 (NAS; Pure-Rust)")
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await
-        .context("failed to send request to pawchive api")?;
+    let resp = paced_api_get(client, &url).await?;
     if !resp.status().is_success() {
         return Err(anyhow!(
             "pawchive api returned HTTP status {}",
@@ -966,6 +987,7 @@ pub struct PostAwaitingDetail {
 pub(super) fn posts_awaiting_detail(
     conn: &Connection,
     limit: usize,
+    only_subscription: Option<i64>,
 ) -> Result<Vec<PostAwaitingDetail>> {
     let mut stmt = conn.prepare(
         "SELECT p.id, p.subscription_id, s.service, s.user_id, p.post_id
@@ -976,7 +998,8 @@ pub(super) fn posts_awaiting_detail(
                AND w.creator_id = s.user_id AND w.post_id = p.post_id
          LEFT JOIN pawchive_work_manifests m
                 ON m.work_id = w.work_id AND m.is_current = 1
-         WHERE COALESCE(m.completeness, '') != 'complete'
+         WHERE COALESCE(m.completeness, '') IN ('unknown', 'legacy_unknown', '')
+           AND (?2 IS NULL OR p.subscription_id = ?2)
          ORDER BY CASE WHEN COALESCE(NULLIF(p.published_at, ''), p.created_at, '') = ''
                        THEN 1 ELSE 0 END,
                   substr(COALESCE(NULLIF(p.published_at, ''), p.created_at, ''), 1, 10) ASC,
@@ -984,7 +1007,7 @@ pub(super) fn posts_awaiting_detail(
          LIMIT ?1",
     )?;
     let rows = stmt
-        .query_map(params![limit as i64], |row| {
+        .query_map(params![limit as i64, only_subscription], |row| {
             Ok(PostAwaitingDetail {
                 post_db_id: row.get(0)?,
                 subscription_id: row.get(1)?,
@@ -1008,14 +1031,20 @@ pub(super) fn posts_awaiting_detail(
 /// next round — the failed read is an error, not evidence that the work is
 /// empty — and the work keeps whatever manifest it already had.
 ///
+/// `only_subscription` narrows the pass to one artist, so a per-artist
+/// 检查缺失 round spends its detail budget — and its effect on the ledger —
+/// on the artist the user asked about, exactly like the discovery and
+/// observation phases around it.
+///
 /// Returns `(read, failed)`.
 async fn fetch_pending_post_details(
     pool: &Arc<DbPool>,
     client: &reqwest::Client,
+    only_subscription: Option<i64>,
 ) -> Result<(usize, usize)> {
     let pending = {
         let conn = pool.get()?;
-        posts_awaiting_detail(&conn, PAWCHIVE_DETAIL_MAX_POSTS)?
+        posts_awaiting_detail(&conn, PAWCHIVE_DETAIL_MAX_POSTS, only_subscription)?
     };
     if pending.is_empty() {
         return Ok((0, 0));
@@ -1030,6 +1059,11 @@ async fn fetch_pending_post_details(
         post_id,
     } in pending
     {
+        // The source is standing this process down: every remaining read would
+        // be refused for the same reason, so the queue waits for the next round.
+        if crate::pawchive_throttle::pawchive_throttle().rate_limited() {
+            break;
+        }
         // No database connection is held across the network await: the batch was
         // read above, and the write below checks one out for its own scope.
         match fetch_post_detail(client, &service, &user_id, &post_id).await {
@@ -1044,30 +1078,56 @@ async fn fetch_pending_post_details(
                     failed += 1;
                     continue;
                 }
-                let completeness = conn
-                    .query_row(
-                        "SELECT COALESCE(m.completeness, '')
-                         FROM pawchive_remote_works w
-                         LEFT JOIN pawchive_work_manifests m
-                                ON m.work_id = w.work_id AND m.is_current = 1
-                         WHERE w.post_id = ?1 AND w.service = ?2 AND w.creator_id = ?3
-                         LIMIT 1",
-                        params![post_id, service, user_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?
-                    .unwrap_or_default();
-                if completeness == ManifestCompleteness::Complete.as_str() {
-                    read += 1;
-                } else {
-                    // The detail answered, but its own resource set was open
-                    // (or the source did not return one). It stays queued for a
-                    // later round rather than being counted as read.
-                    failed += 1;
-                }
+                read += 1;
                 let _ = post_db_id;
             }
-            Err(_) => {
+            Err(err) => {
+                let msg = err.to_string();
+                // Matched against the exact status line this module builds
+                // ("pawchive api returned HTTP status 404 Not Found"), so a
+                // network error whose text happens to contain the digits 404
+                // cannot be misread as the source's own "not found".
+                if msg.contains("HTTP status 404") {
+                    if let Ok(conn) = pool.get() {
+                        // The post left the list: record the observation that
+                        // answers the resource question without answering it,
+                        // so the queue is freed for the works that still have
+                        // a detail to read.
+                        //
+                        // The dummy reports every resource field as *absent*
+                        // (`*_present = false`): a 404 has not said the post
+                        // has no attachments, no file and no links, so the
+                        // discovery write must keep what the ledger already
+                        // holds — files stay required, extracted external
+                        // links stay frozen, the manifest fingerprint stays.
+                        // With the presence flags true this write used to
+                        // retire every known file of the post, wipe its
+                        // external links and bump its manifest version — a
+                        // transient 404 (this source serves them inside its
+                        // 429/403 windows) permanently poisoned the work.
+                        // `has_full: Some(false)` still lands the observation
+                        // as `partial`, which the detail queue's filter
+                        // excludes, so the post does not come back either way.
+                        let dummy_post = PawchivePost {
+                            id: post_id.clone(),
+                            user: user_id.clone(),
+                            service: service.clone(),
+                            title: None,
+                            content: None,
+                            published: None,
+                            added: None,
+                            edited: None,
+                            file: None,
+                            attachments: Vec::new(),
+                            attachments_present: false,
+                            file_present: false,
+                            content_present: false,
+                            has_full: Some(false),
+                        };
+                        let _ =
+                            record_discovered_posts(&conn, subscription_id, &[dummy_post], None);
+                    }
+                }
                 failed += 1;
             }
         }
@@ -1131,7 +1191,7 @@ pub async fn fetch_creator_posts_paged(
     max_pages: usize,
 ) -> Result<Vec<PawchivePost>> {
     Ok(
-        fetch_creator_posts_resumed(client, service, user_id, 0, max_pages, &mut |_| Ok(()))
+        fetch_creator_posts_resumed(client, service, user_id, 0, max_pages, &mut |_| Ok(0))
             .await?
             .posts,
     )
@@ -1144,15 +1204,22 @@ pub async fn fetch_creator_posts_paged(
 /// moves the cursor before the next request goes out; a later failure then
 /// costs only the pages that were never read. The newest page is always read,
 /// so a creator whose history is longer than the budget still reports new work
-/// every round, and the page just before the cursor is re-read as an overlap
+/// every round, and the pages just before the cursor are re-read as an overlap
 /// check because the list shifts between rounds.
+///
+/// `on_page` returns how many posts of the page were new to the ledger. The
+/// head and overlap sweeps use that answer to decide whether the list shifted
+/// by more than one page since the last round and keep reading: a page where
+/// everything was already known says the sweep has reached posts a previous
+/// round saw, while a page that is entirely new says there is more shifting
+/// above it.
 pub async fn fetch_creator_posts_resumed(
     client: &reqwest::Client,
     service: &str,
     user_id: &str,
     start_offset: u64,
     max_pages: usize,
-    on_page: &mut (dyn FnMut(DiscoveryPage) -> Result<()> + Send),
+    on_page: &mut (dyn FnMut(DiscoveryPage) -> Result<usize> + Send),
 ) -> Result<DiscoveryOutcome> {
     fetch_creator_posts_resumed_at(
         client,
@@ -1173,7 +1240,7 @@ pub(super) async fn fetch_creator_posts_resumed_at(
     user_id: &str,
     start_offset: u64,
     max_pages: usize,
-    on_page: &mut (dyn FnMut(DiscoveryPage) -> Result<()> + Send),
+    on_page: &mut (dyn FnMut(DiscoveryPage) -> Result<usize> + Send),
 ) -> Result<DiscoveryOutcome> {
     let start_page = (start_offset / PAWCHIVE_POSTS_PAGE_SIZE) as usize;
     let mut collected: Vec<PawchivePost> = Vec::new();
@@ -1197,36 +1264,85 @@ pub(super) async fn fetch_creator_posts_resumed_at(
     // is paged by offset rather than by a snapshot, so new posts land at the
     // head while the walk is away. Read the head first, or a creator with more
     // history than the budget would never report anything new until the walk
-    // finally reaches the end. This page never moves the cursor: the history
+    // finally reaches the end. These pages never move the cursor: the history
     // walk below owns it.
     if start_page > 0 {
-        let posts = fetch_creator_posts_api_at(client, base, service, user_id, 0).await?;
-        let fresh = absorb(posts, &mut collected);
-        on_page(DiscoveryPage {
-            offset: 0,
-            posts: fresh,
-            cursor_after: None,
-            reached_tail: false,
-        })?;
+        // Head sweep: read forward from the head while whole pages are new to
+        // the ledger. New posts land at the head, so a page that holds even one
+        // known post says everything below it was already seen by an earlier
+        // round; a page that is entirely new says the list shifted by more
+        // than one page, and the posts between this page and the cursor would
+        // have been skipped by a single head page. The sweep is bounded so a
+        // bulk re-import cannot consume the round, and resumes next round
+        // where it stopped being all-new.
+        let mut offset = 0u64;
+        let mut swept = 0usize;
+        loop {
+            if crate::pawchive_throttle::pawchive_throttle().rate_limited() {
+                break;
+            }
+            let posts = fetch_creator_posts_api_at(client, base, service, user_id, offset).await?;
+            let received = posts.len();
+            let fresh = absorb(posts, &mut collected);
+            swept += 1;
+            let new_to_ledger = on_page(DiscoveryPage {
+                offset,
+                posts: fresh,
+                cursor_after: None,
+                reached_tail: false,
+            })?;
+            let all_new =
+                received == PAWCHIVE_POSTS_PAGE_SIZE as usize && new_to_ledger >= received;
+            if !all_new || swept >= PAWCHIVE_DISCOVERY_SWEEP_MAX_PAGES {
+                break;
+            }
+            offset += PAWCHIVE_POSTS_PAGE_SIZE;
+        }
     }
 
-    // The page before the cursor is re-read as an overlap: posts can be added
-    // to or removed from the middle of the list between rounds, so the boundary
-    // is not guaranteed to be where the last round left it.
-    if start_page > 0 {
-        let overlap_page = start_page - 1;
-        let offset = overlap_page as u64 * PAWCHIVE_POSTS_PAGE_SIZE;
-        let posts = fetch_creator_posts_api_at(client, base, service, user_id, offset).await?;
-        let fresh = absorb(posts, &mut collected);
-        on_page(DiscoveryPage {
-            offset,
-            posts: fresh,
-            cursor_after: None,
-            reached_tail: false,
-        })?;
+    // The pages before the cursor are re-read as an overlap: posts can be
+    // removed from the middle of the list between rounds, which pulls the
+    // region the cursor points at upwards, so the boundary is not guaranteed
+    // to be where the last round left it. The sweep walks backwards only while
+    // pages are entirely new to the ledger — the signature of a removal drift
+    // — and stops at the first page an earlier round already saw.
+    // `start_page == 1` needs no overlap: the head sweep above already read
+    // offset 0, and re-requesting it would burn a paced request on a page
+    // whose answer is already in.
+    if start_page > 1 {
+        let mut page = start_page - 1;
+        let mut swept = 0usize;
+        loop {
+            if crate::pawchive_throttle::pawchive_throttle().rate_limited() {
+                break;
+            }
+            let offset = page as u64 * PAWCHIVE_POSTS_PAGE_SIZE;
+            let posts = fetch_creator_posts_api_at(client, base, service, user_id, offset).await?;
+            let received = posts.len();
+            let fresh = absorb(posts, &mut collected);
+            swept += 1;
+            let new_to_ledger = on_page(DiscoveryPage {
+                offset,
+                posts: fresh,
+                cursor_after: None,
+                reached_tail: false,
+            })?;
+            let all_new =
+                received == PAWCHIVE_POSTS_PAGE_SIZE as usize && new_to_ledger >= received;
+            if !all_new || swept >= PAWCHIVE_DISCOVERY_SWEEP_MAX_PAGES || page == 0 {
+                break;
+            }
+            page -= 1;
+        }
     }
 
     for page in start_page..start_page + budget {
+        // Stop the walk at a rate-limit answer instead of spending the budget on
+        // pages that will all be refused; the cursor stays where the last saved
+        // page left it.
+        if crate::pawchive_throttle::pawchive_throttle().rate_limited() {
+            break;
+        }
         let offset = page as u64 * PAWCHIVE_POSTS_PAGE_SIZE;
         let posts = fetch_creator_posts_api_at(client, base, service, user_id, offset).await?;
         let received = posts.len();
@@ -1316,41 +1432,138 @@ pub(super) fn dispatch_subscription_netdisk(
         settings.staging_dir.clone()
     };
     let has_external_links = has_external_links_sql("p");
-    let posts: Vec<(i64, i64, Option<String>)> = {
+    // The day the `since_date` gate compares is the service-aware local day —
+    // the same `post_day_sql` expression discovery, coverage and the claim
+    // gate use. The raw `substr(published_at,1,10)` stamp left here admitted a
+    // post to discovery (local day) while dispatch rejected it (raw day), so a
+    // boundary-hour post was downloaded on every round and its netdisk task
+    // was never created.
+    let post_day = post_day_sql("p", post_source_date_column(conn));
+    // `None` when auto-start may submit: a registered task at the current
+    // version stays a candidate so a failed submit is retried. With auto-start
+    // off, a registered current-version task is waiting for the user and must
+    // stop occupying the window — otherwise the first 32 registrations starve
+    // every post behind them.
+    let registered_current_filter = if settings.auto_start {
+        None
+    } else {
+        Some(1_i64)
+    };
+    let posts: Vec<(i64, i64, Option<String>, String)> = {
         let mut stmt = conn.prepare(&format!(
             "SELECT p.id, p.manifest_version,
                     (SELECT t.task_id FROM netdisk_bridge_tasks t WHERE t.post_id=p.id
-                     ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1)
-             FROM kemono_posts p JOIN kemono_subscriptions s ON s.id=p.subscription_id
+                     ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1),
+                    p.post_id
+             FROM kemono_posts p JOIN kemono_subscriptions s ON s.id = p.subscription_id
              WHERE p.id > ?1 AND s.enabled=1 AND s.mode='auto'
                AND (s.since_date IS NULL OR s.since_date=''
-                    OR substr(COALESCE(NULLIF(p.published_at,''),p.created_at),1,10)>=s.since_date)
+                    OR {post_day}>=s.since_date)
                AND {has_external_links} = 1
                AND NOT EXISTS (
                    SELECT 1 FROM netdisk_bridge_tasks t WHERE t.post_id=p.id
-                     AND (t.state != 'issued' OR t.manifest_version != p.manifest_version)
+                     AND t.state != 'issued'
                )
+               AND (?2 IS NULL OR NOT EXISTS (
+                   SELECT 1 FROM netdisk_bridge_tasks t2 WHERE t2.post_id=p.id
+                     AND t2.state = 'issued' AND t2.manifest_version = p.manifest_version
+               ))
              ORDER BY p.id LIMIT 32",
         ))?;
         let rows = stmt
-            .query_map([baseline], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            .query_map(params![baseline, registered_current_filter], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, String>(3)?,
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?;
         rows
     };
     let mut created = 0;
-    for (post_id, manifest_version, existing_task) in posts {
+    for (post_id, manifest_version, existing_task, source_post_id) in posts {
         let task = if let Some(task_id) = existing_task {
             let Some(task) = load_bridge_task(conn, &task_id)? else {
                 continue;
             };
-            if task.state != crate::netdisk::BRIDGE_TASK_REGISTERED
-                || task.manifest_version != manifest_version
-            {
+            if task.state != crate::netdisk::BRIDGE_TASK_REGISTERED {
                 continue;
             }
-            task
+            if task.manifest_version != manifest_version {
+                // The work's manifest moved on while the task sat registered.
+                // Nothing has been delivered under the old freeze — the task
+                // never left `issued` — so it is re-frozen to the current
+                // version and links instead of being left behind: the old
+                // predicate excluded the post entirely here, and the updated
+                // netdisk links were never dispatched.
+                let raw_links: Option<String> = conn
+                    .query_row(
+                        "SELECT external_links FROM kemono_posts WHERE id = ?1",
+                        [post_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let current_links: Vec<String> = raw_links
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
+                if current_links.is_empty() {
+                    continue;
+                }
+                // The freeze is only correct while the task is still `issued`:
+                // a submit that commits between the read above and this write
+                // has already handed the old link set to the bridge, and
+                // rewriting links or the version under the queued command
+                // would desync the version-bound receipts. Losing the race
+                // skips the post this round; the task's own lifecycle owns
+                // the delivery.
+                //
+                // The archive password is re-derived from the current content
+                // the way creation derives it — the manifest moved because the
+                // post changed, and a password that only exists in the old
+                // body would fail the new archive. When the new content no
+                // longer names one, the old password is kept (the link may be
+                // unchanged).
+                let derived_password: Option<String> = conn
+                    .query_row(
+                        "SELECT content FROM kemono_posts WHERE id = ?1",
+                        [post_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten()
+                    .and_then(|content| {
+                        crate::pawchive::extract_archive_passwords(&content)
+                            .into_iter()
+                            .next()
+                    });
+                let refrozen = conn.execute(
+                    "UPDATE netdisk_bridge_tasks
+                     SET manifest_version = ?1, links = ?2,
+                         password = COALESCE(?3, password), updated_at = ?4
+                     WHERE task_id = ?5 AND state = ?6",
+                    params![
+                        manifest_version,
+                        serde_json::to_string(&current_links)?,
+                        derived_password,
+                        Utc::now().timestamp(),
+                        task.task_id,
+                        crate::netdisk::BRIDGE_TASK_REGISTERED
+                    ],
+                )?;
+                if refrozen == 0 {
+                    continue;
+                }
+                let Some(refrozen) = load_bridge_task(conn, &task_id)? else {
+                    continue;
+                };
+                refrozen
+            } else {
+                task
+            }
         } else {
             match create_bridge_task(conn, bridge_id, &session_id, post_id, &[], None) {
                 Ok(task) => {
@@ -1365,7 +1578,7 @@ pub(super) fn dispatch_subscription_netdisk(
                         None,
                         "",
                         "网盘任务登记失败",
-                        &post_id.to_string(),
+                        &source_post_id,
                     );
                     continue;
                 }
@@ -1379,7 +1592,7 @@ pub(super) fn dispatch_subscription_netdisk(
                 None,
                 "",
                 "网盘任务待开始",
-                &post_id.to_string(),
+                &source_post_id,
             );
         }
     }
@@ -1462,6 +1675,11 @@ pub async fn run_pawchive_sync(
             && (covers_all || (sub.enabled && sub.mode.is_auto()))
     };
     for sub in subscriptions.iter().filter(in_round) {
+        // A rate-limit answer covers every subscription, not just the one that
+        // provoked it: walking the rest would only extend the stand-down.
+        if crate::pawchive_throttle::pawchive_throttle().rate_limited() {
+            break;
+        }
         // Every round resumes the history walk from the stored cursor and reads
         // the newest page on top of it. A manual round used to restart from
         // offset 0, so a creator whose history exceeds the page budget could
@@ -1476,11 +1694,14 @@ pub async fn run_pawchive_sync(
         // Each page is recorded, and the cursor moved, as soon as it arrives.
         // Collecting the whole walk first meant a failure on the last page
         // discarded every page already fetched and the next round started from
-        // the old cursor again.
-        let mut on_page = |page: DiscoveryPage| -> Result<()> {
+        // the old cursor again. The closure answers how many posts of the page
+        // were new to the ledger, which is what the head and overlap sweeps
+        // read to tell "the list shifted" from "a page a earlier round saw".
+        let mut on_page = |page: DiscoveryPage| -> Result<usize> {
             let conn = pool.get()?;
-            page_posts +=
+            let new_posts =
                 record_discovered_posts(&conn, sub.id, &page.posts, since_date.as_deref())?;
+            page_posts += new_posts;
             if let Some(next) = page.cursor_after {
                 conn.execute(
                     "UPDATE kemono_subscriptions
@@ -1495,7 +1716,7 @@ pub async fn run_pawchive_sync(
                 )?;
             }
             pages_saved += 1;
-            Ok(())
+            Ok(new_posts)
         };
         let posts_res = fetch_creator_posts_resumed(
             &client,
@@ -1509,6 +1730,20 @@ pub async fn run_pawchive_sync(
         let conn = pool.get()?;
         match posts_res {
             Ok(outcome) => {
+                // The throttle stood the process down before this walk read a
+                // single page (a manual attempt shares it and can trip it
+                // between rounds of this loop). The subscription is exactly as
+                // the last round left it, so the terminal write below — which
+                // would flip `discovery_complete` back off and clear
+                // `last_error` on a walk that read nothing — must not run, and
+                // this is not one of the round's synced subscriptions either.
+                if pages_saved == 0
+                    && outcome.next_offset == start_offset
+                    && crate::pawchive_throttle::pawchive_throttle().rate_limited()
+                {
+                    discovery_incomplete |= !sub.discovery_complete;
+                    continue;
+                }
                 synced_subs += 1;
                 discovered_posts += page_posts;
                 let count = page_posts;
@@ -1557,6 +1792,10 @@ pub async fn run_pawchive_sync(
             Err(e) => {
                 let err_str = e.to_string();
                 discovery_failures += 1;
+                // The gap as this round found it counts for a failed
+                // subscription too: without it the round-end comparison reads
+                // days that were never measured as days the round "closed".
+                missing_days_before += pending_coverage_day_count(&conn, sub.id).unwrap_or(0);
                 // Pages that were read before the failure are already in the
                 // ledger and the cursor already moved past them, so the round
                 // reports them instead of pretending nothing happened.
@@ -1609,7 +1848,7 @@ pub async fn run_pawchive_sync(
     // and it must not be claimed on the strength of a summary either. The pass
     // records its own event; a failure here is not fatal to the round, and the
     // works it could not read stay unproven instead of being read as empty.
-    if let Err(error) = fetch_pending_post_details(&pool, &client).await {
+    if let Err(error) = fetch_pending_post_details(&pool, &client, only_subscription).await {
         let conn = pool.get()?;
         record_pawchive_event(
             &conn,
@@ -1769,8 +2008,16 @@ pub async fn run_pawchive_sync(
     }
 
     for (post_id, target_dir) in rows {
+        // Downloads are the traffic the source rate-limits hardest; once it has
+        // asked for a wait, the rest of the queue is left for the next round.
+        if crate::pawchive_throttle::pawchive_throttle().rate_limited() {
+            break;
+        }
         let artist_dir = PathBuf::from(&target_dir);
-        if let Ok(cnt) = download_post_files_with_settings(
+        // A failure before the first file (the post row vanished, a database
+        // read failed) used to disappear entirely: no event, no count, and the
+        // post re-queued every round with nothing to show why.
+        match download_post_files_with_settings(
             &pool,
             &client,
             post_id,
@@ -1780,7 +2027,36 @@ pub async fn run_pawchive_sync(
         )
         .await
         {
-            downloaded_files += cnt;
+            Ok(cnt) => downloaded_files += cnt,
+            Err(error) => {
+                if let Ok(conn) = pool.get() {
+                    record_pawchive_event(
+                        &conn,
+                        "warn",
+                        "download",
+                        None,
+                        "",
+                        "作品下载未开始",
+                        &format!("{post_id}: {error}"),
+                    );
+                }
+            }
+        }
+    }
+    // A round that stopped at a rate-limit answer says so, and for how long:
+    // the panel has to be able to tell "nothing left to do" from "the source
+    // told us to wait". The queue is untouched and resumes next round.
+    if let Some(wait) = crate::pawchive_throttle::pawchive_throttle().seconds_until_allowed() {
+        if let Ok(conn) = pool.get() {
+            record_pawchive_event(
+                &conn,
+                "warn",
+                "round",
+                None,
+                "",
+                &format!("源站限流，本轮提前结束（等待 {wait} 秒）"),
+                trigger.as_str(),
+            );
         }
     }
     let netdisk_jobs = if let Some(baseline) = netdisk_baseline {

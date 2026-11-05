@@ -187,12 +187,15 @@ pub fn plan_manual_post(
     post_db_id: i64,
     settings: &PawchiveSettings,
 ) -> Result<Option<ManualPostPlan>> {
+    let post_day = post_day_sql("p", post_source_date_column(conn));
     let post: Option<(String, Option<String>, String, i64, String)> = conn
         .query_row(
-            "SELECT p.post_id, p.title,
-                    substr(COALESCE(NULLIF(p.published_at, ''), p.created_at, ''), 1, 10),
-                    p.manifest_version, p.assessment_state
-             FROM kemono_posts p WHERE p.id = ?1",
+            &format!(
+                "SELECT p.post_id, p.title,
+                        {post_day},
+                        p.manifest_version, p.assessment_state
+                 FROM kemono_posts p WHERE p.id = ?1"
+            ),
             params![post_db_id],
             |row| {
                 Ok((
@@ -244,13 +247,21 @@ pub fn plan_manual_post(
         if !wants_type(settings, &file.file_type) {
             continue;
         }
-        // A delivered resource is recorded at the version the source never
-        // characterised (`unknown`), because this install's own digest is not a
-        // source version. Both sides of the comparison derive the identity the
-        // same way, so a covered resource is found rather than looked for under
-        // a key nothing wrote.
+        // A delivered resource is recorded by the ledger at the identity the
+        // source gave it and the version the evidence supports — the same two
+        // derivations `materialize_work_ledger_inner` uses when it writes the
+        // acquisition events. Looking the plan's answer up under the path with
+        // a hardcoded `unknown` version missed every resource the source names
+        // by id (its events are keyed by that id), so a delivered attachment
+        // read as "fetch" and a manual re-request duplicated it.
+        let (version_key, _) = resource_version_evidence(
+            file.expected_blake3.as_deref().unwrap_or(""),
+            &file.hash_source,
+            &file.resume_validator,
+            file.expected_length,
+        );
         let resource_version_id =
-            resource_version_id_for(&work_id, &file.remote_path, UNKNOWN_VERSION);
+            resource_version_id_for(&work_id, &file.source_identity, &version_key);
         let covered = acquired.contains(&resource_version_id);
         resources.push(ManualResourcePlan {
             file_id: file.id,
@@ -294,7 +305,9 @@ fn selection_fingerprint(post_ids: &[i64], file_ids: &[i64]) -> String {
 #[derive(Debug, Clone)]
 pub struct FilterSelectionOutcome {
     pub outcome: SelectionOutcome,
-    /// How many works the filter matched in total, including any beyond the cap.
+    /// How many works the filter matched inside the cap this request froze.
+    /// The cap is the durability boundary, so a truncated request reports the
+    /// frozen count, not the whole match — the panel asks again for the rest.
     pub matched: usize,
     /// The filter matched more works than this request may freeze, so the
     /// selection holds the first `PAWCHIVE_FILTER_SELECTION_MAX_POSTS` of them.
@@ -343,6 +356,56 @@ pub fn record_selection_for_filter(
     })
 }
 
+/// The selection a request id already froze, when it froze one.
+///
+/// Shared by the read path and by the INSERT's constraint fallback: a double
+/// click that races itself must answer as the reuse the second request is,
+/// not as the 400 a raw constraint error used to become.
+fn reuse_frozen_selection(
+    conn: &Connection,
+    request_id: &str,
+    fingerprint: &str,
+) -> Result<Option<SelectionOutcome>, SelectionError> {
+    let existing: Option<(String, String)> = conn
+        .query_row(
+            "SELECT selection_id, request_fingerprint FROM pawchive_selections
+             WHERE request_id = ?1",
+            params![request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| SelectionError::NotFound(error.to_string()))?;
+    let Some((selection_id, stored_fingerprint)) = existing else {
+        return Ok(None);
+    };
+    if stored_fingerprint != fingerprint {
+        return Err(SelectionError::RequestConflict);
+    }
+    let (posts, resources, expires_at) = conn
+        .query_row(
+            "SELECT posts, resources, expires_at FROM pawchive_selections
+             WHERE selection_id = ?1",
+            params![selection_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as usize,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| SelectionError::NotFound(error.to_string()))?;
+    Ok(Some(SelectionOutcome {
+        selection_id,
+        request_id: request_id.to_string(),
+        reused: true,
+        posts,
+        resources,
+        expires_at,
+        plans: Vec::new(),
+    }))
+}
+
 /// Freeze what the user selected, once per request id.
 ///
 /// The selection is stored as rows rather than as one blob: the panel's "全选"
@@ -372,42 +435,8 @@ pub fn record_selection(
     }
     let fingerprint = selection_fingerprint(&wanted_posts, file_ids);
 
-    let existing: Option<(String, String)> = conn
-        .query_row(
-            "SELECT selection_id, request_fingerprint FROM pawchive_selections
-             WHERE request_id = ?1",
-            params![request_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|error| SelectionError::NotFound(error.to_string()))?;
-    if let Some((selection_id, stored_fingerprint)) = existing {
-        if stored_fingerprint != fingerprint {
-            return Err(SelectionError::RequestConflict);
-        }
-        let (posts, resources, expires_at) = conn
-            .query_row(
-                "SELECT posts, resources, expires_at FROM pawchive_selections
-                 WHERE selection_id = ?1",
-                params![selection_id],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as usize,
-                        row.get::<_, i64>(1)? as usize,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .map_err(|error| SelectionError::NotFound(error.to_string()))?;
-        return Ok(SelectionOutcome {
-            selection_id,
-            request_id: request_id.to_string(),
-            reused: true,
-            posts,
-            resources,
-            expires_at,
-            plans: Vec::new(),
-        });
+    if let Some(outcome) = reuse_frozen_selection(conn, request_id, &fingerprint)? {
+        return Ok(outcome);
     }
 
     // Every named post has to exist: a selection that silently drops one is a
@@ -445,7 +474,7 @@ pub fn record_selection(
     let tx = conn
         .unchecked_transaction()
         .map_err(|error| SelectionError::NotFound(error.to_string()))?;
-    tx.execute(
+    let inserted = match tx.execute(
         "INSERT INTO pawchive_selections
              (selection_id, request_id, request_fingerprint, posts, resources, created_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -458,8 +487,24 @@ pub fn record_selection(
             created_at,
             expires_at
         ],
-    )
-    .map_err(|error| SelectionError::NotFound(error.to_string()))?;
+    ) {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            // A concurrent freeze with the same request id won the race: the
+            // unique request id refused this INSERT. The losing request is the
+            // reuse the winner already answered — unless it named a different
+            // body, which is the same conflict the read path reports. Any
+            // other constraint is a real error.
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                let _ = tx.rollback();
+                if let Some(outcome) = reuse_frozen_selection(conn, request_id, &fingerprint)? {
+                    return Ok(outcome);
+                }
+            }
+            return Err(SelectionError::NotFound(error.to_string()));
+        }
+    };
+    debug_assert!(inserted == 1, "a fresh selection insert changes one row");
     for plan in &plans {
         for resource in &plan.resources {
             tx.execute(
@@ -559,11 +604,13 @@ pub fn create_attempt(
     } else {
         request_id.trim().to_string()
     };
-    if Utc::now().to_rfc3339() > expires_at {
-        return Err(AttemptError::SelectionExpired(selection_id.to_string()));
-    }
-
-    let now = Utc::now().to_rfc3339();
+    // An attempt that already exists under this request id is returned
+    // whatever the selection's age. The freeze it was planned under is the one
+    // the attempt carries, and it is the recovery path for an attempt a
+    // rate-limit answer interrupted mid-run: cutting it at the TTL forced a
+    // fresh attempt, whose manual policy re-fetches every delivered resource
+    // into suffixed copies. The expiry below only guards planning a *new*
+    // attempt from a selection the panel may no longer be showing.
     let attempt_id: Option<String> = conn
         .query_row(
             "SELECT attempt_id FROM pawchive_attempts WHERE request_id = ?1",
@@ -582,6 +629,9 @@ pub fn create_attempt(
             resources,
             no_direct_resources: Vec::new(),
         });
+    }
+    if Utc::now().to_rfc3339() > expires_at {
+        return Err(AttemptError::SelectionExpired(selection_id.to_string()));
     }
 
     // The posts this selection names, and how many resources each holds.
@@ -604,26 +654,44 @@ pub fn create_attempt(
         return Err(AttemptError::SelectionEmpty(selection_id.to_string()));
     }
 
+    // The attempt id names this creation, but the request id is the identity
+    // the caller promised: a concurrent create with the same request id makes
+    // the INSERT below a no-op, and everything after it must attach to the
+    // attempt that actually won — otherwise this call would return an id no
+    // `pawchive_attempts` row answers to, and the spawned run would fail with
+    // "unknown attempt". Immediate, not deferred, so the two statements below
+    // cannot be split by another writer's commit.
+    let now = Utc::now().to_rfc3339();
     let attempt_id = ledger_digest("att", &[selection_id, &request_id, &now]);
-    let tx = conn
-        .unchecked_transaction()
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| AttemptError::NotFound(error.to_string()))?;
-    tx.execute(
-        "INSERT INTO pawchive_attempts
-             (attempt_id, selection_id, request_id, intent, state, posts, resources,
-              created_at, updated_at)
-         VALUES (?1, ?2, ?3, 'manual', 'queued', ?4, ?5, ?6, ?6)
-         ON CONFLICT(request_id) DO NOTHING",
-        params![
-            attempt_id,
-            selection_id,
-            request_id,
-            rows.len() as i64,
-            resource_count,
-            now
-        ],
-    )
-    .map_err(|error| AttemptError::NotFound(error.to_string()))?;
+    let inserted = tx
+        .execute(
+            "INSERT INTO pawchive_attempts
+                 (attempt_id, selection_id, request_id, intent, state, posts, resources,
+                  created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'manual', 'queued', ?4, ?5, ?6, ?6)
+             ON CONFLICT(request_id) DO NOTHING",
+            params![
+                attempt_id,
+                selection_id,
+                request_id,
+                rows.len() as i64,
+                resource_count,
+                now
+            ],
+        )
+        .map_err(|error| AttemptError::NotFound(error.to_string()))?;
+    let attempt_id = if inserted == 0 {
+        tx.query_row(
+            "SELECT attempt_id FROM pawchive_attempts WHERE request_id = ?1",
+            params![request_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| AttemptError::NotFound(error.to_string()))?
+    } else {
+        attempt_id
+    };
     for (post_id, _) in &rows {
         let work_id: String = tx
             .query_row(
@@ -740,7 +808,35 @@ pub async fn run_manual_attempt(
     if state == "done" || state == "cancelled" {
         return Ok(0);
     }
-
+    // One runner at a time (see `claim_attempt_for_run`).
+    {
+        let conn = pool.get()?;
+        if !claim_attempt_for_run(&conn, attempt_id)? {
+            return Ok(0);
+        }
+    }
+    {
+        // A post (or its subscription) deleted mid-attempt leaves its
+        // attempt_posts row behind. The JOIN walk below skips it, while the
+        // settle count still reads it as outstanding — the attempt then
+        // settled `failed` on every resume without doing anything, and only
+        // a manual cancel could end it. Marking the dangling row failed
+        // records the reason and makes both sides agree.
+        let conn = pool.get()?;
+        conn.execute(
+            "UPDATE pawchive_attempt_posts
+             SET state = 'failed',
+                 error = CASE WHEN error = '' THEN '作品记录已不存在' ELSE error END,
+                 updated_at = ?1
+             WHERE attempt_id = ?2
+               AND state NOT IN ('done', 'cancelled')
+               AND NOT EXISTS (
+                   SELECT 1 FROM kemono_posts p
+                   JOIN kemono_subscriptions s ON s.id = p.subscription_id
+                   WHERE p.id = pawchive_attempt_posts.post_id)",
+            params![Utc::now().to_rfc3339(), attempt_id],
+        )?;
+    }
     let posts: Vec<(i64, String, String)> = {
         let conn = pool.get()?;
         let mut stmt = conn.prepare(
@@ -773,6 +869,27 @@ pub async fn run_manual_attempt(
             let conn = pool.get()?;
             if attempt_state(&conn, attempt_id)?.as_deref() == Some("cancelled") {
                 break;
+            }
+        }
+        // A rate-limit answer covers this attempt too: the remaining works stay
+        // unclaimed, so the next attempt resumes instead of collecting refusals.
+        if crate::pawchive_throttle::pawchive_throttle().rate_limited() {
+            break;
+        }
+        // Claim the post as running before touching it. Cancel marks queued
+        // posts between works, and without this marker it would also cancel the
+        // post this pass has just entered. A claim that changes no row means
+        // cancel won the race for this post — cancelled is terminal there, so
+        // the pass skips it and the next loop check stops the attempt.
+        {
+            let conn = pool.get()?;
+            let claimed = conn.execute(
+                "UPDATE pawchive_attempt_posts SET state = 'running', updated_at = ?1
+                 WHERE attempt_id = ?2 AND post_id = ?3 AND state != 'cancelled'",
+                params![Utc::now().to_rfc3339(), attempt_id, post_db_id],
+            )?;
+            if claimed == 0 {
+                continue;
             }
         }
         // The reviewed manifest against the one that stands now. A change means
@@ -819,29 +936,80 @@ pub async fn run_manual_attempt(
             continue;
         }
 
-        let resource_rows = {
+        let (resource_rows, missing_resources) = {
             let conn = pool.get()?;
             attempt_resource_rows(&conn, &selection_id, post_db_id)?
         };
         let file_ids: Vec<i64> = resource_rows.iter().map(|(id, _)| *id).collect();
         if file_ids.is_empty() {
             let conn = pool.get()?;
-            mark_attempt_post(&conn, attempt_id, post_db_id, "done", 0, "")?;
+            // Nothing fetchable is not the same as nothing left: when members
+            // lost their rows, that is the report, not a clean `done`.
+            if missing_resources.is_empty() {
+                mark_attempt_post(&conn, attempt_id, post_db_id, "done", 0, "")?;
+            } else {
+                mark_attempt_post(
+                    &conn,
+                    attempt_id,
+                    post_db_id,
+                    "failed",
+                    0,
+                    &format!("{} 个资源的记录已不存在", missing_resources.len()),
+                )?;
+            }
             continue;
+        }
+        if !missing_resources.is_empty() {
+            // Reviewed resources whose working rows are gone cannot be fetched
+            // and cannot be skipped silently either: one event says which post
+            // and how many, and the post settles as failed below with the same
+            // count in its error.
+            let conn = pool.get()?;
+            record_pawchive_event(
+                &conn,
+                "warn",
+                "attempt",
+                None,
+                "",
+                "选区资源记录缺失",
+                &format!(
+                    "{post_db_id}: {} 个资源在库中已不存在",
+                    missing_resources.len()
+                ),
+            );
         }
 
         // The attempt names the resources; the download pass writes the rows.
         // A manual attempt re-fetches what it names, so the rows it is about to
         // fetch are put back in flight here, while the rows outside its scope
         // are left exactly as they are.
+        //
+        // A row another live pass is receiving is not reset: flipping it to
+        // `pending` and claiming it below used to point two passes at the same
+        // part file, and with no source-published digest nothing downstream
+        // would have caught the interleaved bytes. This attempt's own earlier
+        // pass is dead (the run claim refuses a second live pass), so its
+        // leases are reclaimable without waiting out the window.
         {
             let conn = pool.get()?;
+            let lease_cutoff =
+                (Utc::now() - Duration::minutes(DOWNLOAD_CLAIM_LEASE_MINUTES)).to_rfc3339();
+            let same_attempt_pattern = format!("dl:{attempt_id}:%");
             for (file_id, resource_key) in &resource_rows {
                 conn.execute(
                     "UPDATE kemono_files
                      SET status = 'pending', next_attempt_at = NULL, updated_at = ?1
-                     WHERE id = ?2 AND remote_path = ?3",
-                    params![Utc::now().to_rfc3339(), file_id, resource_key],
+                     WHERE id = ?2 AND remote_path = ?3
+                       AND (claimed_by IS NULL OR claimed_by = ''
+                            OR claimed_at IS NULL OR claimed_at < ?4
+                            OR claimed_by LIKE ?5)",
+                    params![
+                        Utc::now().to_rfc3339(),
+                        file_id,
+                        resource_key,
+                        lease_cutoff,
+                        same_attempt_pattern
+                    ],
                 )?;
             }
         }
@@ -862,10 +1030,44 @@ pub async fn run_manual_attempt(
         )
         .await
         {
-            Ok(count) => {
-                fetched_total += count;
+            Ok(report) => {
+                fetched_total += report.fetched;
                 let conn = pool.get()?;
-                mark_attempt_post(&conn, attempt_id, post_db_id, "done", count as i64, "")?;
+                // A post whose selection lost rows settles as failed with the
+                // count it did deliver: the attempt is not clean, and the
+                // missing resources are the reason.
+                let (state, note) = if !missing_resources.is_empty() {
+                    (
+                        "failed",
+                        format!("{} 个资源的记录已不存在", missing_resources.len()),
+                    )
+                } else if report.stopped_by_rate_limit {
+                    // The pass stopped mid-post on a rate-limit stand-down.
+                    // Marking it `done` here used to strand its undelivered
+                    // files: the resume walk revisits only posts that are not
+                    // done, and for a `manual` subscription no automatic
+                    // round ever picks them up. Keeping it failed is what
+                    // makes "resumes on the next attempt" true.
+                    ("failed", "源站限流，投递中断，待下次尝试恢复".to_string())
+                } else if report.live_claim_skips > 0 {
+                    // Another live pass is receiving these right now; this
+                    // attempt delivered only what it did. A later attempt
+                    // re-walks the post if the other pass did not finish.
+                    (
+                        "failed",
+                        format!("{} 个资源正由进行中的下载接收", report.live_claim_skips),
+                    )
+                } else {
+                    ("done", String::new())
+                };
+                mark_attempt_post(
+                    &conn,
+                    attempt_id,
+                    post_db_id,
+                    state,
+                    report.fetched as i64,
+                    &note,
+                )?;
             }
             Err(error) => {
                 let conn = pool.get()?;
@@ -910,10 +1112,14 @@ pub(super) fn mark_attempt_post(
     fetched: i64,
     error: &str,
 ) -> Result<()> {
+    // Cancelled is terminal for a post, as it is for the attempt itself: a
+    // cancel between works marks the not-yet-started posts, and a pass that
+    // was inside its own post may still settle that one (it is `running`, not
+    // `cancelled`), but nothing may overwrite the rows cancel decided.
     conn.execute(
         "UPDATE pawchive_attempt_posts
          SET state = ?1, fetched = ?2, error = ?3, updated_at = ?4
-         WHERE attempt_id = ?5 AND post_id = ?6",
+         WHERE attempt_id = ?5 AND post_id = ?6 AND state != 'cancelled'",
         params![
             state,
             fetched,
@@ -928,6 +1134,34 @@ pub(super) fn mark_attempt_post(
         params![Utc::now().to_rfc3339(), attempt_id],
     )?;
     Ok(())
+}
+
+/// How long an attempt that is `running` but silent may be before a resend may
+/// reclaim it. A live pass touches the attempt row between works, and the
+/// per-file lease heartbeat touches it during a receive, so the threshold only
+/// needs to outlast one renewal gap — not one post's whole download.
+const ATTEMPT_STALE_RUNNING_HOURS: i64 = 6;
+
+/// Take exclusive ownership of an attempt for one run.
+///
+/// The route spawns a run on every accepted request, and a resend that arrives
+/// while the attempt is still going must not start a second pass over the same
+/// resources: row fencing stops a double settle, not a double download — the
+/// second pass finds every target already published and writes suffixed copies
+/// beside them. The claim is the state transition itself, so of two racing
+/// passes exactly one sees it succeed. A pass that died mid-run leaves
+/// `running` behind; a resend may reclaim it once the attempt has been quiet
+/// long enough that no live pass still plausibly owns it.
+pub(super) fn claim_attempt_for_run(conn: &Connection, attempt_id: &str) -> Result<bool> {
+    let stale_cutoff = (Utc::now() - Duration::hours(ATTEMPT_STALE_RUNNING_HOURS)).to_rfc3339();
+    let claimed = conn.execute(
+        "UPDATE pawchive_attempts SET state = 'running', updated_at = ?1
+         WHERE attempt_id = ?2
+           AND (state IN ('queued', 'failed')
+                OR (state = 'running' AND updated_at < ?3))",
+        params![Utc::now().to_rfc3339(), attempt_id, stale_cutoff],
+    )?;
+    Ok(claimed > 0)
 }
 
 pub(super) fn mark_attempt_done(
@@ -953,34 +1187,46 @@ pub(super) fn mark_attempt_done(
     Ok(())
 }
 
-/// The file rows one selection names for a post, as `(file_id, resource_key)`.
+/// The file rows one selection names for a post, as `(file_id, resource_key)`,
+/// plus the resource keys whose working row no longer exists.
 ///
 /// The selection stores the resource key it reviewed; the working row is looked
 /// up by that key, so a file whose row was re-created by a re-discovery is
-/// still the same resource rather than a new one.
+/// still the same resource rather than a new one. A key with no row is
+/// reported instead of dropped: an INNER JOIN here used to make the resource
+/// vanish from the attempt, the post still settled as `done`, and nothing
+/// anywhere recorded that a reviewed resource was skipped.
 fn attempt_resource_rows(
     conn: &Connection,
     selection_id: &str,
     post_db_id: i64,
-) -> Result<Vec<(i64, String)>> {
+) -> Result<(Vec<(i64, String)>, Vec<String>)> {
     let mut stmt = conn.prepare(
-        "SELECT f.id, m.resource_key
+        "SELECT m.resource_key, f.id
          FROM pawchive_selection_members m
-         JOIN kemono_files f ON f.post_id = m.post_id
-                            AND f.remote_path = m.resource_key
+         LEFT JOIN kemono_files f ON f.post_id = m.post_id
+                             AND f.remote_path = m.resource_key
          WHERE m.selection_id = ?1 AND m.post_id = ?2
-         ORDER BY f.id",
+         ORDER BY m.resource_key",
     )?;
     let rows = stmt
         .query_map(params![selection_id, post_db_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
+            Ok((row.get::<_, Option<i64>>(1)?, row.get::<_, String>(0)?))
         })?
         // Propagated, not filtered: a row-level failure used to disappear,
         // which dropped that resource from `force_file_ids` and from the rows
         // the pass walks — so the resource was skipped and the post was still
         // marked done as if it had been fetched.
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+        .collect::<rusqlite::Result<Vec<(Option<i64>, String)>>>()?;
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    for (file_id, resource_key) in rows {
+        match file_id {
+            Some(file_id) => found.push((file_id, resource_key)),
+            None => missing.push(resource_key),
+        }
+    }
+    Ok((found, missing))
 }
 
 /// The settings one pass may claim under, or `None` when the pass stops here.
@@ -1034,6 +1280,25 @@ pub(super) fn pass_admission_settings(
 /// each network await. Borrowing a checked-out guard across an await would make
 /// this future `!Send` (a `rusqlite::Connection` is `Send` but not `Sync`), and
 /// holding it for a whole download would occupy a pool slot for minutes.
+/// What one scoped download pass delivered, and how it ended.
+///
+/// The pass breaks its file loop when the source stands the process down
+/// (429 / repeated 403) and skips a resource whose row another live pass is
+/// receiving. Callers that settle per-post state must not read a plain count
+/// as completion: an interrupted post has undelivered files, and only the
+/// report says so.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ScopedDownloadReport {
+    pub fetched: usize,
+    /// The pass stopped mid-post on a rate-limit stand-down. The files it
+    /// never reached are still owed, and the resume walk revisits only posts
+    /// that are not `done`.
+    pub stopped_by_rate_limit: bool,
+    /// Resources the pass skipped because a live claim held them — someone
+    /// else is receiving them right now, so this pass did not deliver.
+    pub live_claim_skips: usize,
+}
+
 pub(crate) async fn download_post_files_scoped(
     pool: &Arc<DbPool>,
     client: &reqwest::Client,
@@ -1042,11 +1307,12 @@ pub(crate) async fn download_post_files_scoped(
     roots: &MediaRoots,
     settings: &PawchiveSettings,
     policy: DownloadPostPolicy<'_>,
-) -> Result<usize> {
+) -> Result<ScopedDownloadReport> {
     // Query post and subscription info plus every file row, so the `{index}`
     // token stays the row's position in the post even when only some rows are
     // retried.
     struct PostExportSource {
+        subscription_id: i64,
         post_id: String,
         service: String,
         user_id: String,
@@ -1059,6 +1325,7 @@ pub(crate) async fn download_post_files_scoped(
     }
 
     let PostExportSource {
+        subscription_id,
         post_id,
         service,
         user_id,
@@ -1071,6 +1338,7 @@ pub(crate) async fn download_post_files_scoped(
     } = {
         let conn = pool.get()?;
         let (
+            subscription_id,
             post_id,
             service,
             user_id,
@@ -1080,8 +1348,8 @@ pub(crate) async fn download_post_files_scoped(
             content,
             manifest_version,
         ) = conn.query_row(
-            "SELECT p.post_id, s.service, s.user_id, a.name, p.title, p.published_at, p.content,
-                    p.manifest_version
+            "SELECT p.subscription_id, p.post_id, s.service, s.user_id, a.name, p.title,
+                    p.published_at, p.content, p.manifest_version
              FROM kemono_posts p
              JOIN kemono_subscriptions s ON s.id = p.subscription_id
              LEFT JOIN artists a ON a.id = s.artist_id
@@ -1097,12 +1365,14 @@ pub(crate) async fn download_post_files_scoped(
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )?;
 
         let files = list_post_files(&conn, post_db_id)?;
         PostExportSource {
+            subscription_id,
             post_id,
             service,
             user_id,
@@ -1178,7 +1448,7 @@ pub(crate) async fn download_post_files_scoped(
         // actually make: content on the day is the user's skip policy, and
         // anything else falls through to the resource-level judgement below.
         if matches!(observation.state, OBSERVED_UNREADABLE | OBSERVED_AMBIGUOUS) {
-            return Ok(0);
+            return Ok(ScopedDownloadReport::default());
         }
         // The folder holds files, and this side has no receipt for any of them,
         // so there is nothing here it can prove or improve by fetching.
@@ -1191,7 +1461,7 @@ pub(crate) async fn download_post_files_scoped(
             let conn = pool.get()?;
             let assessment = reassess_post(&conn, post_db_id, settings)?;
             if !assessment.state.is_claimable() {
-                return Ok(0);
+                return Ok(ScopedDownloadReport::default());
             }
         }
     }
@@ -1206,7 +1476,7 @@ pub(crate) async fn download_post_files_scoped(
         pass_admission_settings(&conn, post_db_id, settings, &policy)?
     };
     let Some(admission_settings) = admission_settings else {
-        return Ok(0);
+        return Ok(ScopedDownloadReport::default());
     };
 
     // Publish content and links text files. These are metadata *about* the
@@ -1247,10 +1517,12 @@ pub(crate) async fn download_post_files_scoped(
     }
 
     let mut downloaded_count = 0;
+    let mut stopped_by_rate_limit = false;
+    let mut live_claim_skips = 0usize;
 
     // One owner for the whole pass: the lease is per row, but the pass is what a
     // reclaim supersedes, so one token revokes every claim it holds.
-    let claim = DownloadClaim::new();
+    let claim = DownloadClaim::new(policy.attempt_id());
 
     for (file_idx, file) in files.into_iter().enumerate() {
         // A cancelled request stops claiming here, at the next resource. The
@@ -1318,7 +1590,10 @@ pub(crate) async fn download_post_files_scoped(
         // resource onto whatever the current template would render today.
         let target_file_path = if reserved_path.trim().is_empty() {
             let target_filename = if file_type == "image" {
-                let ext = file_name.rsplit('.').next().unwrap_or("png");
+                let ext = std::path::Path::new(&file_name)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("png");
                 naming.format_image_filename_with_name(
                     file_idx,
                     ext,
@@ -1361,8 +1636,23 @@ pub(crate) async fn download_post_files_scoped(
             let conn = pool.get()?;
             match claim.claim(&conn, file_id)? {
                 Some(token) => token,
-                // The row disappeared; there is nothing left to fetch into.
-                None => continue,
+                // The claim refuses a row a different scope is actively
+                // receiving, and cannot tell that from the row having
+                // disappeared — classify so the attempt can report the
+                // resource as not delivered by this pass.
+                None => {
+                    let exists: Option<i64> = conn
+                        .query_row(
+                            "SELECT 1 FROM kemono_files WHERE id = ?1",
+                            params![file_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if exists.is_some() {
+                        live_claim_skips += 1;
+                    }
+                    continue;
+                }
             }
         };
 
@@ -1422,6 +1712,37 @@ pub(crate) async fn download_post_files_scoped(
                 );
             }
         };
+        // The lease is renewed while the body streams: a slow receive of a
+        // large file can outlive the reclaim window, and a mid-write reclaim
+        // pointed a second pass at the same part file. The renewal is fenced on
+        // the claim, so it stops the moment this pass no longer owns the row.
+        let lease_pool = Arc::clone(pool);
+        let lease_owner = claim.owner().to_string();
+        let lease_attempt_id = policy.attempt_id().map(str::to_string);
+        let mut on_lease = move || {
+            if let Ok(conn) = lease_pool.get() {
+                let now = Utc::now().to_rfc3339();
+                let _ = conn.execute(
+                    "UPDATE kemono_files
+                     SET claimed_at = ?1, updated_at = ?1
+                     WHERE id = ?2 AND claimed_by = ?3 AND claim_token = ?4",
+                    params![now, file_id, lease_owner.as_str(), claim_token],
+                );
+                // The attempt row's `updated_at` is what stops a resend from
+                // reclaiming a `running` attempt, and it is only written
+                // between works. A single post that receives for hours used
+                // to leave the row silent past the stale threshold, so a
+                // resend started a second pass over the same resources. The
+                // file lease fires every few minutes; touching the attempt
+                // row here keeps a live pass alive for its whole duration.
+                if let Some(attempt_id) = lease_attempt_id.as_deref() {
+                    let _ = conn.execute(
+                        "UPDATE pawchive_attempts SET updated_at = ?1 WHERE attempt_id = ?2",
+                        params![now, attempt_id],
+                    );
+                }
+            }
+        };
         let outcome = download_resumable_stream(
             client,
             &remote_url,
@@ -1430,6 +1751,7 @@ pub(crate) async fn download_post_files_scoped(
             expected_blake3.as_deref(),
             resume.as_ref(),
             &mut on_validator,
+            &mut on_lease,
         )
         .await;
 
@@ -1454,7 +1776,7 @@ pub(crate) async fn download_post_files_scoped(
                         &conn,
                         "info",
                         "download",
-                        None,
+                        Some(subscription_id),
                         naming.user,
                         "跳过已失效的认领",
                         &format!("{remote_path}: 认领已被回收，本次不再发布"),
@@ -1521,7 +1843,7 @@ pub(crate) async fn download_post_files_scoped(
                         // retry does not re-fetch it.
                         let message = err.to_string();
                         let class = classify_download_error(&message);
-                        let attempt = current_attempt(&conn, file_id);
+                        let attempt = current_attempt(&conn, file_id)?;
                         let next_attempt = (Utc::now()
                             + Duration::minutes(class.backoff_minutes(attempt)))
                         .to_rfc3339();
@@ -1543,7 +1865,7 @@ pub(crate) async fn download_post_files_scoped(
                             &conn,
                             "error",
                             "download",
-                            None,
+                            Some(subscription_id),
                             naming.user,
                             "文件发布失败",
                             &format!("{}: {}", class.as_str(), message),
@@ -1554,7 +1876,7 @@ pub(crate) async fn download_post_files_scoped(
             Err(err) => {
                 let message = err.to_string();
                 let class = classify_download_error(&message);
-                let attempt = current_attempt(&conn, file_id);
+                let attempt = current_attempt(&conn, file_id)?;
                 let next_attempt = (Utc::now()
                     + Duration::minutes(backoff_minutes_for(&message, class, attempt)))
                 .to_rfc3339();
@@ -1581,11 +1903,23 @@ pub(crate) async fn download_post_files_scoped(
                     &conn,
                     "error",
                     "download",
-                    None,
+                    Some(subscription_id),
                     naming.user,
                     "文件下载失败",
                     &event_message,
                 );
+                if class == DeliveryErrorClass::RateLimited
+                    || crate::pawchive_throttle::pawchive_throttle().rate_limited()
+                {
+                    // The source asked this process to wait (via 429 or repeated 403),
+                    // and that wait covers the rest of the queue: asking for the next file
+                    // would only be refused, which is how a wait becomes a ban.
+                    // The caller has to know the post was left mid-way — reading
+                    // the delivered count as completion used to strand the
+                    // remaining files for every later resume.
+                    stopped_by_rate_limit = true;
+                    break;
+                }
             }
         }
     }
@@ -1616,7 +1950,11 @@ pub(crate) async fn download_post_files_scoped(
         }
     }
 
-    Ok(downloaded_count)
+    Ok(ScopedDownloadReport {
+        fetched: downloaded_count,
+        stopped_by_rate_limit,
+        live_claim_skips,
+    })
 }
 
 /// Public post page for one discovered work.

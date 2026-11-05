@@ -460,11 +460,40 @@ fn resolve_existing_scan_candidate_response_inner(
         let Some(item_id) = item_id else {
             return Ok(None);
         };
+        // The item row predates this resolution; its stored digest may belong
+        // to different bytes than the file the candidate just verified. Adopt
+        // the candidate's `done` digest only after the same in-transaction
+        // content check the sibling write paths run, and when it cannot be
+        // adopted while the file's stat differs from what the row was hashed
+        // over, drop the row back to the hash queue — the queue only picks
+        // `pending`/empty rows, and the scan's reuse check compares against
+        // the freshly overwritten size/mtime, so a stale `done` here would
+        // otherwise never self-heal.
+        let adopt_candidate_hash =
+            candidate.hash_status == "done" && !candidate.content_hash.is_empty();
+        if adopt_candidate_hash && !candidate_content_is_current(roots, &candidate) {
+            bail!("candidate_stale");
+        }
 
         conn.execute(
             "UPDATE items
              SET missing=0, missing_at=NULL, file_size=?1, file_mtime=?2, media_type=?3,
-                 st_dev=?4, st_ino=?5, scanned_at=strftime('%s','now')
+                 st_dev=?4, st_ino=?5, scanned_at=strftime('%s','now'),
+                 content_hash = CASE
+                   WHEN ?7 = 'done' AND ?8 <> '' THEN ?8
+                   WHEN file_size <> ?1 OR abs(file_mtime - ?2) >= ?9 THEN ''
+                   ELSE content_hash
+                 END,
+                 hash_status = CASE
+                   WHEN ?7 = 'done' AND ?8 <> '' THEN 'done'
+                   WHEN file_size <> ?1 OR abs(file_mtime - ?2) >= ?9 THEN 'pending'
+                   ELSE hash_status
+                 END,
+                 hash_updated_at = CASE
+                   WHEN ?7 = 'done' AND ?8 <> '' THEN strftime('%s','now')
+                   WHEN file_size <> ?1 OR abs(file_mtime - ?2) >= ?9 THEN NULL
+                   ELSE hash_updated_at
+                 END
              WHERE id=?6",
             params![
                 candidate.file_size,
@@ -473,6 +502,9 @@ fn resolve_existing_scan_candidate_response_inner(
                 candidate.st_dev,
                 candidate.st_ino,
                 item_id,
+                candidate.hash_status,
+                candidate.content_hash,
+                crate::scan::MTIME_REUSE_EPSILON,
             ],
         )
         .context("update same-path item")?;
@@ -1175,8 +1207,12 @@ fn create_scan_move_candidate(
             ],
         )?;
     }
+    // Status guard: a concurrent resolver may have just moved this row to
+    // resolved/new; never flip such rows back to candidate (same contract as
+    // `waiting_for_hash` below).
     conn.execute(
-        "UPDATE scan_candidates SET status='candidate', resolved_at=NULL WHERE id=?1",
+        "UPDATE scan_candidates SET status='candidate', resolved_at=NULL
+         WHERE id=?1 AND status IN ('pending','candidate')",
         params![candidate.id],
     )?;
     Ok(())

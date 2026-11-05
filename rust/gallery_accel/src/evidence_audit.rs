@@ -73,7 +73,7 @@ pub fn audit_evidence_bindings(conn: &Connection, limit: usize) -> Result<Eviden
     };
 
     let sql = format!(
-        "SELECT f.id, f.post_id, f.evidence_item_id,
+        "SELECT f.id, CAST(f.post_id AS TEXT), f.evidence_item_id,
                 {},
                 {},
                 {}
@@ -117,7 +117,8 @@ pub fn audit_evidence_bindings(conn: &Connection, limit: usize) -> Result<Eviden
 
         let item_res: Option<(String, i64, Option<String>, i64)> = conn
             .query_row(
-                "SELECT file_path, file_size, content_hash, missing FROM items WHERE id = ?1",
+                "SELECT COALESCE(file_path, ''), COALESCE(file_size, 0), content_hash, COALESCE(missing, 0)
+                 FROM items WHERE id = ?1",
                 params![evidence_item_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )

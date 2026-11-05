@@ -31,6 +31,9 @@ export const DOWNLOAD_WORKS_PAGE_SIZE = 50;
 // request per keystroke otherwise, and each one re-derives per-row evidence.
 const DOWNLOAD_WORKS_SEARCH_DEBOUNCE_MS = 300;
 
+let downloadSettingsEditRevision = 0;
+let downloadSettingsSaveRevision = 0;
+
 export const DOWNLOAD_INTERVAL_HOURS = [1, 3, 6, 12, 24];
 
 // The file-type segments, in panel order. `key` is the settings field
@@ -54,7 +57,7 @@ export function downloadTypeEnabled(key) {
 }
 
 export function toggleDownloadType(key) {
-  if (!state.downloadSettings || state.downloadLoading) return;
+  if (!state.downloadSettings) return;
   const field = `download_${key}`;
   state.downloadSettings = {...state.downloadSettings, [field]: !state.downloadSettings[field]};
   markDownloadSettingsDirty();
@@ -66,6 +69,7 @@ export function toggleDownloadType(key) {
 // on every tick would silently undo whatever the user just changed, so the
 // form is left alone until it is saved.
 export function markDownloadSettingsDirty() {
+  downloadSettingsEditRevision += 1;
   state.downloadSettingsDirty = true;
 }
 
@@ -73,9 +77,15 @@ export function markDownloadSettingsDirty() {
 // browse-mode startup wires the variable chips before any maintenance panel
 // loads. Its definition lives in shared.js and is re-exported here so existing
 // importers keep working unchanged.
-import { downloadTemplateInputSelector, TEMPLATE_INPUTS } from './shared.js';
+import {
+  downloadTemplateInputSelector, TEMPLATE_INPUTS,
+  DOWNLOAD_CALENDAR_OPEN_STORAGE_KEY, readDownloadCalendarOpen, saveDownloadCalendarOpen,
+} from './shared.js';
 
-export { downloadTemplateInputSelector };
+export {
+  downloadTemplateInputSelector,
+  DOWNLOAD_CALENDAR_OPEN_STORAGE_KEY, readDownloadCalendarOpen, saveDownloadCalendarOpen,
+};
 
 function downloadTemplateInput(inputId) {
   const selector = downloadTemplateInputSelector(inputId);
@@ -83,6 +93,7 @@ function downloadTemplateInput(inputId) {
 }
 
 export async function loadDownloadsPanel(options = {}) {
+  const settingsSaveRevision = downloadSettingsSaveRevision;
   state.downloadLoading = true;
   renderDownloadsPanel();
   try {
@@ -93,7 +104,8 @@ export async function loadDownloadsPanel(options = {}) {
     ]);
     // Keep the user's unsaved edits instead of overwriting them with the
     // server copy; the form re-reads the server once the save clears the flag.
-    if (!state.downloadSettingsDirty) {
+    if (!state.downloadSettingsDirty && !isActionBusy('downloadSettingsSave')
+      && settingsSaveRevision === downloadSettingsSaveRevision) {
       state.downloadSettings = settingsResult?.settings || null;
     }
     state.downloadDefaults = settingsResult?.defaults || null;
@@ -443,6 +455,29 @@ export function renderDownloadSubscriptions() {
     return;
   }
 
+  // Initialize state.downloadCalendarOpen from localStorage if empty
+  if (!state.downloadCalendarOpen || Object.keys(state.downloadCalendarOpen).length === 0) {
+    const saved = readDownloadCalendarOpen();
+    if (saved && typeof saved === 'object') {
+      state.downloadCalendarOpen = {...saved};
+    }
+  }
+
+  // Preserve manually toggled calendar details states across re-renders
+  if (typeof list.querySelectorAll === 'function') {
+    const existingItems = list.querySelectorAll('.download-subscription-item[data-download-subscription]');
+    for (const item of existingItems) {
+      const subId = Number(item.dataset?.downloadSubscription);
+      const details = typeof item.querySelector === 'function'
+        ? item.querySelector('.download-subscription-calendar-details')
+        : null;
+      if (details && Number.isFinite(subId)) {
+        if (!state.downloadCalendarOpen) state.downloadCalendarOpen = {};
+        state.downloadCalendarOpen[subId] = Boolean(details.open);
+      }
+    }
+  }
+
   list.innerHTML = visibleSubs.map(row => {
     const id = Number(row.id);
     // One round runs at a time across the whole panel, so a running round
@@ -457,10 +492,15 @@ export function renderDownloadSubscriptions() {
     const error = row.last_error ? String(row.last_error) : '';
     const coverage = downloadCoverageText(row.coverage);
     const isComplete = isSubscriptionComplete(row);
+    const hasOpenDay = Boolean(state.downloadOpenDay && Number(state.downloadOpenDay.subscriptionId) === id);
+    const isOpen = hasOpenDay
+      || (state.downloadCalendarOpen && typeof state.downloadCalendarOpen[id] === 'boolean'
+          ? state.downloadCalendarOpen[id]
+          : true);
     const calendarHtml = downloadCalendarHtml(row.coverage, id);
     const dayPostsHtml = downloadDayPostsHtml(id);
     const calendarDetails = calendarHtml ? `
-      <details class="download-subscription-calendar-details" ${isComplete ? '' : 'open'}>
+      <details class="download-subscription-calendar-details" ${isOpen ? 'open' : ''}>
         <summary class="download-subscription-calendar-summary">
           <span>作品日历</span>
         </summary>
@@ -716,6 +756,13 @@ export function downloadCalendar(coverage, today = new Date()) {
     currentKey = key;
     months.push({label: `${t('{Number}月', {Number: Number(key.slice(5, 7))})}`, columns: 1});
   }
+  // If the first month run is narrower than 2 columns (under ~23px), its label
+  // would overflow and collide directly with the next month caption (e.g. "10月"
+  // colliding with "11月" to look like "10月月"). Suppress the label while
+  // keeping its column span so the grid stays aligned.
+  if (months.length > 1 && months[0].columns < 2) {
+    months[0].label = '';
+  }
 
   return {weeks, months, activeDays, missingDays, olderDays};
 }
@@ -921,12 +968,14 @@ export async function openDownloadDay(subscriptionId, day) {
   if (!Number.isFinite(id) || !key) return;
   const open = state.downloadOpenDay;
   if (open && Number(open.subscriptionId) === id && String(open.day) === key) {
+    state.downloadDayPostsRequest = null;
     state.downloadOpenDay = null;
     state.downloadDayPosts = null;
     renderDownloadsPanel();
     return;
   }
   state.downloadOpenDay = {subscriptionId: id, day: key};
+  saveDownloadCalendarOpen(id, true);
   state.downloadDayPosts = {loading: true, posts: [], total: 0, next_cursor: null, error: ''};
   renderDownloadsPanel();
   await loadDownloadDayPosts();
@@ -964,8 +1013,12 @@ export async function loadDownloadDayPosts(options = {}) {
       loading: false,
       error: '读取作品失败：' + (error.message || error),
     };
+  } finally {
+    if (state.downloadDayPostsRequest === request) {
+      state.downloadDayPosts = {...state.downloadDayPosts, loading: false};
+      renderDownloadsPanel();
+    }
   }
-  renderDownloadsPanel();
 }
 
 export function loadMoreDownloadDayPosts() {
@@ -1087,19 +1140,28 @@ export async function saveDownloadsSettings() {
     return;
   }
   setActionBusy('downloadSettingsSave', '', true);
+  // Fence reads begun before or during this save, and preserve any edit made
+  // after the submitted snapshot while the form remains interactive.
+  downloadSettingsSaveRevision += 1;
+  const editRevision = downloadSettingsEditRevision;
+  const payload = readDownloadsSettingsFromForm();
   const statusEl = $('#downloadSettingsStatus');
   if (statusEl) statusEl.textContent = '保存中';
   try {
-    const result = await API.putJson('/api/pawchive/settings', readDownloadsSettingsFromForm());
-    state.downloadSettings = result?.settings || state.downloadSettings;
-    // The form now matches the server again, so the panel may repopulate.
-    state.downloadSettingsDirty = false;
-    if (statusEl) statusEl.textContent = '已保存';
-    logUiAction('download_settings_save', {enabled: Boolean(state.downloadSettings?.enabled)});
+    const result = await API.putJson('/api/pawchive/settings', payload);
+    if (editRevision === downloadSettingsEditRevision) {
+      state.downloadSettings = result?.settings || payload;
+      state.downloadSettingsDirty = false;
+      if (statusEl) statusEl.textContent = '已保存';
+    } else if (statusEl) {
+      statusEl.textContent = '';
+    }
+    logUiAction('download_settings_save', {enabled: Boolean(result?.settings?.enabled ?? payload.enabled)});
   } catch (error) {
     if (statusEl) statusEl.textContent = '';
     toast('保存下载设置失败：' + (error.message || error), 'error');
   } finally {
+    downloadSettingsSaveRevision += 1;
     setActionBusy('downloadSettingsSave', '', false);
     renderDownloadsPanel();
   }
@@ -1134,6 +1196,7 @@ export function insertDownloadTemplateToken(value) {
   const start = input.selectionStart ?? input.value.length;
   const end = input.selectionEnd ?? input.value.length;
   input.value = input.value.slice(0, start) + value + input.value.slice(end);
+  markDownloadSettingsDirty();
   input.focus();
   input.setSelectionRange(start + value.length, start + value.length);
   rememberDownloadTemplateInput(inputId);
@@ -2044,14 +2107,13 @@ export async function loadDownloadAllWorks(options = {}) {
     error: '',
   };
   renderDownloadAllWorks();
-  // Same guard as loadDownloadDayPosts: the query string pins the filter and
-  // cursor this read was built from, so a slow "load more" for the previous
-  // filter cannot overwrite a newer filtered first page that already landed.
-  const request = downloadWorksQuery(cursor);
+  // Give each read its own identity, even when it repeats the same query or
+  // returns to an earlier filter. Comparing URLs lets an older response win.
+  const request = {query: downloadWorksQuery(cursor)};
   state.downloadAllWorksRequest = request;
   try {
     const fetchOptions = options.signal ? {signal: options.signal} : {};
-    const result = await API.get(request, fetchOptions);
+    const result = await API.get(request.query, fetchOptions);
     if (state.downloadAllWorksRequest !== request) return;
     const posts = downloadWorksDayPosts(result);
     // A page the earlier read already holds is not appended twice when a refresh
@@ -2075,8 +2137,14 @@ export async function loadDownloadAllWorks(options = {}) {
       loading: false,
       error: '读取作品失败：' + (error.message || error),
     };
+  } finally {
+    // An abort is silent but still settles this load. A superseded request
+    // must not clear the loading state owned by its successor.
+    if (state.downloadAllWorksRequest === request) {
+      state.downloadAllWorks = {...state.downloadAllWorks, loading: false};
+      renderDownloadAllWorks();
+    }
   }
-  renderDownloadAllWorks();
 }
 
 export function loadMoreDownloadWorks() {

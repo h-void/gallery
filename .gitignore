@@ -60,4 +60,6 @@ rust/**/target/
 # recovery artifacts (not source)
 recovered-448-history/
 tmp/
+character_art/
+.credentials
 

@@ -523,17 +523,27 @@ export function renderRecycleBin() {
                 ? t('文件在飞牛系统回收站中，请在系统桌面回收站恢复')
                 : (originalExists ? t('原路径已被同名文件占用，禁止恢复以防误覆盖现有文件') : (!fileExists ? t('回收站文件已缺失') : t('恢复到原始路径')));
               const isSelected = state.recycleSelectedIds.has(id);
-              const isImage = entry.media_type === 'image' || (!entry.media_type && /\.(jpe?g|png|webp|gif|bmp|avif)$/i.test(originalPath));
+              const ext = (originalPath.split('.').pop() || '').toLowerCase();
+              const isImage = entry.media_type === 'image' || (!entry.media_type && /^(jpe?g|png|webp|gif|bmp|avif|tiff?)$/i.test(ext));
+              const isArchive = entry.media_type === 'archive' || (!entry.media_type && /^(zip|rar|7z|tar|gz|bz2|xz)$/i.test(ext));
+              const isVideo = entry.media_type === 'video' || (!entry.media_type && /^(mp4|mkv|webm|mov|avi|flv|wmv)$/i.test(ext));
+              const iconName = isImage ? 'image' : (isVideo ? 'play' : 'file');
+              const canPreview = fileExists && !systemTrash && (isImage || isArchive || isVideo);
+              const previewVersion = Math.floor(entry.created_at || 0);
+              const previewUrl = canPreview ? `/api/recycle/${id}/preview?max=240&t=${previewVersion}` : '';
               const fileName = String(entry.file_name || originalPath.split('/').pop() || '-');
               return `
-                <tr class="recycle-bin-row recycle-table-row${canRestore ? '' : ' blocked'}${isSelected ? ' selected' : ''}" data-recycle-id="${id}">
+                <tr class="recycle-table-row${canRestore ? '' : ' blocked'}${isSelected ? ' selected' : ''}" data-recycle-id="${id}">
                   <td class="recycle-td-check">
                     <input type="checkbox" class="recycle-check" data-recycle-check="${id}" ${isSelected ? 'checked' : ''} aria-label="${t('选择此项')}">
                   </td>
                   <td class="recycle-td-name">
                     <div class="recycle-table-name">
-                      <span class="recycle-table-icon" aria-hidden="true">${buttonIcon(isImage ? 'image' : 'file')}</span>
-                      <span class="recycle-bin-row-head"><code data-i18n-skip title="${escHtml(originalPath)}">${escHtml(fileName)}</code></span>
+                      <span class="recycle-table-icon" aria-hidden="true">${previewUrl
+                        ? `<img class="recycle-table-thumb" src="${escHtml(previewUrl)}" alt="" loading="lazy" decoding="async" onerror="this.style.display='none';this.nextElementSibling.style.display='inline-flex'"><span class="recycle-table-icon-fallback" style="display:none">${buttonIcon(iconName)}</span>`
+                        : buttonIcon(iconName)
+                      }</span>
+                      <code class="recycle-table-filename" data-i18n-skip title="${escHtml(originalPath)}">${escHtml(fileName)}</code>
                     </div>
                   </td>
                   <td class="recycle-td-path">
@@ -580,9 +590,15 @@ export function renderRecycleBin() {
             ? t('文件在飞牛系统回收站中，请在系统桌面回收站恢复')
             : (originalExists ? t('原路径已被同名文件占用，禁止恢复以防误覆盖现有文件') : (!fileExists ? t('回收站文件已缺失') : t('恢复到原始路径')));
           const isSelected = state.recycleSelectedIds.has(id);
-          const isImage = entry.media_type === 'image' || (!entry.media_type && /\.(jpe?g|png|webp|gif|bmp|avif)$/i.test(originalPath));
+          const ext = (originalPath.split('.').pop() || '').toLowerCase();
+          const isImage = entry.media_type === 'image' || (!entry.media_type && /^(jpe?g|png|webp|gif|bmp|avif|tiff?)$/i.test(ext));
+          const isArchive = entry.media_type === 'archive' || (!entry.media_type && /^(zip|rar|7z|tar|gz|bz2|xz)$/i.test(ext));
+          const isVideo = entry.media_type === 'video' || (!entry.media_type && /^(mp4|mkv|webm|mov|avi|flv|wmv)$/i.test(ext));
+          const iconName = isImage ? 'image' : (isVideo ? 'play' : 'file');
           const fileName = String(entry.file_name || originalPath.split('/').pop() || '-');
-          const previewUrl = fileExists && isImage ? `/api/recycle/${id}/preview?max=240` : '';
+          const canPreview = fileExists && !systemTrash && (isImage || isArchive || isVideo);
+          const previewVersion = Math.floor(entry.created_at || 0);
+          const previewUrl = canPreview ? `/api/recycle/${id}/preview?max=240&t=${previewVersion}` : '';
           return `
             <div class="recycle-bin-row recycle-card${canRestore ? '' : ' blocked'}${isSelected ? ' selected' : ''}" data-recycle-id="${id}">
               <div class="recycle-check-wrap">
@@ -590,8 +606,8 @@ export function renderRecycleBin() {
               </div>
               <div class="recycle-card-thumb-wrap">
                 ${previewUrl
-                  ? `<img class="recycle-thumb" src="${escHtml(previewUrl)}" loading="lazy" decoding="async" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="recycle-thumb-placeholder" style="display:none">${buttonIcon('image')}</div>`
-                  : `<div class="recycle-thumb-placeholder">${buttonIcon(isImage ? 'image' : 'file')}</div>`
+                  ? `<img class="recycle-thumb" src="${escHtml(previewUrl)}" loading="lazy" decoding="async" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="recycle-thumb-placeholder" style="display:none">${buttonIcon(iconName)}</div>`
+                  : `<div class="recycle-thumb-placeholder">${buttonIcon(iconName)}</div>`
                 }
               </div>
               <div class="recycle-card-info">

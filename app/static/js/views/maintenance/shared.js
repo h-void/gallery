@@ -10,6 +10,7 @@
 // and maintenance/index.js re-export them under their original names.
 
 import { $ } from '../../utils.js';
+import { state } from '../../store.js';
 
 export const TEMPLATE_INPUTS = {
   folder: '#downloadFolderTemplateInput',
@@ -32,4 +33,34 @@ export function restoreMovePanelScroll(top) {
   if (!panel) return;
   panel.scrollTop = top;
   requestAnimationFrame(() => { panel.scrollTop = top; });
+}
+
+export const DOWNLOAD_CALENDAR_OPEN_STORAGE_KEY = 'gallery.downloadCalendarOpen';
+
+export function readDownloadCalendarOpen() {
+  if (typeof localStorage === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(DOWNLOAD_CALENDAR_OPEN_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch (e) {}
+  return {};
+}
+
+export function saveDownloadCalendarOpen(subId, isOpen) {
+  const id = Number(subId);
+  if (!Number.isFinite(id)) return;
+  if (!state.downloadCalendarOpen) state.downloadCalendarOpen = {};
+  state.downloadCalendarOpen[id] = Boolean(isOpen);
+  if (typeof localStorage !== 'undefined') {
+    try {
+      localStorage.setItem(
+        DOWNLOAD_CALENDAR_OPEN_STORAGE_KEY,
+        JSON.stringify(state.downloadCalendarOpen)
+      );
+    } catch (e) {}
+  }
 }

@@ -187,6 +187,11 @@ prepare_env() {
     export DB_BACKUP_RETENTION="${DB_BACKUP_RETENTION:-8}"
     export DB_BACKUP_ON_START="${DB_BACKUP_ON_START:-0}"
     export DB_BACKUP_START_DELAY="${DB_BACKUP_START_DELAY:-120}"
+    export DB_POOL_SIZE="${DB_POOL_SIZE:-6}"
+    export SQLITE_MMAP_SIZE="${SQLITE_MMAP_SIZE:-33554432}"
+    export SQLITE_CACHE_SIZE="${SQLITE_CACHE_SIZE:--16000}"
+    export MALLOC_CONF="${MALLOC_CONF:-narenas:2,background_thread:true,dirty_decay_ms:3000,muzzy_decay_ms:3000}"
+    export _RJEM_MALLOC_CONF="${_RJEM_MALLOC_CONF:-narenas:2,background_thread:true,dirty_decay_ms:3000,muzzy_decay_ms:3000}"
     export GALLERY_STATIC_DIR="${GALLERY_STATIC_DIR:-${APP_DIR}/app/static}"
     export APP_STARTUP_LOG_FILE="${DATA_DIR}/logs/startup.log"
     export LOG_FILE="${APP_STARTUP_LOG_FILE}"
@@ -465,8 +470,8 @@ launch_rust_primary() {
         # fnOS) has no printf %q, so instead export the variables and let the
         # inner shell expand quoted references itself — safe for spaces and
         # metacharacters in DATA_DIR / GALLERY_STATIC_DIR.
-        export RUST_ACCEL_BIN PORT DATA_DIR GALLERY_STATIC_DIR
-        nohup sg render -c 'exec "$RUST_ACCEL_BIN" --primary --host 0.0.0.0 --port "$PORT" --db "$DATA_DIR/gallery.db" --enable-writes --enable-media --enable-ml --static-dir "$GALLERY_STATIC_DIR"' \
+        export RUST_ACCEL_BIN PORT DATA_DIR GALLERY_STATIC_DIR DB_POOL_SIZE
+        nohup sg render -c 'exec "$RUST_ACCEL_BIN" --primary --host 0.0.0.0 --port "$PORT" --db "$DATA_DIR/gallery.db" --pool-size "${DB_POOL_SIZE:-6}" --enable-writes --enable-media --enable-ml --static-dir "$GALLERY_STATIC_DIR"' \
             >> "$LOG_FILE" 2>&1 &
     else
         log "Gallery starting without sg render (group/sg missing); OpenVINO may fall back to CPU."
@@ -475,6 +480,7 @@ launch_rust_primary() {
             --host 0.0.0.0 \
             --port "$PORT" \
             --db "${DATA_DIR}/gallery.db" \
+            --pool-size "${DB_POOL_SIZE:-6}" \
             --enable-writes \
             --enable-media \
             --enable-ml \

@@ -572,9 +572,10 @@ export function renderArtistDropdown(query = '') {
   const input = $('#artistSearch');
   if (input) input.setAttribute('aria-expanded', 'true');
   let optionIndex = 0;
+  const currentId = state.currentArtist ? Number(state.currentArtist.id) : null;
   const optionHtml = artist => artistOptionButtonHtml(
     artist,
-    'artist-option',
+    currentId !== null && Number(artist.id) === currentId ? 'artist-option is-current' : 'artist-option',
     ` role="option" aria-selected="false" id="artist-option-${optionIndex++}"`,
   );
   if (results.length === 0) {

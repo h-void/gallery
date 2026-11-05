@@ -172,6 +172,10 @@ def _build_clean_via_podman_wsl(wsl_root: str, output: Path) -> Path:
         f"-e {shlex.quote(CARGO_PATH_ENV)} "
         "-e CARGO_HOME=/cargo-home "
         "-e CARGO_TARGET_DIR=/cargo-target "
+        # The router/organize type graph grew past rustc's default 8 MiB main
+        # thread stack in the build container (stable SIGSEGV compiling
+        # main.rs, rustc suggesting RUST_MIN_STACK=33554432 / 67108864).
+        "-e RUST_MIN_STACK=67108864 "
         f"{shlex.quote(image)} "
         "cargo build --release --locked --target x86_64-unknown-linux-gnu; "
         f"mkdir -p {shlex.quote(output_parent_wsl)}; "

@@ -1,6 +1,6 @@
 [package]
 name = "gallery_accel"
-version = "1.1.8"
+version = "1.1.9"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/h-void/gallery"
@@ -20,6 +20,7 @@ rusqlite = { version = "0.37", features = ["bundled", "collation", "backup", "ho
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "time", "process", "io-util", "signal"] }
+tower = "0.5"
 tower-http = { version = "0.6", features = ["fs"] }
 futures-util = "0.3"
 http-body-util = "0.1"
@@ -44,6 +45,7 @@ tempfile = "3.25"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 
 [dev-dependencies]
 tower = "0.5"

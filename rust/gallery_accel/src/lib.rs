@@ -14,6 +14,8 @@ mod artist_stats;
 mod artists;
 pub mod character_ccip;
 pub mod character_cleanup;
+pub mod character_clusters;
+pub mod character_organize;
 mod character_references;
 mod character_summary;
 mod character_summary_tags;
@@ -64,6 +66,7 @@ pub mod pawchive_groups;
 pub mod pawchive_import;
 pub mod pawchive_pairing;
 pub mod pawchive_pairing_write;
+pub mod pawchive_throttle;
 pub mod pinyin_search;
 pub mod product_ui;
 pub mod recognition_status;
@@ -93,7 +96,9 @@ pub use artist_profile_links::{
 pub use artist_reference_scores::artist_reference_scores_response;
 pub use artist_references::artist_references_response;
 pub use artist_stats::artist_stats_response;
-pub use artists::{artist_detail_response, artists_response};
+pub use artists::{
+    artist_detail_response, artists_response, artists_response_cached, invalidate_artists_cache,
+};
 pub use character_cleanup::cleanup_character_references;
 pub use character_references::character_references_response;
 pub use character_summary::character_summary_response;
@@ -116,7 +121,7 @@ pub use hash_run::{run_hash_batch_with_budget, run_hash_batch_with_roots, HashCo
 pub use hash_status::hash_status_response;
 pub use image_preview::{
     clamp_max_edge, existing_preview_cache_file, image_preview_bytes,
-    DEFAULT_MAX_EDGE as IMAGE_PREVIEW_DEFAULT_MAX_EDGE,
+    image_preview_bytes_from_memory, DEFAULT_MAX_EDGE as IMAGE_PREVIEW_DEFAULT_MAX_EDGE,
 };
 pub use item_dates::update_item_dates_response;
 pub use item_detail::item_detail_response;

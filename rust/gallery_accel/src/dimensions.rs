@@ -163,7 +163,12 @@ where
 }
 
 fn video_dimensions(path: &Path) -> Result<(u32, u32)> {
-    let output = Command::new("ffprobe")
+    // A hung probe (flapping mount, pathological file) must not pin its
+    // backfill thread and a pooled connection forever: bound the whole probe
+    // and kill the child past the deadline. Pipes are drained on threads so a
+    // chatty probe can never fill them and deadlock the wait.
+    const FFPROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    let mut child = Command::new("ffprobe")
         .args([
             "-v",
             "error",
@@ -181,12 +186,47 @@ fn video_dimensions(path: &Path) -> Result<(u32, u32)> {
         ])
         .arg(path)
         .stdin(Stdio::null())
-        .output()
-        .context("read video dimensions")?;
-    if !output.status.success() {
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn ffprobe")?;
+    let mut stdout_pipe = child.stdout.take().context("ffprobe stdout")?;
+    let mut stderr_pipe = child.stderr.take().context("ffprobe stderr")?;
+    let stdout_drain = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        stdout_pipe.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    });
+    let stderr_drain = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        stderr_pipe.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    });
+    let deadline = std::time::Instant::now() + FFPROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => break None,
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!("ffprobe timed out");
+    };
+    let stdout = stdout_drain
+        .join()
+        .map_err(|_| anyhow::anyhow!("ffprobe stdout reader failed"))?
+        .context("read ffprobe stdout")?;
+    let _stderr = stderr_drain
+        .join()
+        .map_err(|_| anyhow::anyhow!("ffprobe stderr reader failed"))?
+        .context("read ffprobe stderr")?;
+    if !status.success() {
         anyhow::bail!("ffprobe failed");
     }
-    let dimensions = String::from_utf8_lossy(&output.stdout);
+    let dimensions = String::from_utf8_lossy(&stdout);
     let first_line = dimensions
         .lines()
         .map(str::trim)

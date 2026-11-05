@@ -325,7 +325,13 @@ pub fn stream_archive_entry(
     password: Option<&str>,
 ) -> Result<Vec<u8>> {
     let clean_entry = entry_path.replace('\\', "/");
-    let has_traversal = clean_entry.is_empty()
+    // `*` and `?` are wildcards to the 7z include pattern, so an entry named
+    // with them (legal inside a zip) would stream every matching entry
+    // concatenated instead of the one requested. Bracket classes are rarer and
+    // cannot be disabled without breaking legitimate names, so they stay.
+    let has_glob = clean_entry.chars().any(|c| matches!(c, '*' | '?'));
+    let has_traversal = has_glob
+        || clean_entry.is_empty()
         || clean_entry.starts_with('/')
         || clean_entry.contains(':')
         || Path::new(&clean_entry).components().any(|c| {
@@ -362,6 +368,20 @@ pub fn stream_archive_entry(
         .spawn()
         .context("execute 7z single-entry extraction")?;
 
+    // Drain stderr on a thread from the start: reading it only after the
+    // stdout loop deadlocked whenever a chatty 7z filled the pipe while we
+    // were still waiting for stdout to reach EOF.
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("missing child stderr pipe"))?;
+    let stderr_drain = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut pipe = stderr_pipe;
+        let mut buffer = Vec::new();
+        std::io::Read::read_to_end(&mut pipe, &mut buffer)?;
+        Ok(buffer)
+    });
+
     let max_preview_bytes: u64 = 50 * 1024 * 1024;
     let mut stdout = child
         .stdout
@@ -374,6 +394,7 @@ pub fn stream_archive_entry(
     if buffer.len() > max_preview_bytes as usize {
         let _ = child.kill();
         let _ = child.wait();
+        let _ = stderr_drain.join();
         bail!("entry exceeds 50MB in-memory preview limit");
     }
 
@@ -388,10 +409,12 @@ pub fn stream_archive_entry(
     // under a one-hour cache header — whenever a fatal message used text this
     // code did not list.
     if !matches!(exit_code, Some(0) | Some(1)) || (buffer.is_empty() && exit_code != Some(0)) {
-        let mut stderr = String::new();
-        if let Some(mut err_pipe) = child.stderr.take() {
-            let _ = std::io::Read::read_to_string(&mut err_pipe, &mut stderr);
-        }
+        let stderr = stderr_drain
+            .join()
+            .ok()
+            .and_then(|read| read.ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
         let code = exit_code
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string());

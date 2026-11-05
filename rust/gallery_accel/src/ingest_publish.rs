@@ -502,8 +502,9 @@ pub(crate) fn publish_generated_file(temp: &Path, target: &Path) -> Result<()> {
 /// On mounts that refuse hard-link (e.g. exFAT or cross-directory constraints),
 /// Linux uses `renameat2(..., RENAME_NOREPLACE)` to atomically publish without
 /// creating any empty placeholder file or risking overwriting a concurrent entrant.
-/// On Windows, `std::fs::rename` natively refuses to overwrite without
-/// `MOVEFILE_REPLACE_EXISTING`.
+/// Windows has no atomic non-replacing rename in `std`, so the name is
+/// reserved with an exclusive `create_new` first and the rename then replaces
+/// only that empty reservation; a failed rename removes it again.
 pub(crate) fn publish_noreplace(temp: &Path, target: &Path) -> Result<()> {
     match std::fs::hard_link(temp, target) {
         Ok(()) => {
@@ -533,20 +534,43 @@ pub(crate) fn publish_noreplace(temp: &Path, target: &Path) -> Result<()> {
             }
             #[cfg(windows)]
             {
-                if target.exists() {
+                // std's `fs::rename` maps to `MOVEFILE_REPLACE_EXISTING` here
+                // and would silently replace an entrant created after any
+                // `target.exists()` pre-check. Reserve the name exclusively
+                // first: the placeholder is an empty file this pass owns, so
+                // the rename that follows can only ever replace ourselves.
+                if let Err(reserve_error) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(target)
+                {
+                    if reserve_error.kind() == std::io::ErrorKind::AlreadyExists {
+                        return Err(anyhow!(
+                            "target path already exists: refuse to overwrite {target:?}"
+                        ));
+                    }
                     return Err(anyhow!(
-                        "target path already exists: refuse to overwrite {target:?}"
+                        "cannot publish {temp:?} to {target:?} without overwrite: \
+                             hard link failed ({link_error}); reserve failed ({reserve_error})"
                     ));
                 }
                 match std::fs::rename(temp, target) {
                     Ok(()) => Ok(()),
-                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
-                        "target path already exists: refuse to overwrite {target:?}"
-                    )),
-                    Err(rename_error) => Err(anyhow!(
-                        "cannot publish {temp:?} to {target:?} without overwrite: \
-                             hard link failed ({link_error}); rename failed ({rename_error})"
-                    )),
+                    // The reservation is ours; a failure here must take the
+                    // empty placeholder back with it.
+                    Err(err) => {
+                        let _ = std::fs::remove_file(target);
+                        if err.kind() == std::io::ErrorKind::AlreadyExists {
+                            Err(anyhow!(
+                                "target path already exists: refuse to overwrite {target:?}"
+                            ))
+                        } else {
+                            Err(anyhow!(
+                                "cannot publish {temp:?} to {target:?} without overwrite: \
+                             hard link failed ({link_error}); rename failed ({err})"
+                            ))
+                        }
+                    }
                 }
             }
             #[cfg(all(not(target_os = "linux"), not(windows)))]
@@ -804,7 +828,7 @@ pub fn publish_completed_file(
         .optional()?;
 
     let job_id = match existing {
-        Some((id, stage_str, _, private_temp_path)) => {
+        Some((id, stage_str, _, _private_temp_path)) => {
             let stage = PublishStage::parse(&stage_str).unwrap_or(PublishStage::Failed);
             if matches!(stage, PublishStage::Published | PublishStage::Ingested) {
                 // Already published. Repeat the call idempotently when the file
@@ -824,10 +848,21 @@ pub fn publish_completed_file(
                             file_length: req.expected_length,
                         });
                     }
-                    return Err(anyhow!(
+                    // The refusal is correct (the file is not this job's
+                    // artifact), but it used to leave no trace on the job row:
+                    // a publish blocked forever by an occupied target read as a
+                    // healthy `published` job.
+                    let message = format!(
                         "target path holds a different file: refuse to overwrite {:?}",
                         req.target_path
-                    ));
+                    );
+                    let _ = conn.execute(
+                        "UPDATE download_publish_jobs
+                         SET error_message = ?1, updated_at = strftime('%s','now')
+                         WHERE id = ?2",
+                        params![message, id],
+                    );
+                    return Err(anyhow!("{}", message));
                 }
                 // The file is gone: this job may publish again.
             } else if req.target_path.is_file() {
@@ -855,21 +890,85 @@ pub fn publish_completed_file(
                         file_length: req.expected_length,
                     });
                 }
-                return Err(anyhow!(
+                let message = format!(
                     "target path already exists: refuse to overwrite {:?}",
                     req.target_path
-                ));
+                );
+                let _ = conn.execute(
+                    "UPDATE download_publish_jobs
+                     SET error_message = ?1, updated_at = strftime('%s','now')
+                     WHERE id = ?2",
+                    params![message, id],
+                );
+                return Err(anyhow!("{}", message));
             }
-            // The staging file of the interrupted attempt is this job's own and
-            // is replaced below; leaving it would accumulate one part file per
-            // retry.
-            if !private_temp_path.trim().is_empty() {
-                let _ = std::fs::remove_file(&private_temp_path);
+            // The staging file of the interrupted attempt is this job's own
+            // and is replaced below; leaving it would accumulate one part file
+            // per retry. A concurrent publisher of the same key can be writing
+            // it, but the failure paths below are stage-guarded, so the worst
+            // case of deleting under it is one wasted copy — never a ledger
+            // that contradicts the disk.
+            if !_private_temp_path.trim().is_empty() {
+                let _ = std::fs::remove_file(&_private_temp_path);
             }
-            conn.execute(
-                "UPDATE download_publish_jobs SET stage = 'verified', private_temp_path = '', error_message = NULL, updated_at = strftime('%s','now') WHERE id = ?1",
-                params![id],
+            // CAS on the stage this pass read: a concurrent publisher of the
+            // same key may have carried the row to `published` between the
+            // read above and here, and an unconditional write used to stomp
+            // that back to `verified` — after which this pass's occupied
+            // target failure passed its own guard and left a correct file
+            // marked failed, re-fetched by reconcile forever. When the CAS
+            // loses, the winner's state decides: its published artifact is
+            // answered idempotently, a foreign file is refused, and a target
+            // that is still absent re-enters the staging flow.
+            let re_staged = conn.execute(
+                "UPDATE download_publish_jobs SET stage = 'verified', private_temp_path = '', error_message = NULL, updated_at = strftime('%s','now') WHERE id = ?1 AND stage = ?2",
+                params![id, stage_str],
             )?;
+            if re_staged == 0 {
+                let (current_stage, _): (String, i64) = conn.query_row(
+                    "SELECT stage, item_id FROM download_publish_jobs WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                match PublishStage::parse(&current_stage) {
+                    Some(stage @ (PublishStage::Published | PublishStage::Ingested)) => {
+                        if req.target_path.is_file() {
+                            if file_matches_artifact(
+                                req.target_path,
+                                req.expected_length,
+                                req.expected_blake3,
+                            )? {
+                                return Ok(PublishResult {
+                                    job_id: id,
+                                    published_path: req.target_path.to_path_buf(),
+                                    stage,
+                                    blake3_hash: req.expected_blake3.to_string(),
+                                    file_length: req.expected_length,
+                                });
+                            }
+                            let message = format!(
+                                "target path holds a different file: refuse to overwrite {:?}",
+                                req.target_path
+                            );
+                            let _ = conn.execute(
+                                "UPDATE download_publish_jobs
+                                 SET error_message = ?1, updated_at = strftime('%s','now')
+                                 WHERE id = ?2",
+                                params![message, id],
+                            );
+                            return Err(anyhow!("{}", message));
+                        }
+                        // The winner's file is gone the same way ours was:
+                        // continue staging, leaving the row's stage as it is.
+                    }
+                    _ => {
+                        conn.execute(
+                            "UPDATE download_publish_jobs SET stage = 'verified', private_temp_path = '', error_message = NULL, updated_at = strftime('%s','now') WHERE id = ?1",
+                            params![id],
+                        )?;
+                    }
+                }
+            }
             id
         }
         None => {
@@ -1064,17 +1163,23 @@ pub fn publish_completed_file(
         Err(err) => {
             let _ = std::fs::remove_file(&temp_path);
             let err_msg = err.to_string();
+            // The failure only fails the stage this pass still holds: another
+            // publisher of the same key may have carried the row to a terminal
+            // state while this copy was running, and overwriting `published`
+            // with `failed` described a job the disk contradicted.
             let _ = conn.execute(
-                "UPDATE download_publish_jobs SET stage = 'failed', error_message = ?1, private_temp_path = '', updated_at = strftime('%s','now') WHERE id = ?2",
+                "UPDATE download_publish_jobs SET stage = 'failed', error_message = ?1, private_temp_path = '', updated_at = strftime('%s','now') WHERE id = ?2 AND stage NOT IN ('published', 'ingested')",
                 params![err_msg, job_id],
             );
             return Err(err);
         }
     };
 
-    // Update job stage to staged.
+    // Update job stage to staged. Guarded like the failure writes: a row
+    // another publisher already carried to published/ingested must not be
+    // regressed by a pass that was staging at the same time.
     conn.execute(
-        "UPDATE download_publish_jobs SET stage = 'staged', private_temp_path = ?1, updated_at = strftime('%s','now') WHERE id = ?2",
+        "UPDATE download_publish_jobs SET stage = 'staged', private_temp_path = ?1, updated_at = strftime('%s','now') WHERE id = ?2 AND stage NOT IN ('published', 'ingested')",
         params![temp_path_str, job_id],
     )?;
 
@@ -1105,7 +1210,7 @@ pub fn publish_completed_file(
         let _ = std::fs::remove_file(&temp_path);
         let err_msg = err.to_string();
         let _ = conn.execute(
-            "UPDATE download_publish_jobs SET stage = 'failed', error_message = ?1, private_temp_path = '', updated_at = strftime('%s','now') WHERE id = ?2",
+            "UPDATE download_publish_jobs SET stage = 'failed', error_message = ?1, private_temp_path = '', updated_at = strftime('%s','now') WHERE id = ?2 AND stage NOT IN ('published', 'ingested')",
             params![err_msg, job_id],
         );
         return Err(err);
@@ -1121,9 +1226,12 @@ pub fn publish_completed_file(
         return Err(err);
     }
 
-    // 6. Update stage to published.
+    // 6. Update stage to published. An `ingested` row is further along than
+    // this pass and must not be pulled back; a `published` row is re-asserted
+    // (this pass just created the file, so the previous published claim was
+    // the vanished-file fall-through).
     conn.execute(
-        "UPDATE download_publish_jobs SET stage = 'published', private_temp_path = '', error_message = NULL, updated_at = strftime('%s','now') WHERE id = ?1",
+        "UPDATE download_publish_jobs SET stage = 'published', private_temp_path = '', error_message = NULL, updated_at = strftime('%s','now') WHERE id = ?1 AND stage != 'ingested'",
         params![job_id],
     )?;
 

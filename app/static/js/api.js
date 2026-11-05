@@ -46,6 +46,53 @@ function fetchWithTimeout(path, options = {}) {
   });
 }
 
+// 启动门在进程仍在初始化时对其余路由回答 503 {"error":"initializing"}。
+// 在该窗口内打开的页面若不做处理，所有面板都会显示加载失败，直到手动
+// 刷新；这里做有上限的短退避重试，让请求搭过窗口的尾巴。上限 4 次
+// （1s/2s/4s/8s，最坏约 15s）后按原样抛出，不掩盖真正的服务故障。
+export const initializingRetry = {max: 4, baseMs: 1000};
+
+function abortableSleep(ms, signal) {
+  if (signal && signal.aborted) {
+    const error = new Error('请求已中断');
+    error.name = 'AbortError';
+    error.code = 20;
+    return Promise.reject(error);
+  }
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const onAbort = () => {
+      clearTimeout(timer);
+      const error = new Error('请求已中断');
+      error.name = 'AbortError';
+      error.code = 20;
+      reject(error);
+    };
+    timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) signal.addEventListener('abort', onAbort, {once: true});
+  });
+}
+
+async function requestWithInitializingRetry(path, options = {}) {
+  let delay = initializingRetry.baseMs;
+  for (let attempt = 0; ; attempt++) {
+    const r = await fetchWithTimeout(path, options);
+    if (r.status === 503 && attempt < initializingRetry.max) {
+      let body = {};
+      try { body = await r.clone().json(); } catch (e) { body = {}; }
+      if (body && body.error === 'initializing') {
+        await abortableSleep(delay, options.signal);
+        delay *= 2;
+        continue;
+      }
+    }
+    return r;
+  }
+}
+
 export const API = {
   async parseResponse(r) {
     let body = {};
@@ -68,20 +115,20 @@ export const API = {
     return body;
   },
   async get(path, options = {}) {
-    const r = await fetchWithTimeout(path, options);
+    const r = await requestWithInitializingRetry(path, options);
     return this.parseResponse(r);
   },
   async post(path, data, options = {}) {
     if (data !== undefined && data !== null) return this.postJson(path, data, options);
-    const r = await fetchWithTimeout(path, {method:'POST', keepalive:true, ...options});
+    const r = await requestWithInitializingRetry(path, {method:'POST', keepalive:true, ...options});
     return this.parseResponse(r);
   },
   async put(path, options = {}) {
-    const r = await fetchWithTimeout(path, {method:'PUT', ...options});
+    const r = await requestWithInitializingRetry(path, {method:'PUT', ...options});
     return this.parseResponse(r);
   },
   async putJson(path, data, options = {}) {
-    const r = await fetchWithTimeout(path, {
+    const r = await requestWithInitializingRetry(path, {
       method:'PUT',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify(data || {}),
@@ -91,7 +138,7 @@ export const API = {
   },
   async postJson(path, data, options = {}) {
     const body = JSON.stringify(data || {});
-    const r = await fetchWithTimeout(path, {
+    const r = await requestWithInitializingRetry(path, {
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body,
@@ -105,7 +152,7 @@ export const API = {
   // No `keepalive` either: it is capped at 64 KiB and throws on a real photo.
   async postFile(path, file, options = {}) {
     const {timeoutMs = 300000, ...rest} = options;
-    const r = await fetchWithTimeout(path, {
+    const r = await requestWithInitializingRetry(path, {
       method:'POST',
       headers:{'Content-Type': (file && file.type) || 'application/octet-stream'},
       body: file,
@@ -115,7 +162,7 @@ export const API = {
     return this.parseResponse(r);
   },
   async del(path, options = {}) {
-    const r = await fetchWithTimeout(path, {method:'DELETE', ...options});
+    const r = await requestWithInitializingRetry(path, {method:'DELETE', ...options});
     return this.parseResponse(r);
   },
   fileUrl(filePath, version) {

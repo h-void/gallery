@@ -16,6 +16,10 @@ import { $, $$, escHtml, isAbortError, copyText } from '../../utils.js';
 import { toast, logUiAction } from '../../logging.js';
 import { t } from '../../i18n.js';
 
+let netdiskPanelRequest = null;
+let netdiskSettingsEditRevision = 0;
+let netdiskSettingsSaveRevision = 0;
+
 // 检查间隔: the plan allows 5–300 seconds; below that the local bridge would
 // spend its whole time in its own request.
 export const NETDISK_INTERVAL_MIN = 5;
@@ -73,6 +77,9 @@ export function clampNetdiskReserve(value) {
 }
 
 export async function loadNetdiskPanel(options = {}) {
+  const request = {};
+  netdiskPanelRequest = request;
+  const saveRevision = netdiskSettingsSaveRevision;
   const fetchOptions = options.signal ? {signal: options.signal} : {};
   state.netdiskLoading = true;
   try {
@@ -84,7 +91,9 @@ export async function loadNetdiskPanel(options = {}) {
       API.get('/api/netdisk/connection', fetchOptions),
       listNetdiskJobs(fetchOptions),
     ]);
-    if (settings.status === 'fulfilled') {
+    if (netdiskPanelRequest !== request) return;
+    if (settings.status === 'fulfilled' && !isActionBusy('netdiskSave')
+      && saveRevision === netdiskSettingsSaveRevision) {
       state.netdiskSettings = {...NETDISK_DEFAULTS, ...(settings.value || {})};
     }
     if (connection.status === 'fulfilled') {
@@ -99,20 +108,15 @@ export async function loadNetdiskPanel(options = {}) {
       logUiAction('netdisk settings read failed', {error: String(settings.reason && settings.reason.message ? settings.reason.message : settings.reason)});
     }
   } finally {
-    state.netdiskLoading = false;
+    if (netdiskPanelRequest === request) state.netdiskLoading = false;
   }
 }
 
 async function listNetdiskJobs(fetchOptions) {
-  try {
-    // The route has no paging: it is the bounded list the bridge tracks, and a
-    // half-page would read as "the rest are gone".
-    const body = await API.get('/api/netdisk/jobs', fetchOptions);
-    return Array.isArray(body?.jobs) ? body.jobs : [];
-  } catch (e) {
-    if (isAbortError(e)) throw e;
-    return [];
-  }
+  // Let the panel's allSettled distinguish a failed read from an empty list,
+  // so a transient error does not erase the last known jobs.
+  const body = await API.get('/api/netdisk/jobs', fetchOptions);
+  return Array.isArray(body?.jobs) ? body.jobs : [];
 }
 
 export function renderNetdiskPanel() {
@@ -380,6 +384,7 @@ export function renderNetdiskScript() {
 }
 
 export function markNetdiskSettingsDirty() {
+  netdiskSettingsEditRevision += 1;
   state.netdiskSettingsDirty = true;
   const badge = $('#netdiskDirtyBadge');
   if (badge) badge.hidden = false;
@@ -416,22 +421,33 @@ export async function saveNetdiskSettings() {
     return;
   }
   setActionBusy('netdiskSave', '', true);
+  netdiskSettingsSaveRevision += 1;
+  const editRevision = netdiskSettingsEditRevision;
+  let saved = false;
   setButtonBusy('#netdiskSaveBtn', false, 'netdiskSave');
   try {
     await API.putJson('/api/netdisk/settings', payload);
     state.netdiskSettings = payload;
-    state.netdiskSettingsDirty = false;
-    const badge = $('#netdiskDirtyBadge');
-    if (badge) badge.hidden = true;
+    if (editRevision === netdiskSettingsEditRevision) {
+      state.netdiskSettingsDirty = false;
+      const badge = $('#netdiskDirtyBadge');
+      if (badge) badge.hidden = true;
+    }
+    saved = true;
     toast('网盘设置已保存');
-    await loadNetdiskPanel();
-    renderNetdiskPanel();
   } catch (e) {
     // A 409 here is the backend refusing 下载后入库 before the capability
     // handshake; its message is the approved wording, so it is shown as-is.
     toast(String(e?.message || e), 'error');
   } finally {
+    netdiskSettingsSaveRevision += 1;
     setActionBusy('netdiskSave', '', false);
+    renderNetdiskPanel();
+  }
+  // Read back only after closing the save revision, so this fresh read can
+  // hydrate server-normalized settings while older reads stay invalidated.
+  if (saved) {
+    await loadNetdiskPanel();
     renderNetdiskPanel();
   }
 }

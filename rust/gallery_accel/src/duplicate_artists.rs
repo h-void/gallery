@@ -47,13 +47,9 @@ fn list_duplicate_artists(
 ) -> Result<Vec<DuplicateArtistGroup>> {
     let mut stmt = conn.prepare(
         "
-        SELECT a.id, a.name, a.path, COUNT(i.id) AS item_count
-        FROM artists a
-        LEFT JOIN items i ON i.artist_id = a.id
-            AND i.missing = 0
-            AND (i.media_type IN ('image', 'video', 'source', 'archive', 'text') OR i.is_archive = 1)
-        WHERE a.missing = 0
-        GROUP BY a.id
+        SELECT id, name, path
+        FROM artists
+        WHERE missing = 0
         ",
     )?;
     let rows = stmt
@@ -62,7 +58,7 @@ fn list_duplicate_artists(
                 id: row.get("id")?,
                 name: row.get("name")?,
                 path: row.get("path")?,
-                item_count: row.get("item_count")?,
+                item_count: 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -75,10 +71,43 @@ fn list_duplicate_artists(
         by_name.entry(name.to_lowercase()).or_default().push(row);
     }
 
+    let mut dup_artist_ids = Vec::new();
+    for entries in by_name.values() {
+        if entries.len() >= 2 {
+            for entry in entries {
+                dup_artist_ids.push(entry.id);
+            }
+        }
+    }
+
+    if dup_artist_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut count_stmt = conn.prepare(
+        "
+        SELECT COUNT(id)
+        FROM items
+        WHERE artist_id = ?
+            AND missing = 0
+            AND (media_type IN ('image', 'video', 'source', 'archive', 'text') OR is_archive = 1)
+        ",
+    )?;
+    let mut counts: HashMap<i64, i64> = HashMap::new();
+    for aid in dup_artist_ids {
+        let count: i64 = count_stmt.query_row([aid], |r| r.get(0)).unwrap_or(0);
+        counts.insert(aid, count);
+    }
+
     let mut groups = Vec::new();
     for mut entries in by_name.into_values() {
         if entries.len() < 2 {
             continue;
+        }
+        for entry in &mut entries {
+            if let Some(&cnt) = counts.get(&entry.id) {
+                entry.item_count = cnt;
+            }
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let display_name = entries

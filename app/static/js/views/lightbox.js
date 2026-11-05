@@ -4,13 +4,13 @@
 import { API, scheduleFolderRenamesRefresh } from '../api.js';
 import { state, isActionBusy, setActionBusy } from '../store.js';
 import {
-  $, $$, escHtml, formatSize, copyText, downloadFileName, renderTagNamesHtml,
+  $, $$, escHtml, formatSize, copyText, downloadFileName, renderTagNamesHtml, joinUiMeta,
 } from '../utils.js';
 import { toast, logUiAction, collectUiLogContext, frontendErrorText } from '../logging.js';
 import { t } from '../i18n.js';
-import { syncFavoriteButtons, toggleItemFavorite, isGifItem, fileVersionParam, renderGrid } from './grid.js';
-import { renderSidebar, renderToolbar, renderFolderTree, selectFolder, isGlobalSearchActive } from './sidebar.js';
-import { selectArtist } from '../router.js';
+import { syncFavoriteButtons, toggleItemFavorite, isGifItem, fileVersionParam, renderGrid, jumpToTag } from './grid.js';
+import { renderSidebar, renderToolbar, renderFolderTree, selectFolder, isGlobalSearchActive, syncClearSearch, loadItems } from './sidebar.js';
+import { selectArtist, syncBrowseUrl } from '../router.js';
 
 const LIGHTBOX_ZOOM_MIN = 0.5;
 const LIGHTBOX_ZOOM_MAX = 4;
@@ -538,6 +538,16 @@ export function showLightboxImage(items) {
         img.classList.remove('loading', 'failed', 'placeholder');
         img.classList.add('ready');
         img.style.display = '';
+        if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+          item.width = item.width || img.naturalWidth;
+          item.height = item.height || img.naturalHeight;
+          const specsEl = $('#lightboxMetaSpecs');
+          if (specsEl) {
+            const nextSpecs = formatLightboxSpecs(item, img.naturalWidth, img.naturalHeight);
+            specsEl.textContent = nextSpecs;
+            specsEl.hidden = !nextSpecs;
+          }
+        }
       };
       if (img.decode) {
         img.decode().then(reveal).catch(reveal);
@@ -618,10 +628,13 @@ export function showLightboxImage(items) {
   const indexBadgeHtml = items.length > 0
     ? `<span class="lightbox-meta-index" data-i18n-skip>${state.lightboxIndex + 1} / ${items.length}</span>`
     : '';
+  const initialSpecs = formatLightboxSpecs(item);
+  const specsBadgeHtml = `<span class="lightbox-meta-specs" id="lightboxMetaSpecs" data-i18n-skip${initialSpecs ? '' : ' hidden'}>${escHtml(initialSpecs)}</span>`;
   const lightboxMeta = [
     indexBadgeHtml,
     `<span class="lightbox-meta-tags">${renderTagNamesHtml(item.tags)}</span>`,
     item.date ? `<span class="lightbox-meta-date">${escHtml(item.date)}</span>` : '<span class="lightbox-meta-date"></span>',
+    specsBadgeHtml,
     item.file_name ? `<span class="lightbox-meta-name" data-i18n-skip>${escHtml(item.file_name)}</span>` : '',
   ];
   $('#lightboxPath').innerHTML = `
@@ -654,7 +667,19 @@ export function showLightboxImage(items) {
     });
   }
   bindLightboxInPlaceEditing(item);
+  syncLightboxZoomBadge();
   preloadAdjacentLightboxMedia(items, state.lightboxIndex);
+}
+
+function formatLightboxSpecs(item, naturalW = 0, naturalH = 0) {
+  if (!item) return '';
+  const w = Number(naturalW) > 0 ? Number(naturalW) : Number(item.width || 0);
+  const h = Number(naturalH) > 0 ? Number(naturalH) : Number(item.height || 0);
+  const size = Number(item.file_size || 0);
+  const parts = [];
+  if (w > 0 && h > 0) parts.push(`${w} × ${h}`);
+  if (size > 0) parts.push(formatSize(size));
+  return joinUiMeta(parts);
 }
 
 let lightboxJustPanned = false;
@@ -1146,6 +1171,30 @@ function renderLightboxTags(item) {
     `;
   }
   container.innerHTML = html;
+
+  container.querySelectorAll('.meta-tag-editable').forEach(chip => {
+    chip.addEventListener('click', e => {
+      if (e.target instanceof Element && e.target.closest('.meta-tag-remove')) return;
+      e.stopPropagation();
+      const tagName = (chip.dataset.tagName || '').trim();
+      if (!tagName) return;
+      const matchedTag = (Array.isArray(state.tags) ? state.tags : []).find(row => row && row.name === tagName && row.id)
+        || (Array.isArray(state.stats?.tags) ? state.stats.tags : []).find(row => row && row.name === tagName && row.id)
+        || (Array.isArray(item.tags) ? item.tags : []).find(row => row && row.name === tagName && row.id);
+      const artistId = item.artist_id || state.currentArtist?.id;
+      closeLightbox();
+      if (matchedTag?.id && artistId) {
+        jumpToTag(Number(artistId), Number(matchedTag.id));
+      } else {
+        const searchInput = $('#searchInput');
+        if (searchInput) searchInput.value = tagName;
+        state.search = tagName;
+        syncClearSearch();
+        syncBrowseUrl('push');
+        loadItems();
+      }
+    });
+  });
 
   container.querySelectorAll('.meta-tag-remove').forEach(btn => {
     btn.addEventListener('click', async e => {

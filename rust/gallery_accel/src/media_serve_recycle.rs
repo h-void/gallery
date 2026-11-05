@@ -1377,6 +1377,10 @@ pub fn delete_folder_to_recycle(
     let mut recycled_items: usize = 0;
     let mut recycled_loose_files: usize = 0;
     let mut failed: usize = 0;
+    // Read once for the whole request: the getter re-runs the recycle schema
+    // DDL probe on every call, and the loose-file walk below would otherwise
+    // repeat it per loose file in a large folder.
+    let prefer_system = crate::recycle::get_recycle_target_setting(conn) != "app";
     // Paths whose item row went to recycle successfully, in the same normalized
     // form the walk below produces. The walk must not touch them: the per-item
     // delete already committed them, and moving them again would leave a second,
@@ -1430,8 +1434,6 @@ pub fn delete_folder_to_recycle(
                         failed_paths.push(loose_text.to_string());
                         continue;
                     }
-                    let recycle_target = crate::recycle::get_recycle_target_setting(conn);
-                    let prefer_system = recycle_target != "app";
                     match move_into_recycle(loose_path, Some(roots), prefer_system) {
                         Ok((_recycled_path, _warning)) => {
                             recycled_loose_files += 1;

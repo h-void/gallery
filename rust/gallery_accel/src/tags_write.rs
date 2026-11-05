@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
 
 /// Create a new tag. Returns the tag dict (`id`, `name`, `sort_order`) on
@@ -65,7 +65,7 @@ fn create_tag_in_tx(conn: &Connection, artist_id: i64, name: &str) -> Result<Val
 }
 
 /// Update a tag's name and/or sort_order.  Returns `None` when the tag does
-/// not exist (caller falls back to Python).
+/// not exist for this artist; database failures remain errors.
 pub fn update_tag(
     conn: &Connection,
     artist_id: i64,
@@ -82,6 +82,8 @@ pub fn update_tag(
             rusqlite::params![tag_id, artist_id],
             |_| Ok(true),
         )
+        .optional()
+        .context("check tag before update")?
         .unwrap_or(false);
     if !exists {
         return Ok(None);
@@ -141,7 +143,8 @@ pub fn delete_tag(conn: &Connection, artist_id: i64, tag_id: i64) -> Result<Opti
                 Ok(json!({"id": id, "name": n, "sort_order": s}))
             },
         )
-        .ok();
+        .optional()
+        .context("read tag before deletion")?;
     let tag_row = match tag_row {
         Some(v) => v,
         None => return Ok(None),
@@ -160,7 +163,7 @@ pub fn delete_tag(conn: &Connection, artist_id: i64, tag_id: i64) -> Result<Opti
             rusqlite::params![tag_id],
             |row| row.get(0),
         )
-        .unwrap_or(0);
+        .context("count items affected by tag deletion")?;
 
     // Dropping the tag changes the names its items' folder-rename targets were
     // rendered from: demote those plans in this transaction too, or auto-run
@@ -214,13 +217,15 @@ pub fn update_item_tags_by_name_response(
     }
 
     let names = normalize_tag_names(tag_names);
-    let by_artist = items_grouped_by_artist(conn, &requested_items)?;
     let mut updated = 0i64;
     let mut propagated = 0i64;
     let mut changed_item_ids = BTreeSet::new();
 
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("begin batch tag update")?;
+    // Pin ownership while resolving names: a scan/move can reassign an item
+    // between an unlocked grouping query and BEGIN, creating cross-artist tags.
+    let by_artist = items_grouped_by_artist(&tx, &requested_items)?;
     for (artist_id, ids) in by_artist.iter() {
         let tag_ids = if names.is_empty() {
             Vec::new()
@@ -280,14 +285,15 @@ pub fn update_item_tags_response(
         return Ok(json!({"updated": 0, "changed_item_ids": []}));
     }
 
-    let ids = valid_item_ids(conn, artist_id, &requested_items)?;
+    // Validate eligibility under the same write lock as the mutation so a
+    // concurrent move, missing-file mark, or tag change cannot stale these IDs.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .context("begin item tag update")?;
+    let ids = valid_item_ids(&tx, artist_id, &requested_items)?;
     if ids.is_empty() {
         return Ok(json!({"updated": 0, "changed_item_ids": []}));
     }
-    let valid_tags = valid_tag_ids(conn, artist_id, &sorted_unique(tag_ids))?;
-
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .context("begin item tag update")?;
+    let valid_tags = valid_tag_ids(&tx, artist_id, &sorted_unique(tag_ids))?;
     let result = update_item_tags_in_tx(&tx, &ids, &valid_tags, mode)?;
     tx.commit().context("commit item tag update")?;
     Ok(result)
@@ -297,7 +303,7 @@ pub fn update_item_tags_response(
 ///
 /// Runs inside the caller's transaction (no BEGIN/COMMIT here) so a
 /// multi-artist batch can stay atomic.
-fn update_item_tags_in_tx(
+pub(crate) fn update_item_tags_in_tx(
     tx: &Transaction,
     ids: &[i64],
     valid_tags: &[i64],
@@ -313,6 +319,13 @@ fn update_item_tags_in_tx(
         let mut removed = BTreeSet::new();
         for tags in before_by_item.values() {
             removed.extend(tags.iter().copied());
+        }
+        // A newly discovered twin may still have a different tag set. Include
+        // tags held only by unselected members, or a set/clear on an untagged
+        // item preserves those tags and the union below resurrects them.
+        for (artist_id, content_hash) in active_hash_groups_for_items(tx, ids)? {
+            let group_ids = group_item_ids(tx, artist_id, &content_hash)?;
+            removed.extend(tag_ids_for_items(tx, &group_ids)?);
         }
         removed
             .into_iter()
@@ -747,7 +760,7 @@ fn invalidate_plans_for_changed_items(
             [],
             |row| row.get(0),
         )
-        .unwrap_or(false);
+        .context("check folder rename plan schema")?;
     if !has_plans || changed_item_ids.is_empty() {
         return Ok(());
     }

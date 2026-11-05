@@ -242,7 +242,9 @@ pub fn extract_external_links(content: &str) -> Vec<String> {
         if let Some(suffix) = fragment_split_after_closing_tags(content, mat.end()) {
             let reattached = format!("{raw_url}{suffix}");
             if url::Url::parse(&reattached).is_ok() {
-                seen.remove(&raw_url);
+                // The bare form stays marked as seen: a later href copy of the
+                // same anchor re-inserted it, and the links file carried the
+                // one form of the URL that cannot be downloaded.
                 found.retain(|existing| existing != &raw_url);
                 candidate = reattached;
             }
@@ -358,11 +360,24 @@ pub fn normalize_post_datetime_format(
         let local_dt = dt.with_timezone(&target_tz);
         return local_dt.format(format_str).to_string();
     }
+    let to_local = |dt: chrono::DateTime<FixedOffset>| -> String {
+        dt.with_timezone(&target_tz).format(format_str).to_string()
+    };
+    // A compact offset ("+0900") is valid ISO 8601 that the RFC 3339 parser
+    // refuses; without this branch it fell through to the raw-date fallback
+    // and skipped the shift to UTC+8 entirely.
+    if let Ok(dt) = chrono::DateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%z") {
+        return to_local(dt);
+    }
 
-    // 2. Parse naive datetime (e.g. "2025-02-13T00:37:33" or "2025-02-13 00:37:33")
+    // 2. Parse naive datetime (e.g. "2025-02-13T00:37:33" or "2025-02-13 00:37:33").
+    // A timestamp without seconds parses too: it carries the same instant and
+    // used to fall through to the unconverted raw date, which reported a
+    // different local day than the same moment written with seconds.
     let s = raw.replace(' ', "T");
     let naive_res = NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S")
-        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f"));
+        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M"));
 
     if let Ok(ndt) = naive_res {
         let service_norm = service.map(|srv| srv.trim().to_lowercase());
@@ -413,35 +428,50 @@ pub fn format_post_datetime_display(
         None => return (Some(raw.to_string()), Some(raw.to_string())),
     };
 
-    // 1. Try parsing full RFC 3339 / ISO 8601 with explicit timezone offset
-    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
-        let local_dt = dt.with_timezone(&target_tz);
-        let local_str = format!("{} (UTC+8)", local_dt.format("%Y-%m-%d %H:%M:%S"));
+    // 1. Try parsing full RFC 3339 / ISO 8601 with explicit timezone offset.
+    // A compact offset ("+0900") is valid ISO 8601 that the RFC 3339 parser
+    // refuses — the folder-day parser grew that branch first, and without it
+    // here the display fell to the date-only fallback and labeled an
+    // unconverted date "(UTC+8)" beside a folder filed under the shifted day.
+    let offset_display =
+        |dt: chrono::DateTime<chrono::FixedOffset>| -> (Option<String>, Option<String>) {
+            let local_dt = dt.with_timezone(&target_tz);
+            let local_str = format!("{} (UTC+8)", local_dt.format("%Y-%m-%d %H:%M:%S"));
 
-        let offset_secs = dt.offset().local_minus_utc();
-        let tz_label = if offset_secs == 9 * 3600 {
-            "JST / UTC+9".to_string()
-        } else if offset_secs == 0 {
-            "UTC".to_string()
-        } else if offset_secs == 8 * 3600 {
-            "UTC+8".to_string()
-        } else {
-            // Take the sign from the offset itself: integer division
-            // truncates toward zero, so -1800s would render as "UTC+00:30".
-            let sign = if offset_secs < 0 { '-' } else { '+' };
-            let abs_secs = offset_secs.abs();
-            let hours = abs_secs / 3600;
-            let minutes = (abs_secs % 3600) / 60;
-            format!("UTC{sign}{hours:02}:{minutes:02}")
+            let offset_secs = dt.offset().local_minus_utc();
+            let tz_label = if offset_secs == 9 * 3600 {
+                "JST / UTC+9".to_string()
+            } else if offset_secs == 0 {
+                "UTC".to_string()
+            } else if offset_secs == 8 * 3600 {
+                "UTC+8".to_string()
+            } else {
+                // Take the sign from the offset itself: integer division
+                // truncates toward zero, so -1800s would render as "UTC+00:30".
+                let sign = if offset_secs < 0 { '-' } else { '+' };
+                let abs_secs = offset_secs.abs();
+                let hours = abs_secs / 3600;
+                let minutes = (abs_secs % 3600) / 60;
+                format!("UTC{sign}{hours:02}:{minutes:02}")
+            };
+            let orig_str = format!("{} ({})", dt.format("%Y-%m-%d %H:%M:%S"), tz_label);
+            (Some(local_str), Some(orig_str))
         };
-        let orig_str = format!("{} ({})", dt.format("%Y-%m-%d %H:%M:%S"), tz_label);
-        return (Some(local_str), Some(orig_str));
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return offset_display(dt);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%z") {
+        return offset_display(dt);
     }
 
-    // 2. Parse naive datetime (e.g. "2025-02-13T00:37:33" or "2025-02-13 00:37:33")
+    // 2. Parse naive datetime (e.g. "2025-02-13T00:37:33" or "2025-02-13 00:37:33").
+    // A timestamp without seconds parses too: the folder-day side accepts it,
+    // and the display used to answer an unconverted "(UTC+8)" date for the
+    // same moment the folder was filed under the shifted day.
     let s = raw.replace(' ', "T");
     let naive_res = NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S")
-        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f"));
+        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M"));
 
     if let Ok(ndt) = naive_res {
         let service_norm = service.map(|srv| srv.trim().to_lowercase());
@@ -527,6 +557,23 @@ impl<'a> PostNamingContext<'a> {
         self
     }
 
+    /// `{year}` from the context's own date, read by parsing rather than by
+    /// byte position: the date is normally `%Y-%m-%d` but is not guaranteed to
+    /// be (see `with_date_format`), and slicing a non-ISO value produced
+    /// fragments like "7-".
+    fn date_year(&self) -> &str {
+        chrono::NaiveDate::parse_from_str(&self.date, "%Y-%m-%d")
+            .map(|_| self.date.get(..4).unwrap_or(""))
+            .unwrap_or("")
+    }
+
+    /// `{month}` from the context's own date, on the same terms as `date_year`.
+    fn date_month(&self) -> &str {
+        chrono::NaiveDate::parse_from_str(&self.date, "%Y-%m-%d")
+            .map(|_| self.date.get(5..7).unwrap_or(""))
+            .unwrap_or("")
+    }
+
     pub fn with_date_format(
         user: &'a str,
         published_at: Option<&'a str>,
@@ -609,11 +656,18 @@ impl<'a> PostNamingContext<'a> {
     /// 外链的文件名：`links {title} {id}.txt`
     pub fn format_links_filename(&self) -> String {
         let safe_title = sanitize_path_component(self.title);
-        if safe_title.is_empty() {
-            format!("links {}.txt", self.post_id)
-        } else {
-            format!("links {} {}.txt", safe_title, self.post_id)
-        }
+        // The clamp has to see the rendered result: the title is clamped on
+        // its own first, and `links ` + 255 bytes + ` {id}.txt` on top of that
+        // overshot the filesystem's name limit and failed the whole text
+        // publish with ENAMETOOLONG.
+        clamp_name_bytes(
+            &if safe_title.is_empty() {
+                format!("links {}.txt", self.post_id)
+            } else {
+                format!("links {} {}.txt", safe_title, self.post_id)
+            },
+            MAX_RENDERED_NAME_BYTES,
+        )
     }
 
     /// 正文（Content）的文件名：`content {id}.txt`
@@ -787,7 +841,15 @@ impl<'a> PostNamingContext<'a> {
         let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
         let mut out =
             safe_download_name(&out, &safe_download_name(&safe_name, "unnamed_attachment"));
-        if !ext.is_empty() && Path::new(&out).extension().is_none() {
+        // Compare against the real extension, not `Path::extension()`'s
+        // "anything after the last dot": a title like "Part 2.5" made the
+        // rendered name look like it already carried one, and the attachment
+        // landed on disk without its real suffix.
+        if !ext.is_empty()
+            && !out
+                .to_lowercase()
+                .ends_with(&format!(".{ext}").to_lowercase())
+        {
             out.push('.');
             out.push_str(ext);
         }
@@ -814,8 +876,11 @@ impl<'a> PostNamingContext<'a> {
                 "user" | "artist" => user,
                 "userID" | "user_id" | "creator_id" | "creator" => &creator,
                 "date" => date,
-                "year" => self.date.get(..4).unwrap_or(""),
-                "month" => self.date.get(5..7).unwrap_or(""),
+                // Read through the date parser rather than by byte position:
+                // a non-padded or non-ISO date used to slice "7-" out of the
+                // middle of the string.
+                "year" => self.date_year(),
+                "month" => self.date_month(),
                 "title" => title,
                 "id" => &id,
                 "name" => name,
@@ -898,7 +963,10 @@ pub fn sanitize_path_component(raw: &str) -> String {
             c => out.push(c),
         }
     }
-    let trimmed = out.trim().trim_matches('.').trim();
+    // One pass over a combined set: alternating dot/space endings
+    // ("name. .") need the whole run removed, and the old triple-trim left a
+    // trailing dot behind.
+    let trimmed = out.trim_matches(|c: char| c.is_whitespace() || c == '.');
     let basename = trimmed.split('.').next().unwrap_or("").to_ascii_uppercase();
     let reserved = matches!(basename.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || (basename.len() == 4

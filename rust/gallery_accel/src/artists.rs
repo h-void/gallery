@@ -2,6 +2,8 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::natural_sort::natural_compare;
 use crate::pinyin_search::search_text_for_values;
@@ -31,8 +33,47 @@ struct ArtistDetailRow {
 
 /// Historical FastAPI contract: bare JSON **array** of artists (not `{artists:[]}`).
 /// Static UI does `state.artists = asArray(await API.get('/api/artists'))`.
+struct CachedArtists {
+    response: Value,
+    cached_at: Instant,
+}
+
+static ARTISTS_CACHE: OnceLock<Mutex<Option<CachedArtists>>> = OnceLock::new();
+const ARTISTS_CACHE_TTL: Duration = Duration::from_secs(10);
+
+pub fn invalidate_artists_cache() {
+    if let Some(mutex) = ARTISTS_CACHE.get() {
+        if let Ok(mut guard) = mutex.lock() {
+            *guard = None;
+        }
+    }
+}
+
+pub fn artists_response_cached(conn: &Connection) -> Result<Value> {
+    let mutex = ARTISTS_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = mutex.lock() {
+        if let Some(cached) = &*guard {
+            if cached.cached_at.elapsed() < ARTISTS_CACHE_TTL {
+                return Ok(cached.response.clone());
+            }
+        }
+    }
+    let res = json!(list_artists(conn)?);
+    if let Ok(mut guard) = mutex.lock() {
+        *guard = Some(CachedArtists {
+            response: res.clone(),
+            cached_at: Instant::now(),
+        });
+    }
+    Ok(res)
+}
+
 pub fn artists_response(conn: &Connection) -> Result<Value> {
-    Ok(json!(list_artists(conn)?))
+
+    #[cfg(not(test))]
+    {
+        artists_response_cached(conn)
+    }
 }
 
 pub fn artist_detail_response(conn: &Connection, artist_id: i64) -> Result<Value> {

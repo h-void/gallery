@@ -6,6 +6,7 @@ import { API, scheduleFolderRenamesRefresh } from '../api.js';
 import { state, nextRequestSeq, isCurrentRequestSeq } from '../store.js';
 import {
   $, $$, escHtml, mergeTagsByNameCollator, buttonIcon, searchableTextMatches,
+  isAbortError,
 } from '../utils.js';
 import { toast, logUiAction, collectUiLogContext } from '../logging.js';
 import { t } from '../i18n.js';
@@ -288,7 +289,12 @@ export function syncSearchOptionsControl() {
 
   const btn = $('#searchOptionsBtn');
   if (btn) {
-    btn.textContent = searchOptionsLabel();
+    const labelText = searchOptionsLabel();
+    const labelSpan = typeof btn.querySelector === 'function'
+      ? btn.querySelector('span:not(.btn-glyph)')
+      : null;
+    if (labelSpan) labelSpan.textContent = labelText;
+    else btn.textContent = labelText;
     btn.classList.toggle('active', state.searchScope !== 'auto' || state.searchTarget === 'tags');
     btn.setAttribute('aria-expanded', state.searchOptionsOpen ? 'true' : 'false');
   }
@@ -666,6 +672,33 @@ export function bindMobileColumnToggle() {
   });
 }
 
+function renderDuplicatePathHtml(rawPath) {
+  const norm = String(rawPath || '').replace(/\\/g, '/');
+  const lastSlash = norm.lastIndexOf('/');
+  if (lastSlash === -1) {
+    return `<span class="duplicate-path-leaf">${escHtml(norm)}</span>`;
+  }
+  const dir = norm.slice(0, lastSlash + 1);
+  const name = norm.slice(lastSlash + 1);
+  return `<span class="duplicate-path-dir">${escHtml(dir)}</span><span class="duplicate-path-leaf">${escHtml(name)}</span>`;
+}
+
+export function syncActiveDuplicatePath() {
+  const currentId = state.currentArtist ? String(state.currentArtist.id) : null;
+  const list = $('#duplicateList');
+  if (!list) return;
+  const buttons = typeof list.querySelectorAll === 'function' ? list.querySelectorAll('.duplicate-path') : [];
+  for (const btn of buttons) {
+    const active = currentId && btn.dataset && btn.dataset.artistId === currentId;
+    if (btn.classList && typeof btn.classList.toggle === 'function') {
+      btn.classList.toggle('active', Boolean(active));
+    }
+    if (typeof btn.setAttribute === 'function') {
+      btn.setAttribute('aria-current', active ? 'true' : 'false');
+    }
+  }
+}
+
 export function renderDuplicateFolders() {
   const section = $('#duplicateSection');
   const groups = state.duplicateFolders;
@@ -687,19 +720,41 @@ export function renderDuplicateFolders() {
   section.style.display = '';
   if (appeared) setSidebarCollapsed('duplicates', false, true);
   $('#duplicateCount').textContent = t('{count}组', {count: groups.length});
+  const currentArtistId = state.currentArtist ? String(state.currentArtist.id) : null;
   $('#duplicateList').innerHTML = groups.map(group => `
     <div class="duplicate-group">
-      <div class="duplicate-name"><span data-i18n-skip>${escHtml(group.name)}</span> <span>${group.count}</span></div>
-      ${group.paths.map(path => `
-        <button class="duplicate-path" type="button" data-artist-id="${path.id}" title="${escHtml(path.path)}">
-          <span>${escHtml(path.display_path || path.path)}</span>
-          <strong>${path.item_count || 0}</strong>
-        </button>
-      `).join('')}
+      <div class="duplicate-name">
+        <div class="duplicate-name-label">
+          <svg class="duplicate-name-icon" viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
+            <path d="M2 3a1 1 0 0 1 1-1h3.586a1 1 0 0 1 .707.293l1.414A1 1 0 0 0 9.414 4H13a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3z"/>
+          </svg>
+          <span class="duplicate-name-text" data-i18n-skip title="${escHtml(group.name)}">${escHtml(group.name)}</span>
+        </div>
+        <span class="duplicate-badge" title="${escHtml(t('{count}处', {count: group.count}))}">${escHtml(t('{count}处', {count: group.count}))}</span>
+      </div>
+      <div class="duplicate-paths">
+        ${group.paths.map(path => {
+          const displayPath = path.display_path || path.path;
+          const isActive = currentArtistId && String(path.id) === currentArtistId;
+          const activeClass = isActive ? ' active' : '';
+          return `
+            <button class="duplicate-path${activeClass}" type="button" data-artist-id="${path.id}" title="${escHtml(path.path)}" aria-current="${isActive ? 'true' : 'false'}">
+              <span class="duplicate-path-icon" aria-hidden="true">
+                <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor">
+                  <path d="M.54 3.87.5 3a2 2 0 0 1 2-2h3.672a2 2 0 0 1 1.414.586l.828.828A2 2 0 0 0 9.828 3h3.982a2 2 0 0 1 1.992 2.181l-.637 7A2 2 0 0 1 13.174 14H2.826a2 2 0 0 1-1.991-1.819l-.637-7a1.99 1.99 0 0 1 .342-1.31z"/>
+                </svg>
+              </span>
+              <span class="duplicate-path-route" title="${escHtml(displayPath)}">${renderDuplicatePathHtml(displayPath)}</span>
+              <strong>${path.item_count || 0}</strong>
+            </button>
+          `;
+        }).join('')}
+      </div>
     </div>
   `).join('');
 
   bindDuplicateListActions($('#duplicateList'));
+  syncActiveDuplicatePath();
 }
 
 // Duplicate paths jump to the artist and close the mobile drawer; one
@@ -715,14 +770,43 @@ function bindDuplicateListActions(container) {
   });
 }
 
+let tagFilterQuery = '';
+
 export function renderSidebar() {
+  syncActiveDuplicatePath();
   $('#tagFilterReset').disabled = !state.activeRole || (String(state.activeRole).startsWith('__') && state.activeRole !== BROWSE_KINDS.untagged);
+  const tagSearchBar = $('#tagSearchBar');
+  const tagSearchInput = $('#tagSearchInput');
+  if (tagSearchInput && !tagSearchInput.dataset.bound) {
+    tagSearchInput.dataset.bound = '1';
+    const syncTagFilter = e => {
+      const next = (e.target.value || '').trim();
+      if (next === tagFilterQuery) return;
+      tagFilterQuery = next;
+      renderSidebar();
+    };
+    tagSearchInput.addEventListener('input', syncTagFilter);
+    tagSearchInput.addEventListener('search', syncTagFilter);
+    tagSearchInput.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && tagSearchInput.value) {
+        e.preventDefault();
+        e.stopPropagation();
+        tagSearchInput.value = '';
+        tagFilterQuery = '';
+        renderSidebar();
+      }
+    });
+  }
   const s = state.stats;
   if (!s) {
     $('#sidebarList').innerHTML = '';
+    if (tagSearchBar) tagSearchBar.hidden = true;
     return;
   }
   const tags = Array.isArray(s.tags) ? s.tags : [];
+  if (tagSearchBar) {
+    tagSearchBar.hidden = tags.length <= 6 && !tagFilterQuery;
+  }
   let html = '';
   const untaggedCount = Number(s.untagged || 0);
   const isUntaggedActive = state.activeRole === BROWSE_KINDS.untagged;
@@ -731,7 +815,10 @@ export function renderSidebar() {
   html += `<div class="sidebar-item sidebar-item-untagged${untaggedClass}${untaggedEmptyClass}" data-role="${BROWSE_KINDS.untagged}" role="button" tabindex="0">
     <span>未加角色</span><span class="count">${untaggedCount}</span></div>`;
 
+  let matchedTags = 0;
   sortSidebarTags(tags).forEach(r => {
+    if (tagFilterQuery && !searchableTextMatches(tagFilterQuery, r.name)) return;
+    matchedTags += 1;
     const active = state.activeRole === String(r.id) ? ' active' : '';
     // `data-i18n-skip`: a character name is user data, so the i18n auto pass
     // must not rewrite it (a character named 全部 would otherwise show as "All",
@@ -739,6 +826,9 @@ export function renderSidebar() {
     html += `<div class="sidebar-item${active}" data-role="${r.id}" role="button" tabindex="0">
       <span data-i18n-skip>${escHtml(r.name)}</span><span class="count">${r.count}</span></div>`;
   });
+  if (tagFilterQuery && matchedTags === 0) {
+    html += '<div class="sidebar-list-empty sidebar-empty-state">没有角色</div>';
+  }
   $('#sidebarList').innerHTML = html || '<div class="sidebar-list-empty sidebar-empty-state">没有角色</div>';
 
   bindSidebarEvents();
@@ -808,7 +898,7 @@ function countFolderNodes(node) {
 function folderNodeMatchesFilter(node, query) {
   if (!query) return true;
   if (!node || typeof node !== 'object' || Array.isArray(node)) return false;
-  if (searchableTextMatches(node.name || node.path || '', query)) return true;
+  if (searchableTextMatches(query, node.name, node.path)) return true;
   const children = Array.isArray(node.children) ? node.children : [];
   return children.some(child => folderNodeMatchesFilter(child, query));
 }
@@ -829,9 +919,22 @@ export function renderFolderTree() {
   const searchInput = $('#folderSearchInput');
   if (searchInput && !searchInput.dataset.bound) {
     searchInput.dataset.bound = '1';
-    searchInput.addEventListener('input', e => {
-      folderFilterQuery = (e.target.value || '').trim();
+    const syncFolderFilter = e => {
+      const next = (e.target.value || '').trim();
+      if (next === folderFilterQuery) return;
+      folderFilterQuery = next;
       renderFolderTree();
+    };
+    searchInput.addEventListener('input', syncFolderFilter);
+    searchInput.addEventListener('search', syncFolderFilter);
+    searchInput.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && searchInput.value) {
+        e.preventDefault();
+        e.stopPropagation();
+        searchInput.value = '';
+        folderFilterQuery = '';
+        renderFolderTree();
+      }
     });
   }
   if (!tree || typeof tree !== 'object' || Array.isArray(tree)) {
@@ -845,7 +948,12 @@ export function renderFolderTree() {
     searchBar.hidden = totalFolders <= 5 && !folderFilterQuery;
   }
 
-  $('#folderTree').innerHTML = renderFolderNode(tree, 0);
+  let folderTreeHtml = renderFolderNode(tree, 0);
+  const rootChildren = Array.isArray(tree.children) ? tree.children : [];
+  if (folderFilterQuery && rootChildren.length > 0 && !rootChildren.some(child => folderNodeMatchesFilter(child, folderFilterQuery))) {
+    folderTreeHtml += `<div class="sidebar-list-empty sidebar-empty-state">${t('未找到匹配的文件夹')}</div>`;
+  }
+  $('#folderTree').innerHTML = folderTreeHtml;
   bindFolderEvents();
 }
 
@@ -1103,6 +1211,8 @@ export function renderToolbar() {
   updateDuplicateFilesButton();
 }
 
+let itemsAbortController = null;
+
 export async function loadItems(options = {}) {
   const append = Boolean(options.append);
   if (append && !state.hasMoreItems) return;
@@ -1123,6 +1233,10 @@ export async function loadItems(options = {}) {
     state.itemsOffset = 0;
     state.hasMoreItems = false;
     if (!append) {
+      if (itemsAbortController) {
+        itemsAbortController.abort();
+        itemsAbortController = null;
+      }
       // This call claimed the load sequence number; an in-flight older load is
       // now stale and would skip its own flag reset, so release the flags here.
       state.loadingItems = false;
@@ -1139,12 +1253,17 @@ export async function loadItems(options = {}) {
   state.loadingMoreItems = append;
   state.itemsLoadError = false;
   if (!append) {
+    if (itemsAbortController) {
+      itemsAbortController.abort();
+    }
+    itemsAbortController = new AbortController();
     state.itemsCursor = null;
     releaseAllImageLoads();
     releaseAllVideoPreviewLoads();
     resetCharacterTagSuggestions();
   }
 
+  const abortSignal = itemsAbortController ? itemsAbortController.signal : undefined;
   const cursorSearch = globalSearch;
   const offset = append ? state.itemsOffset : 0;
   const previousCount = append ? state.allItems.length : 0;
@@ -1190,13 +1309,13 @@ export async function loadItems(options = {}) {
   if (!append && state.search && state.searchTarget === 'tags') {
     const tagParams = new URLSearchParams({search: state.search, limit: 100});
     if (!globalSearch && state.currentArtist) tagParams.set('artist_id', state.currentArtist.id);
-    tagSearchPromise = API.get('/api/tags/search?' + tagParams.toString());
+    tagSearchPromise = API.get('/api/tags/search?' + tagParams.toString(), {signal: abortSignal});
   }
 
   let loadSucceeded = false;
   try {
     const [data, tagData] = await Promise.all([
-      API.get('/api/items?' + params.toString()),
+      API.get('/api/items?' + params.toString(), {signal: abortSignal}),
       tagSearchPromise,
     ]);
     if (!isCurrentRequestSeq('itemLoadSeq', seq)
@@ -1239,6 +1358,9 @@ export async function loadItems(options = {}) {
     }));
     loadSucceeded = true;
   } catch (e) {
+    if (isAbortError(e)) {
+      return;
+    }
     if (isCurrentRequestSeq('itemLoadSeq', seq) && append) {
       toast('加载更多媒体失败', 'error');
     } else if (isCurrentRequestSeq('itemLoadSeq', seq)) {
@@ -1260,12 +1382,18 @@ export async function loadItems(options = {}) {
   }
   if (!isCurrentRequestSeq('itemLoadSeq', seq)) return;
   if (!loadSucceeded) return;
-  requestAnimationFrame(maybeLoadMoreOnScroll);
+  // An empty page can race a stale total count. Do not repeatedly request the
+  // same offset via animation frames; a later scroll can still retry it.
+  if (state.itemsOffset > previousCount) requestAnimationFrame(maybeLoadMoreOnScroll);
+  return true;
 }
 
 export async function loadItemsPreservingDepth() {
   const expectedCount = state.allItems.length;
-  await loadItems();
+  const firstPage = loadItems();
+  const seq = Number(state.itemLoadSeq || 0);
+  // A superseded/failed first page does not own the current view's depth.
+  if (!await firstPage || !isCurrentRequestSeq('itemLoadSeq', seq)) return;
   if (expectedCount <= 0 || !state.hasMoreItems) return;
   let pages = 0;
   while (
@@ -1274,11 +1402,14 @@ export async function loadItemsPreservingDepth() {
     && state.allItems.length < expectedCount
     && pages < MAX_DEPTH_REFILL_PAGES
   ) {
-    const seqBefore = Number(state.itemLoadSeq || 0);
-    await loadItems({append: true});
+    const previousCount = state.allItems.length;
+    const loaded = await loadItems({append: true});
     pages += 1;
     // A user-initiated reload owns newer state now; stop refilling.
-    if (Number(state.itemLoadSeq || 0) !== seqBefore) return;
+    if (!isCurrentRequestSeq('itemLoadSeq', seq)) return;
+    // Preserve retryability without turning one failure/empty page into a
+    // burst of up to MAX_DEPTH_REFILL_PAGES identical requests and toasts.
+    if (!loaded || state.allItems.length <= previousCount) return;
   }
 }
 
@@ -1397,6 +1528,16 @@ export function clearUI() {
   state.stats = null;
   state.tags = [];
   state.folders = null;
+  tagFilterQuery = '';
+  const tagSearchInput = $('#tagSearchInput');
+  if (tagSearchInput) tagSearchInput.value = '';
+  const tagSearchBar = $('#tagSearchBar');
+  if (tagSearchBar) tagSearchBar.hidden = true;
+  folderFilterQuery = '';
+  const folderSearchInput = $('#folderSearchInput');
+  if (folderSearchInput) folderSearchInput.value = '';
+  const folderSearchBar = $('#folderSearchBar');
+  if (folderSearchBar) folderSearchBar.hidden = true;
   resetCharacterTagSuggestions();
   releaseAllImageLoads();
   releaseAllVideoPreviews();
@@ -1412,6 +1553,7 @@ export function clearUI() {
   tagResultsSignature = null;
   renderLibraryEmptyState();
   renderToolbar();
+  syncActiveDuplicatePath();
 }
 
 export function syncItemFilterControls() {

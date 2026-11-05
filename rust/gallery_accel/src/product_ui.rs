@@ -1100,6 +1100,7 @@ pub fn auto_resolve_move_candidates_with_roots(
                       (SELECT COUNT(*) FROM item_tags it WHERE it.item_id=i.id) AS tag_count,
                       (SELECT COUNT(*) FROM items dup
                         WHERE dup.missing=0 AND dup.id<>i.id
+                          AND dup.hash_status='done'
                           AND dup.content_hash<>'' AND dup.content_hash=i.content_hash) AS active_hash_duplicates
                  FROM move_candidates mc
                  JOIN items i ON i.id=mc.item_id
@@ -1841,16 +1842,15 @@ fn fake_embedding_for_item(item_id: i64) -> Vec<f32> {
 }
 
 fn embed_for_import_with_roots(
-    conn: &Connection,
     roots: &crate::media_roots::MediaRoots,
     item_id: i64,
+    file_path: &str,
+    media_type: &str,
 ) -> Result<Vec<f32>> {
     if fake_import_embedding_enabled() {
         return Ok(fake_embedding_for_item(item_id));
     }
-    let (emb, _path, _name, _src) =
-        crate::character_ccip::embed_item_with_roots(conn, roots, item_id)?;
-    Ok(emb)
+    crate::character_ccip::embed_candidate_with_roots(roots, item_id, file_path, media_type)
 }
 
 fn character_tag_single_count(conn: &Connection, character_id: i64) -> i64 {
@@ -2245,15 +2245,16 @@ fn run_claimed_character_import_job(
         .map_or(0, Vec::len);
     run_guard.changed |= cleanup_deleted > 0;
 
-    // Single-tag image/video candidates; exclude archives and prefer items with no reference yet.
+    // Single-tag image candidates; exclude archives/videos and prefer items with no reference yet.
     let mut sql = String::from(
-        "SELECT i.id, i.file_path, i.artist_id, t.id AS tag_id, t.name AS tag_name
+        "SELECT i.id, i.file_path, i.artist_id, t.id AS tag_id, t.name AS tag_name,
+                COALESCE(i.media_type, 'image') AS media_type
          FROM items i
          JOIN item_tags it ON it.item_id = i.id
          JOIN tags t ON t.id = it.tag_id
          WHERE i.missing = 0
            AND COALESCE(i.is_archive, 0) = 0
-           AND (i.media_type IN ('image', 'video') OR i.media_type IS NULL OR i.media_type = '')
+           AND (i.media_type = 'image' OR i.media_type IS NULL OR i.media_type = '')
            AND i.id IN (
              SELECT item_id FROM item_tags GROUP BY item_id HAVING COUNT(*) = 1
            )",
@@ -2309,7 +2310,7 @@ fn run_claimed_character_import_job(
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         params_vec.iter().map(|b| b.as_ref()).collect();
 
-    let rows: Vec<(i64, String, Option<i64>, i64, String)> = stmt
+    let rows: Vec<(i64, String, Option<i64>, i64, String, String)> = stmt
         .query_map(param_refs.as_slice(), |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -2317,6 +2318,7 @@ fn run_claimed_character_import_job(
                 r.get::<_, Option<i64>>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -2347,6 +2349,9 @@ fn run_claimed_character_import_job(
         &failures,
         &imported_character_ids,
     );
+
+    let mut check_exists_stmt =
+        conn.prepare("SELECT 1 FROM character_references WHERE item_id=? LIMIT 1")?;
 
     let mut row_index = 0usize;
     'tags: while row_index < rows.len() {
@@ -2384,6 +2389,7 @@ fn run_claimed_character_import_job(
                 |r| r.get(0),
             )
             .optional()?;
+        let mut tag_single_count = char_id.map_or(0, |id| character_tag_single_count(conn, id));
         let mut reference_records = match char_id {
             Some(id) => crate::character_cleanup::load_character_refs(conn, id)?,
             None => Vec::new(),
@@ -2408,7 +2414,8 @@ fn run_claimed_character_import_job(
         };
         let mut candidates: Vec<(i64, crate::character_cleanup::RefRec)> = Vec::new();
 
-        for (item_id, path, candidate_artist_id, _tag_id, _) in &rows[group_start..seed_window_end]
+        for (item_id, path, candidate_artist_id, _tag_id, _, media_type) in
+            &rows[group_start..seed_window_end]
         {
             if cancel_requested(&job_id) {
                 cancelled = true;
@@ -2416,25 +2423,19 @@ fn run_claimed_character_import_job(
             }
             processed += 1;
             visited_in_group += 1;
-            let exists = conn
-                .query_row(
-                    "SELECT 1 FROM character_references WHERE item_id=? LIMIT 1",
-                    params![item_id],
-                    |_| Ok(true),
-                )
+            let exists = check_exists_stmt
+                .query_row(params![item_id], |_| Ok(true))
                 .optional()?
                 .unwrap_or(false);
             if exists {
                 skipped_existing += 1;
                 continue;
             }
-            if hard_max > 0
-                && char_id.is_some_and(|id| character_tag_single_count(conn, id) >= hard_max)
-            {
+            if hard_max > 0 && tag_single_count >= hard_max {
                 skipped_max += 1;
                 continue;
             }
-            match embed_for_import_with_roots(conn, roots, *item_id) {
+            match embed_for_import_with_roots(roots, *item_id, path, media_type) {
                 Ok(vector) => candidates.push((
                     *item_id,
                     crate::character_cleanup::RefRec::candidate(
@@ -2518,16 +2519,22 @@ fn run_claimed_character_import_job(
             let candidate = &candidates[candidate_index];
             let vote =
                 crate::character_cleanup::core_vote_records(&candidate.1.vector, &voting_core);
-            if vote.duplicate {
+            let is_dup = vote.duplicate
+                || crate::character_cleanup::is_near_duplicate_of_any(
+                    &candidate.1.vector,
+                    &reference_records,
+                );
+            if is_dup {
                 let remaining_needed = seed_target - seed_added;
                 let replacements = seed_order[position + 1..]
                     .iter()
                     .filter(|&&index| {
-                        !crate::character_cleanup::core_vote_records(
-                            &candidates[index].1.vector,
-                            &voting_core,
-                        )
-                        .duplicate
+                        let v = &candidates[index].1.vector;
+                        !crate::character_cleanup::core_vote_records(v, &voting_core).duplicate
+                            && !crate::character_cleanup::is_near_duplicate_of_any(
+                                v,
+                                &reference_records,
+                            )
                     })
                     .count();
                 if replacements >= remaining_needed {
@@ -2535,9 +2542,7 @@ fn run_claimed_character_import_job(
                     continue;
                 }
             }
-            if hard_max > 0
-                && char_id.is_some_and(|id| character_tag_single_count(conn, id) >= hard_max)
-            {
+            if hard_max > 0 && tag_single_count >= hard_max {
                 skipped_max += 1;
                 continue;
             }
@@ -2547,6 +2552,7 @@ fn run_claimed_character_import_job(
                     added += 1;
                     added_for_tag += 1;
                     seed_added += 1;
+                    tag_single_count += 1;
                     run_guard.changed = true;
                     reference_records.push(candidate.1.clone());
                     voting_core = crate::character_cleanup::stable_core_records(&reference_records);
@@ -2576,7 +2582,12 @@ fn run_claimed_character_import_job(
             }
             let vote =
                 crate::character_cleanup::core_vote_records(&candidate.1.vector, &voting_core);
-            if vote.duplicate {
+            if vote.duplicate
+                || crate::character_cleanup::is_near_duplicate_of_any(
+                    &candidate.1.vector,
+                    &reference_records,
+                )
+            {
                 skipped_duplicate += 1;
                 continue;
             }
@@ -2584,9 +2595,7 @@ fn run_claimed_character_import_job(
                 skipped_low_similarity += 1;
                 continue;
             }
-            if hard_max > 0
-                && char_id.is_some_and(|id| character_tag_single_count(conn, id) >= hard_max)
-            {
+            if hard_max > 0 && tag_single_count >= hard_max {
                 skipped_max += 1;
                 continue;
             }
@@ -2595,6 +2604,7 @@ fn run_claimed_character_import_job(
                 Ok(()) => {
                     added += 1;
                     added_for_tag += 1;
+                    tag_single_count += 1;
                     run_guard.changed = true;
                     reference_records.push(candidate.1.clone());
                     voting_core = crate::character_cleanup::stable_core_records(&reference_records);
@@ -2617,7 +2627,9 @@ fn run_claimed_character_import_job(
 
         // Lazy post-seed evaluation for remaining rows in this tag group:
         // stops immediately once `limit_per_tag` or `hard_max` is satisfied.
-        for (item_id, path, candidate_artist_id, _tag_id, _) in &rows[seed_window_end..row_index] {
+        for (item_id, path, candidate_artist_id, _tag_id, _, media_type) in
+            &rows[seed_window_end..row_index]
+        {
             if cancel_requested(&job_id) {
                 cancelled = true;
                 break 'tags;
@@ -2625,27 +2637,21 @@ fn run_claimed_character_import_job(
             if limit_per_tag > 0 && added_for_tag >= limit_per_tag {
                 break;
             }
-            if hard_max > 0
-                && char_id.is_some_and(|id| character_tag_single_count(conn, id) >= hard_max)
-            {
+            if hard_max > 0 && tag_single_count >= hard_max {
                 skipped_max += 1;
                 break;
             }
             processed += 1;
             visited_in_group += 1;
-            let exists = conn
-                .query_row(
-                    "SELECT 1 FROM character_references WHERE item_id=? LIMIT 1",
-                    params![item_id],
-                    |_| Ok(true),
-                )
+            let exists = check_exists_stmt
+                .query_row(params![item_id], |_| Ok(true))
                 .optional()?
                 .unwrap_or(false);
             if exists {
                 skipped_existing += 1;
                 continue;
             }
-            match embed_for_import_with_roots(conn, roots, *item_id) {
+            match embed_for_import_with_roots(roots, *item_id, path, media_type) {
                 Ok(vector) => {
                     let candidate_rec = crate::character_cleanup::RefRec::candidate(
                         *item_id,
@@ -2657,7 +2663,12 @@ fn run_claimed_character_import_job(
                         &candidate_rec.vector,
                         &voting_core,
                     );
-                    if vote.duplicate {
+                    if vote.duplicate
+                        || crate::character_cleanup::is_near_duplicate_of_any(
+                            &candidate_rec.vector,
+                            &reference_records,
+                        )
+                    {
                         skipped_duplicate += 1;
                     } else if !vote.supported {
                         skipped_low_similarity += 1;
@@ -2672,6 +2683,7 @@ fn run_claimed_character_import_job(
                             Ok(()) => {
                                 added += 1;
                                 added_for_tag += 1;
+                                tag_single_count += 1;
                                 run_guard.changed = true;
                                 reference_records.push(candidate_rec);
                                 voting_core = crate::character_cleanup::stable_core_records(

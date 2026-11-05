@@ -26,10 +26,10 @@
 </script>
 <title>画廊</title>
 <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%23F4ECDD"/><circle cx="24" cy="24" r="7" fill="%23C04B3A"/><path d="M12 48l14-18 10 12 6-7 10 13z" fill="%23C04B3A"/></svg>'>
-<link rel="stylesheet" href="/static/styles/tokens.css?v=1.1.8">
-<link rel="stylesheet" href="/static/styles/base.css?v=1.1.8">
-<link rel="stylesheet" href="/static/styles/layout.css?v=1.1.8">
-<link rel="stylesheet" href="/static/styles/views.css?v=1.1.8">
+<link rel="stylesheet" href="/static/styles/tokens.css?v=1.1.9">
+<link rel="stylesheet" href="/static/styles/base.css?v=1.1.9">
+<link rel="stylesheet" href="/static/styles/layout.css?v=1.1.9">
+<link rel="stylesheet" href="/static/styles/views.css?v=1.1.9">
 <!-- Boot module graph, preloaded without ?v= so the hrefs match the import
      specifiers exactly (./store.js from main.js resolves to /static/js/store.js).
      Without these the browser discovers each module depth-by-depth from the
@@ -228,6 +228,9 @@
         </button>
       </div>
       <div class="sidebar-section-body" id="tagSectionBody">
+        <div class="folder-search-bar tag-search-bar" id="tagSearchBar" hidden>
+          <input type="search" id="tagSearchInput" placeholder="搜索角色" maxlength="100" autocomplete="off" aria-label="搜索角色">
+        </div>
         <div class="sidebar-list" id="sidebarList"></div>
       </div>
     </div>
@@ -775,6 +778,49 @@
           <div class="download-subscription-list" id="downloadSubscriptionList"></div>
         </details>
 
+        <details class="maintenance-section download-works-panel maintenance-advanced-detail" id="downloadWorksPanel" open>
+          <summary>全部作品</summary>
+          <div class="maintenance-section-head">
+            <div>
+              <div class="move-section-title">全部作品</div>
+              <div class="health-subtitle">跨订阅列出所有已发现的作品，勾选后手动下载</div>
+            </div>
+            <div class="maintenance-section-actions">
+              <span id="downloadWorksCount" class="health-subtitle"></span>
+            </div>
+          </div>
+          <div class="download-works-filters">
+            <label class="archive-field"><span>搜索</span><input id="downloadWorksSearch" type="text" maxlength="200" autocomplete="off" placeholder="标题或作品 ID"></label>
+            <div class="archive-field download-works-artist-field"><span id="downloadWorksArtistLabel">画师</span>
+              <div class="download-artist-combo" id="downloadWorksArtistCombo">
+                <input id="downloadWorksArtistInput" type="text" maxlength="200" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="downloadWorksArtistListbox" aria-labelledby="downloadWorksArtistLabel" placeholder="全部画师（输入搜索）">
+                <input id="downloadWorksArtist" type="hidden" value="">
+                <ul class="download-artist-listbox" id="downloadWorksArtistListbox" role="listbox" aria-labelledby="downloadWorksArtistLabel" hidden></ul>
+              </div>
+            </div>
+            <label class="archive-field"><span>日期</span><input id="downloadWorksDay" type="date" aria-label="日期"></label>
+            <label class="archive-field"><span>状态</span>
+              <select id="downloadWorksState" aria-label="状态">
+                <option value="missing">只看缺失</option>
+                <option value="" selected>全部作品</option>
+                <option value="external">有网盘</option>
+                <option value="completed">已下齐</option>
+              </select>
+            </label>
+          </div>
+          <div class="download-works-actions">
+            <label class="maintenance-auto-toggle" title="当前筛选下的全部作品，不只是这一屏">
+              <input id="downloadWorksSelectAll" type="checkbox">
+              <span>全选当前筛选</span>
+            </label>
+            <button id="downloadWorksClearBtn" class="btn btn-ghost" type="button">清空选择</button>
+            <button id="downloadWorksDownloadBtn" class="btn btn-ops" type="button">下载所选</button>
+            <button id="downloadWorksNetdiskBtn" class="btn btn-ops" type="button" title="将所选作品的网盘链接批量投递至下载器">投递网盘</button>
+            <span id="downloadWorksSelection" class="health-subtitle" role="status"></span>
+          </div>
+          <div class="download-works-list" id="downloadWorksList"></div>
+        </details>
+
         <details class="maintenance-section download-settings-panel maintenance-advanced-detail" id="downloadSettingsPanel">
           <summary>订阅下载设置</summary>
           <div class="maintenance-section-head">
@@ -955,49 +1001,6 @@
               </div>
             </details>
           </div>
-        </details>
-
-        <details class="maintenance-section download-works-panel maintenance-advanced-detail" id="downloadWorksPanel" open>
-          <summary>全部作品</summary>
-          <div class="maintenance-section-head">
-            <div>
-              <div class="move-section-title">全部作品</div>
-              <div class="health-subtitle">跨订阅列出所有已发现的作品，勾选后手动下载</div>
-            </div>
-            <div class="maintenance-section-actions">
-              <span id="downloadWorksCount" class="health-subtitle"></span>
-            </div>
-          </div>
-          <div class="download-works-filters">
-            <label class="archive-field"><span>搜索</span><input id="downloadWorksSearch" type="text" maxlength="200" autocomplete="off" placeholder="标题或作品 ID"></label>
-            <div class="archive-field download-works-artist-field"><span id="downloadWorksArtistLabel">画师</span>
-              <div class="download-artist-combo" id="downloadWorksArtistCombo">
-                <input id="downloadWorksArtistInput" type="text" maxlength="200" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="downloadWorksArtistListbox" aria-labelledby="downloadWorksArtistLabel" placeholder="全部画师（输入搜索）">
-                <input id="downloadWorksArtist" type="hidden" value="">
-                <ul class="download-artist-listbox" id="downloadWorksArtistListbox" role="listbox" aria-labelledby="downloadWorksArtistLabel" hidden></ul>
-              </div>
-            </div>
-            <label class="archive-field"><span>日期</span><input id="downloadWorksDay" type="date" aria-label="日期"></label>
-            <label class="archive-field"><span>状态</span>
-              <select id="downloadWorksState" aria-label="状态">
-                <option value="missing">只看缺失</option>
-                <option value="" selected>全部作品</option>
-                <option value="external">有网盘</option>
-                <option value="completed">已下齐</option>
-              </select>
-            </label>
-          </div>
-          <div class="download-works-actions">
-            <label class="maintenance-auto-toggle" title="当前筛选下的全部作品，不只是这一屏">
-              <input id="downloadWorksSelectAll" type="checkbox">
-              <span>全选当前筛选</span>
-            </label>
-            <button id="downloadWorksClearBtn" class="btn btn-ghost" type="button">清空选择</button>
-            <button id="downloadWorksDownloadBtn" class="btn btn-ops" type="button">下载所选</button>
-            <button id="downloadWorksNetdiskBtn" class="btn btn-ops" type="button" title="将所选作品的网盘链接批量投递至下载器">投递网盘</button>
-            <span id="downloadWorksSelection" class="health-subtitle" role="status"></span>
-          </div>
-          <div class="download-works-list" id="downloadWorksList"></div>
         </details>
 
         <details class="maintenance-section download-log-panel maintenance-advanced-detail" id="downloadLogPanel">
@@ -1444,7 +1447,7 @@
           </div>
           <div class="maintenance-guide-item">
             <b>灯箱操作</b>
-            <span>按 ← / → 切换前后项，Esc 退出；F 收藏，D 下载，I 切换信息面板。</span>
+            <span>按 ← / → 切换前后项，Esc 退出；S 收藏，C 复制路径，I 切换信息面板。</span>
           </div>
           <div class="maintenance-guide-item">
             <b>语言切换</b>
@@ -1573,7 +1576,7 @@
   </div>
 </div>
 
-<script type="module" src="/static/js/main.js?v=1.1.8"></script>
+<script type="module" src="/static/js/main.js?v=1.1.9"></script>
 
 </body>
 </html>

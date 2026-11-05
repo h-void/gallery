@@ -114,6 +114,9 @@ const maintenanceLoaders = {
 };
 
 function activeMaintenanceViewHasActiveWork() {
+  if (state.healthSummary && state.healthSummary.initializing) {
+    return true;
+  }
   const view = state.maintenanceView || 'overview';
   const hashWorker = state.hashStatus && state.hashStatus.worker ? state.hashStatus.worker : {};
   const scan = (state.lastScanState && state.lastScanState.status === 'scanning')
@@ -146,7 +149,7 @@ function activeMaintenanceViewHasActiveWork() {
   return false;
 }
 
-function maintenanceRefreshDelayMs() {
+export function maintenanceRefreshDelayMs() {
   return activeMaintenanceViewHasActiveWork() ? MAINTENANCE_AUTO_REFRESH_MS : MAINTENANCE_IDLE_REFRESH_MS;
 }
 

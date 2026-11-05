@@ -77,9 +77,10 @@ fn file_mtime_ns_size(path: &Path) -> Option<(i64, u64)> {
 }
 
 /// Match Python `app/api/files.py:_image_preview_cache_path` key + layout.
-/// Cache is only enabled for the default max_edge (512) like Python.
+/// Content-addressed preview cache path. Cached files are indexed by source
+/// path, modification time, size, and target `max_edge`.
 pub fn preview_cache_path_for_source(full: &Path, max_edge: u32) -> Option<PathBuf> {
-    if max_edge != DEFAULT_MAX_EDGE || preview_cache_max_bytes() == 0 {
+    if max_edge == 0 || preview_cache_max_bytes() == 0 {
         return None;
     }
     let root = preview_cache_root()?;
@@ -121,7 +122,7 @@ pub fn existing_preview_cache_file(full: &Path) -> Option<PathBuf> {
     }
 }
 
-fn write_preview_cache(cache_path: &Path, body: &[u8]) {
+pub(crate) fn write_preview_cache(cache_path: &Path, body: &[u8]) {
     if let Some(root) = preview_cache_root() {
         maybe_cleanup_preview_cache(&root, body.len() as u64);
     }
@@ -135,7 +136,7 @@ static PART_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Minimal structural JPEG check (SOI ... EOI) before publishing a cached
 /// image.
-fn looks_like_jpeg(body: &[u8]) -> bool {
+pub(crate) fn looks_like_jpeg(body: &[u8]) -> bool {
     body.len() >= 4 && body.starts_with(&[0xFF, 0xD8]) && body.ends_with(&[0xFF, 0xD9])
 }
 
@@ -411,7 +412,16 @@ pub fn image_preview_bytes(path: &str, max_edge: u32) -> Result<Vec<u8>> {
         .with_context(|| format!("decode image for preview: {}", path.display()))?;
 
     let oriented = apply_orientation(img, exif_orientation(path));
-    let thumb = oriented.thumbnail(max_edge, max_edge);
+    let bytes = dynamic_image_to_jpeg_preview(&oriented, max_edge)?;
+    if let Some(cache) = cache.as_ref() {
+        write_preview_cache(cache, &bytes);
+    }
+    Ok(bytes)
+}
+
+/// Convert a decoded DynamicImage into a scaled JPEG preview payload.
+pub fn dynamic_image_to_jpeg_preview(img: &DynamicImage, max_edge: u32) -> Result<Vec<u8>> {
+    let thumb = img.thumbnail(max_edge, max_edge);
 
     let rgb = if matches!(
         thumb.color(),
@@ -419,14 +429,28 @@ pub fn image_preview_bytes(path: &str, max_edge: u32) -> Result<Vec<u8>> {
     ) || thumb.color().has_alpha()
     {
         let rgba = thumb.to_rgba8();
-        let rgba_dyn = DynamicImage::ImageRgba8(rgba.clone());
-        let mut base = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
-            rgba.width(),
-            rgba.height(),
-            image::Rgb(PREVIEW_BG),
-        ));
-        image::imageops::overlay(&mut base, &rgba_dyn, 0, 0);
-        base.to_rgb8()
+        let (width, height) = (rgba.width(), rgba.height());
+        let mut rgb = image::RgbImage::new(width, height);
+        let raw_rgba = rgba.as_raw();
+        let raw_rgb = rgb.as_mut();
+        for (src, dst) in raw_rgba.chunks_exact(4).zip(raw_rgb.chunks_exact_mut(3)) {
+            let a = src[3] as u32;
+            if a == 255 {
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+            } else if a == 0 {
+                dst[0] = PREVIEW_BG[0];
+                dst[1] = PREVIEW_BG[1];
+                dst[2] = PREVIEW_BG[2];
+            } else {
+                let inv = 255 - a;
+                dst[0] = ((src[0] as u32 * a + PREVIEW_BG[0] as u32 * inv + 127) / 255) as u8;
+                dst[1] = ((src[1] as u32 * a + PREVIEW_BG[1] as u32 * inv + 127) / 255) as u8;
+                dst[2] = ((src[2] as u32 * a + PREVIEW_BG[2] as u32 * inv + 127) / 255) as u8;
+            }
+        }
+        rgb
     } else {
         thumb.to_rgb8()
     };
@@ -438,11 +462,35 @@ pub fn image_preview_bytes(path: &str, max_edge: u32) -> Result<Vec<u8>> {
             .encode_image(&DynamicImage::ImageRgb8(rgb))
             .context("encode jpeg preview")?;
     }
-    let bytes = out.into_inner();
-    if let Some(cache) = cache.as_ref() {
-        write_preview_cache(cache, &bytes);
+    Ok(out.into_inner())
+}
+
+/// Render a JPEG preview from raw image bytes in memory (e.g. from an archive stream).
+pub fn image_preview_bytes_from_memory(bytes: &[u8], max_edge: u32) -> Result<Vec<u8>> {
+    let source_limit = max_source_pixels();
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("identify in-memory image format")?;
+    if source_limit > 0 {
+        let (width, height) = reader.into_dimensions().context("read image dimensions")?;
+        if width == 0 || height == 0 {
+            anyhow::bail!("invalid image dimensions");
+        }
+        if (width as u64) * (height as u64) > source_limit {
+            anyhow::bail!("image is too large for preview");
+        }
+        let mut decode_reader = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .context("identify in-memory image format")?;
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(source_limit.saturating_mul(4));
+        decode_reader.limits(limits);
+        reader = decode_reader;
     }
-    Ok(bytes)
+    let img = reader
+        .decode()
+        .context("decode in-memory image for preview")?;
+    dynamic_image_to_jpeg_preview(&img, max_edge)
 }
 
 fn maybe_cleanup_preview_cache(root: &Path, reserve_bytes: u64) {

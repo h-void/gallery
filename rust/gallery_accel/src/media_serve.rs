@@ -334,12 +334,7 @@ fn parse_http_date(value: &str) -> Option<SystemTime> {
 /// `If-None-Match` wins when both are present, because it is the field that can
 /// tell two same-second revisions apart; `If-Modified-Since` is only consulted
 /// on its own, and a date it cannot parse is not a match.
-fn not_modified_since(
-    headers: &HeaderMap,
-    etag: &str,
-    last_modified: Option<&str>,
-    modified: Option<SystemTime>,
-) -> bool {
+fn not_modified_since(headers: &HeaderMap, etag: &str, modified: Option<SystemTime>) -> bool {
     if let Some(value) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
@@ -365,8 +360,11 @@ fn not_modified_since(
     };
     // The comparison is at one-second resolution because that is the resolution
     // of the field, so "not newer than" is the condition.
-    let _ = last_modified;
-    parse_http_date(value).is_some_and(|since| modified <= since + Duration::from_secs(1))
+    parse_http_date(value).is_some_and(|since| {
+        modified
+            .duration_since(since)
+            .map_or(true, |elapsed| elapsed < Duration::from_secs(1))
+    })
 }
 
 /// Whether an `If-Range` still names the current version.
@@ -382,7 +380,11 @@ fn if_range_allows(value: &str, etag: &str, modified: Option<SystemTime>) -> boo
         return !value.starts_with("W/") && value == etag;
     }
     match (parse_http_date(value), modified) {
-        (Some(since), Some(modified)) => modified <= since + Duration::from_secs(1),
+        // Unlike If-Modified-Since, If-Range requires an exact date match at
+        // HTTP's second resolution. Neither an older nor a future date matches.
+        (Some(since), Some(modified)) => modified
+            .duration_since(since)
+            .is_ok_and(|elapsed| elapsed < Duration::from_secs(1)),
         _ => false,
     }
 }
@@ -407,7 +409,7 @@ async fn file_response(
     let etag = media_etag(len, modified);
     let last_modified = modified.map(http_date);
 
-    if not_modified_since(headers, &etag, last_modified.as_deref(), modified) {
+    if not_modified_since(headers, &etag, modified) {
         let mut builder = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, &etag);
@@ -540,6 +542,15 @@ fn parse_bytes_range(header: &str, len: u64) -> ParsedRange {
     let Some((first, last)) = rest.split_once('-') else {
         return ParsedRange::Ignored;
     };
+    // HTTP byte positions are 1*DIGIT; Rust's integer parser also accepts a
+    // leading '+', which must not turn a malformed Range into a partial body.
+    if !first
+        .bytes()
+        .chain(last.bytes())
+        .all(|byte| byte.is_ascii_digit())
+    {
+        return ParsedRange::Ignored;
+    }
     if first.is_empty() {
         // Suffix form `bytes=-N`: the final N bytes. A suffix of zero is a
         // well-formed request for nothing, so it is unsatisfiable rather than
@@ -563,15 +574,14 @@ fn parse_bytes_range(header: &str, len: u64) -> ParsedRange {
         };
         end
     };
-    // The bounds check comes first: an open-ended range past the end of the
-    // file has `last` empty, so `end` is already clamped to the final byte and
-    // the reversal test below would misread it as malformed.
+    // Validate explicit endpoints before checking file bounds: bytes=20-10
+    // is malformed even for a ten-byte file. An open-ended range has no
+    // explicit last position, so its clamped end must not trigger this check.
+    if !last.is_empty() && start > end {
+        return ParsedRange::Ignored;
+    }
     if len == 0 || start >= len {
         return ParsedRange::Unsatisfiable;
-    }
-    // A reversed pair is malformed, not unsatisfiable.
-    if start > end {
-        return ParsedRange::Ignored;
     }
     ParsedRange::Satisfiable(start, end.min(len - 1))
 }

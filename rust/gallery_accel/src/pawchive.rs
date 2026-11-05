@@ -26,11 +26,21 @@ use crate::media_roots::{path_under_authorized_roots, MediaRoots};
 pub const PAWCHIVE_API_BASE: &str = "https://pawchive.pw/api/v1";
 pub const PAWCHIVE_FILE_BASE: &str = "https://file.pawchive.pw/data";
 
+/// Identifiable tool user-agent for outbound Pawchive requests.
+/// Note: file.pawchive.pw returns 403 when impersonating a browser ("pretending to be a browser").
+pub const PAWCHIVE_USER_AGENT: &str = "gallery-downloader/1.1 (https://github.com/h-void/gallery)";
+
 /// The list endpoint paginates with `o` advancing by 50 (see plan section 2.2).
 pub const PAWCHIVE_POSTS_PAGE_SIZE: u64 = 50;
 /// Per-sync discovery page budget: 20 pages is the plan's work-batch bound and
 /// caps one round at 1000 posts so a huge creator cannot stall the sync slot.
 pub const PAWCHIVE_DISCOVERY_MAX_PAGES: usize = 20;
+/// How many extra pages the head sweep and the overlap sweep may each read
+/// when the creator's list shifted by more than one page between rounds. The
+/// sweeps stop at the first page an earlier round already saw, so this bound
+/// only spends itself on a bulk re-import or removal drift, and the remainder
+/// continues on the next round.
+pub const PAWCHIVE_DISCOVERY_SWEEP_MAX_PAGES: usize = 5;
 /// Per-sync detail budget: how many posts one round may ask the source about
 /// individually. A summary page lists up to fifty posts and the fields it is
 /// allowed to omit are exactly the ones a manifest needs, so the walk has to
@@ -71,6 +81,7 @@ pub const PAWCHIVE_MAX_REQUEST_DURATION: std::time::Duration =
 /// same file downloaded fine from a scheduled round.
 pub fn pawchive_http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
+        .user_agent(PAWCHIVE_USER_AGENT)
         .connect_timeout(PAWCHIVE_CONNECT_TIMEOUT)
         .read_timeout(PAWCHIVE_STALL_TIMEOUT)
         .timeout(PAWCHIVE_MAX_REQUEST_DURATION)
@@ -168,6 +179,8 @@ pub struct PawchiveFileRef {
     pub id: Option<String>,
     pub name: Option<String>,
     pub path: Option<String>,
+    #[serde(default)]
+    pub preview_only: Option<bool>,
 }
 
 impl PawchiveFileRef {
@@ -235,7 +248,13 @@ impl PawchivePost {
         if self.has_full == Some(false) {
             return ManifestCompleteness::Partial;
         }
-        if self.attachments_present || self.file_present {
+        // Both resource keys have to have been stated before the observation
+        // can speak for the whole set: the manifest write's retirement set is
+        // the union of `file` and `attachments`, so an observation that
+        // stated only one of them cannot retire what it never listed —
+        // reading a stated `file` as "attachments withdrawn" (the old `||`)
+        // retired every attachment the post was known to have.
+        if self.attachments_present && self.file_present {
             ManifestCompleteness::Complete
         } else {
             ManifestCompleteness::Unknown
@@ -332,7 +351,9 @@ pub enum FileCategory {
 impl FileCategory {
     pub fn from_filename(name: &str) -> Self {
         let lower = name.to_lowercase();
-        let ext = lower.rsplit('.').next().unwrap_or("");
+        // An extensionless name ("mp3", "zip") must not classify by its whole
+        // name — only a real `.ext` suffix counts.
+        let ext = lower.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
         match ext {
             "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "avif" | "jxl" | "heic" | "heif"
             | "tif" | "tiff" => FileCategory::Image,
@@ -1489,7 +1510,9 @@ fn resource_version_evidence(
             if is_weak_validator(value) {
                 return (UNKNOWN_VERSION.to_string(), VERSION_BASIS_WEAK_VALIDATOR);
             }
-            return (value.to_string(), VERSION_BASIS_STRONG_VALIDATOR);
+            if ResumeValidator::is_usable_value(value) {
+                return (value.to_string(), VERSION_BASIS_STRONG_VALIDATOR);
+            }
         }
         if validator.total_length > 0 {
             return (UNKNOWN_VERSION.to_string(), VERSION_BASIS_LENGTH_ONLY);
@@ -1503,10 +1526,10 @@ fn resource_version_evidence(
 
 /// Whether a resource key is the source's own id or a path standing in for one.
 ///
-/// The working ledger defines `source_identity` as the remote path today, so
-/// `path` is the honest answer for every row that exists now. Deriving it
-/// rather than hardcoding it means the day discovery starts recording real
-/// attachment ids, the ledger says so without a second change here.
+/// Discovery records whichever identity the source publishes — an attachment
+/// that carries an id is keyed by that id, and one that does not is keyed by
+/// its normalized path — so readers comparing identities must derive the key
+/// the same way rather than assuming either basis.
 fn resource_identity_basis(source_identity: &str, remote_path: &str) -> &'static str {
     if source_identity == remote_path || source_identity == normalize_remote_path(remote_path) {
         IDENTITY_BASIS_PATH
@@ -1763,9 +1786,20 @@ fn receipt_covered_resources(
         let selected: Option<String> = conn.query_row(
             "SELECT links FROM netdisk_bridge_tasks WHERE task_id=?1 AND bridge_id=?2 AND post_id=?3 AND manifest_version=?4",
             params![receipt.task_id,receipt.bridge_id,post_db_id,receipt.manifest_version], |r|r.get(0)).optional()?;
-        if let Some(selected) = selected {
-            let selected: Vec<String> = serde_json::from_str(&selected)?;
-            links.retain(|link| selected.contains(link));
+        match selected {
+            Some(selected) => {
+                let selected: Vec<String> = serde_json::from_str(&selected)?;
+                links.retain(|link| selected.contains(link));
+            }
+            None => {
+                // No task row answers this receipt's identity (the task was
+                // cleaned up, or its version no longer matches), so which
+                // subset it delivered cannot be proven. Covering every link
+                // anyway read a partial delivery as the whole requirement;
+                // covering none leaves the undelivered shares re-claimable,
+                // which is the honest failure.
+                links.clear();
+            }
         }
     }
     for link in links {
@@ -2085,8 +2119,32 @@ fn move_resource_identity_exec(
         });
     };
 
-    let old_version = resource_version_id_for(&work_id, &normalized, UNKNOWN_VERSION);
-    let new_version = resource_version_id_for(&work_id, new_identity, UNKNOWN_VERSION);
+    // The version key comes from the row's own evidence, exactly as the
+    // ledger's materialisation derives it: a resource carrying a site digest
+    // or a resume validator is versioned under that, not under `unknown`, and
+    // re-keying from a hardcoded `unknown` matched no rows — the move reported
+    // success while every event stayed behind on the old key, then surfaced
+    // again as a duplicate under the next materialisation.
+    let (evidence_blake3, evidence_hash_source, evidence_validator, evidence_length): (
+        String,
+        String,
+        String,
+        Option<i64>,
+    ) = conn.query_row(
+        "SELECT COALESCE(expected_blake3, ''), COALESCE(hash_source, ''),
+                COALESCE(resume_validator, ''), expected_length
+         FROM kemono_files WHERE id = ?1",
+        params![file_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let (version_key, _) = resource_version_evidence(
+        &evidence_blake3,
+        &evidence_hash_source,
+        &evidence_validator,
+        evidence_length,
+    );
+    let old_version = resource_version_id_for(&work_id, &normalized, &version_key);
+    let new_version = resource_version_id_for(&work_id, new_identity, &version_key);
     conn.execute(
         "UPDATE kemono_files
          SET source_identity = ?1, identity_basis = ?2, updated_at = ?3
@@ -2143,6 +2201,49 @@ fn move_resource_identity_exec(
                 &format!("DELETE FROM {table} WHERE {column} = ?1"),
                 params![old_version],
             )?;
+            continue;
+        }
+        if table == "pawchive_acquisition_events" {
+            // The event's idempotency key embeds the resource_version_id, so
+            // re-pointing the column alone left every event keyed by the old
+            // version — the next identical acquisition then inserted a second
+            // row instead of hitting ON CONFLICT(idempotency_key). Recompute
+            // the key per event, exactly as the startup migration does, and
+            // drop an event whose recomputed key already exists at the
+            // destination (the same fact recorded twice).
+            let events: Vec<(String, String, Option<i64>)> = conn
+                .prepare(
+                    "SELECT event_id, evidence_source, publish_job_id
+                     FROM pawchive_acquisition_events
+                     WHERE resource_version_id = ?1",
+                )?
+                .query_map(params![old_version], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (event_id, evidence_source, publish_job_id) in events {
+                let new_key =
+                    acquisition_idempotency_key(&new_version, &evidence_source, publish_job_id);
+                let duplicate: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pawchive_acquisition_events
+                     WHERE idempotency_key = ?1",
+                    params![new_key],
+                    |row| row.get(0),
+                )?;
+                if duplicate > 0 {
+                    conn.execute(
+                        "DELETE FROM pawchive_acquisition_events WHERE event_id = ?1",
+                        params![event_id],
+                    )?;
+                } else {
+                    conn.execute(
+                        "UPDATE pawchive_acquisition_events
+                         SET resource_version_id = ?1, idempotency_key = ?2
+                         WHERE event_id = ?3",
+                        params![new_version, new_key, event_id],
+                    )?;
+                }
+            }
             continue;
         }
         conn.execute(
@@ -3982,7 +4083,15 @@ pub fn demand_set_for_work(
                     if !day.is_empty() {
                         let mut stmt = conn.prepare(
                             "SELECT group_id, generation FROM content_groups
-                                 WHERE date = ?1 AND artist_scope_id = (SELECT printf('artist:%d', artist_id) FROM kemono_subscriptions WHERE id = ?2)",
+                                 WHERE date = ?1
+                                   -- A tombstoned group keeps its date column but
+                                   -- no longer holds any content; counting it (the
+                                   -- sibling read in verified_location_for_post was
+                                   -- fixed for the same reason) froze every post on
+                                   -- the calendar date behind an ambiguity that has
+                                   -- nothing on disk to protect.
+                                   AND state != 'gone'
+                                   AND artist_scope_id = (SELECT printf('artist:%d', artist_id) FROM kemono_subscriptions WHERE id = ?2)",
                         )?;
                         let rows = stmt.query_map(params![day, sub_id], |row| {
                             Ok((row.get(0)?, row.get(1)?))
@@ -4183,7 +4292,13 @@ fn reassess_posts(conn: &Connection, only_subscription: Option<i64>) -> Result<A
     // post — a type switch on a 300k-post library was 300k WAL commits inside a
     // request handler — and a failure part-way left half the library assessed
     // against the old settings with no marker saying so.
-    let tx = conn.unchecked_transaction()?;
+    //
+    // IMMEDIATE, not deferred: the pass reads each post's evidence inside the
+    // transaction before writing its row, and a concurrent writer (a discovery
+    // page or a manual attempt) committing between the read and the write
+    // aborts a deferred transaction with SQLITE_BUSY_SNAPSHOT — which ignores
+    // `busy_timeout` and surfaced as "database is locked".
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     {
         // Prepared once: the loop below runs it per post, and `conn.execute`
         // re-prepares on every call.
@@ -4587,6 +4702,10 @@ pub fn list_pawchive_events(conn: &Connection, limit: Option<i64>) -> Result<Vec
 pub fn coverage_gap_summary(days: &[DayCoverage]) -> String {
     days.iter()
         .rev()
+        // An undated group is real backlog but is not a day; showing it in the
+        // date summary printed " 缺 N 个" in the slot meant for the oldest
+        // missing days.
+        .filter(|day| !day.day.trim().is_empty())
         .take(3)
         .map(|day| format!("{} 缺 {} 个", day.day, day.missing_posts()))
         .collect::<Vec<_>>()
@@ -4754,7 +4873,13 @@ pub fn delete_subscription(conn: &Connection, id: i64) -> Result<bool> {
     // died part-way left the ledger half-migrated with its watermark unmoved, so
     // the next startup repeated the work it had already paid for.
     // Keyset pagination bounds memory so a 50k-post creator is never materialized whole.
-    let tx = conn.unchecked_transaction()?;
+    //
+    // IMMEDIATE: the loop reads post rows inside the transaction before
+    // migrating their ledger, so a concurrent writer committing mid-pass would
+    // abort a deferred transaction with SQLITE_BUSY_SNAPSHOT (outside
+    // `busy_timeout`) — the delete request then fails with "database is
+    // locked" after having held the write lock for minutes.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut last_post_id = 0i64;
     const POST_BATCH_SIZE: usize = 500;
     loop {
@@ -4991,13 +5116,41 @@ pub fn add_subscription_from_url(
         user_id.clone()
     };
 
-    let artist_id: Option<i64> = conn
+    // The folder a subscription delivers into is that creator's artist folder,
+    // exactly the one a full scan would register. Registering it here — instead
+    // of waiting for the first published file — is what makes a creator the user
+    // just added show up in the library, and therefore in the character
+    // library's artist scope, straight away. A target outside every authorized
+    // root stays unbound: the publish step reports that rather than inventing an
+    // artist for a path nothing can be written to.
+    let artist_id: Option<i64> = match conn
         .query_row(
             "SELECT id FROM artists WHERE path = ?1 OR name = ?2 LIMIT 1",
             params![resolved_target, user_id],
             |row| row.get(0),
         )
-        .optional()?;
+        .optional()?
+    {
+        Some(id) => Some(id),
+        None => roots
+            .map_to_real(&resolved_target)
+            .ok()
+            // The folder is created here only when its authorized root is really
+            // on disk: that is the difference between an install and a test
+            // root, and it keeps this from inventing directories somewhere no
+            // media root exists.
+            .filter(|real| {
+                path_under_authorized_roots(real, roots)
+                    && real.parent().is_some_and(|parent| parent.is_dir())
+            })
+            .and_then(|real| {
+                let _ = std::fs::create_dir_all(&real);
+                crate::scan::ensure_artist_for_folder(conn, roots, &resolved_target, &user_id)
+                    .ok()
+                    .flatten()
+                    .map(|(id, _)| id)
+            }),
+    };
 
     let id = upsert_subscription(
         conn,
@@ -5056,7 +5209,16 @@ pub fn record_discovered_posts(
     // long-term observation) and each one committed on its own, so a page that
     // failed or was killed half-way left posts with a partial file list and an
     // unmoved manifest version — a state the source never had.
-    let tx = conn.unchecked_transaction()?;
+    //
+    // Immediate, not deferred: the inner function reads (does this post exist,
+    // which manifest version stands) and then writes on the same connection. A
+    // deferred transaction that has already read holds a snapshot, and when
+    // another connection — a manual attempt, the scanner — commits before this
+    // page's first write, SQLite refuses the promotion with
+    // SQLITE_BUSY_SNAPSHOT ("database is locked") without consulting
+    // busy_timeout at all. Taking the write lock up front turns that collision
+    // into a wait the timeout can absorb.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let count = record_discovered_posts_in(&tx, sub_id, posts, since_date)?;
     tx.commit()?;
     Ok(count)
@@ -5072,9 +5234,26 @@ fn record_discovered_posts_in(
     let mut new_posts_count = 0;
 
     for post in posts {
-        // Date boundary filter
-        if let (Some(since), Some(pub_at)) = (since_date, post.published.as_deref()) {
-            if pub_at < since {
+        // The date this post's folder is named after, derived from the same
+        // function the naming context uses. Computed here rather than in SQL
+        // because the shift depends on the service's own timezone, which a
+        // pure-SQL expression cannot reproduce faithfully.
+        let published_local_date =
+            normalize_post_date(post.published.as_deref(), Some(post.service.as_str()));
+
+        // Date boundary filter, read on the same local day (UTC+8 shifted,
+        // service aware) that coverage, claiming and dispatch all use.
+        // Comparing the source's raw timestamp string instead dropped every
+        // post published in the hours before the boundary in source time that
+        // land on or after it in local time — silently, before it was ever
+        // recorded. A post whose date cannot be read is not filtered: the
+        // boundary has no answer for it, and the rest of the pipeline judges.
+        if let Some(since) = since_date {
+            // The boundary is a day; a since value that carries a time is
+            // compared by its day, the way the dispatch predicate already
+            // compares (`substr(...,1,10) >= since`).
+            let since_day = since.split(['T', ' ']).next().unwrap_or(since);
+            if !published_local_date.is_empty() && published_local_date.as_str() < since_day {
                 continue;
             }
         }
@@ -5085,13 +5264,6 @@ fn record_discovered_posts_in(
             .map(extract_external_links)
             .unwrap_or_default();
         let ext_links_json = serde_json::to_string(&ext_links)?;
-
-        // The date this post's folder is named after, derived from the same
-        // function the naming context uses. Computed here rather than in SQL
-        // because the shift depends on the service's own timezone, which a
-        // pure-SQL expression cannot reproduce faithfully.
-        let published_local_date =
-            normalize_post_date(post.published.as_deref(), Some(post.service.as_str()));
 
         // What this response actually saw of the resource set. Everything below
         // that decides what the work *requires* is gated on it: a summary that
@@ -5227,6 +5399,18 @@ fn record_discovered_posts_in(
             } else {
                 source_identity
             };
+
+            // If the attachment is marked preview_only, it is an image teaser/thumbnail,
+            // not an actual downloadable media file. Retire any existing row and do not queue.
+            if fref.preview_only == Some(true) {
+                let _ = tx.execute(
+                    "UPDATE kemono_files SET present_in_manifest = 0, updated_at = ?1
+                     WHERE post_id = ?2 AND (source_identity = ?3 OR remote_path = ?4)",
+                    params![now, post_db_id, source_identity, normalized_path],
+                );
+                continue;
+            }
+
             manifest_keys.push(source_identity.clone());
             current_identities.push(source_identity.clone());
 
@@ -5282,7 +5466,13 @@ fn record_discovered_posts_in(
         // reading an omitted key as an empty list retired every attachment the
         // post was known to have — after which the post read as requiring
         // nothing at all, which is the one answer that stops a download.
-        if completeness == ManifestCompleteness::Complete {
+        //
+        // The gate is conjunctive on purpose: the retirement set below is the
+        // union of `file` and `attachments`, so the observation may only speak
+        // for both classes when it stated both. A response that named the
+        // primary file but omitted `attachments` (or the reverse) used to
+        // retire every resource of the class it had not listed.
+        if post.attachments_present && post.file_present {
             if current_identities.is_empty() {
                 tx.execute(
                     "UPDATE kemono_files
@@ -5368,7 +5558,12 @@ fn record_discovered_posts_in(
 /// of reading as a file that vanished.
 pub fn link_evidence_to_items(conn: &Connection) -> Result<usize> {
     // Candidate identity and the binding must observe one database snapshot.
-    let tx = conn.unchecked_transaction()?;
+    //
+    // IMMEDIATE: the transaction reads (`sqlite_master`, then item lookups)
+    // before its bulk UPDATE, so a concurrent writer committing in between
+    // aborts a deferred transaction with SQLITE_BUSY_SNAPSHOT instead of
+    // waiting on `busy_timeout`.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let conn = &tx;
     let has_items = conn
         .query_row(
@@ -5931,15 +6126,21 @@ fn folder_name_matches_post_id(folder_name: &str, post_id: &str) -> bool {
         return false;
     }
     for (pos, _) in folder_name.match_indices(pid) {
+        // The boundary test is Unicode, not ASCII: a CJK character adjacent to
+        // the id (`第1234話`) is a letter, and a letter next to the digits
+        // means the id is embedded in other text, not standing on its own.
+        // The ASCII test used to read every non-ASCII character as a
+        // separator, so another work's titled folder could satisfy this
+        // post's match.
         let before_ok = folder_name[..pos]
             .chars()
             .next_back()
-            .is_none_or(|c| !c.is_ascii_alphanumeric());
+            .is_none_or(|c| !c.is_alphanumeric());
         let after_idx = pos + pid.len();
         let after_ok = folder_name[after_idx..]
             .chars()
             .next()
-            .is_none_or(|c| !c.is_ascii_alphanumeric());
+            .is_none_or(|c| !c.is_alphanumeric());
         if before_ok && after_ok {
             return true;
         }
@@ -6564,7 +6765,12 @@ pub fn record_external_receipt(
         None => Vec::new(),
     };
     let work_id_str = work_id.as_deref().unwrap_or("");
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE: the receipt row is read inside the transaction before the
+    // insert/update, and a discovery page committing in between used to abort
+    // the deferred transaction with SQLITE_BUSY_SNAPSHOT — a receipt POST
+    // answering "database is locked" while `busy_timeout` believed it had
+    // already covered the wait.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let existing: Option<(String, i64, String)> = tx
         .query_row(
             "SELECT result, settled, content_fingerprint FROM pawchive_external_receipts
@@ -6728,17 +6934,26 @@ fn load_resume_validator(conn: &Connection, file_id: i64) -> Result<Option<Resum
             |row| row.get(0),
         )
         .optional()?;
-    Ok(raw.as_deref().and_then(ResumeValidator::decode))
+    Ok(raw
+        .as_deref()
+        .and_then(ResumeValidator::decode)
+        .filter(|known| ResumeValidator::is_usable_value(&known.value)))
 }
 
 /// How many times this resource has been attempted, for the backoff curve.
-fn current_attempt(conn: &Connection, file_id: i64) -> i64 {
-    conn.query_row(
-        "SELECT attempt_count FROM kemono_files WHERE id = ?1",
-        params![file_id],
-        |row| row.get(0),
-    )
-    .unwrap_or(1)
+fn current_attempt(conn: &Connection, file_id: i64) -> Result<i64> {
+    // A missing row and a failed read are different facts: the first retry is
+    // attempt 1 for a row that is gone, but a database error used to collapse
+    // into the same answer and silently reset the backoff curve of a resource
+    // that had been failing for days.
+    let attempt: Option<i64> = conn
+        .query_row(
+            "SELECT attempt_count FROM kemono_files WHERE id = ?1",
+            params![file_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(attempt.unwrap_or(1))
 }
 
 /// Which version of a remote artifact a partial file belongs to.
@@ -6756,6 +6971,21 @@ pub struct ResumeValidator {
 }
 
 impl ResumeValidator {
+    fn is_strong_etag(value: &str) -> bool {
+        value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .is_some_and(|opaque| {
+                opaque
+                    .bytes()
+                    .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte))
+            })
+    }
+
+    fn is_usable_value(value: &str) -> bool {
+        Self::is_strong_etag(value) || chrono::DateTime::parse_from_rfc2822(value).is_ok()
+    }
+
     fn from_headers(headers: &reqwest::header::HeaderMap, total_length: u64) -> Option<Self> {
         let pick = |name: reqwest::header::HeaderName| {
             headers
@@ -6765,7 +6995,14 @@ impl ResumeValidator {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         };
-        let value = pick(reqwest::header::ETAG).or_else(|| pick(reqwest::header::LAST_MODIFIED))?;
+        // A weak ETag can describe different bytes and is forbidden in
+        // If-Range. Fall back to a valid modification date, or start over.
+        let value = pick(reqwest::header::ETAG)
+            .filter(|value| Self::is_strong_etag(value))
+            .or_else(|| {
+                pick(reqwest::header::LAST_MODIFIED)
+                    .filter(|value| chrono::DateTime::parse_from_rfc2822(value).is_ok())
+            })?;
         Some(Self {
             value,
             total_length,
@@ -6780,6 +7017,8 @@ impl ResumeValidator {
 
     fn decode(raw: &str) -> Option<Self> {
         let (length, value) = raw.split_once('\n')?;
+        // Keep historical weak/empty values readable for evidence reporting;
+        // the resume boundary separately rejects them as request validators.
         Some(Self {
             value: value.to_string(),
             total_length: length.trim().parse().ok()?,
@@ -6833,6 +7072,11 @@ fn declared_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 /// which they can still be recorded: a first response that disconnects halfway
 /// through used to leave a part file with no validator, so the next round could
 /// not resume and fetched the whole artifact again.
+///
+/// `on_lease` renews the caller's claim while the body streams: it is invoked
+/// once before the body and then roughly every `LEASE_RENEWAL_INTERVAL`, so a
+/// receive that outlives the reclaim window does not have its row — and its
+/// part file — handed to a second pass mid-write.
 pub async fn download_resumable_stream(
     client: &reqwest::Client,
     file_url: &str,
@@ -6841,7 +7085,11 @@ pub async fn download_resumable_stream(
     expected_blake3: Option<&str>,
     resume: Option<&ResumeValidator>,
     on_validator: &mut (dyn FnMut(&ResumeValidator) + Send),
+    on_lease: &mut (dyn FnMut() + Send),
 ) -> Result<DownloadResult> {
+    // Validate direct callers as well as decoded ledger values from older
+    // versions, which could have persisted a weak or malformed validator.
+    let resume = resume.filter(|known| ResumeValidator::is_usable_value(&known.value));
     if !path_under_authorized_roots(part_path, roots) {
         return Err(anyhow!(
             "staging path is outside authorized media roots: {:?}",
@@ -6863,7 +7111,9 @@ pub async fn download_resumable_stream(
         };
         // Resume only when a validator pins the version already on disk.
         let resuming = existing_len > 0 && resume.is_some();
-        let mut request = client.get(file_url);
+        let mut request = client
+            .get(file_url)
+            .header(reqwest::header::REFERER, "https://pawchive.pw/");
         if resuming {
             request = request.header(reqwest::header::RANGE, format!("bytes={existing_len}-"));
             request = request.header(
@@ -6875,6 +7125,11 @@ pub async fn download_resumable_stream(
             let _ = fs::remove_file(part_path);
         };
 
+        // Every request to the source is paced here, where the manual task and
+        // the automatic round both come through: the source answers a burst
+        // with 429 and then refuses the round for hours, so the spacing belongs
+        // at the request, not at the loop above it.
+        crate::pawchive_throttle::pawchive_throttle().wait().await;
         let response = request
             .send()
             .await
@@ -6897,7 +7152,18 @@ pub async fn download_resumable_stream(
             // A source that states how long to wait is obeyed. Dropping the
             // header made the caller fall back to a fixed delay, which is
             // exactly the hammering a rate limiter is asking to stop.
-            let suffix = match retry_after_seconds(response.headers()) {
+            let retry_after = retry_after_seconds(response.headers());
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                // The whole round stands down, not just this resource. The next
+                // file in the queue would be refused for the same reason, and
+                // asking for it anyway is what turned a wait into a ban.
+                crate::pawchive_throttle::pawchive_throttle().note_rate_limit(retry_after);
+            } else if status == reqwest::StatusCode::FORBIDDEN
+                || status == reqwest::StatusCode::UNAUTHORIZED
+            {
+                crate::pawchive_throttle::pawchive_throttle().note_access_denied();
+            }
+            let suffix = match retry_after {
                 Some(seconds) => format!(" (retry-after: {seconds})"),
                 None => String::new(),
             };
@@ -6906,7 +7172,14 @@ pub async fn download_resumable_stream(
             ));
         }
 
+        crate::pawchive_throttle::pawchive_throttle().note_success();
+
         let resuming_response = status == reqwest::StatusCode::PARTIAL_CONTENT;
+        if resuming_response && !resuming {
+            return Err(anyhow!(
+                "unsolicited 206 response without a validated resume request"
+            ));
+        }
 
         // Work out the artifact's true length before writing anything.
         let (total_length, open_offset) = if resuming_response {
@@ -6944,6 +7217,38 @@ pub async fn download_resumable_stream(
                 }
                 continue;
             }
+            // A same-length replacement is the sneaky case: every range number
+            // lines up while the bytes belong to another version. If-Range
+            // asked for exactly this proof, but a proxy that honors Range
+            // while ignoring If-Range would otherwise have its replacement
+            // appended to the staged bytes and published as verified.
+            if let Some(known) = resume {
+                // A changed validator of the requested kind invalidates the prefix,
+                // even if the served ETag is weak and cannot be saved for a
+                // later resume. Do not mistake an unusable value for absence.
+                let validator_header = if ResumeValidator::is_strong_etag(&known.value) {
+                    reqwest::header::ETAG
+                } else {
+                    reqwest::header::LAST_MODIFIED
+                };
+                if let Some(served) = response
+                    .headers()
+                    .get(validator_header)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && *value != known.value)
+                {
+                    restart_from_zero(part_path);
+                    if attempt > 1 {
+                        return Err(anyhow!(
+                            "artifact version changed while resuming: staged {}, served {}",
+                            known.value,
+                            served
+                        ));
+                    }
+                    continue;
+                }
+            }
             if let Some(declared) = declared_length(response.headers()) {
                 if declared != end - start + 1 {
                     return Err(anyhow!(
@@ -6974,11 +7279,19 @@ pub async fn download_resumable_stream(
         if let Some(known) = validator.as_ref() {
             on_validator(known);
         }
+        // Renewed here and periodically below: the reclaim window is minutes,
+        // and a slow link on a large file runs for hours.
+        on_lease();
+        let mut last_lease_renewal = std::time::Instant::now();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("error reading download stream")?;
             file.write_all(&chunk)
                 .context("error writing to staging file")?;
+            if last_lease_renewal.elapsed() >= LEASE_RENEWAL_INTERVAL {
+                on_lease();
+                last_lease_renewal = std::time::Instant::now();
+            }
         }
         file.sync_all().context("error syncing staging file")?;
         drop(file);
@@ -7676,9 +7989,37 @@ fn looks_like_post_dir(name: &str) -> bool {
     };
 
     let bytes = test_str.as_bytes();
+    // A directory is only "post-shaped" when its date is a real calendar date:
+    // an 8-digit run or a `YYYY?MM?DD` prefix with month 1-12 and day 1-31.
+    // The shape test alone accepted `20261399` and `2026-99-99`, which skipped
+    // real delivery directories (anything numeric of the right length, a
+    // numeric user id included) during the folder search.
+    let plausible_date = |year: &[u8], month: &[u8], day_prefix: &[u8]| -> bool {
+        let as_number = |digits: &[u8]| {
+            digits
+                .iter()
+                .fold(0u32, |acc, b| acc * 10 + (b - b'0') as u32)
+        };
+        if year.len() != 4 || !year.iter().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        if month.is_empty()
+            || month.len() > 2
+            || !month.iter().all(|b| b.is_ascii_digit())
+            || !(1..=12).contains(&as_number(month))
+        {
+            return false;
+        }
+        !day_prefix.is_empty() && day_prefix.iter().all(|b| b.is_ascii_digit()) && {
+            let day = as_number(day_prefix);
+            (1..=31).contains(&day)
+        }
+    };
     if bytes.len() >= 8 {
         // YYYYMMDD (8 consecutive digits)
-        if bytes[0..8].iter().all(|b| b.is_ascii_digit()) {
+        if bytes[0..8].iter().all(|b| b.is_ascii_digit())
+            && plausible_date(&bytes[0..4], &bytes[4..6], &bytes[6..8])
+        {
             return true;
         }
         // YYYY-MM-DD, YYYY_MM_DD, or YYYY.MM.DD
@@ -7688,12 +8029,12 @@ fn looks_like_post_dir(name: &str) -> bool {
                 if let Some(second_sep_pos) = bytes[5..].iter().position(|&b| b == sep) {
                     let second_idx = 5 + second_sep_pos;
                     let month = &bytes[5..second_idx];
-                    if !month.is_empty()
-                        && (1..=2).contains(&month.len())
-                        && month.iter().all(|b| b.is_ascii_digit())
-                        && second_idx + 1 < bytes.len()
-                        && bytes[second_idx + 1].is_ascii_digit()
-                    {
+                    let day: Vec<u8> = bytes[second_idx + 1..]
+                        .iter()
+                        .copied()
+                        .take_while(|b| b.is_ascii_digit())
+                        .collect();
+                    if !day.is_empty() && plausible_date(&bytes[0..4], month, &day) {
                         return true;
                     }
                 }
@@ -8099,6 +8440,12 @@ fn posts_to_observe(
          LEFT JOIN artists a ON a.id = s.artist_id
          WHERE (?3 IS NULL OR p.subscription_id = ?3)
            AND (p.assessment_state IN ('pending', 'partial', 'unverified', 'unavailable', 'unassessed', 'external')
+            -- `template` is the marker older ledgers carry; the sweep keeps
+            -- re-reading it so a pre-conversion row is not stranded. The
+            -- current value `template_scoped` is deliberately absent: a
+            -- converted row's reading no longer depends on the day search,
+            -- so it leaves the queue (pinned by the sibling-marker and
+            -- reason-arm tests).
             OR p.observed_source IN ('{FOLDER_FROM_DAY}', '{FOLDER_FROM_SIBLING_DAY}', 'template', '{FOLDER_SHARED_TEMPLATE}')
             OR (p.observed_source = '' AND p.assessment_reason = ?2))
          ORDER BY COALESCE(NULLIF(p.observed_at, ''), '1970-01-01T00:00:00Z') ASC, p.id ASC
@@ -8155,8 +8502,12 @@ enum ObserveRound {
 }
 
 /// Returns how the round ended. A round whose query or connection failed, or
-/// which could not persist a reading it took, reports `Failed`: no rows were
-/// read into the ledger, so nothing may be treated as newly observed.
+/// which could not persist a reading it took, reports `Failed`: the pass did
+/// not complete, so its outcome must not be read as a check that happened.
+/// Observations persisted before the failure stay in the ledger — they are
+/// facts about the folders they describe — but the caller gets no count for
+/// them and must not treat the round as evidence about anything it did not
+/// reach.
 fn observe_post_folders(pool: &Arc<DbPool>, only_subscription: Option<i64>) -> ObserveRound {
     let (rows, template) = {
         let conn = match pool.get() {
@@ -8279,6 +8630,17 @@ struct PostFileRow {
     /// Whether the source still lists this resource. A withdrawn attachment
     /// keeps its row and its delivered file but is no longer fetched.
     present_in_manifest: bool,
+    /// The source's own identity for the resource. Not always the path: an
+    /// attachment the source names by id is keyed by that id, and a reader
+    /// that answers "is this covered" under the path key misses every event
+    /// the ledger recorded under the id key.
+    source_identity: String,
+    /// Whether `expected_blake3` is the source's own digest (`source`) or this
+    /// install's checksum of received bytes (`local`). See `HASH_SOURCE_SITE`.
+    hash_source: String,
+    /// The last validator (ETag/Last-Modified) a response offered, encoded.
+    resume_validator: String,
+    expected_length: Option<i64>,
 }
 
 /// Stable creation order of a post's file rows.
@@ -8290,7 +8652,10 @@ struct PostFileRow {
 fn list_post_files(conn: &Connection, post_db_id: i64) -> Result<Vec<PostFileRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, remote_path, file_name, file_type, expected_blake3, status,
-                target_path, next_attempt_at, present_in_manifest
+                target_path, next_attempt_at, present_in_manifest,
+                COALESCE(source_identity, remote_path),
+                COALESCE(hash_source, ''), COALESCE(resume_validator, ''),
+                expected_length
          FROM kemono_files
          WHERE post_id = ?1
          ORDER BY id ASC",
@@ -8307,6 +8672,10 @@ fn list_post_files(conn: &Connection, post_db_id: i64) -> Result<Vec<PostFileRow
                 target_path: row.get(6)?,
                 next_attempt_at: row.get(7)?,
                 present_in_manifest: row.get::<_, Option<i64>>(8)?.unwrap_or(1) != 0,
+                source_identity: row.get(9)?,
+                hash_source: row.get(10)?,
+                resume_validator: row.get(11)?,
+                expected_length: row.get(12)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -8459,19 +8828,29 @@ fn backoff_minutes_for(message: &str, class: DeliveryErrorClass, attempt: i64) -
 /// the result is persisted so every later retry reuses it rather than
 /// re-rendering whatever the template says today.
 fn reserve_target_path(conn: &Connection, file_id: i64, desired: &Path) -> Result<PathBuf> {
+    // The check and the write share one IMMEDIATE transaction: two passes run
+    // concurrently by design (the scheduled round and a manual attempt are
+    // deliberately independent of the round slot), and with the check outside
+    // the write both could observe the target free and pin both rows to it —
+    // the loser's publish then fails `already exists` on every later round,
+    // and the following automatic pass settles its row from the winner's file
+    // being present. `kemono_files.target_path` carries no UNIQUE constraint
+    // that would catch the race, so the transaction is the only fence.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut target = desired.to_path_buf();
-    if target_reserved_by_another(conn, file_id, &target)? {
-        let (post_db_id, source_identity): (i64, String) = conn.query_row(
+    if target_reserved_by_another(&tx, file_id, &target)? {
+        let (post_db_id, source_identity): (i64, String) = tx.query_row(
             "SELECT post_id, source_identity FROM kemono_files WHERE id = ?1",
             params![file_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         target = with_stable_suffix(&target, &target_suffix(post_db_id, &source_identity));
     }
-    conn.execute(
+    tx.execute(
         "UPDATE kemono_files SET target_path = ?1, updated_at = ?2 WHERE id = ?3",
         params![target.to_string_lossy(), Utc::now().to_rfc3339(), file_id],
     )?;
+    tx.commit()?;
     Ok(target)
 }
 
@@ -8698,6 +9077,11 @@ impl RoundQueue {
 /// stopping earlier — so bounding the queue can never reorder or skip work.
 pub fn schedule_round_order(conn: &Connection, auto_only: bool) -> Result<RoundQueue> {
     let queued = {
+        // The day a scheduled row reports is the same local day the coverage
+        // calendar and the claim gate read. Projecting it from the raw source
+        // timestamp instead let a post published near UTC midnight carry a
+        // different day in the queue than in every other view of it.
+        let local_day = post_day_sql("p", post_source_date_column(conn));
         let mut stmt = conn.prepare(&format!(
             "SELECT id, subscription_id, artist_id, day
              FROM (
@@ -8707,7 +9091,7 @@ pub fn schedule_round_order(conn: &Connection, auto_only: bool) -> Result<RoundQ
                  FROM (
                      SELECT p.id AS id, p.subscription_id AS subscription_id,
                             s.artist_id AS artist_id,
-                            NULLIF(substr({POST_SORT_KEY_SQL}, 1, 10), '') AS day,
+                            NULLIF({local_day}, '') AS day,
                             {POST_SORT_KEY_SQL} AS sort_key
                      FROM kemono_posts p
                      JOIN kemono_subscriptions s ON s.id = p.subscription_id
@@ -8798,6 +9182,10 @@ pub fn schedule_round_order(conn: &Connection, auto_only: bool) -> Result<RoundQ
 /// which restored a file somebody had replaced with a same-size one as a
 /// completed download.
 fn reconcile_published_files(conn: &Connection, roots: &MediaRoots) -> Result<usize> {
+    // Mirrors `reset_stale_download_claims`'s window: anything older than
+    // this is a dead pass's leftover, anything younger may still be writing.
+    let stale_cutoff =
+        (Utc::now() - chrono::Duration::minutes(DOWNLOAD_CLAIM_LEASE_MINUTES)).to_rfc3339();
     let rows: Vec<(i64, String, i64, i64, String, String)> = {
         let mut stmt = conn.prepare(
             "SELECT f.id, j.target_path, j.expected_length, j.id, j.expected_blake3,
@@ -8810,10 +9198,18 @@ fn reconcile_published_files(conn: &Connection, roots: &MediaRoots) -> Result<us
                  AND j.source_identity = f.source_identity
                  AND j.manifest_version = p.manifest_version
                  AND j.stage IN ('published', 'ingested')
-             WHERE f.status != 'done'",
+             WHERE f.status != 'done'
+               -- A row a live pass holds is not this function's to settle:
+               -- writing it done behind the pass's back let the pass's own
+               -- settle then fail on the occupied target and mark a verified
+               -- delivery as failed. Stale claims (older than the reclaim
+               -- window) are fair game: their pass is gone.
+               AND (f.claimed_by = '' OR f.claimed_by IS NULL
+                    OR f.claimed_at IS NULL
+                    OR f.claimed_at < ?1)",
         )?;
         let collected = stmt
-            .query_map([], |row| {
+            .query_map(params![stale_cutoff], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -8851,9 +9247,18 @@ fn reconcile_published_files(conn: &Connection, roots: &MediaRoots) -> Result<us
              SET status = 'done', delivery_source = 'download', publish_job_id = ?1,
                  target_path = ?2, expected_length = ?3, expected_blake3 = ?6, local_hash = ?6,
                  integrity = 'verified', hash_source = 'local', verified_at = ?4,
-                 claimed_at = NULL, error_message = NULL, error_class = '',
+                 claimed_at = NULL, claimed_by = '', claim_token = claim_token + 1,
+                 resume_validator = '', error_message = NULL, error_class = '',
                  next_attempt_at = NULL, updated_at = ?4
-             WHERE id = ?5 AND source_identity = ?7",
+             WHERE id = ?5 AND source_identity = ?7
+               -- The candidate list was taken before the digest pass below,
+               -- which for large media takes seconds to minutes. A row that
+               -- was freshly re-claimed in that window is a live pass's
+               -- again; repeating the SELECT's freshness guard here keeps
+               -- this restore from clearing a claim it does not own.
+               AND (claimed_by = '' OR claimed_by IS NULL
+                    OR claimed_at IS NULL
+                    OR claimed_at < ?8)",
             params![
                 job_id,
                 target_path,
@@ -8861,7 +9266,8 @@ fn reconcile_published_files(conn: &Connection, roots: &MediaRoots) -> Result<us
                 Utc::now().to_rfc3339(),
                 file_id,
                 expected_blake3,
-                source_identity
+                source_identity,
+                stale_cutoff,
             ],
         )?;
         restored += 1;
@@ -8877,12 +9283,23 @@ fn reconcile_published_files(conn: &Connection, roots: &MediaRoots) -> Result<us
 #[derive(Clone, Debug)]
 struct DownloadClaim {
     owner: String,
+    /// The attempt this pass belongs to, when it has one. A previous pass of
+    /// the same attempt is dead by construction — `claim_attempt_for_run`
+    /// refuses a second live pass — so its fresh-looking lease is reclaimable
+    /// without waiting out the window. That is the resume path.
+    attempt_scope: Option<String>,
 }
 
 impl DownloadClaim {
-    fn new() -> Self {
+    fn new(attempt_scope: Option<&str>) -> Self {
         Self {
-            owner: format!("dl_{}", uuid::Uuid::new_v4().simple()),
+            owner: match attempt_scope {
+                Some(attempt_id) => {
+                    format!("dl:{attempt_id}:{}", uuid::Uuid::new_v4().simple())
+                }
+                None => format!("dl_{}", uuid::Uuid::new_v4().simple()),
+            },
+            attempt_scope: attempt_scope.map(str::to_string),
         }
     }
 
@@ -8895,7 +9312,19 @@ impl DownloadClaim {
     /// The claim increments the token itself, so the value returned here is the
     /// only one this pass can ever write with: a reclaim moves the row past it,
     /// and every guarded write then matches nothing.
+    ///
+    /// A row a *different* scope is actively receiving — a lease younger than
+    /// the reclaim window — is refused: two writers would append to the same
+    /// part file, and when the source published no digest nothing would stop
+    /// the interleaved bytes from being published as verified. A stale lease,
+    /// an unowned row, or a previous pass of this attempt is reclaimable.
     fn claim(&self, conn: &Connection, file_id: i64) -> Result<Option<i64>> {
+        let lease_cutoff =
+            (Utc::now() - Duration::minutes(DOWNLOAD_CLAIM_LEASE_MINUTES)).to_rfc3339();
+        let same_attempt_pattern = self
+            .attempt_scope
+            .as_deref()
+            .map(|attempt_id| format!("dl:{attempt_id}:%"));
         let token = conn
             .query_row(
                 "UPDATE kemono_files
@@ -8903,8 +9332,18 @@ impl DownloadClaim {
                      claim_token = claim_token + 1, attempt_count = attempt_count + 1,
                      updated_at = ?1
                  WHERE id = ?3
+                   AND (claimed_by IS NULL OR claimed_by = ''
+                        OR claimed_at IS NULL OR claimed_at < ?4
+                        OR claimed_by = ?2
+                        OR (?5 IS NOT NULL AND claimed_by LIKE ?5))
                  RETURNING claim_token",
-                params![Utc::now().to_rfc3339(), self.owner, file_id],
+                params![
+                    Utc::now().to_rfc3339(),
+                    self.owner,
+                    file_id,
+                    lease_cutoff,
+                    same_attempt_pattern
+                ],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?;
@@ -8980,6 +9419,19 @@ fn settle_claimed_file(
 /// that worker makes is conditional on that token. That is what makes "the lease
 /// expired" mean "the old worker can no longer commit" instead of "the old
 /// worker is assumed to have stopped".
+/// How often a streaming receive renews its row lease. The reclaim window is
+/// sixty minutes; renewing well inside it keeps a live receive from having its
+/// row — and with it the part file it is appending to — handed to a second
+/// pass while the first is still writing.
+const LEASE_RENEWAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// How long a `downloading` row's lease is trusted before another pass may
+/// take it. `reset_stale_download_claims`, `DownloadClaim::claim`, the manual
+/// attempt's row reset, and `reconcile_published_files` all share the window:
+/// a live receive renews roughly every `LEASE_RENEWAL_INTERVAL`, so the window
+/// only has to outlast one renewal gap with margin.
+const DOWNLOAD_CLAIM_LEASE_MINUTES: i64 = 60;
+
 fn reset_stale_download_claims(conn: &Connection, lease_minutes: i64) -> Result<usize> {
     let cutoff = (Utc::now() - Duration::minutes(lease_minutes.max(1))).to_rfc3339();
     let recovered = conn.execute(
@@ -9038,7 +9490,12 @@ pub fn cancel_attempt(conn: &Connection, attempt_id: &str) -> Result<CancelOutco
         "done" => Ok(CancelOutcome::AlreadyFinished),
         _ => {
             let now = Utc::now().to_rfc3339();
-            let changed = conn.execute(
+            // One transaction for both writes: the attempt flag and its posts'
+            // cancelled rows are one decision, and a crash between two bare
+            // statements left the attempt cancelled with posts still reading
+            // as outstanding.
+            let tx = conn.unchecked_transaction()?;
+            let changed = tx.execute(
                 "UPDATE pawchive_attempts SET state = 'cancelled', updated_at = ?1
                  WHERE attempt_id = ?2 AND state NOT IN ('done', 'cancelled')",
                 params![now, attempt_id],
@@ -9046,17 +9503,19 @@ pub fn cancel_attempt(conn: &Connection, attempt_id: &str) -> Result<CancelOutco
             if changed == 0 {
                 // The state moved between the read and the write; report what it
                 // is now rather than claiming a cancel that did not happen.
+                drop(tx);
                 return Ok(match attempt_state(conn, attempt_id)?.as_deref() {
                     Some("cancelled") => CancelOutcome::AlreadyCancelled,
                     Some("done") => CancelOutcome::AlreadyFinished,
                     _ => CancelOutcome::Unknown,
                 });
             }
-            let posts = conn.execute(
+            let posts = tx.execute(
                 "UPDATE pawchive_attempt_posts SET state = 'cancelled', updated_at = ?1
                  WHERE attempt_id = ?2 AND state IN ('queued', 'failed', 'conflict')",
                 params![now, attempt_id],
             )? as i64;
+            tx.commit()?;
             Ok(CancelOutcome::Cancelled { posts })
         }
     }
@@ -9114,6 +9573,10 @@ pub async fn download_post_files_with_settings(
         DownloadPostPolicy::Automatic,
     )
     .await
+    // The automatic path derives completion from evidence (the evaluator is
+    // its only writer), so the interruption facts the report carries matter
+    // only to the manual attempt's per-post states.
+    .map(|report| report.fetched)
 }
 
 /// What caused a sync round. The per-subscription `enabled` flag only gates

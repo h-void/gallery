@@ -1,14 +1,14 @@
 //! Character CCIP embedding + recognition (pure Rust, official ONNX Runtime).
 //!
 //! Preprocess matches Python `embedding.py`:
-//! RGB → resize 384×384 bicubic → NCHW float32 /255 → session → L2 normalize (dim 768).
+//! RGB → resize 384×384 bilinear (Triangle) → NCHW float32 /255 → session → L2 normalize (dim 768).
 //! Prefer existing `IMAGE_PREVIEW_CACHE_DIR` thumbs (512) over decoding the full original.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use image::imageops::FilterType;
@@ -24,7 +24,12 @@ use crate::media_roots::{authorized_media_path, env_media_roots, MediaRoots};
 
 const IMAGE_SIZE: u32 = 384;
 const EMBEDDING_DIM: usize = 768;
-const DEFAULT_THRESHOLD: f32 = 0.23;
+/// Default cosine-similarity acceptance threshold aligned with official
+/// `ccip-caformer_b36-24` DBSCAN eps 0.14132 (`cos = 1 - 2 * diff = 0.7174`)
+/// and validated on the live library distribution (`tools/scan_ccip_distribution_api.py`).
+/// `needs_review` uses `thr * 0.8` (`0.5739`), matching the official pairwise
+/// F1-optimal threshold (`diff = 0.21323 → cos = 0.5735`).
+const DEFAULT_THRESHOLD: f32 = 0.7174;
 const DEFAULT_MIN_GAP: f32 = 0.04;
 const DEFAULT_MODEL_IDLE_TIMEOUT_SECONDS: u64 = 600;
 
@@ -834,21 +839,21 @@ fn open_rgb_for_recognition(path: &Path) -> Result<(image::RgbImage, &'static st
 }
 
 /// NCHW float32 /255 plane, shape (1, 3, 384, 384).
-// The `channel * plane_size` idiom is kept explicit for all three channels;
-// clippy flags the channel-0 `0 * h * w` term as an erasing operation.
-#[allow(clippy::erasing_op, clippy::identity_op)]
+// Uses bilinear interpolation (standard for deep learning vision models and 4x
+// faster than CatmullRom cubic) and contiguous plane-slice unpacking for auto-vectorization.
 fn preprocess_rgb(img: &image::RgbImage) -> Vec<f32> {
-    let resized = image::imageops::resize(img, IMAGE_SIZE, IMAGE_SIZE, FilterType::CatmullRom);
+    let resized = image::imageops::resize(img, IMAGE_SIZE, IMAGE_SIZE, FilterType::Triangle);
     let h = IMAGE_SIZE as usize;
     let w = IMAGE_SIZE as usize;
-    let mut data = vec![0.0f32; 1 * 3 * h * w];
-    for y in 0..h {
-        for x in 0..w {
-            let p = resized.get_pixel(x as u32, y as u32).0;
-            data[0 * h * w + y * w + x] = p[0] as f32 / 255.0;
-            data[1 * h * w + y * w + x] = p[1] as f32 / 255.0;
-            data[2 * h * w + y * w + x] = p[2] as f32 / 255.0;
-        }
+    let plane = h * w;
+    let mut data = vec![0.0f32; 3 * plane];
+    let (r_plane, rest) = data.split_at_mut(plane);
+    let (g_plane, b_plane) = rest.split_at_mut(plane);
+    let raw = resized.as_raw();
+    for (i, rgb) in raw.chunks_exact(3).enumerate() {
+        r_plane[i] = rgb[0] as f32 / 255.0;
+        g_plane[i] = rgb[1] as f32 / 255.0;
+        b_plane[i] = rgb[2] as f32 / 255.0;
     }
     data
 }
@@ -883,16 +888,161 @@ fn run_embedding(data: Vec<f32>) -> Result<Vec<f32>> {
     })
 }
 
+/// Bounded in-memory item/path embedding cache (~3 MiB cap at 1024 × 768 f32)
+/// so `discover` → `commit` rounds, repeated UI recognitions, and import retries
+/// reuse extracted feature vectors without re-decoding or re-running ONNX.
+const EMBEDDING_CACHE_MAX_ENTRIES: usize = 1024;
+
+#[derive(Clone)]
+struct CachedMediaEmbedding {
+    key: String,
+    vector: Vec<f32>,
+    source: &'static str,
+}
+
+fn media_embedding_cache_slot() -> &'static Mutex<VecDeque<CachedMediaEmbedding>> {
+    static CACHE: OnceLock<Mutex<VecDeque<CachedMediaEmbedding>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(VecDeque::with_capacity(EMBEDDING_CACHE_MAX_ENTRIES)))
+}
+
+fn media_embedding_cache_key(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let (repo, variant, file) = embedding_model_meta();
+    Some(format!(
+        "{}|{}|{}|{}|{}|{}",
+        path.to_string_lossy(),
+        meta.len(),
+        modified,
+        repo,
+        variant,
+        file
+    ))
+}
+
+fn lookup_cached_media_embedding(key: &str) -> Option<(Vec<f32>, &'static str)> {
+    let mut guard = media_embedding_cache_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let pos = guard.iter().position(|entry| entry.key == key)?;
+    let entry = guard.remove(pos)?;
+    let out = (entry.vector.clone(), entry.source);
+    guard.push_back(entry);
+    Some(out)
+}
+
+fn store_cached_media_embedding(key: String, vector: &[f32], source: &'static str) {
+    let mut guard = media_embedding_cache_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(pos) = guard.iter().position(|entry| entry.key == key) {
+        guard.remove(pos);
+    } else if guard.len() >= EMBEDDING_CACHE_MAX_ENTRIES {
+        guard.pop_front();
+    }
+    guard.push_back(CachedMediaEmbedding {
+        key,
+        vector: vector.to_vec(),
+        source,
+    });
+}
+
+/// Sample pixel luminance variance on a stride to detect solid black/white
+/// video fade-in frames at `0.1s`.
+fn rgb_luminance_variance(img: &image::RgbImage) -> f32 {
+    let raw = img.as_raw();
+    let pixels = raw.len() / 3;
+    if pixels <= 1 {
+        return 0.0;
+    }
+    let step = (pixels / 1024).max(1);
+    let mut count = 0usize;
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut idx = 0usize;
+    while idx < pixels {
+        let base = idx * 3;
+        let y = 0.299 * (raw[base] as f64)
+            + 0.587 * (raw[base + 1] as f64)
+            + 0.114 * (raw[base + 2] as f64);
+        sum += y;
+        sum_sq += y * y;
+        count += 1;
+        idx += step;
+    }
+    if count <= 1 {
+        return 0.0;
+    }
+    let mean = sum / (count as f64);
+    ((sum_sq / (count as f64)) - mean * mean).max(0.0) as f32
+}
+
+/// Extract a representative video frame (reusing the shared disk frame cache),
+/// probing `1.0s` when `0.1s` lands on a near-uniform black/white fade-in frame.
+fn open_video_rgb_for_recognition(
+    path: &Path,
+    item_id: i64,
+) -> Result<(image::RgbImage, &'static str)> {
+    let (jpeg, _) = crate::media_serve::cached_or_extract_video_frame_jpeg_blocking(path, 0.1)
+        .map_err(|e| anyhow!(e.to_string()))?;
+    let img = image::load_from_memory(&jpeg)
+        .with_context(|| format!("decode video frame for item {item_id}"))?
+        .to_rgb8();
+    let var_early = rgb_luminance_variance(&img);
+    if var_early < 16.0 {
+        if let Ok((later_jpeg, _)) =
+            crate::media_serve::cached_or_extract_video_frame_jpeg_blocking(path, 1.0)
+        {
+            if let Ok(later_img) = image::load_from_memory(&later_jpeg).map(|d| d.to_rgb8()) {
+                if rgb_luminance_variance(&later_img) > var_early {
+                    return Ok((later_img, "video_frame"));
+                }
+            }
+        }
+    }
+    Ok((img, "video_frame"))
+}
+
 /// Embed a local image file path via CCIP.
 pub fn embed_image_path(path: &Path) -> Result<Vec<f32>> {
-    let (rgb, _src) = open_rgb_for_recognition(path)?;
-    run_embedding(preprocess_rgb(&rgb))
+    let (emb, _src) = embed_image_path_with_source(path)?;
+    Ok(emb)
 }
 
 /// Embed + report whether preview cache was used.
 pub fn embed_image_path_with_source(path: &Path) -> Result<(Vec<f32>, &'static str)> {
+    let cache_key = media_embedding_cache_key(path);
+    if let Some(ref key) = cache_key {
+        if let Some(hit) = lookup_cached_media_embedding(key) {
+            return Ok(hit);
+        }
+    }
     let (rgb, src) = open_rgb_for_recognition(path)?;
-    Ok((run_embedding(preprocess_rgb(&rgb))?, src))
+    let emb = run_embedding(preprocess_rgb(&rgb))?;
+    if let Some(key) = cache_key {
+        store_cached_media_embedding(key, &emb, src);
+    }
+    Ok((emb, src))
+}
+
+fn embed_video_path_with_source(path: &Path, item_id: i64) -> Result<(Vec<f32>, &'static str)> {
+    let cache_key = media_embedding_cache_key(path);
+    if let Some(ref key) = cache_key {
+        if let Some(hit) = lookup_cached_media_embedding(key) {
+            return Ok(hit);
+        }
+    }
+    let (img, src) = open_video_rgb_for_recognition(path, item_id)?;
+    let emb = run_embedding(preprocess_rgb(&img))?;
+    if let Some(key) = cache_key {
+        store_cached_media_embedding(key, &emb, src);
+    }
+    Ok((emb, src))
 }
 
 /// Embed a gallery item (image via preview path, video via ffmpeg frame).
@@ -938,14 +1088,26 @@ pub(crate) fn embed_item_with_roots(
         let (emb, src) = embed_image_path_with_source(&path)?;
         return Ok((emb, file_path, file_name, src));
     }
-    // video: extract a frame via shared media_serve ffmpeg executor to memory, decode directly
-    let jpeg = crate::media_serve::extract_video_frame_jpeg_blocking(&path, 0.1)
-        .map_err(|e| anyhow!(e.to_string()))?;
-    let img = image::load_from_memory(&jpeg)
-        .with_context(|| format!("decode video frame for item {item_id}"))?
-        .to_rgb8();
-    let emb = run_embedding(preprocess_rgb(&img))?;
-    Ok((emb, file_path, file_name, "video_frame"))
+    let (emb, src) = embed_video_path_with_source(&path, item_id)?;
+    Ok((emb, file_path, file_name, src))
+}
+
+/// Embed a candidate item whose path and media_type are already known, avoiding
+/// an extra SQLite roundtrip query per candidate.
+pub(crate) fn embed_candidate_with_roots(
+    roots: &MediaRoots,
+    item_id: i64,
+    file_path: &str,
+    media_type: &str,
+) -> Result<Vec<f32>> {
+    let path = authorized_media_path(roots, file_path)
+        .map_err(|_| anyhow!("item media path is not allowed"))?;
+    if media_type != "video" {
+        let (emb, _src) = embed_image_path_with_source(&path)?;
+        return Ok(emb);
+    }
+    let (emb, _src) = embed_video_path_with_source(&path, item_id)?;
+    Ok(emb)
 }
 
 /// Validate a 768-d non-zero embedding and pack little-endian blob.
@@ -1002,7 +1164,7 @@ fn parse_embedding_blob(blob: &[u8], dim: i64) -> Option<Vec<f32>> {
 }
 
 #[derive(Clone)]
-struct RefMeta {
+pub(crate) struct RefMeta {
     character_id: i64,
     character_name: String,
     reference_id: i64,
@@ -1021,23 +1183,27 @@ fn reference_index_cache_slot() -> &'static ReferenceIndexCache {
     REFERENCE_INDEX_CACHE.get_or_init(|| Mutex::new(None))
 }
 
-/// Fingerprint covering inserts (MAX(id)), deletes (COUNT), and item_id
-/// remaps (item_id aggregates). Embedding blobs are written together with a
-/// new row id in this codebase, so no update-only mutation exists.
+/// Fingerprint covering inserts (MAX(id)), deletes (COUNT), item_id remaps
+/// (item_id aggregates), and `verified` promotion/demotion (verified count and
+/// id sum).
 fn reference_table_signature(conn: &Connection) -> Result<String> {
     conn.query_row(
         "SELECT COUNT(*), COALESCE(MAX(id), 0),
                 COALESCE(MAX(COALESCE(item_id, 0)), 0),
-                COALESCE(SUM(COALESCE(item_id, 0)), 0)
+                COALESCE(SUM(COALESCE(item_id, 0)), 0),
+                COALESCE(SUM(CASE WHEN COALESCE(verified, 1) = 1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN COALESCE(verified, 1) = 1 THEN id ELSE 0 END), 0)
          FROM character_references",
         [],
         |row| {
             Ok(format!(
-                "{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}",
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         },
     )
@@ -1069,7 +1235,7 @@ fn store_reference_index(conn: &Connection, signature: &str, vectors: &[RefMeta]
     *guard = Some((key, vectors.to_vec()));
 }
 
-fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
+pub(crate) fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
     let signature = reference_table_signature(conn)?;
     if let Some(cached) = cached_reference_index(conn, &signature) {
         return Ok(cached);
@@ -1077,6 +1243,11 @@ fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
     let repo = model_repo_id();
     let variant = model_variant();
     let file = model_file();
+    // Only verified rows join the retrieval library; the autonomous
+    // organization pipeline enrolls unconfirmed candidates as verified=0
+    // (RFC-2026-AUTONOMOUS-ORGANIZE chapter 7), which must never answer
+    // recognition queries. Legacy databases gain the column with DEFAULT 1
+    // through ensure_character_reference_columns.
     let mut stmt = conn.prepare(
         "SELECT cr.id, cr.character_id, c.name, cr.item_id, cr.embedding, cr.embedding_dim,
                 cr.embedding_model_repo_id, cr.embedding_model_variant, cr.embedding_model_file
@@ -1084,6 +1255,7 @@ fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
          JOIN characters c ON c.id = cr.character_id
          WHERE cr.embedding IS NOT NULL
            AND cr.embedding_dim = ?
+           AND COALESCE(cr.verified, 1) = 1
            AND (
              (cr.embedding_model_variant = ? AND cr.embedding_model_file = ?)
              OR (cr.embedding_model_variant = ? AND (cr.embedding_model_file = '' OR cr.embedding_model_file IS NULL))
@@ -1130,7 +1302,7 @@ fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
             "SELECT cr.id, cr.character_id, c.name, cr.item_id, cr.embedding, cr.embedding_dim
              FROM character_references cr
              JOIN characters c ON c.id = cr.character_id
-             WHERE cr.embedding IS NOT NULL AND cr.embedding_dim = ?",
+             WHERE cr.embedding IS NOT NULL AND cr.embedding_dim = ? AND COALESCE(cr.verified, 1) = 1",
         )?;
         let rows = stmt.query_map(params![EMBEDDING_DIM as i64], |r| {
             Ok((
@@ -1159,16 +1331,23 @@ fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
     Ok(out)
 }
 
-fn rank_characters(query: &[f32], refs: &[RefMeta], top_k: usize) -> Vec<Value> {
-    let mut best: HashMap<i64, (f32, &RefMeta)> = HashMap::new();
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+pub(crate) fn rank_characters(query: &[f32], refs: &[RefMeta], top_k: usize) -> Vec<Value> {
+    let mut best: HashMap<i64, (f32, &RefMeta)> = HashMap::with_capacity(refs.len().min(128));
     for r in refs {
-        let mut score = 0.0f32;
-        for (a, b) in query.iter().zip(r.vector.iter()) {
-            score += a * b;
-        }
-        match best.get(&r.character_id) {
-            Some((prev, _)) if *prev >= score => {}
-            _ => {
+        let score = dot(query, &r.vector);
+        match best.get_mut(&r.character_id) {
+            Some((prev, prev_ref)) => {
+                if score > *prev {
+                    *prev = score;
+                    *prev_ref = r;
+                }
+            }
+            None => {
                 best.insert(r.character_id, (score, r));
             }
         }

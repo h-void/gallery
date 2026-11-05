@@ -105,6 +105,8 @@ export function openArchiveModal(itemId, opener = null) {
   const dialog = $('#archiveDialog');
   if (!dialog) return;
 
+  // Ensure listeners are wired even when opened directly before bindArchiveModal runs.
+  bindArchiveModal();
   archiveDialogOpener = opener;
   currentItemId = itemId;
   currentArchiveData = null;

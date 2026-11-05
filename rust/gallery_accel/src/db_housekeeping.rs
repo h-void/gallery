@@ -169,10 +169,60 @@ fn run_housekeeping_batch_inner(
         params![scan_candidate_cutoff, batch_size],
     )?;
     tx.commit()?;
+    if missing_sweep {
+        if let Err(error) = maybe_vacuum_database(conn) {
+            crate::log_error!("housekeeping vacuum failed: {error}");
+        }
+    }
     Ok(HousekeepingResult {
         missing_items_deleted,
         scan_seen_deleted,
         scan_candidates_deleted,
         missing_items_backup,
     })
+}
+
+const VACUUM_MIN_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+static LAST_VACUUM: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Run VACUUM when the freelist has grown past 100 MB and accounts for at least 20%
+/// of total database pages. Throttled to at most once per 24 hours.
+pub fn maybe_vacuum_database(conn: &Connection) -> Result<bool> {
+    let mut last = LAST_VACUUM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(at) = *last {
+        if at.elapsed() < VACUUM_MIN_INTERVAL {
+            return Ok(false);
+        }
+    }
+
+    let free_pages: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap_or(0);
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap_or(0);
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap_or(4096);
+    let reclaimable = free_pages.saturating_mul(page_size);
+
+    if reclaimable >= 100 * 1024 * 1024
+        && page_count > 0
+        && (free_pages as f64 / page_count as f64) >= 0.20
+    {
+        *last = Some(Instant::now());
+        drop(last);
+        log_info!(
+            "housekeeping: reclaimable space {} MB ({}/{} pages); running VACUUM",
+            reclaimable / (1024 * 1024),
+            free_pages,
+            page_count
+        );
+        conn.execute_batch("VACUUM;")?;
+        log_info!("housekeeping: VACUUM completed successfully");
+        return Ok(true);
+    }
+    Ok(false)
 }

@@ -29,6 +29,27 @@ const ACTUAL_PROVIDER_LABELS = {
   none: '无可用会话',
 };
 
+const DEGRADED_REASON_LABELS = {
+  folder_archive_failed_plans: '文件夹整理',
+  database_missing: '数据库文件不存在',
+  database_metadata_unavailable: '数据库状态未上报',
+  database_error: '数据库读取失败',
+  schema_error: '数据库结构检查失败',
+  database_connection_unavailable: '数据库异常',
+  backup_error: '数据库备份失败',
+  health_worker_failed: '状态检查失败',
+  worker_status_mutex_poisoned: '检查异常',
+  worker_scan: '扫描出错',
+  worker_hash: '检查异常',
+  worker_backup: '数据库备份失败',
+};
+
+function degradedReasonLabel(reason) {
+  const key = String(reason || '').trim();
+  const label = DEGRADED_REASON_LABELS[key];
+  return label ? t(label) : key;
+}
+
 function providerLabel(value, map, fallback) {
   return map[value] || value || fallback;
 }
@@ -61,7 +82,10 @@ export async function loadDimensionBackfillStatus(options = {}) {
     return status;
   } catch (e) {
     if (isAbortError(e)) throw e;
-    state.dimensionBackfill = {running: false, complete: false, error: e.message || String(e)};
+    const isInitializing = e?.message === 'initializing' || state.healthSummary?.initializing;
+    state.dimensionBackfill = isInitializing
+      ? {running: false, complete: false, initializing: true}
+      : {running: false, complete: false, error: e.message || String(e)};
     renderDimensionBackfillStatus();
     return state.dimensionBackfill;
   }
@@ -119,7 +143,10 @@ export async function loadHashStatus(options = {}) {
     return status;
   } catch (e) {
     if (isAbortError(e)) throw e;
-    const status = {database_error: true, error: e.message || String(e)};
+    const isInitializing = e?.message === 'initializing' || state.healthSummary?.initializing;
+    const status = isInitializing
+      ? {initializing: true}
+      : {database_error: true, error: e.message || String(e)};
     if (updateState) state.hashStatus = status;
     if (render) renderHashStatus();
     return status;
@@ -143,7 +170,8 @@ export async function loadMlRuntime(options = {}) {
     return {status, settings};
   } catch (e) {
     if (isAbortError(e)) throw e;
-    const errorStatus = {error: e.message || String(e)};
+    const isInitializing = e?.message === 'initializing' || state.healthSummary?.initializing;
+    const errorStatus = isInitializing ? {initializing: true} : {error: e.message || String(e)};
     if (updateState) state.mlRuntimeStatus = errorStatus;
     if (render) renderMlRuntime();
     return {status: errorStatus, settings: null};
@@ -181,6 +209,17 @@ export function renderMlRuntime() {
 
   const inlineStatus = $('#mlRuntimeInlineStatus');
   panel.classList.toggle('is-error', Boolean(status.error));
+  if (status.initializing) {
+    summaryEl.textContent = t('初始化中');
+    statusEl.innerHTML = `<div class="status-muted small">${escHtml(t('初始化中'))}</div>`;
+    if (inlineStatus) {
+      inlineStatus.textContent = '';
+      inlineStatus.classList.remove('is-error');
+    }
+    if (retryBtn) retryBtn.disabled = true;
+    if (sourceSelect) sourceSelect.disabled = busy;
+    return;
+  }
   if (status.error) {
     summaryEl.textContent = '读取失败';
     statusEl.innerHTML = `<div class="status-muted small">${escHtml(status.error)}</div>`;
@@ -527,7 +566,10 @@ export function renderDimensionBackfillStatus() {
   const running = Boolean(status.running);
   btn.disabled = busy || running;
   btn.textContent = running || busy ? '补全中' : '补全媒体尺寸';
-  if (status.error) {
+  if (status.initializing) {
+    result.textContent = '';
+    result.style.color = '';
+  } else if (status.error) {
     result.textContent = `${t('补全失败：{status}', {status: status.error})}`;
     result.style.color = 'var(--status-danger)';
   } else if (running) {
@@ -743,7 +785,9 @@ export function renderHealthSummary() {
     && healthNumber(scan.total_estimate) != null
     && scan.scanned_count < scan.total_estimate;
   const scanIsError = scanKnown && (scan.status === 'error' || scan.phase === 'error' || scan.phase === 'failed');
-  const scanIsWarn = scanIncomplete || scan.phase === 'interrupted' || scan.phase === 'partial';
+  // `scan` is absent from the boot gate's initializing health answer, so
+  // every read below it stays behind its own known-flag.
+  const scanIsWarn = scanKnown && (scanIncomplete || scan.phase === 'interrupted' || scan.phase === 'partial');
   const scanStatus = !scanKnown
     ? 'status-muted'
     : (scanIsError ? 'status-danger' : (scanIsWarn ? 'status-warn' : (scan.status === 'scanning' ? 'status-info' : 'status-ok')));
@@ -757,8 +801,14 @@ export function renderHealthSummary() {
   const errorStatus = !errorsKnown ? 'status-muted' : (errors.length ? 'status-warn' : 'status-ok');
   const archiveFailedPlans = folderArchiveKnown ? healthNumber(folderArchive.failed_plans) : null;
   const archiveStatus = !folderArchiveKnown || archiveFailedPlans == null ? 'status-muted' : (archiveFailedPlans > 0 ? 'status-danger' : 'status-ok');
-  const overallStatus = health.degraded === true ? 'status-danger' : 'status-ok';
-  const overallText = health.degraded === true ? (degradedReasons.length ? t('需要处理 \u00b7 {reasons}', {reasons: degradedReasons.join('、')}) : t('需要处理')) : t('系统运行正常');
+  // The boot gate answers health with `initializing` while startup is
+  // still running; the status card then reports the phase instead of
+  // reading a healthy steady-state summary that is not there yet.
+  const initializing = health.initializing === true;
+  const overallStatus = initializing ? 'status-info' : (health.degraded === true ? 'status-danger' : 'status-ok');
+  const overallText = initializing
+    ? (health.phase ? t('初始化中 \u00b7 {phase}', {phase: String(health.phase)}) : t('初始化中'))
+    : (health.degraded === true ? (degradedReasons.length ? t('需要处理 \u00b7 {reasons}', {reasons: degradedReasons.map(degradedReasonLabel).join('、')}) : t('需要处理')) : t('系统运行正常'));
   const databaseText = !databaseKnown
     ? [t('数据库状态未上报')]
     : [
@@ -814,7 +864,7 @@ export function renderHealthSummary() {
     <div class="maintenance-card status-card ${scanStatus}"><b>${t('扫描')}</b><span title="${escHtml(formatHealthScanStatus(scan))}">${escHtml(formatHealthScanStatus(scan))}</span><span class="health-schedule">${escHtml(formatHealthSchedule(scanSchedule, 'next_auto_scan_at'))}</span></div>
     <div class="maintenance-card status-card ${hashStatus}"><b>${t('相同文件检查')}</b><span title="${escHtml(formatHealthHashStatus(hash))}">${escHtml(formatHealthHashStatus(hash))}</span></div>
     <div class="maintenance-card status-card ${archiveStatus}"><b>${t('文件夹整理')}</b><span title="${escHtml(archiveFailedPlans == null ? t('状态未上报') : (archiveFailedPlans ? `执行失败 ${archiveFailedPlans}` : t('无执行失败')))}">${escHtml(archiveFailedPlans == null ? t('状态未上报') : (archiveFailedPlans ? `执行失败 ${archiveFailedPlans}` : t('无执行失败')))}</span></div>
-    <button class="maintenance-card status-card ${errorArtistsCount ? 'status-danger' : 'status-ok'} error-artists-card" type="button" data-error-artists-open aria-haspopup="dialog" title="${t('点击查看出错画师列表及处理指引')}"><b>${t('出错画师（按画师）')}</b><span title="${escHtml(errorArtistsCount == null ? t('状态未上报') : (errorArtistsCount ? t('{count} 位画师', {count: errorArtistsCount}) : t('暂无出错画师')))}">${escHtml(errorArtistsCount == null ? t('状态未上报') : (errorArtistsCount ? t('{count} 位画师', {count: errorArtistsCount}) : t('暂无出错画师')))}</span></button>
+    <button class="maintenance-card status-card ${errorArtistsCount == null ? 'status-muted' : (errorArtistsCount ? 'status-danger' : 'status-ok')} error-artists-card" type="button" data-error-artists-open aria-haspopup="dialog" title="${t('点击查看出错画师列表及处理指引')}"><b>${t('出错画师（按画师）')}</b><span title="${escHtml(errorArtistsCount == null ? t('状态未上报') : (errorArtistsCount ? t('{count} 位画师', {count: errorArtistsCount}) : t('暂无出错画师')))}">${escHtml(errorArtistsCount == null ? t('状态未上报') : (errorArtistsCount ? t('{count} 位画师', {count: errorArtistsCount}) : t('暂无出错画师')))}</span></button>
     <div class="maintenance-card status-card ${logStatus}"><b>${t('日志')}</b>${healthSummaryDetail(logText, 1)}</div>
     <div class="maintenance-card status-card ${errorStatus}"><b>${t('最近错误')}</b><span>${errorHtml}</span></div>
   `;
@@ -825,7 +875,7 @@ export function renderHealthSummary() {
 
 export function renderHashStatus() {
   const status = state.hashStatus;
-  if (!status) {
+  if (!status || status.initializing) {
     $('#hashStatusText').textContent = t('等待检查');
     return;
   }

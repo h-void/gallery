@@ -123,6 +123,10 @@ pub(crate) struct ItemsQuery {
     /// 全部. Mirrors `app/api/items.py` `list_items(inbox=...)`.
     #[serde(default, deserialize_with = "deserialize_bool_lenient")]
     pub(crate) inbox: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_bool_lenient")]
+    pub(crate) undated: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_bool_lenient")]
+    pub(crate) missing_date: Option<bool>,
     /// Search filter, handled natively (raw substring on file_name/folder_name/
     /// file_path + pinyin on item tag names); mirrors `app/api/items.py`.
     pub(crate) search: Option<String>,

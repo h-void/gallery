@@ -23,7 +23,7 @@ pub fn tags_response(conn: &Connection, artist_id: i64) -> Result<Value> {
 }
 
 fn list_tags(conn: &Connection, artist_id: i64) -> Result<Vec<TagRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT t.id, t.artist_id, t.name, t.sort_order, COUNT(i.id) AS item_count
         FROM tags t
@@ -38,11 +38,11 @@ fn list_tags(conn: &Connection, artist_id: i64) -> Result<Vec<TagRow>> {
     let mut tags = stmt
         .query_map([artist_id], |row| {
             Ok(TagRow {
-                id: row.get("id")?,
-                artist_id: row.get("artist_id")?,
-                name: row.get("name")?,
-                sort_order: row.get("sort_order")?,
-                item_count: row.get("item_count")?,
+                id: row.get(0)?,
+                artist_id: row.get(1)?,
+                name: row.get(2)?,
+                sort_order: row.get(3)?,
+                item_count: row.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

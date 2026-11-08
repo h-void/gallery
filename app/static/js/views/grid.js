@@ -10,7 +10,7 @@ import { computeJustifiedRows, justifiedRowHeight } from '../justified.js';
 import { toast, logUiAction, collectSelectionLayoutLogContext } from '../logging.js';
 import { t } from '../i18n.js';
 import {
-  renderTagSearchResults, isGlobalSearchActive, renderSidebar, loadItemsPreservingDepth,
+  renderTagSearchResults, isGlobalSearchActive, renderSidebar, renderMediaFilter, loadItemsPreservingDepth,
 } from './sidebar.js';
 import { toggleSelect, selectOnly, applySelectionChange, scheduleCharacterTagSuggestions, executeBundleSelectedItems, classifyItems } from './editbar.js';
 import { openLightbox } from './lightbox.js';
@@ -460,7 +460,6 @@ function buildItemCardHtml(item, idx) {
     const artistJump = isGlobalSearchActive() && item.artist_id
       ? `<button class="btn btn-ghost artist-jump" type="button" data-artist-jump="${item.artist_id}" title="${t('转到 {name}', {name: escHtml(item.artist_name || '画师')})}">转到画师</button>`
       : '';
-    const previewUrl = escHtml(videoPreviewUrl(item));
 
     if (isArchive) {
       return `<div class="card archive-card${sel}" data-id="${item.id}" data-idx="${idx}" role="button" tabindex="0">
@@ -475,6 +474,7 @@ function buildItemCardHtml(item, idx) {
       </div>`;
     }
     if (mediaType === 'video') {
+      const previewUrl = escHtml(videoPreviewUrl(item));
       return `<div class="card video-card${sel}" data-id="${item.id}" data-idx="${idx}" role="button" tabindex="0">
         <div class="check${checkVisible}${chk}" data-check="${item.id}"></div>
         ${cardActions}
@@ -528,9 +528,12 @@ function buildItemCardHtml(item, idx) {
         </div>
       </div>`;
     }
-    return `<div class="card${sel}" data-id="${item.id}" data-idx="${idx}" role="button" tabindex="0">
+    const isLongImage = Number(item.width) > 0 && Number(item.height) > 0 && (Number(item.width) / Number(item.height)) < 0.52;
+    const longImageBadge = isLongImage ? `<span class="long-image-badge">${t('长图')}</span>` : '';
+    return `<div class="card${sel}" data-id="${item.id}" data-idx="${idx}"${isLongImage ? ' data-long-image="1"' : ''} role="button" tabindex="0">
         <div class="check${checkVisible}${chk}" data-check="${item.id}"></div>
         ${cardActions}
+        ${longImageBadge}
         <img class="thumb" data-src="${previewFileUrl}" decoding="async" fetchpriority="${imagePriority}" draggable="false">
         <div class="info">
           ${titleRow}
@@ -1121,7 +1124,8 @@ export function syncFavoriteButtons(item) {
 export async function toggleItemFavorite(item) {
   if (!item || isActionBusy('item-favorite', item.id)) return;
   const previous = Boolean(item.favorite);
-  const anchor = state.activeRole === '__favorites__' ? captureGridScrollAnchor() : null;
+  const isFavoritesView = state.activeMedia === '__favorites__' || state.activeRole === '__favorites__';
+  const anchor = isFavoritesView ? captureGridScrollAnchor() : null;
   setActionBusy('item-favorite', item.id, true);
   syncFavoriteButtons(item);
   try {
@@ -1132,8 +1136,9 @@ export async function toggleItemFavorite(item) {
     if (state.stats) {
       state.stats.favorites = Math.max(0, Number(state.stats.favorites || 0) + (item.favorite ? 1 : -1));
       renderSidebar();
+      renderMediaFilter();
     }
-    if (state.activeRole === '__favorites__' && !item.favorite) {
+    if (isFavoritesView && !item.favorite) {
       await loadItemsPreservingDepth();
       restoreGridScrollAnchor(anchor);
     } else {
@@ -1181,16 +1186,18 @@ export function observeImages() {
   if (!imageObserver) {
     const container = $('#gridContainer');
     imageObserver = new IntersectionObserver((entries) => {
+      let queuedAny = false;
       entries.forEach(entry => {
         if (entry.isIntersecting) {
           const img = entry.target;
           if (img.dataset.src) {
             if (imageObserver) imageObserver.unobserve(img);
             delete img.dataset.imageObserved;
-            queueImageLoad(img);
+            if (queueImageLoad(img, true)) queuedAny = true;
           }
         }
       });
+      if (queuedAny) pumpImageLoadQueue();
     }, { root: container || null, rootMargin: IMAGE_OBSERVER_ROOT_MARGIN });
   }
 
@@ -1204,6 +1211,40 @@ export function observeImages() {
   // Apply their intrinsic ratio so a mode switch cannot leave fallback rows.
   $$('#grid .thumb, #grid .video-thumb').forEach(img => {
     if (img.complete && img.naturalWidth > 0) updateItemAspectFromMedia(img);
+  });
+  observeGifAspectProbes();
+}
+
+const activeGifAspectProbes = new Map();
+
+function observeGifAspectProbes() {
+  if (typeof Image !== 'function') return;
+  const itemMap = itemsByIdMap();
+  $$('#grid .gif-card[data-id]').forEach(card => {
+    const id = Number(card.dataset.id);
+    const item = itemMap.get(id);
+    if (!item || (Number(item.width) > 0 && Number(item.height) > 0)) return;
+    if (card.dataset.gifAspectProbed === '1' || card.dataset.gifAspectProbing === '1') return;
+    card.dataset.gifAspectProbing = '1';
+    const probe = new Image();
+    probe.decoding = 'async';
+    activeGifAspectProbes.set(probe, card);
+    const previewSrc = API.previewUrl(item.file_path, fileVersionParam(item), IMAGE_PREVIEW_MAX_EDGE);
+    probe.onload = () => {
+      activeGifAspectProbes.delete(probe);
+      delete card.dataset.gifAspectProbing;
+      card.dataset.gifAspectProbed = '1';
+      updateItemAspectFromMedia({
+        naturalWidth: probe.naturalWidth,
+        naturalHeight: probe.naturalHeight,
+        closest: () => card,
+      });
+    };
+    probe.onerror = () => {
+      activeGifAspectProbes.delete(probe);
+      delete card.dataset.gifAspectProbing;
+    };
+    probe.src = previewSrc;
   });
 }
 
@@ -1227,11 +1268,11 @@ function reobserveImage(img) {
   imageObserver.observe(img);
 }
 
-function queueImageLoad(img) {
-  if (!img.dataset.src || img.dataset.imageQueued === '1' || img.dataset.imageLoading === '1' || img.dataset.imageLoaded === '1') return;
-  if (!isImageNearLoadWindow(img)) {
+function queueImageLoad(img, fromObserver = false) {
+  if (!img.dataset.src || img.dataset.imageQueued === '1' || img.dataset.imageLoading === '1' || img.dataset.imageLoaded === '1') return false;
+  if (!fromObserver && !isImageNearLoadWindow(img)) {
     reobserveImage(img);
-    return;
+    return false;
   }
   img.dataset.imageQueued = '1';
   // The pulse placeholder marks queued-or-loading thumbs only. Attaching it in
@@ -1240,7 +1281,8 @@ function queueImageLoad(img) {
   // never be scrolled to — so the class now travels with the load queue.
   img.classList.add('loading');
   if (!pendingImageLoads.includes(img)) pendingImageLoads.push(img);
-  pumpImageLoadQueue();
+  if (!fromObserver) pumpImageLoadQueue();
+  return true;
 }
 
 function pumpImageLoadQueue() {
@@ -1343,6 +1385,13 @@ export function releaseAllImageLoads() {
     delete img.dataset.imageQueued;
     img.removeAttribute('src');
   });
+  activeGifAspectProbes.forEach((card, probe) => {
+    probe.onload = null;
+    probe.onerror = null;
+    probe.src = '';
+    if (card && card.dataset) delete card.dataset.gifAspectProbing;
+  });
+  activeGifAspectProbes.clear();
 }
 
 function videoPreviewUrl(item) {
@@ -1527,14 +1576,26 @@ export function captureGridScrollAnchor() {
   if (!container) return null;
   const containerRect = container.getBoundingClientRect();
   const cards = [...$$('#grid .card[data-id]')];
-  const fullyVisible = cards.find(card => {
+  let fullyVisible = null;
+  let fullyVisibleRect = null;
+  let partiallyVisible = null;
+  let partiallyVisibleRect = null;
+  for (let i = 0; i < cards.length; i += 1) {
+    const card = cards[i];
     const rect = card.getBoundingClientRect();
-    return rect.top >= containerRect.top && rect.bottom <= containerRect.bottom;
-  });
-  const partiallyVisible = cards.find(card => {
-    const rect = card.getBoundingClientRect();
-    return rect.bottom > containerRect.top && rect.top < containerRect.bottom;
-  });
+    if (rect.top >= containerRect.top && rect.bottom <= containerRect.bottom) {
+      fullyVisible = card;
+      fullyVisibleRect = rect;
+      break;
+    }
+    if (!partiallyVisible && rect.bottom > containerRect.top && rect.top < containerRect.bottom) {
+      partiallyVisible = card;
+      partiallyVisibleRect = rect;
+    }
+    if (rect.top >= containerRect.bottom && partiallyVisible) {
+      break;
+    }
+  }
   const firstVisible = fullyVisible || partiallyVisible || cards[0] || null;
   const documentScroller = document.scrollingElement || document.documentElement;
   const containerScrollable = container.scrollHeight > container.clientHeight + 1;
@@ -1556,7 +1617,7 @@ export function captureGridScrollAnchor() {
     };
   }
   const visibleIndex = cards.indexOf(firstVisible);
-  const firstVisibleRect = firstVisible.getBoundingClientRect();
+  const firstVisibleRect = fullyVisibleRect || partiallyVisibleRect || firstVisible.getBoundingClientRect();
   return {
     id: firstVisible.dataset.id,
     orderedIds: cards.map(card => card.dataset.id).filter(Boolean),

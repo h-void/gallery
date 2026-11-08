@@ -13,7 +13,7 @@
     if(d){
       document.documentElement.setAttribute('data-theme','dark');
       var meta=document.querySelector('meta[name="theme-color"]');
-      if(meta)meta.setAttribute('content','#1A1612');
+      if(meta)meta.setAttribute('content','#151413');
     }
     // Language applies before first paint: <html lang> drives fonts and
     // assistive tech, data-lang lets CSS key off the active language.
@@ -26,10 +26,10 @@
 </script>
 <title>画廊</title>
 <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%23F4ECDD"/><circle cx="24" cy="24" r="7" fill="%23C04B3A"/><path d="M12 48l14-18 10 12 6-7 10 13z" fill="%23C04B3A"/></svg>'>
-<link rel="stylesheet" href="/static/styles/tokens.css?v=1.1.9">
-<link rel="stylesheet" href="/static/styles/base.css?v=1.1.9">
-<link rel="stylesheet" href="/static/styles/layout.css?v=1.1.9">
-<link rel="stylesheet" href="/static/styles/views.css?v=1.1.9">
+<link rel="stylesheet" href="/static/styles/tokens.css?v=1.1.10">
+<link rel="stylesheet" href="/static/styles/base.css?v=1.1.10">
+<link rel="stylesheet" href="/static/styles/layout.css?v=1.1.10">
+<link rel="stylesheet" href="/static/styles/views.css?v=1.1.10">
 <!-- Boot module graph, preloaded without ?v= so the hrefs match the import
      specifiers exactly (./store.js from main.js resolves to /static/js/store.js).
      Without these the browser discovers each module depth-by-depth from the
@@ -108,7 +108,7 @@
       </div>
       <label class="search-tags-only">
         <input type="checkbox" id="tagsOnlyToggle">
-        <span>仅角色精确匹配</span>
+        <span>仅搜角色</span>
       </label>
     </div>
   </div>
@@ -179,6 +179,7 @@
       <div class="sidebar-header">
         <button id="itemFiltersToggle" class="sidebar-section-toggle" data-sidebar-section-toggle="filters" type="button" aria-expanded="true" aria-controls="itemFiltersBody">
           <span>排序与日期</span>
+          <span id="itemDateFilterBadge" class="filter-active-dot" hidden aria-hidden="true"></span>
         </button>
         <button id="itemFiltersChevronToggle" class="sidebar-chevron-toggle" data-sidebar-chevron-toggle="filters" type="button" aria-expanded="true" aria-controls="itemFiltersBody" aria-label="折叠排序与日期">
           <span class="sidebar-section-chevron" aria-hidden="true"></span>
@@ -194,6 +195,12 @@
             <span>结束日期</span>
             <input id="itemDateTo" type="date">
           </label>
+        </div>
+        <div class="item-filter-undated-row">
+          <button id="itemUndatedBtn" class="sidebar-item sidebar-item-undated" type="button" aria-pressed="false">
+            <span>未识别日期</span>
+            <span class="count" id="itemUndatedCount" hidden>0</span>
+          </button>
         </div>
         <div class="item-filter-date-actions">
           <button id="itemDateReset" class="item-filter-reset item-date-reset-btn" type="button" disabled>重置日期</button>
@@ -217,6 +224,7 @@
         <button id="tagSectionToggle" class="sidebar-section-toggle" data-sidebar-section-toggle="tags" type="button" aria-expanded="true" aria-controls="tagSectionBody">
           <span>角色</span>
         </button>
+        <button id="tagCrossArtistBtn" class="item-filter-reset" type="button" hidden>跨画师</button>
         <button id="tagFilterReset" class="item-filter-reset" type="button" disabled>清空筛选</button>
         <select id="tagSort" class="tag-sort" aria-label="角色排序：默认 / 按名称升序 / 按作品数量降序" title="默认：系统顺序；名称：自然升序；数量：从多到少">
           <option value="default">默认</option>
@@ -261,7 +269,7 @@
     <div class="toolbar">
       <button id="browseReturnBtn" class="btn btn-primary browse-return-btn" type="button" hidden title="返回下载">← 返回下载</button>
       <button id="editModeBtn" class="btn btn-ghost edit-mode-btn" type="button" aria-pressed="false" title="进入编辑模式" aria-label="进入编辑模式">选择</button>
-      <button id="mobileFilterBtn" class="btn btn-ghost mobile-filter-btn" type="button" aria-expanded="false" aria-controls="filterSidebar">筛选</button>
+      <button id="mobileFilterBtn" class="btn btn-ghost mobile-filter-btn" type="button" aria-expanded="false" aria-controls="filterSidebar"><span>筛选</span><span id="mobileFilterBadge" class="filter-active-dot" hidden aria-hidden="true"></span></button>
       <select id="mediaFilter" class="media-filter-select" aria-label="媒体筛选" title="媒体筛选" disabled>
         <option value="">全部媒体</option>
       </select>
@@ -695,6 +703,7 @@
               <div class="character-library-column-head">
                 <div class="operation-log-title">已建角色</div>
                 <div class="character-library-column-head-actions">
+                  <button class="btn btn-ghost" id="characterUnverifiedFilterBtn" type="button" aria-pressed="false" title="仅显示有待复核参考图的角色">待复核</button>
                   <button class="btn btn-ghost" id="characterCreateBtn" type="button">新建角色</button>
                 </div>
               </div>
@@ -712,6 +721,7 @@
                   <div class="character-card-created" id="characterLibrarySelectedMeta"></div>
                 </div>
                 <div class="character-library-column-head-actions">
+                  <button class="btn btn-ghost" id="characterDiscoverCandidatesBtn" type="button" title="从该角色的作品与相似未标图中发现候选参考图">发现候选图</button>
                   <button class="btn btn-ghost" id="characterReferenceUploadBtn" type="button" title="从本机选一张照片作为该角色的参考图">添加照片</button>
                   <button class="btn btn-ghost character-library-back" id="characterLibraryBackBtn" type="button">返回角色</button>
                 </div>
@@ -1117,6 +1127,7 @@
         <div class="library-empty-artist-choices" id="libraryEmptyArtists" hidden></div>
         <div class="library-empty-actions">
           <button id="emptySelectArtistBtn" class="btn btn-primary" type="button" style="display:none">选择画师</button>
+          <button id="emptyGlobalFavoritesBtn" class="btn btn-ghost" type="button" style="display:none">★ 全库收藏</button>
           <button id="emptyScanBtn" class="btn btn-primary" type="button">扫描全库</button>
           <span id="libraryEmptyMeta">扫描将在后台自动运行，顶部会实时显示扫描进度。</span>
         </div>
@@ -1576,7 +1587,7 @@
   </div>
 </div>
 
-<script type="module" src="/static/js/main.js?v=1.1.9"></script>
+<script type="module" src="/static/js/main.js?v=1.1.10"></script>
 
 </body>
 </html>

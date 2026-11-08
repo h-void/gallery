@@ -127,8 +127,10 @@ pub use item_dates::update_item_dates_response;
 pub use item_detail::item_detail_response;
 pub use items::items_page_cursor_query_response;
 pub use items::items_page_cursor_query_response_ext;
+pub use items::items_page_cursor_query_response_with_undated;
 pub use items::items_page_query_response;
 pub use items::items_page_query_response_ext;
+pub use items::items_page_query_response_with_undated;
 pub use items::set_item_favorite_response;
 pub use link_index::{
     artist_links_response, reindex_artist_links, reindex_scanned_artist_links,
@@ -199,13 +201,15 @@ pub use pinyin_search::{search_text_for_values, text_matches_search};
 pub use product_ui::{
     auto_resolve_move_candidates, auto_resolve_move_candidates_with_roots,
     cancel_character_import_job, cleanup_stale_tag_single_references, confirm_all_artist_plans,
-    confirm_artist_suggestion, delete_character_reference, folder_rename_auto_run,
-    get_character_import_job, merge_move_candidate_group, merge_move_candidate_group_with_roots,
-    operation_log_response, purge_pseudo_tag_single_references, rebuild_character_index,
-    reconfirm_plan, run_idle_character_import_once, spawn_character_import_idle_worker,
+    confirm_artist_suggestion, delete_character_reference, discover_character_reference_candidates,
+    folder_rename_auto_run, get_character_import_job, merge_move_candidate_group,
+    merge_move_candidate_group_with_roots, operation_log_response,
+    purge_pseudo_tag_single_references, rebuild_character_index, reconfirm_plan,
+    run_idle_character_import_once, spawn_character_import_idle_worker,
     spawn_character_import_job_with_roots, start_character_import_job,
     start_character_import_job_with_roots, unconfirm_all_artist_plans, unconfirm_plan,
     update_folder_tags_by_name_response, update_folder_tags_response,
+    verify_all_character_references, verify_character_reference,
 };
 pub use recognition_status::{
     artist_recognition_status, character_model_signature, character_recognition_status,

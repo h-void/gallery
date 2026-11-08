@@ -14,6 +14,7 @@ import {
 } from './grid.js';
 import { loadItems, loadItemsPreservingDepth, isCurrentFolderScopeActive } from './sidebar.js';
 import { deleteMediaItem } from './lightbox.js';
+import { isBatchExtractableArchiveItem } from './archive_modal.js';
 
 const CHARACTER_SUGGESTION_SELECTED_LIMIT = 3;
 const CHARACTER_SUGGESTION_DELAY_MS = 120;
@@ -27,9 +28,34 @@ let editTagContextLoadToken = 0;
 let editTagContextInFlight = null;
 let editGlobalTagSearchToken = 0;
 
+let editItemsIndexRef = null;
+let editItemsIndexLen = -1;
+let editTaggableIdSet = new Set();
+let editItemsById = new Map();
+
+function ensureEditItemsIndex() {
+  const items = state.allItems || [];
+  if (items === editItemsIndexRef && items.length === editItemsIndexLen) {
+    return;
+  }
+  editItemsIndexRef = items;
+  editItemsIndexLen = items.length;
+  editTaggableIdSet = new Set();
+  editItemsById = new Map();
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i];
+    if (!item || item.id == null) continue;
+    const id = Number(item.id);
+    editItemsById.set(id, item);
+    if (isTaggableItem(item)) {
+      editTaggableIdSet.add(id);
+    }
+  }
+}
+
 function normalizeSelectionIds(ids) {
-  const validIds = new Set((state.allItems || []).filter(isTaggableItem).map(item => Number(item.id)));
-  return new Set([...ids].map(Number).filter(id => validIds.has(id)));
+  ensureEditItemsIndex();
+  return new Set([...ids].map(Number).filter(id => editTaggableIdSet.has(id)));
 }
 
 function selectionSetsEqual(a, b) {
@@ -45,12 +71,16 @@ export function applySelectionChange(ids, options = {}) {
   // cards, so the per-frame anchor capture — a getBoundingClientRect walk over
   // every card above the viewport — only burns the frame budget; its restore
   // calls no-op on a null anchor. The drag-end update takes the full path.
+  const nextIds = normalizeSelectionIds(ids instanceof Set ? ids : new Set(ids || []));
+  const changed = !selectionSetsEqual(state.selectedIds, nextIds);
+  if (!changed && options.reason === 'selection_box' && !options.forceLog) {
+    if (nextIds.size === 0) state.lastSelectedItemId = null;
+    return false;
+  }
   const gridScrollAnchor = options.reason === 'selection_box'
     ? null
     : captureGridScrollAnchor();
   const restoreSeq = nextRequestSeq('selectionRestoreSeq');
-  const nextIds = normalizeSelectionIds(ids instanceof Set ? ids : new Set(ids || []));
-  const changed = !selectionSetsEqual(state.selectedIds, nextIds);
   if (nextIds.size === 0) state.lastSelectedItemId = null;
   if (changed) {
     state.selectedIds = nextIds;
@@ -292,7 +322,8 @@ export function updateEditBar() {
     }
     const selectAllBtn = $('#editSelectAllBtn');
     if (selectAllBtn) {
-      const taggableCount = (state.allItems || []).filter(isTaggableItem).length;
+      ensureEditItemsIndex();
+      const taggableCount = editTaggableIdSet.size;
       const isAllSelected = taggableCount > 0 && state.selectedIds.size >= taggableCount;
       selectAllBtn.textContent = isAllSelected ? '取消全选' : '全选';
     }
@@ -306,12 +337,17 @@ export function updateEditBar() {
     }
     const extractArchivesBtn = $('#editExtractArchivesBtn');
     if (extractArchivesBtn) {
-      const selectedArchives = selectionActive
-        ? (state.allItems || []).filter(item => state.selectedIds.has(item.id) && (item.media_type === 'archive' || item.is_archive))
-        : [];
-      if (selectedArchives.length > 0) {
+      let selectedArchiveCount = 0;
+      if (selectionActive) {
+        ensureEditItemsIndex();
+        state.selectedIds.forEach(id => {
+          const item = editItemsById.get(Number(id));
+          if (item && isBatchExtractableArchiveItem(item)) selectedArchiveCount += 1;
+        });
+      }
+      if (selectedArchiveCount > 0) {
         extractArchivesBtn.hidden = false;
-        extractArchivesBtn.textContent = t('解压所选 ({count})', {count: selectedArchives.length});
+        extractArchivesBtn.textContent = t('解压所选 ({count})', {count: selectedArchiveCount});
       } else {
         extractArchivesBtn.hidden = true;
       }
@@ -335,8 +371,13 @@ export function updateEditBar() {
 }
 
 function selectedEditDateItems() {
-  const ids = new Set([...state.selectedIds].map(Number));
-  return (state.allItems || []).filter(item => ids.has(Number(item.id)));
+  ensureEditItemsIndex();
+  const out = [];
+  state.selectedIds.forEach(id => {
+    const item = editItemsById.get(Number(id));
+    if (item) out.push(item);
+  });
+  return out;
 }
 
 function effectiveRawDateOf(item) {
@@ -515,9 +556,11 @@ function mergeTagRecords(existingRecords, nextRecords) {
 }
 
 export function selectedEditArtistIds() {
+  ensureEditItemsIndex();
   const artistIds = new Set();
-  (state.allItems || []).forEach(item => {
-    if (state.selectedIds.has(item.id) && isTaggableItem(item)) {
+  state.selectedIds.forEach(id => {
+    const item = editItemsById.get(Number(id));
+    if (item && isTaggableItem(item)) {
       artistIds.add(Number(item.artist_id));
     }
   });
@@ -572,12 +615,27 @@ export function mergeTagsByName(tagGroups) {
   return [...byName.values()].sort((a, b) => compareNameParts(a.name || '', b.name || ''));
 }
 
+let cachedEditTagsRef = null;
+let cachedEditGlobalTagsRef = null;
+let cachedEditCharTagsRef = null;
+let cachedEditAvailableTags = [];
+
 export function editAvailableTags() {
-  return mergeTagsByName([
-    state.tags || [],
-    state.editGlobalTagResults || [],
-    state.editCharacterResults || [],
-  ]);
+  const t1 = state.tags || [];
+  const t2 = state.editGlobalTagResults || [];
+  const t3 = state.editCharacterResults || [];
+  if (
+    t1 === cachedEditTagsRef &&
+    t2 === cachedEditGlobalTagsRef &&
+    t3 === cachedEditCharTagsRef
+  ) {
+    return cachedEditAvailableTags;
+  }
+  cachedEditTagsRef = t1;
+  cachedEditGlobalTagsRef = t2;
+  cachedEditCharTagsRef = t3;
+  cachedEditAvailableTags = mergeTagsByName([t1, t2, t3]);
+  return cachedEditAvailableTags;
 }
 
 async function loadGlobalEditTagResults(query = '') {
@@ -1113,9 +1171,11 @@ function selectedEditTagNameKeys() {
 }
 
 function selectedItemExistingEditTagKeys() {
+  ensureEditItemsIndex();
   const keys = new Set();
-  (state.allItems || []).forEach(item => {
-    if (!state.selectedIds.has(item.id)) return;
+  state.selectedIds.forEach(id => {
+    const item = editItemsById.get(Number(id));
+    if (!item) return;
     (item.tags || []).forEach(tag => {
       const key = tagNameKey(tag.name || tag.tag_name || '');
       if (key) keys.add(key);

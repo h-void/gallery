@@ -83,10 +83,6 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    1.0 - dot(a, b)
-}
-
 /// Union-find over `0..n` with path compression.
 struct UnionFind {
     parent: Vec<usize>,
@@ -129,12 +125,12 @@ impl UnionFind {
 /// one-element component so every input index maps to exactly one
 /// representative. Components are keyed by their smallest member and returned
 /// sorted by that index.
-fn fold_components(vectors: &[Vec<f32>], fold_similarity: f32) -> Vec<Vec<usize>> {
-    let n = vectors.len();
+fn fold_components_from_sim(sim_matrix: &[f32], n: usize, fold_similarity: f32) -> Vec<Vec<usize>> {
     let mut uf = UnionFind::new(n);
     for i in 0..n {
+        let row_offset = i * n;
         for j in (i + 1)..n {
-            if dot(&vectors[i], &vectors[j]) >= fold_similarity {
+            if sim_matrix[row_offset + j] >= fold_similarity {
                 uf.union(i, j);
             }
         }
@@ -150,14 +146,15 @@ fn fold_components(vectors: &[Vec<f32>], fold_similarity: f32) -> Vec<Vec<usize>
 /// Medoid of `indices`: the member minimizing the sum of squared cosine
 /// distances to all other members (RFC chapter 3.2). Ties keep the lowest
 /// index so the result is deterministic.
-fn medoid_of(vectors: &[Vec<f32>], indices: &[usize]) -> usize {
+fn medoid_of_from_sim(sim_matrix: &[f32], n: usize, indices: &[usize]) -> usize {
     let mut best = indices[0];
     let mut best_score = f32::INFINITY;
     for &i in indices {
+        let row_offset = i * n;
         let mut score = 0.0f32;
         for &j in indices {
             if i != j {
-                let d = cosine_distance(&vectors[i], &vectors[j]);
+                let d = 1.0 - sim_matrix[row_offset + j];
                 score += d * d;
             }
         }
@@ -175,8 +172,9 @@ fn medoid_of(vectors: &[Vec<f32>], indices: &[usize]) -> usize {
 /// `diameter_threshold`. Returns one cluster (a `Vec` of *positions* into
 /// `reps`) per final group, singletons included. The lowest pair index wins
 /// distance ties, so the outcome is deterministic.
-fn complete_linkage(
-    vectors: &[Vec<f32>],
+fn complete_linkage_from_sim(
+    sim_matrix: &[f32],
+    n: usize,
     reps: &[usize],
     diameter_threshold: f32,
 ) -> Vec<Vec<usize>> {
@@ -186,12 +184,13 @@ fn complete_linkage(
     }
     // Cluster-to-cluster distances start as rep-to-rep distances and grow by
     // the max update on merges.
-    let mut dist = vec![vec![f32::INFINITY; r]; r];
+    let mut dist = vec![f32::INFINITY; r * r];
     for i in 0..r {
+        let rep_i_offset = reps[i] * n;
         for j in (i + 1)..r {
-            let d = cosine_distance(&vectors[reps[i]], &vectors[reps[j]]);
-            dist[i][j] = d;
-            dist[j][i] = d;
+            let d = 1.0 - sim_matrix[rep_i_offset + reps[j]];
+            dist[i * r + j] = d;
+            dist[j * r + i] = d;
         }
     }
     let mut active = vec![true; r];
@@ -202,9 +201,10 @@ fn complete_linkage(
             if !active[i] {
                 continue;
             }
+            let row_offset = i * r;
             for j in (i + 1)..r {
-                if active[j] && dist[i][j] < best.0 {
-                    best = (dist[i][j], i, j);
+                if active[j] && dist[row_offset + j] < best.0 {
+                    best = (dist[row_offset + j], i, j);
                 }
             }
         }
@@ -214,9 +214,9 @@ fn complete_linkage(
         }
         for k in 0..r {
             if active[k] && k != i && k != j {
-                let merged = dist[i][k].max(dist[j][k]);
-                dist[i][k] = merged;
-                dist[k][i] = merged;
+                let merged = dist[i * r + k].max(dist[j * r + k]);
+                dist[i * r + k] = merged;
+                dist[k * r + i] = merged;
             }
         }
         let drained = std::mem::take(&mut members[j]);
@@ -249,13 +249,23 @@ pub fn cluster_unorganized(
                 anyhow::bail!("inconsistent embedding dimensions: {dim} vs {}", v.len());
             }
             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if (norm - 1.0).abs() > 1e-3 {
+            if !norm.is_finite() || (norm - 1.0).abs() > 1e-3 {
                 anyhow::bail!("embedding is not L2-normalized (norm = {norm})");
             }
         }
     }
 
-    let components = fold_components(vectors, FOLD_SIMILARITY);
+    let n = vectors.len();
+    let mut sim_matrix = vec![1.0f32; n * n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let s = dot(&vectors[i], &vectors[j]);
+            sim_matrix[i * n + j] = s;
+            sim_matrix[j * n + i] = s;
+        }
+    }
+
+    let components = fold_components_from_sim(&sim_matrix, n, FOLD_SIMILARITY);
     let fold_groups: Vec<Vec<usize>> = components
         .iter()
         .filter(|component| component.len() > 1)
@@ -265,8 +275,11 @@ pub fn cluster_unorganized(
     // One representative per fold component — its medoid — so near-duplicate
     // packs cannot weight the centroids. Complete-linkage runs over
     // representatives; the position it returns maps back through `reps`.
-    let reps: Vec<usize> = components.iter().map(|g| medoid_of(vectors, g)).collect();
-    let rep_clusters = complete_linkage(vectors, &reps, 1.0 - min_similarity);
+    let reps: Vec<usize> = components
+        .iter()
+        .map(|g| medoid_of_from_sim(&sim_matrix, n, g))
+        .collect();
+    let rep_clusters = complete_linkage_from_sim(&sim_matrix, n, &reps, 1.0 - min_similarity);
 
     let mut clusters = Vec::new();
     let mut noise = Vec::new();
@@ -287,26 +300,31 @@ pub fn cluster_unorganized(
         // never qualify: any cross pair below the fold line would have merged
         // them into one component already.
         let is_all_duplicates = rep_cluster.len() == 1 && components[rep_cluster[0]].len() > 1;
-        let medoid = medoid_of(vectors, &members);
+        let medoid = medoid_of_from_sim(&sim_matrix, n, &members);
         // Members are ascending, and the strict `>` keeps the first (lowest
         // index) maximum, so ties resolve deterministically.
         let mut diverse: Option<usize> = None;
-        let mut best_distance = f32::NEG_INFINITY;
-        for &k in &members {
-            if k == medoid {
-                continue;
-            }
-            let d = cosine_distance(&vectors[medoid], &vectors[k]);
-            if d > DIVERSE_MIN_DISTANCE && d > best_distance {
-                best_distance = d;
-                diverse = Some(k);
+        if !is_all_duplicates {
+            let mut best_distance = f32::NEG_INFINITY;
+            let medoid_offset = medoid * n;
+            for &k in &members {
+                if k == medoid {
+                    continue;
+                }
+                let sim = sim_matrix[medoid_offset + k];
+                let d = 1.0 - sim;
+                if sim < FOLD_SIMILARITY && d > DIVERSE_MIN_DISTANCE && d > best_distance {
+                    best_distance = d;
+                    diverse = Some(k);
+                }
             }
         }
         let mut pair_count = 0usize;
         let mut sim_sum = 0.0f32;
         for (pos, &a) in members.iter().enumerate() {
+            let a_offset = a * n;
             for &b in &members[pos + 1..] {
-                sim_sum += dot(&vectors[a], &vectors[b]);
+                sim_sum += sim_matrix[a_offset + b];
                 pair_count += 1;
             }
         }

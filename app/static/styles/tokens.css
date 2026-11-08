@@ -59,7 +59,7 @@
   /* Rules: crease at rest, deeper crease on hover — paper never uses white. */
   --border-subtle:#D9C9AC;--border-strong:#C2AE8C;
   /* Type scale */
-  --fs-display:24px;--fs-title:18px;--fs-section:15px;--fs-body:14px;--fs-small:13px;--fs-micro:11px;
+  --fs-display:24px;--fs-title:19px;--fs-section:15px;--fs-body:14px;--fs-small:13px;--fs-micro:12px;
   --fw-medium:500;
   /* Display serif for folio titles (local stacks only, no webfonts). */
   --font-display:"Cormorant Garamond","EB Garamond","Source Serif Pro","Songti SC","SimSun",serif;
@@ -98,58 +98,58 @@
   color-scheme:light;
 }
 
-/* Studio Folio Dark (乌木夜色): warm dark lacquer paper, ivory text, vibrant vermilion seal.
-   Maintains the handcrafted illustration folio aesthetic with zero eye strain in dark environments.
-   WCAG AA compliant: text contrast >= 4.5:1 across all surfaces. */
+/* Studio Folio Dark (墨色): warm neutral ink charcoal, ivory text, vibrant vermilion seal.
+   Eliminates muddy brown tint on artwork while separating canvas / raised / overlay layers.
+   WCAG AA compliant: text contrast >= 4.5:1 across all surfaces, solid button white >= 4.6:1. */
 [data-theme="dark"]{
-  --paper-canvas:#1A1612;
-  --paper-raised:#241F1A;
-  --paper-overlay:#2D2620;
-  --paper-crease:#3A3128;
-  --bg-chrome:#1F1A15;
-  --bg-canvas:#1A1612;
-  --bg-raised:#241F1A;
-  --bg-overlay:#2D2620;
+  --paper-canvas:#151413;
+  --paper-raised:#1F1E1C;
+  --paper-overlay:#282624;
+  --paper-crease:#33302C;
+  --bg-chrome:#191817;
+  --bg-canvas:#151413;
+  --bg-raised:#1F1E1C;
+  --bg-overlay:#282624;
   --bg-card:var(--paper-raised);
   --bg-hover:rgba(255,255,255,.08);
-  --ink-1:#EDE3D0;
-  --ink-2:#B3A28C;
-  --ink-3:#9E8E7A;
-  --text-1:#EDE3D0;
-  --text-2:#B3A28C;
-  --text-3:#9E8E7A;
-  --vermilion:#D95D4A;
-  --vermilion-deep:#E06C5B;
-  --vermilion-soft:rgba(217,93,74,.18);
-  --vermilion-line:rgba(217,93,74,.45);
-  --accent:#D95D4A;
-  --accent-solid:#C04B3A;
-  --accent-deep:#9E3729;
-  --accent-soft:rgba(217,93,74,.18);
-  --accent-line:rgba(217,93,74,.45);
-  --accent-faint:rgba(217,93,74,.08);
-  --accent-selection:rgba(217,93,74,.32);
+  --ink-1:#ECE6DA;
+  --ink-2:#B8AFA1;
+  --ink-3:#9C9385;
+  --text-1:#ECE6DA;
+  --text-2:#B8AFA1;
+  --text-3:#9C9385;
+  --vermilion:#E06A55;
+  --vermilion-deep:#EE8571;
+  --vermilion-soft:rgba(224,106,85,.14);
+  --vermilion-line:rgba(224,106,85,.45);
+  --accent:#E06A55;
+  --accent-solid:#C4503D;
+  --accent-deep:#A3402F;
+  --accent-soft:rgba(224,106,85,.14);
+  --accent-line:rgba(224,106,85,.45);
+  --accent-faint:rgba(224,106,85,.08);
+  --accent-selection:rgba(224,106,85,.32);
   --indigo:#6A8BB3;
-  --ochre:#D49B38;
+  --ochre:#D9A548;
   --ochre-deep:#E2B258;
-  --moss:#6A9A72;
+  --moss:#7DAA84;
   --rose-stone:#C48E8E;
   --danger:#B84242;
   --danger-solid:#B84242;
   --danger-deep:#9E3232;
-  --ok:#6A9A72;
-  --warn:#D49B38;
-  --status-ok:#6A9A72;
+  --ok:#7DAA84;
+  --warn:#D9A548;
+  --status-ok:#7DAA84;
   --status-info:#6A8BB3;
-  --status-warn:#D49B38;
+  --status-warn:#D9A548;
   --status-danger:#B84242;
-  --unclassified:#D49B38;
-  --border-subtle:#3A3128;
-  --border-strong:#52463A;
+  --unclassified:#D9A548;
+  --border-subtle:#33302C;
+  --border-strong:#4A4640;
   --shadow-label:0 1px 2px rgba(0,0,0,.5);
   --shadow-pop:0 8px 24px rgba(0,0,0,.45);
   --shadow-card-lift:0 2px 8px rgba(0,0,0,.45);
-  --paper-glow:radial-gradient(1100px 420px at 50% -80px,rgba(255,230,190,.04),transparent 65%);
+  --paper-glow:radial-gradient(1100px 420px at 50% -80px,rgba(255,240,220,.03),transparent 65%);
   --paper-vignette:radial-gradient(140% 90% at 50% 0%,transparent 60%,rgba(0,0,0,.35));
   --paper-binding:linear-gradient(180deg,var(--vermilion) 0 1px,var(--paper-crease) 1px 2px);
   color-scheme:dark;

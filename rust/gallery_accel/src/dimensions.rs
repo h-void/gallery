@@ -114,22 +114,159 @@ pub(crate) fn media_dimensions(path: &Path, media_type: &str) -> Result<(u32, u3
     }
 }
 
+fn fast_header_dimensions(prefix: &[u8]) -> Option<(u32, u32)> {
+    if prefix.len() >= 10 && (&prefix[..6] == b"GIF87a" || &prefix[..6] == b"GIF89a") {
+        let width = u32::from(u16::from_le_bytes([prefix[6], prefix[7]]));
+        let height = u32::from(u16::from_le_bytes([prefix[8], prefix[9]]));
+        if width > 0 && height > 0 {
+            return Some((width, height));
+        }
+    }
+    if prefix.len() >= 24 && &prefix[..8] == b"\x89PNG\r\n\x1a\n" && &prefix[12..16] == b"IHDR" {
+        let width = u32::from_be_bytes([prefix[16], prefix[17], prefix[18], prefix[19]]);
+        let height = u32::from_be_bytes([prefix[20], prefix[21], prefix[22], prefix[23]]);
+        if width > 0 && height > 0 {
+            return Some((width, height));
+        }
+    }
+    if prefix.len() >= 30 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WEBP" {
+        match &prefix[12..16] {
+            b"VP8 " if prefix[23] == 0x9D && prefix[24] == 0x01 && prefix[25] == 0x2A => {
+                let width = u32::from(u16::from_le_bytes([prefix[26], prefix[27]]) & 0x3FFF);
+                let height = u32::from(u16::from_le_bytes([prefix[28], prefix[29]]) & 0x3FFF);
+                if width > 0 && height > 0 {
+                    return Some((width, height));
+                }
+            }
+            b"VP8L" if prefix[20] == 0x2F => {
+                let bits = u32::from_le_bytes([prefix[21], prefix[22], prefix[23], prefix[24]]);
+                let width = (bits & 0x3FFF) + 1;
+                let height = ((bits >> 14) & 0x3FFF) + 1;
+                if width > 0 && height > 0 {
+                    return Some((width, height));
+                }
+            }
+            b"VP8X" => {
+                let width = u32::from_le_bytes([prefix[24], prefix[25], prefix[26], 0]) + 1;
+                let height = u32::from_le_bytes([prefix[27], prefix[28], prefix[29], 0]) + 1;
+                if width > 0 && height > 0 {
+                    return Some((width, height));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn fast_jpeg_sof_dimensions(file: &mut File) -> Option<(u32, u32)> {
+    let mut reader = BufReader::with_capacity(8192, file);
+    let mut soi = [0u8; 2];
+    if reader.read_exact(&mut soi).is_err() || soi != [0xFF, 0xD8] {
+        return None;
+    }
+    let mut scanned = 2u64;
+    let mut byte = [0u8; 1];
+    while scanned < IMAGE_DIMENSION_READ_LIMIT {
+        if reader.read_exact(&mut byte).is_err() {
+            return None;
+        }
+        scanned += 1;
+        if byte[0] != 0xFF {
+            continue;
+        }
+        let marker = loop {
+            if reader.read_exact(&mut byte).is_err() {
+                return None;
+            }
+            scanned += 1;
+            if byte[0] != 0xFF {
+                break byte[0];
+            }
+        };
+        if marker == 0x00 || (0xD0..=0xD8).contains(&marker) || marker == 0x01 {
+            continue;
+        }
+        if marker == 0xD9 || marker == 0xDA {
+            return None;
+        }
+        let mut len_bytes = [0u8; 2];
+        if reader.read_exact(&mut len_bytes).is_err() {
+            return None;
+        }
+        scanned += 2;
+        let seg_len = u16::from_be_bytes(len_bytes) as u64;
+        if seg_len < 2 {
+            return None;
+        }
+        if matches!(
+            marker,
+            0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
+        ) {
+            if seg_len < 7 {
+                return None;
+            }
+            let mut sof = [0u8; 5];
+            if reader.read_exact(&mut sof).is_err() {
+                return None;
+            }
+            let height = u32::from(u16::from_be_bytes([sof[1], sof[2]]));
+            let width = u32::from(u16::from_be_bytes([sof[3], sof[4]]));
+            if width > 0 && height > 0 {
+                return Some((width, height));
+            }
+            return None;
+        }
+        let skip = seg_len - 2;
+        if reader
+            .seek(std::io::SeekFrom::Current(skip as i64))
+            .is_err()
+        {
+            return None;
+        }
+        scanned = scanned.saturating_add(skip);
+    }
+    None
+}
+
 fn image_dimensions(path: &Path) -> Result<(u32, u32)> {
+    let mut file =
+        File::open(path).with_context(|| format!("open image dimensions: {}", path.display()))?;
+    let mut header = [0u8; 30];
+    let header_len = file
+        .read(&mut header)
+        .with_context(|| format!("read image header: {}", path.display()))?;
+    if let Some(dimensions) = fast_header_dimensions(&header[..header_len]) {
+        return Ok(dimensions);
+    }
+    file.seek(std::io::SeekFrom::Start(0))
+        .with_context(|| format!("rewind image dimensions: {}", path.display()))?;
+
     // `image` 0.25 buffers JPEG input to EOF before returning dimensions.
-    // Probe a bounded prefix first; unusual headers fall back to the full reader.
-    if is_jpeg_path(path) {
-        let prefix = read_prefix(
-            File::open(path)
-                .with_context(|| format!("open image dimensions: {}", path.display()))?,
-            IMAGE_DIMENSION_READ_LIMIT,
-        )
-        .with_context(|| format!("read image dimensions: {}", path.display()))?;
+    // Scan JPEG SOF markers first without allocating 1 MiB, then fall back to a
+    // bounded prefix and finally the full reader.
+    let is_jpeg_magic = header_len >= 2 && header[0] == 0xFF && header[1] == 0xD8;
+    if is_jpeg_magic || is_jpeg_path(path) {
+        if is_jpeg_magic {
+            if let Some(dimensions) = fast_jpeg_sof_dimensions(&mut file) {
+                return Ok(dimensions);
+            }
+            file.seek(std::io::SeekFrom::Start(0))
+                .with_context(|| format!("rewind image dimensions: {}", path.display()))?;
+        }
+        let prefix = read_prefix(file, IMAGE_DIMENSION_READ_LIMIT)
+            .with_context(|| format!("read image dimensions: {}", path.display()))?;
         if let Ok(dimensions) = image_dimensions_from_reader(Cursor::new(prefix)) {
             return Ok(dimensions);
         }
+        let file = File::open(path)
+            .with_context(|| format!("open image dimensions: {}", path.display()))?;
+        let reader = image::ImageReader::new(BufReader::new(file))
+            .with_guessed_format()
+            .context("identify image format")?;
+        return reader.into_dimensions().context("read image dimensions");
     }
-    let reader = image::ImageReader::open(path)
-        .with_context(|| format!("open image dimensions: {}", path.display()))?
+    let reader = image::ImageReader::new(BufReader::new(file))
         .with_guessed_format()
         .context("identify image format")?;
     reader.into_dimensions().context("read image dimensions")
@@ -140,6 +277,8 @@ fn is_jpeg_path(path: &Path) -> bool {
         path.extension().and_then(|extension| extension.to_str()),
         Some(extension) if extension.eq_ignore_ascii_case("jpg")
             || extension.eq_ignore_ascii_case("jpeg")
+            || extension.eq_ignore_ascii_case("jpe")
+            || extension.eq_ignore_ascii_case("jfif")
     )
 }
 

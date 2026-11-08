@@ -45,7 +45,7 @@ fn list_duplicate_artists(
     conn: &Connection,
     roots: &MediaRoots,
 ) -> Result<Vec<DuplicateArtistGroup>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT id, name, path
         FROM artists
@@ -55,9 +55,9 @@ fn list_duplicate_artists(
     let rows = stmt
         .query_map([], |row| {
             Ok(DuplicateArtistSourceRow {
-                id: row.get("id")?,
-                name: row.get("name")?,
-                path: row.get("path")?,
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
                 item_count: 0,
             })
         })?
@@ -84,19 +84,26 @@ fn list_duplicate_artists(
         return Ok(Vec::new());
     }
 
-    let mut count_stmt = conn.prepare(
-        "
-        SELECT COUNT(id)
-        FROM items
-        WHERE artist_id = ?
-            AND missing = 0
-            AND (media_type IN ('image', 'video', 'source', 'archive', 'text') OR is_archive = 1)
-        ",
-    )?;
-    let mut counts: HashMap<i64, i64> = HashMap::new();
-    for aid in dup_artist_ids {
-        let count: i64 = count_stmt.query_row([aid], |r| r.get(0)).unwrap_or(0);
-        counts.insert(aid, count);
+    let mut counts: HashMap<i64, i64> = HashMap::with_capacity(dup_artist_ids.len());
+    for chunk in dup_artist_ids.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "
+            SELECT artist_id, COUNT(id)
+            FROM items
+            WHERE artist_id IN ({placeholders})
+                AND missing = 0
+                AND (media_type IN ('image', 'video', 'source', 'archive', 'text') OR is_archive = 1)
+            GROUP BY artist_id
+            "
+        );
+        let mut count_stmt = conn.prepare(&sql)?;
+        let mut count_rows = count_stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
+        while let Some(row) = count_rows.next()? {
+            counts.insert(row.get(0)?, row.get(1)?);
+        }
     }
 
     let mut groups = Vec::new();

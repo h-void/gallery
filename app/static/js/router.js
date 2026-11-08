@@ -8,6 +8,7 @@ import {
   folderTreeHasPath, validBrowseDate,
 } from './utils.js';
 import { toast } from './logging.js';
+import { t } from './i18n.js';
 import {
   renderSidebar, renderFolderTree, renderToolbar, clearUI, loadItems, scrollToItemsTop,
   syncSearchOptionsControl, syncItemFilterControls, validSearchScope, isGlobalSearchActive,
@@ -25,6 +26,12 @@ const BROWSE_KINDS = {
   sources: '__sources__',
   favorites: '__favorites__',
 };
+const MEDIA_BROWSE_KINDS = {
+  favorites: BROWSE_KINDS.favorites,
+  archives: BROWSE_KINDS.archives,
+  videos: BROWSE_KINDS.videos,
+  sources: BROWSE_KINDS.sources,
+};
 const BROWSE_SORTS = ['date_desc', 'date_asc', 'name', 'name_desc', 'size', 'size_asc', 'scanned_desc'];
 const BROWSE_VIEWS = ['grid', 'compact', 'list'];
 const ARTIST_ROUTE_RESERVED_SEGMENTS = new Set(['.', '..', 'api', 'static', 'ws', 'favicon.ico']);
@@ -37,7 +44,7 @@ const ARTIST_HISTORY_STORAGE_KEY = 'gallery.artist-history.v1';
 const MAX_ARTIST_HISTORY = 6;
 const MAX_ARTIST_DROPDOWN_RESULTS = 1000;
 
-export { BROWSE_KINDS, BROWSE_SORTS, BROWSE_VIEWS };
+export { BROWSE_KINDS, MEDIA_BROWSE_KINDS, BROWSE_SORTS, BROWSE_VIEWS };
 
 function getSavedItemSort() {
   try {
@@ -177,7 +184,13 @@ export function bindArtistChoiceContainer(container) {
   if (!container || container.dataset.artistChoiceBound === '1') return;
   container.dataset.artistChoiceBound = '1';
   container.addEventListener('click', e => {
-    const btn = e.target instanceof Element ? e.target.closest('[data-artist-id]') : null;
+    const target = e.target instanceof Element ? e.target : null;
+    const favBtn = target ? target.closest('[data-global-favorites]') : null;
+    if (favBtn && container.contains(favBtn)) {
+      selectGlobalBrowse({role: BROWSE_KINDS.favorites});
+      return;
+    }
+    const btn = target ? target.closest('[data-artist-id]') : null;
     if (!btn || !container.contains(btn)) return;
     selectArtist(btn.dataset.artistId);
   });
@@ -210,8 +223,17 @@ export function artistRouteKey(segment) {
   }
 }
 
-export function artistRouteEntries(artists = state.artists) {
-  const rows = artists.filter(artist => artist && artist.id != null);
+let cachedRouteArtistsRef = null;
+let cachedRouteArtistsLen = -1;
+let cachedRouteEntries = [];
+let cachedRouteById = new Map();
+let cachedRouteByKey = new Map();
+
+function ensureArtistRouteCache(artists = state.artists) {
+  if (artists === cachedRouteArtistsRef && Array.isArray(artists) && artists.length === cachedRouteArtistsLen) {
+    return {entries: cachedRouteEntries, byId: cachedRouteById, byKey: cachedRouteByKey};
+  }
+  const rows = (artists || []).filter(artist => artist && artist.id != null);
   const nameCounts = new Map();
   const bases = new Map();
   rows.forEach(artist => {
@@ -248,12 +270,27 @@ export function artistRouteEntries(artists = state.artists) {
       suffixes.set(entry.id, `${suffixes.get(entry.id) || ''}--${entry.id}`);
     });
   }
-  return entries;
+  const byId = new Map();
+  const byKey = new Map();
+  entries.forEach(entry => {
+    byId.set(entry.id, entry);
+    byKey.set(artistRouteKey(entry.segment), entry);
+  });
+  cachedRouteArtistsRef = artists;
+  cachedRouteArtistsLen = Array.isArray(artists) ? artists.length : -1;
+  cachedRouteEntries = entries;
+  cachedRouteById = byId;
+  cachedRouteByKey = byKey;
+  return {entries, byId, byKey};
+}
+
+export function artistRouteEntries(artists = state.artists) {
+  return ensureArtistRouteCache(artists).entries;
 }
 
 export function artistRoutePath(artist) {
   const id = String(artist?.id || '');
-  const entry = artistRouteEntries().find(candidate => candidate.id === id);
+  const entry = ensureArtistRouteCache().byId.get(id);
   return entry ? `/${entry.segment}` : '/';
 }
 
@@ -262,7 +299,7 @@ export function artistFromBrowsePath() {
   if (!raw || raw.includes('/')) return null;
   const key = artistRouteKey(raw);
   if (!key) return null;
-  return artistRouteEntries().find(entry => artistRouteKey(entry.segment) === key)?.artist || null;
+  return ensureArtistRouteCache().byKey.get(key)?.artist || null;
 }
 
 // The archive triage filter ('all' | 'inbox' | 'archived') rides the browse URL
@@ -278,19 +315,29 @@ export function browseUrlParams() {
     return params;
   }
   const activeRole = String(state.activeRole || '');
-  if (activeRole && !activeRole.startsWith('__')) {
+  if (activeRole === BROWSE_KINDS.untagged) {
+    params.set('tag', 'untagged');
+  } else if (activeRole && !activeRole.startsWith('__')) {
     params.set('tag', activeRole);
-  } else {
-    const kind = Object.keys(BROWSE_KINDS).find(key => BROWSE_KINDS[key] === activeRole);
+  }
+  const activeMedia = String(state.activeMedia || '');
+  const mediaVal = activeMedia || (Object.values(MEDIA_BROWSE_KINDS).includes(activeRole) ? activeRole : '');
+  if (mediaVal) {
+    const kind = Object.keys(MEDIA_BROWSE_KINDS).find(key => MEDIA_BROWSE_KINDS[key] === mediaVal);
     if (kind) params.set('kind', kind);
   }
   if (state.currentArtist && state.activeFolder) params.set('folder', state.activeFolder);
+  if (!state.currentArtist && state.globalTagName) params.set('tags', state.globalTagName);
   if (state.search) params.set('q', state.search);
   if (state.searchScope !== 'auto') params.set('scope', state.searchScope);
   if (state.searchTarget !== 'all') params.set('target', state.searchTarget);
   if (state.itemSort !== 'date_desc' || state.itemSortExplicit) params.set('sort', state.itemSort);
-  if (state.itemDateFrom) params.set('from', state.itemDateFrom);
-  if (state.itemDateTo) params.set('to', state.itemDateTo);
+  if (state.itemUndatedOnly) {
+    params.set('undated', '1');
+  } else {
+    if (state.itemDateFrom) params.set('from', state.itemDateFrom);
+    if (state.itemDateTo) params.set('to', state.itemDateTo);
+  }
   if (state.view !== 'grid') params.set('view', state.view);
   if (state.duplicatesOnly && isDuplicateFilesScopeActive()) params.set('duplicates', '1');
   if (state.activeTriage && state.activeTriage !== 'all') params.set('triage', state.activeTriage);
@@ -368,7 +415,12 @@ export async function restoreBrowseUrl() {
   const savedDates = getSavedItemDates();
   const hasParamFrom = params.has('from');
   const hasParamTo = params.has('to');
-  if (hasParamFrom || hasParamTo) {
+  const restoredUndated = params.get('undated') === '1' || params.get('undated') === 'true';
+  state.itemUndatedOnly = restoredUndated;
+  if (restoredUndated) {
+    state.itemDateFrom = '';
+    state.itemDateTo = '';
+  } else if (hasParamFrom || hasParamTo) {
     state.itemDateFrom = validRange ? dateFrom : '';
     state.itemDateTo = validRange ? dateTo : '';
   } else {
@@ -377,6 +429,8 @@ export async function restoreBrowseUrl() {
   }
   state.view = BROWSE_VIEWS.includes(params.get('view')) ? params.get('view') : 'grid';
   state.activeRole = null;
+  state.activeMedia = null;
+  state.globalTagName = '';
   state.activeFolder = null;
   state.duplicatesOnly = false;
 
@@ -394,7 +448,12 @@ export async function restoreBrowseUrl() {
   const tag = params.get('tag') || '';
   const tagId = state.currentArtist && state.tags.some(row => String(row.id) === tag) ? tag : '';
   const kind = params.get('kind') || '';
-  state.activeRole = tagId || BROWSE_KINDS[kind] || null;
+  const untaggedRole = state.currentArtist && (tag === 'untagged' || kind === 'untagged') ? BROWSE_KINDS.untagged : null;
+  const globalFavRole = !state.currentArtist && kind === 'favorites' ? BROWSE_KINDS.favorites : null;
+  state.activeRole = tagId || untaggedRole || globalFavRole || null;
+  state.activeMedia = state.currentArtist && MEDIA_BROWSE_KINDS[kind] ? MEDIA_BROWSE_KINDS[kind] : null;
+  state.globalTagName = !state.currentArtist ? (params.get('tags') || '').trim() : '';
+  setArtistSearchLabel();
   const folder = params.get('folder') || '';
   state.activeFolder = state.currentArtist && folderTreeHasPath(state.folders, folder) ? folder : null;
   state.duplicatesOnly = params.get('duplicates') === '1';
@@ -469,6 +528,8 @@ export async function selectArtist(id, options = {}) {
   closeArtistDropdown();
   if (!options.preserveBrowseState) {
     state.activeRole = options.tagId ? String(options.tagId) : null;
+    state.activeMedia = null;
+    state.globalTagName = '';
     state.activeFolder = null;
     state.duplicatesOnly = false;
     state.tagSearchResults = [];
@@ -531,6 +592,42 @@ export async function selectArtist(id, options = {}) {
   await loadItems();
 }
 
+export async function selectGlobalBrowse({role = null, tagName = '', history = 'push'} = {}) {
+  nextRequestSeq('artistLoadSeq');
+  resetArtistLinks();
+  resetArtistProfileLinks();
+  state.currentArtist = null;
+  state.stats = null;
+  state.tags = [];
+  state.folders = null;
+  state.activeRole = role || null;
+  state.activeMedia = null;
+  state.globalTagName = tagName ? String(tagName).trim() : '';
+  state.activeFolder = null;
+  state.duplicatesOnly = false;
+  state.tagSearchResults = [];
+  state.search = '';
+  const searchInput = $('#searchInput');
+  if (searchInput) searchInput.value = '';
+  syncSearchOptionsControl();
+  state.selectedIds.clear();
+  state.editContextArtistId = null;
+  state.editContextKey = '';
+  state.selectedEditTagIds.clear();
+  state.selectedEditTagNames.clear();
+  state.editTagQuery = '';
+  resetCharacterTagSuggestions();
+  closeArtistDropdown();
+  setArtistSearchLabel();
+  renderLibraryEmptyState();
+  renderSidebar();
+  renderFolderTree();
+  renderToolbar();
+  if (history !== false) syncBrowseUrl(history || 'push');
+  scrollToItemsTop();
+  await loadItems();
+}
+
 export function focusArtistPicker() {
   const input = $('#artistSearch');
   if (!input) return;
@@ -554,7 +651,17 @@ export function artistOptionLabel(artist) {
 export function setArtistSearchLabel(value = null) {
   const input = $('#artistSearch');
   if (!input) return;
-  input.value = value !== null ? value : (state.currentArtist ? artistOptionLabel(state.currentArtist) : '');
+  if (value !== null) {
+    input.value = value;
+  } else if (state.currentArtist) {
+    input.value = artistOptionLabel(state.currentArtist);
+  } else if (state.globalTagName) {
+    input.value = state.globalTagName;
+  } else if (state.activeRole === BROWSE_KINDS.favorites) {
+    input.value = t('★ 全库收藏');
+  } else {
+    input.value = '';
+  }
 }
 
 export function artistMatchesQuery(artist, query) {
@@ -587,11 +694,13 @@ export function renderArtistDropdown(query = '') {
   if (trimmedQuery) {
     dropdown.innerHTML = results.map(optionHtml).join('');
   } else {
+    const favActive = !state.currentArtist && state.activeRole === BROWSE_KINDS.favorites ? ' is-current' : '';
+    const globalShortcutHtml = `<button class="artist-global-shortcut${favActive}" type="button" data-global-favorites="1"><span>${t('★ 全库收藏')}</span></button>`;
     const recent = recentArtistList().slice(0, MAX_ARTIST_DROPDOWN_RESULTS);
     const recentHtml = recent.length
       ? `<div class="artist-section-label">最近访问</div>${recent.map(optionHtml).join('')}`
       : '';
-    dropdown.innerHTML = `${recentHtml}<div class="artist-section-label">全部画师</div>${results.map(optionHtml).join('')}`;
+    dropdown.innerHTML = `${globalShortcutHtml}${recentHtml}<div class="artist-section-label">全部画师</div>${results.map(optionHtml).join('')}`;
   }
   artistDropdownActiveIndex = -1;
   syncArtistDropdownActive();

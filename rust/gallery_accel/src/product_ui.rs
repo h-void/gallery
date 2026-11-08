@@ -1515,6 +1515,246 @@ pub fn delete_character_reference(
     }))
 }
 
+pub fn verify_character_reference(
+    conn: &Connection,
+    character_id: i64,
+    reference_id: i64,
+) -> Result<Value> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT COALESCE(verified, 1) FROM character_references WHERE id=? AND character_id=?",
+            params![reference_id, character_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(_prev) = exists else {
+        return Ok(json!({
+            "ok": false,
+            "character_id": character_id,
+            "reference_id": reference_id,
+            "verified": 0,
+        }));
+    };
+    let updated = conn.execute(
+        "UPDATE character_references SET verified = 1 WHERE id=? AND character_id=? AND COALESCE(verified, 1) = 0",
+        params![reference_id, character_id],
+    )? as i64;
+    Ok(json!({
+        "ok": true,
+        "character_id": character_id,
+        "reference_id": reference_id,
+        "verified": updated,
+    }))
+}
+
+pub fn verify_all_character_references(conn: &Connection, character_id: i64) -> Result<Value> {
+    let char_exists: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM characters WHERE id=?",
+            params![character_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if char_exists.is_none() {
+        return Ok(json!({
+            "ok": false,
+            "character_id": character_id,
+            "verified": 0,
+        }));
+    }
+    let updated = conn.execute(
+        "UPDATE character_references SET verified = 1 WHERE character_id=? AND COALESCE(verified, 1) = 0",
+        params![character_id],
+    )? as i64;
+    Ok(json!({
+        "ok": true,
+        "character_id": character_id,
+        "verified": updated,
+    }))
+}
+
+pub fn discover_character_reference_candidates(
+    conn: &Connection,
+    roots: &crate::media_roots::MediaRoots,
+    character_id: i64,
+    limit: i64,
+) -> Result<Value> {
+    let char_name: Option<String> = conn
+        .query_row(
+            "SELECT name FROM characters WHERE id=?",
+            params![character_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(char_name) = char_name else {
+        return Ok(json!({
+            "ok": false,
+            "character_id": character_id,
+            "added": 0,
+            "error": "character not found",
+        }));
+    };
+    let limit = limit.clamp(1, 24) as usize;
+
+    // 1. Gather unreferenced image items tagged with `char_name` (preferring single-tag items first, then multi-tag items).
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.file_path, COALESCE(i.media_type, 'image') AS media_type,
+                (SELECT COUNT(*) FROM item_tags it2 WHERE it2.item_id = i.id) AS tag_count
+         FROM items i
+         JOIN item_tags it ON it.item_id = i.id
+         JOIN tags t ON t.id = it.tag_id
+         WHERE i.missing = 0
+           AND COALESCE(i.is_archive, 0) = 0
+           AND (i.media_type = 'image' OR i.media_type IS NULL OR i.media_type = '')
+           AND t.name = ?
+           AND NOT EXISTS (
+               SELECT 1 FROM character_references cr WHERE cr.item_id = i.id
+           )
+         ORDER BY tag_count ASC, i.id DESC
+         LIMIT ?",
+    )?;
+    let tagged_candidates: Vec<(i64, String, String)> = stmt
+        .query_map(params![char_name, (limit * 2) as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let (repo, variant, file) = crate::character_ccip::embedding_model_meta();
+    let dim = crate::character_ccip::CCIP_EMBEDDING_DIM as i64;
+    let mut added = 0i64;
+    let mut scanned = 0i64;
+
+    for (item_id, file_path, media_type) in tagged_candidates {
+        if added as usize >= limit {
+            break;
+        }
+        scanned += 1;
+        let Ok(embedding) = embed_for_import_with_roots(roots, item_id, &file_path, &media_type)
+        else {
+            continue;
+        };
+        let Ok(blob) = crate::character_ccip::pack_embedding_blob(&embedding) else {
+            continue;
+        };
+        let inserted = conn.execute(
+            "INSERT INTO character_references
+             (character_id, embedding, embedding_dim, source_type, item_id, created_at,
+              embedding_model_repo_id, embedding_model_variant, embedding_model_file,
+              embedding_updated_at, verified, prototype_role)
+             VALUES (?, ?, ?, 'cluster_verified', ?, ?, ?, ?, ?, ?, 0, 'candidate')",
+            params![
+                character_id,
+                blob,
+                dim,
+                item_id,
+                now(),
+                repo,
+                variant,
+                file,
+                now(),
+            ],
+        )?;
+        added += inserted as i64;
+    }
+
+    // 2. If we still have room and the character has verified reference embeddings,
+    // scan recent untagged images from artists who have works of this character
+    // and stage high-similarity matches (cosine >= 0.68) as verified=0 candidates.
+    if (added as usize) < limit {
+        let existing_refs =
+            crate::character_cleanup::load_character_refs(conn, character_id).unwrap_or_default();
+        let verified_vecs: Vec<&[f32]> = existing_refs
+            .iter()
+            .map(|r| r.vector.as_slice())
+            .filter(|v| v.len() == crate::character_ccip::CCIP_EMBEDDING_DIM)
+            .collect();
+        if !verified_vecs.is_empty() {
+            let mut untagged_stmt = conn.prepare(
+                "SELECT i.id, i.file_path, COALESCE(i.media_type, 'image') AS media_type
+                 FROM items i
+                 WHERE i.missing = 0
+                   AND COALESCE(i.is_archive, 0) = 0
+                   AND (i.media_type = 'image' OR i.media_type IS NULL OR i.media_type = '')
+                   AND NOT EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id = i.id)
+                   AND NOT EXISTS (SELECT 1 FROM character_references cr WHERE cr.item_id = i.id)
+                   AND (
+                       i.artist_id IN (
+                           SELECT DISTINCT t.artist_id FROM tags t WHERE t.name = ?
+                       )
+                       OR NOT EXISTS (SELECT 1 FROM tags t WHERE t.name = ?)
+                   )
+                 ORDER BY i.id DESC
+                 LIMIT 40",
+            )?;
+            let untagged_rows: Vec<(i64, String, String)> = untagged_stmt
+                .query_map(params![char_name, char_name], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            for (item_id, file_path, media_type) in untagged_rows {
+                if added as usize >= limit {
+                    break;
+                }
+                scanned += 1;
+                let Ok(embedding) =
+                    embed_for_import_with_roots(roots, item_id, &file_path, &media_type)
+                else {
+                    continue;
+                };
+                let norm_a: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm_a <= 1e-8 {
+                    continue;
+                }
+                let best_sim = verified_vecs
+                    .iter()
+                    .map(|v| {
+                        let dot: f32 = embedding.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                        let norm_b: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        if norm_b <= 1e-8 {
+                            0.0
+                        } else {
+                            dot / (norm_a * norm_b)
+                        }
+                    })
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if best_sim < 0.68 {
+                    continue;
+                }
+                let Ok(blob) = crate::character_ccip::pack_embedding_blob(&embedding) else {
+                    continue;
+                };
+                let inserted = conn.execute(
+                    "INSERT INTO character_references
+                     (character_id, embedding, embedding_dim, source_type, item_id, created_at,
+                      embedding_model_repo_id, embedding_model_variant, embedding_model_file,
+                      embedding_updated_at, verified, prototype_role)
+                     VALUES (?, ?, ?, 'cluster_verified', ?, ?, ?, ?, ?, ?, 0, 'candidate')",
+                    params![
+                        character_id,
+                        blob,
+                        dim,
+                        item_id,
+                        now(),
+                        repo,
+                        variant,
+                        file,
+                        now(),
+                    ],
+                )?;
+                added += inserted as i64;
+            }
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "character_id": character_id,
+        "character_name": char_name,
+        "scanned": scanned,
+        "added": added,
+    }))
+}
+
 pub fn rebuild_character_index(conn: &Connection) -> Result<Value> {
 
     let count: i64 = conn

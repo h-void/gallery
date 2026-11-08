@@ -585,7 +585,11 @@ export function renderRecycleBin() {
           const restoring = isActionBusy('recycle-restore', String(id));
           const purging = isActionBusy('recycle-purge', String(id));
           const canRestore = Number.isFinite(id) && status === 'recycled' && fileExists && !originalExists && !systemTrash && !batchBusy && !restoring && !purging;
-          const fileState = !fileExists ? t('文件已缺失') : (originalExists ? t('原路径已被占用（不可恢复，避免覆盖现有文件）') : t('可以恢复'));
+          const fileState = !fileExists
+            ? t('文件已缺失')
+            : (originalExists
+              ? t('原路径已被占用（不可恢复，避免覆盖现有文件）')
+              : (systemTrash ? t('文件在飞牛系统回收站中，请在系统桌面回收站恢复') : t('可以恢复')));
           const restoreTitle = systemTrash
             ? t('文件在飞牛系统回收站中，请在系统桌面回收站恢复')
             : (originalExists ? t('原路径已被同名文件占用，禁止恢复以防误覆盖现有文件') : (!fileExists ? t('回收站文件已缺失') : t('恢复到原始路径')));

@@ -11,6 +11,11 @@ import { renderHashStatus } from './overview.js';
 import { loadArtists } from '../../router.js';
 
 const MOVE_HISTORY_PAGE_SIZE = 80;
+const MOJIBAKE_RE = /[ÃÂÐÑÕÖØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ]{2,}|[锟斤拷烫屯]{2,}|\uFFFD/;
+
+function hasPathEncodingAnomaly(text) {
+  return MOJIBAKE_RE.test(String(text || ''));
+}
 
 export function renderMovePathSummary() {
   syncMaintenanceTabBadges();
@@ -137,10 +142,13 @@ export function renderMoveCandidates() {
           <div><span>新画师</span><code title="${escHtml(c.candidate_artist_path || newArtistPath)}">${escHtml(newArtistPath || '-')}</code></div>
         </div>` : '';
     const confirmButton = cannotConfirm ? '' : `<button class="btn btn-primary" type="button" data-move-action="confirm" data-id="${c.id}">确认同一文件</button>`;
+    const encodingBadge = (hasPathEncodingAnomaly(oldPath) || hasPathEncodingAnomaly(newPath))
+      ? `<span class="path-encoding-badge" title="${t('检测到疑似乱码文件名，建议重命名修正')}">${t('编码异常')}</span>`
+      : '';
     return `<div class="move-card" data-id="${c.id}">
       <div class="move-card-main">
         <div class="move-card-top">
-          <span class="move-reason">${escHtml(label)}</span>
+          <span class="move-reason">${escHtml(label)}${encodingBadge}</span>
           <span class="move-id">#${c.id}</span>
         </div>
         <div class="move-path old"><span>旧</span><code title="${escHtml(c.old_path || oldPath)}">${escHtml(oldPath)}</code></div>

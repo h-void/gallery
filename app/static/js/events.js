@@ -10,6 +10,7 @@ import { t } from './i18n.js';
 import {
   restoreBrowseUrl, syncBrowseUrl, browseUrlParams, saveItemSort, saveItemDates,
   getSavedTagSort, saveTagSort, loadArtists, closeArtistDropdown, updateBrowseReturnButton,
+  selectGlobalBrowse, BROWSE_KINDS,
 } from './router.js';
 import {
   syncFilterDrawer, openFilterDrawer, closeFilterDrawer, closeFilterDrawerIfMobile,
@@ -17,7 +18,8 @@ import {
   syncMobileHeaderTools, syncSearchOptionsControl, openSearchOptions, closeSearchOptions,
   toggleSearchOptions, setSearchScope, setSearchTarget, bindSidebarResize,
   bindSidebarTagResize, bindSidebarSectionToggles, bindMobileColumnToggle, setSidebarWidth,
-  setCardRatio, syncItemFilterControls, selectBrowseRole, renderSidebar, renderFolderTree,
+  setCardRatio, syncItemFilterControls, selectBrowseRole, selectMediaFilter, toggleUndatedFilter,
+  renderSidebar, renderFolderTree,
   renderToolbar, loadItems, loadItemsPreservingDepth, updateDuplicateFilesButton,
   updateScanFolderButton, isDuplicateFilesScopeActive, scrollToItemsTop,
   onViewportLayoutChange, renderLibraryEmptyState, isMobileViewport, syncClearSearch,
@@ -41,7 +43,7 @@ import {
   renderEditDateControl, moveEditTagPickerActive,
 } from './views/editbar.js';
 import { bindArtistLinks, bindArtistProfileLinks, renderArtistLinks, renderArtistProfileLinks, closeArtistLinksDialog } from './views/links.js';
-import { bindArchiveModal, closeArchiveModal, openBatchArchiveModal, bindBatchArchiveModal, closeBatchArchiveModal, isBatchArchiveExtracting, stopBatchArchiveExtraction } from './views/archive_modal.js';
+import { bindArchiveModal, closeArchiveModal, openBatchArchiveModal, bindBatchArchiveModal, closeBatchArchiveModal, isBatchArchiveExtracting, stopBatchArchiveExtraction, isBatchExtractableArchiveItem } from './views/archive_modal.js';
 import { downloadTemplateInputSelector, saveDownloadCalendarOpen } from './views/maintenance/shared.js';
 // Maintenance views load lazily: browse-mode startup must not download the
 // maintenance workbench. Every name below forwards through lazy.js.
@@ -84,7 +86,8 @@ import {
   generateNetdiskScript, resetNetdiskPairing, copyNetdiskScript, runNetdiskJobAction,
   markNetdiskSettingsDirty, resolveNetdiskDispatchPost, submitNetdiskDispatch, setNetdiskJobFilter,
   toggleNetdiskJobsFold, toggleArchivePlanConfirmation, undoArchivePlan, jumpToArchivePlanFolder,
-  annotateArchivePlan,
+  annotateArchivePlan, pickArchivePlanDate, verifyCharacterReference, verifyAllCharacterReferences,
+  discoverCharacterReferenceCandidates, toggleCharacterUnverifiedFilter,
 } from './views/maintenance/lazy.js';
 import { toggleTheme, setThemeMode } from './views/theme.js';
 
@@ -181,6 +184,9 @@ function applyItemFilterControls() {
   if (sortEl) state.itemSort = sortEl.value;
   state.itemDateFrom = dateFrom ? dateFrom.value : '';
   state.itemDateTo = dateTo ? dateTo.value : '';
+  if (state.itemDateFrom || state.itemDateTo) {
+    state.itemUndatedOnly = false;
+  }
   saveItemSort(state.itemSort);
   saveItemDates(state.itemDateFrom, state.itemDateTo);
   syncItemFilterControls();
@@ -270,8 +276,8 @@ export async function refreshCurrentView({reason = 'manual'} = {}) {
     // 全部 badge reflects the actual order. Explicit sorts and any scoped
     // browse state (folder, tag/role, search, duplicates) remain untouched.
     if (reason === 'scan_complete' && !state.itemSortExplicit && state.itemSort === 'date_desc' &&
-        !state.itemDateFrom && !state.itemDateTo &&
-        !state.activeFolder && !state.activeRole && !state.search && !state.duplicatesOnly) {
+        !state.itemDateFrom && !state.itemDateTo && !state.itemUndatedOnly &&
+        !state.activeFolder && !state.activeRole && !state.activeMedia && !state.search && !state.duplicatesOnly) {
       state.itemSort = 'scanned_desc';
       state.itemSortExplicit = true;
       syncItemFilterControls();
@@ -470,7 +476,7 @@ export function bindEvents() {
     });
   }
   syncItemFilterControls();
-  $('#mediaFilter').addEventListener('change', e => selectBrowseRole(e.target.value));
+  $('#mediaFilter').addEventListener('change', e => selectMediaFilter(e.target.value));
   const tagSortEl = $('#tagSort');
   if (tagSortEl) {
     tagSortEl.value = getSavedTagSort();
@@ -480,6 +486,20 @@ export function bindEvents() {
     });
   }
   $('#tagFilterReset').addEventListener('click', () => selectBrowseRole(null));
+  const tagCrossArtistBtn = $('#tagCrossArtistBtn');
+  if (tagCrossArtistBtn) {
+    tagCrossArtistBtn.addEventListener('click', () => {
+      if (tagCrossArtistBtn.dataset.tagName) {
+        selectGlobalBrowse({tagName: tagCrossArtistBtn.dataset.tagName});
+      }
+    });
+  }
+  const emptyGlobalFavoritesBtn = $('#emptyGlobalFavoritesBtn');
+  if (emptyGlobalFavoritesBtn) {
+    emptyGlobalFavoritesBtn.addEventListener('click', () => {
+      selectGlobalBrowse({role: BROWSE_KINDS.favorites});
+    });
+  }
   const itemSortEl = $('#itemSort');
   if (itemSortEl) {
     itemSortEl.addEventListener('change', () => {
@@ -491,11 +511,14 @@ export function bindEvents() {
   if (itemDateFromEl) itemDateFromEl.addEventListener('change', applyItemFilterControls);
   const itemDateToEl = $('#itemDateTo');
   if (itemDateToEl) itemDateToEl.addEventListener('change', applyItemFilterControls);
+  const itemUndatedBtn = $('#itemUndatedBtn');
+  if (itemUndatedBtn) itemUndatedBtn.addEventListener('click', toggleUndatedFilter);
   const itemDateResetEl = $('#itemDateReset');
   if (itemDateResetEl) {
     itemDateResetEl.addEventListener('click', () => {
       state.itemDateFrom = '';
       state.itemDateTo = '';
+      state.itemUndatedOnly = false;
       saveItemDates('', '');
       // A range error reported earlier otherwise stays on the inputs: the
       // fields are cleared here rather than through `applyItemFilterControls`,
@@ -855,6 +878,10 @@ export function bindEvents() {
     if (jump && archivePlanList.contains(jump)) return void jumpToArchivePlanFolder(jump.dataset.archivePlanJump);
     const annotate = target.closest('[data-archive-plan-annotate]');
     if (annotate && archivePlanList.contains(annotate)) return void annotateArchivePlan(annotate.dataset.archivePlanAnnotate);
+    const pickDate = target.closest('[data-archive-plan-pick-date]');
+    if (pickDate && archivePlanList.contains(pickDate)) {
+      return void pickArchivePlanDate(pickDate.dataset.archivePlanFolder, pickDate.dataset.archivePlanPickDate);
+    }
   });
   const archivePlansFoldBtn = $('#archivePlansFoldBtn');
   if (archivePlansFoldBtn) archivePlansFoldBtn.addEventListener('click', toggleArchivePlansFold);
@@ -1583,6 +1610,18 @@ export function bindEvents() {
       setCharacterLibraryMobileView('characters');
     });
   }
+  const characterUnverifiedFilterBtn = $('#characterUnverifiedFilterBtn');
+  if (characterUnverifiedFilterBtn) {
+    characterUnverifiedFilterBtn.addEventListener('click', () => {
+      toggleCharacterUnverifiedFilter();
+    });
+  }
+  const characterDiscoverCandidatesBtn = $('#characterDiscoverCandidatesBtn');
+  if (characterDiscoverCandidatesBtn) {
+    characterDiscoverCandidatesBtn.addEventListener('click', () => {
+      discoverCharacterReferenceCandidates(state.characterLibrarySelectedCharacterId);
+    });
+  }
   const characterReferenceUploadBtn = $('#characterReferenceUploadBtn');
   const characterReferenceUploadInput = $('#characterReferenceUploadInput');
   if (characterReferenceUploadBtn && characterReferenceUploadInput) {
@@ -1607,6 +1646,16 @@ export function bindEvents() {
   if (characterReferenceList) {
     characterReferenceList.addEventListener('click', e => {
       const target = e.target instanceof Element ? e.target : null;
+      const verifyAllBtn = target ? target.closest('[data-character-reference-verify-all]') : null;
+      if (verifyAllBtn && characterReferenceList.contains(verifyAllBtn)) {
+        verifyAllCharacterReferences(Number(verifyAllBtn.dataset.characterReferenceVerifyAll));
+        return;
+      }
+      const verifyBtn = target ? target.closest('[data-character-reference-verify]') : null;
+      if (verifyBtn && characterReferenceList.contains(verifyBtn)) {
+        verifyCharacterReference(Number(verifyBtn.dataset.characterId), Number(verifyBtn.dataset.characterReferenceVerify));
+        return;
+      }
       const btn = target ? target.closest('[data-character-reference-delete]') : null;
       if (!btn || !characterReferenceList.contains(btn)) return;
       deleteCharacterReference(Number(btn.dataset.characterId), Number(btn.dataset.characterReferenceDelete));
@@ -1648,7 +1697,21 @@ export function bindEvents() {
   const healthGrid = $('#healthGrid');
   if (healthGrid) healthGrid.addEventListener('click', e => {
     const target = e.target instanceof Element ? e.target.closest('[data-error-artists-open]') : null;
-    if (target && healthGrid.contains(target)) openErrorArtistsDialog();
+    if (target && healthGrid.contains(target)) {
+      openErrorArtistsDialog();
+      return;
+    }
+    const errCard = e.target instanceof Element ? e.target.closest('[data-recent-errors-jump]') : null;
+    if (errCard && healthGrid.contains(errCard) && !(e.target instanceof Element && e.target.closest('summary'))) {
+      setMaintenanceView('records');
+      loadMoveWorkbench({view: 'records'}).then(() => {
+        const panel = $('#operationRuntimeLogPanel');
+        if (panel) {
+          panel.open = true;
+          panel.scrollIntoView?.({behavior: 'smooth', block: 'start'});
+        }
+      }).catch(() => {});
+    }
   });
   const mlDownloadSourceSelect = $('#mlDownloadSourceSelect');
   if (mlDownloadSourceSelect) {
@@ -1794,8 +1857,8 @@ export function bindEvents() {
   const editExtractArchivesBtn = $('#editExtractArchivesBtn');
   if (editExtractArchivesBtn) {
     editExtractArchivesBtn.addEventListener('click', () => {
-      const selectedArchives = (state.allItems || []).filter(item =>
-        state.selectedIds.has(item.id) && (item.media_type === 'archive' || item.is_archive)
+      const selectedArchives = (state.allItems || []).filter(
+        item => state.selectedIds.has(item.id) && isBatchExtractableArchiveItem(item),
       );
       if (selectedArchives.length === 0) return;
       openBatchArchiveModal({
@@ -2007,6 +2070,17 @@ export function bindEvents() {
         if (state.selectedIds.size > 0 && state.currentArtist) {
           e.preventDefault();
           repeatLastBundleSelectedItems();
+        }
+      }
+    }
+    if (e.key === '?' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      const activeEl = document.activeElement;
+      const tag = activeEl ? activeEl.tagName : '';
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !activeEl?.isContentEditable && !globalDeleteShortcutBlocked()) {
+        const guideDialog = $('#maintenanceGuideDialog');
+        if (guideDialog && typeof guideDialog.showModal === 'function' && !guideDialog.open) {
+          e.preventDefault();
+          guideDialog.showModal();
         }
       }
     }

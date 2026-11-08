@@ -80,6 +80,7 @@ export async function loadNetdiskPanel(options = {}) {
   const request = {};
   netdiskPanelRequest = request;
   const saveRevision = netdiskSettingsSaveRevision;
+  const editRevision = netdiskSettingsEditRevision;
   const fetchOptions = options.signal ? {signal: options.signal} : {};
   state.netdiskLoading = true;
   try {
@@ -92,8 +93,10 @@ export async function loadNetdiskPanel(options = {}) {
       listNetdiskJobs(fetchOptions),
     ]);
     if (netdiskPanelRequest !== request) return;
-    if (settings.status === 'fulfilled' && !isActionBusy('netdiskSave')
-      && saveRevision === netdiskSettingsSaveRevision) {
+    if (settings.status === 'fulfilled' && !state.netdiskSettingsDirty
+      && !isActionBusy('netdiskSave')
+      && saveRevision === netdiskSettingsSaveRevision
+      && editRevision === netdiskSettingsEditRevision) {
       state.netdiskSettings = {...NETDISK_DEFAULTS, ...(settings.value || {})};
     }
     if (connection.status === 'fulfilled') {
@@ -427,8 +430,8 @@ export async function saveNetdiskSettings() {
   setButtonBusy('#netdiskSaveBtn', false, 'netdiskSave');
   try {
     await API.putJson('/api/netdisk/settings', payload);
-    state.netdiskSettings = payload;
     if (editRevision === netdiskSettingsEditRevision) {
+      state.netdiskSettings = payload;
       state.netdiskSettingsDirty = false;
       const badge = $('#netdiskDirtyBadge');
       if (badge) badge.hidden = true;

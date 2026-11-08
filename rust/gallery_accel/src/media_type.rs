@@ -15,24 +15,195 @@ const ARCHIVE: &[&str] = &["rar", "zip", "7z", "tar", "gz", "bz2", "xz"];
 const TEXT: &[&str] = &["txt", "md", "html", "htm"];
 
 pub fn media_type_for_file(filename: &str) -> Option<&'static str> {
-    let ext = filename
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if IMAGE.contains(&ext.as_str()) {
-        Some("image")
-    } else if VIDEO.contains(&ext.as_str()) {
-        Some("video")
-    } else if SOURCE.contains(&ext.as_str()) {
-        Some("source")
-    } else if ARCHIVE.contains(&ext.as_str()) {
-        Some("archive")
-    } else if TEXT.contains(&ext.as_str()) {
-        Some("text")
-    } else {
-        None
+    let (_, ext) = filename.rsplit_once('.').unwrap_or(("", filename));
+    if IMAGE.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+        return Some("image");
     }
+    if VIDEO.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+        return Some("video");
+    }
+    if SOURCE.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+        return Some("source");
+    }
+    if TEXT.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+        return Some("text");
+    }
+    if is_secondary_archive_volume(filename) {
+        return None;
+    }
+    if is_primary_split_archive(filename) || ARCHIVE.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+        return Some("archive");
+    }
+    None
+}
+
+fn is_archive_ext(ext: &str) -> bool {
+    ARCHIVE.iter().any(|&e| e.eq_ignore_ascii_case(ext))
+}
+
+/// Returns `true` if `filename` is the first volume of a numeric split archive
+/// such as `pack.7z.001`, `pack.zip.001`, `pack.rar.001`, or `pack.7z.0001`.
+pub fn is_primary_split_archive(filename: &str) -> bool {
+    let Some((before_num, digits)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    if !(3..=4).contains(&digits.len())
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+        || digits.parse::<u32>() != Ok(1)
+    {
+        return false;
+    }
+    let Some((stem, arch_ext)) = before_num.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty() && is_archive_ext(arch_ext)
+}
+
+/// Returns `true` if `filename` is a primary `.7z` archive (`*.7z`, `*.part1.7z`,
+/// `*.7z.001`, `*.7z.0001`).
+pub fn is_7z_archive_filename(filename: &str) -> bool {
+    if is_secondary_archive_volume(filename) {
+        return false;
+    }
+    let Some((before_ext, ext)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    if before_ext.is_empty() {
+        return false;
+    }
+    if ext.eq_ignore_ascii_case("7z") {
+        return true;
+    }
+    if (3..=4).contains(&ext.len())
+        && ext.bytes().all(|b| b.is_ascii_digit())
+        && ext.parse::<u32>() == Ok(1)
+    {
+        if let Some((stem, arch_ext)) = before_ext.rsplit_once('.') {
+            return !stem.is_empty() && arch_ext.eq_ignore_ascii_case("7z");
+        }
+    }
+    false
+}
+
+/// Returns `true` if `filename` is a non-primary volume of a multi-volume archive
+/// (`.part02.rar`, `.7z.002`, `.z01`, `.r00`, `.s00`, `.t00`, etc.).
+pub fn is_secondary_archive_volume(filename: &str) -> bool {
+    let Some((before_ext, ext)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    if before_ext.is_empty() {
+        return false;
+    }
+
+    if ext.eq_ignore_ascii_case("rar")
+        || ext.eq_ignore_ascii_case("zip")
+        || ext.eq_ignore_ascii_case("7z")
+    {
+        if let Some((stem, part_seg)) = before_ext.rsplit_once('.') {
+            if !stem.is_empty()
+                && part_seg.len() > 4
+                && part_seg
+                    .get(..4)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("part"))
+            {
+                let digits = &part_seg[4..];
+                if digits.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(num) = digits.parse::<u32>() {
+                        return num != 1;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    if (3..=4).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_digit()) {
+        if let Some((stem, arch_ext)) = before_ext.rsplit_once('.') {
+            if !stem.is_empty() && is_archive_ext(arch_ext) {
+                if let Ok(num) = ext.parse::<u32>() {
+                    return num != 1;
+                }
+            }
+        }
+        return false;
+    }
+
+    let eb = ext.as_bytes();
+    if eb.len() >= 3 {
+        if eb[0].eq_ignore_ascii_case(&b'z') && eb[1..].iter().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+        if eb.len() == 3
+            && matches!(eb[0].to_ascii_lowercase(), b'r' | b's' | b't')
+            && eb[1].is_ascii_digit()
+            && eb[2].is_ascii_digit()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` if `filename` is the first volume of a `.part1.{rar,zip,7z}`
+/// (or `.part01.{rar,zip,7z}`) multi-volume archive.
+pub fn is_primary_part_archive(filename: &str) -> bool {
+    let Some((before_ext, ext)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    if !ext.eq_ignore_ascii_case("rar")
+        && !ext.eq_ignore_ascii_case("zip")
+        && !ext.eq_ignore_ascii_case("7z")
+    {
+        return false;
+    }
+    let Some((stem, part_seg)) = before_ext.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty()
+        || part_seg.len() <= 4
+        || !part_seg
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("part"))
+    {
+        return false;
+    }
+    let digits = &part_seg[4..];
+    digits.bytes().all(|b| b.is_ascii_digit()) && digits.parse::<u32>() == Ok(1)
+}
+
+/// Returns `true` for any multi-volume archive filename (primary or secondary),
+/// used by Pawchive `FileCategory::from_filename` so split volumes are categorized
+/// as `Archive` rather than `Other`.
+pub fn is_archive_volume_filename(filename: &str) -> bool {
+    is_primary_split_archive(filename)
+        || is_primary_part_archive(filename)
+        || is_secondary_archive_volume(filename)
+}
+
+/// Splits `filename` into `(stem, extension_with_leading_dot)`, preserving compound
+/// multi-volume or compressed-tar suffixes such as `.part01.rar`, `.7z.001`, or `.tar.gz`.
+pub fn split_filename_stem_and_ext(filename: &str) -> (&str, &str) {
+    static COMPOUND_RE: OnceLock<Regex> = OnceLock::new();
+    let re = COMPOUND_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)^(.+?)(\.(?:part\d+\.(?:rar|zip|7z)|tar\.(?:gz|bz2|xz|zst|lz4)\.\d{3,4}|(?:7z|zip|rar|tar|gz|bz2|xz)\.\d{3,4}|tar\.(?:gz|bz2|xz|zst|lz4)))$",
+        )
+        .unwrap()
+    });
+    if let Some(caps) = re.captures(filename) {
+        if let (Some(stem), Some(ext)) = (caps.get(1), caps.get(2)) {
+            return (stem.as_str(), ext.as_str());
+        }
+    }
+    match filename.rfind('.') {
+        Some(idx) if idx > 0 => (&filename[..idx], &filename[idx..]),
+        _ => (filename, ""),
+    }
+}
+
+/// Strips archive and multi-volume suffixes from `filename` to return the clean base stem.
+pub fn strip_archive_volume_suffix(filename: &str) -> &str {
+    split_filename_stem_and_ext(filename).0
 }
 
 /// A recognized date that preserves its original precision.
@@ -94,6 +265,9 @@ fn normalized_month(year: u32, month: u32) -> Option<String> {
 /// with a canonical `YYYY-MM-01`. Full-date matching comes first. Impossible
 /// calendar dates are rejected.
 pub fn extract_date_value_from_folder(folder: &str) -> Option<DateValue> {
+    if !folder.bytes().any(|b| b.is_ascii_digit()) {
+        return None;
+    }
     static FULL: OnceLock<Regex> = OnceLock::new();
     static FULL2: OnceLock<Regex> = OnceLock::new();
     static COMPACT: OnceLock<Regex> = OnceLock::new();

@@ -155,9 +155,10 @@ body.mode-moves .search-shortcut-hint{
   background:var(--border-subtle);border-radius:var(--radius-pill);overflow:hidden;position:relative;
 }
 .scan-progress-track .fill{
-  height:100%;background:var(--accent);border-radius:var(--radius-pill);
-  will-change:width;
-  transition:width .2s ease-out;
+  height:100%;width:100%;background:var(--accent);border-radius:var(--radius-pill);
+  transform:scaleX(0);transform-origin:left center;
+  will-change:transform;
+  transition:transform .2s ease-out;
 }
 .scan-progress-path{
   color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
@@ -211,6 +212,13 @@ main{display:flex;flex:1;overflow:hidden}
 .item-filter-dates{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:2px}
 .item-filter-dates .item-filter-field:first-child{padding-right:0}
 .item-filter-dates .item-filter-field:last-child{padding-left:0}
+.item-filter-undated-row{padding:6px 6px 0}
+.sidebar-item-undated{width:100%;border:0;background:transparent;font:inherit;text-align:left}
+.filter-active-dot{
+  width:6px;height:6px;min-width:6px;flex:0 0 6px;
+  border-radius:var(--radius-pill);background:var(--vermilion);display:inline-block;
+}
+.filter-active-dot[hidden]{display:none}
 .item-filter-date-actions{display:flex;justify-content:flex-end;padding:0 12px;margin-top:6px}
 .item-filter-sort-field{margin-top:8px}
 .item-date-reset-btn{
@@ -343,7 +351,7 @@ header .btn:hover:not(:disabled),
 .media-filter-select{height:var(--control-height);min-width:128px;max-width:190px;font-size:var(--toolbar-control-font-size)}
 .mobile-filter-btn{
     height:var(--control-height);min-height:var(--control-height);padding:0 var(--control-padding-x);
-    font-size:var(--toolbar-control-font-size);line-height:1.2;align-items:center;justify-content:center;
+    font-size:var(--toolbar-control-font-size);line-height:1.2;align-items:center;justify-content:center;gap:6px;
   }
 .duplicate-files-toggle{display:inline-flex}
 .mobile-header-toggle{
@@ -368,8 +376,8 @@ header .btn:hover:not(:disabled),
    keeps the tight 6px gap. */
 @media(min-width:769px){
   .toolbar #duplicateFilesToggle{margin-left:6px}
-  .toolbar #desktopRatioToggle{margin-left:auto}
-  .toolbar #desktopViewToggle{margin-left:6px}
+  .toolbar #desktopRatioToggle{display:none;margin-left:auto}
+  .toolbar #desktopViewToggle{margin-left:auto}
   .toolbar .artist-links-launcher{margin-left:6px}
 }
 

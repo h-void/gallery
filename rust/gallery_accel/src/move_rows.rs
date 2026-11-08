@@ -87,16 +87,13 @@ fn batch_artist_lookup(
     Ok(map)
 }
 
-/// Batched `id -> integer column` lookup, mirroring `batch_artist_lookup`.
-/// Used for evidence the row needs to judge an action but must not expose as
-/// a new serialized field.
-fn batch_i64_lookup(
+type ItemMoveContextEntry = (Option<i64>, Option<String>, Option<i64>);
+
+fn batch_item_context_lookup(
     conn: &Connection,
-    table: &str,
-    column: &str,
     ids: &[i64],
-) -> Result<HashMap<i64, Option<i64>>> {
-    let mut map: HashMap<i64, Option<i64>> = HashMap::new();
+) -> Result<HashMap<i64, ItemMoveContextEntry>> {
+    let mut map: HashMap<i64, ItemMoveContextEntry> = HashMap::new();
     let unique: BTreeSet<i64> = ids.iter().copied().collect();
     let unique: Vec<i64> = unique.into_iter().collect();
     for chunk in unique.chunks(500) {
@@ -104,19 +101,19 @@ fn batch_i64_lookup(
             .collect::<Vec<_>>()
             .join(",");
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, {column} FROM {table} WHERE id IN ({placeholders})"
+            "SELECT id, artist_id, content_hash, missing FROM items WHERE id IN ({placeholders})"
         ))?;
-        let found: Vec<(i64, i64)> = stmt
-            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (id, value) in found {
-            map.insert(id, Some(value));
+        let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let artist_id: Option<i64> = row.get(1)?;
+            let content_hash: Option<String> = row.get(2)?;
+            let missing: Option<i64> = row.get(3)?;
+            map.insert(id, (artist_id, content_hash, missing));
         }
     }
     for id in unique {
-        map.entry(id).or_insert(None);
+        map.entry(id).or_insert((None, None, None));
     }
     Ok(map)
 }
@@ -131,17 +128,14 @@ fn attach_move_context_batch(
         .iter()
         .filter_map(|row| row.scan_candidate_id)
         .collect();
-    let artist_by_item = batch_artist_lookup(conn, "items", &item_ids)?;
+    let item_context_by_id = batch_item_context_lookup(conn, &item_ids)?;
     let artist_by_scan_candidate = batch_artist_lookup(conn, "scan_candidates", &candidate_ids)?;
-    let hash_by_item = batch_text_lookup(conn, "items", "content_hash", &item_ids)?;
-    let missing_by_item = batch_i64_lookup(conn, "items", "missing", &item_ids)?;
     let store = ArtistContextStore::load(
         conn,
         rows.iter().flat_map(|row| {
             let item_artist = row
                 .item_id
-                .and_then(|id| artist_by_item.get(&id).copied())
-                .flatten();
+                .and_then(|id| item_context_by_id.get(&id).and_then(|ctx| ctx.0));
             let candidate_artist = row
                 .scan_candidate_id
                 .and_then(|id| artist_by_scan_candidate.get(&id).copied())
@@ -155,75 +149,30 @@ fn attach_move_context_batch(
             assemble_move_row(
                 roots,
                 row,
-                &artist_by_item,
+                &item_context_by_id,
                 &artist_by_scan_candidate,
-                &hash_by_item,
-                &missing_by_item,
                 &store,
             )
         })
         .collect()
 }
 
-/// Batched `id -> text column` lookup, mirroring `batch_artist_lookup`.
-fn batch_text_lookup(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    ids: &[i64],
-) -> Result<HashMap<i64, Option<String>>> {
-    let mut map: HashMap<i64, Option<String>> = HashMap::new();
-    let unique: BTreeSet<i64> = ids.iter().copied().collect();
-    let unique: Vec<i64> = unique.into_iter().collect();
-    for chunk in unique.chunks(500) {
-        let placeholders = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id, {column} FROM {table} WHERE id IN ({placeholders})"
-        ))?;
-        let found: Vec<(i64, Option<String>)> = stmt
-            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (id, value) in found {
-            map.insert(id, value);
-        }
-    }
-    for id in unique {
-        map.entry(id).or_insert(None);
-    }
-    Ok(map)
-}
-
 fn assemble_move_row(
     roots: &MediaRoots,
     row: BasicMoveRow,
-    artist_by_item: &HashMap<i64, Option<i64>>,
+    item_context_by_id: &HashMap<i64, ItemMoveContextEntry>,
     artist_by_scan_candidate: &HashMap<i64, Option<i64>>,
-    hash_by_item: &HashMap<i64, Option<String>>,
-    missing_by_item: &HashMap<i64, Option<i64>>,
     store: &ArtistContextStore,
 ) -> Result<MoveRow> {
-    let item_artist_id = row
-        .item_id
-        .and_then(|id| artist_by_item.get(&id).copied())
-        .flatten();
+    let item_ctx = row.item_id.and_then(|id| item_context_by_id.get(&id));
+    let item_artist_id = item_ctx.and_then(|ctx| ctx.0);
     let candidate_artist_id = row
         .scan_candidate_id
         .and_then(|id| artist_by_scan_candidate.get(&id).copied())
         .flatten()
         .or(Some(row.artist_id));
-    let item_hash = row
-        .item_id
-        .and_then(|id| hash_by_item.get(&id).cloned())
-        .flatten()
-        .unwrap_or_default();
-    let item_missing = row
-        .item_id
-        .and_then(|id| missing_by_item.get(&id).copied())
-        .flatten();
+    let item_hash = item_ctx.and_then(|ctx| ctx.1.clone()).unwrap_or_default();
+    let item_missing = item_ctx.and_then(|ctx| ctx.2);
     let item_artist = store.get(item_artist_id);
     let candidate_artist = store.get(candidate_artist_id);
     Ok(build_move_row(

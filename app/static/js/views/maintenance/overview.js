@@ -866,7 +866,7 @@ export function renderHealthSummary() {
     <div class="maintenance-card status-card ${archiveStatus}"><b>${t('文件夹整理')}</b><span title="${escHtml(archiveFailedPlans == null ? t('状态未上报') : (archiveFailedPlans ? `执行失败 ${archiveFailedPlans}` : t('无执行失败')))}">${escHtml(archiveFailedPlans == null ? t('状态未上报') : (archiveFailedPlans ? `执行失败 ${archiveFailedPlans}` : t('无执行失败')))}</span></div>
     <button class="maintenance-card status-card ${errorArtistsCount == null ? 'status-muted' : (errorArtistsCount ? 'status-danger' : 'status-ok')} error-artists-card" type="button" data-error-artists-open aria-haspopup="dialog" title="${t('点击查看出错画师列表及处理指引')}"><b>${t('出错画师（按画师）')}</b><span title="${escHtml(errorArtistsCount == null ? t('状态未上报') : (errorArtistsCount ? t('{count} 位画师', {count: errorArtistsCount}) : t('暂无出错画师')))}">${escHtml(errorArtistsCount == null ? t('状态未上报') : (errorArtistsCount ? t('{count} 位画师', {count: errorArtistsCount}) : t('暂无出错画师')))}</span></button>
     <div class="maintenance-card status-card ${logStatus}"><b>${t('日志')}</b>${healthSummaryDetail(logText, 1)}</div>
-    <div class="maintenance-card status-card ${errorStatus}"><b>${t('最近错误')}</b><span>${errorHtml}</span></div>
+    <div class="maintenance-card status-card ${errorStatus}${errorsKnown && errors.length ? ' is-clickable-error' : ''}"${errorsKnown && errors.length ? ' data-recent-errors-jump="1" role="button" tabindex="0"' : ''}><b>${t('最近错误')}</b><span>${errorHtml}</span></div>
   `;
   renderHashStatus();
   renderDimensionBackfillStatus();

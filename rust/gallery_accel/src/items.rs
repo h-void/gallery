@@ -75,6 +75,51 @@ pub fn items_page_query_response_ext(
     favorite_only: Option<bool>,
     inbox: Option<bool>,
 ) -> Result<Value> {
+    items_page_query_response_with_undated(
+        conn,
+        artist_id,
+        limit,
+        offset,
+        sort,
+        media_type,
+        folder,
+        date_from,
+        date_to,
+        image_only,
+        untagged,
+        tag_id,
+        duplicates_only,
+        tag_names,
+        search,
+        search_tags_only,
+        favorite_only,
+        inbox,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn items_page_query_response_with_undated(
+    conn: &Connection,
+    artist_id: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    sort: Option<&str>,
+    media_type: Option<&str>,
+    folder: Option<&str>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+    image_only: Option<bool>,
+    untagged: Option<bool>,
+    tag_id: Option<i64>,
+    duplicates_only: Option<bool>,
+    tag_names: Option<&str>,
+    search: Option<&str>,
+    search_tags_only: bool,
+    favorite_only: Option<bool>,
+    inbox: Option<bool>,
+    undated: Option<bool>,
+) -> Result<Value> {
     items_page_query_response_inner(
         conn,
         artist_id,
@@ -94,6 +139,7 @@ pub fn items_page_query_response_ext(
         search_tags_only,
         favorite_only,
         inbox,
+        undated,
         None,
         false,
     )
@@ -165,6 +211,53 @@ pub fn items_page_cursor_query_response_ext(
     inbox: Option<bool>,
     cursor: Option<&str>,
 ) -> Result<Value> {
+    items_page_cursor_query_response_with_undated(
+        conn,
+        artist_id,
+        limit,
+        offset,
+        sort,
+        media_type,
+        folder,
+        date_from,
+        date_to,
+        image_only,
+        untagged,
+        tag_id,
+        duplicates_only,
+        tag_names,
+        search,
+        search_tags_only,
+        favorite_only,
+        inbox,
+        None,
+        cursor,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn items_page_cursor_query_response_with_undated(
+    conn: &Connection,
+    artist_id: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    sort: Option<&str>,
+    media_type: Option<&str>,
+    folder: Option<&str>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+    image_only: Option<bool>,
+    untagged: Option<bool>,
+    tag_id: Option<i64>,
+    duplicates_only: Option<bool>,
+    tag_names: Option<&str>,
+    search: Option<&str>,
+    search_tags_only: bool,
+    favorite_only: Option<bool>,
+    inbox: Option<bool>,
+    undated: Option<bool>,
+    cursor: Option<&str>,
+) -> Result<Value> {
     let parsed_cursor = cursor
         .map(|value| parse_item_cursor(value, sort))
         .transpose()?;
@@ -187,6 +280,7 @@ pub fn items_page_cursor_query_response_ext(
         search_tags_only,
         favorite_only,
         inbox,
+        undated,
         parsed_cursor.as_ref(),
         true,
     )
@@ -212,6 +306,7 @@ fn items_page_query_response_inner(
     search_tags_only: bool,
     favorite_only: Option<bool>,
     inbox: Option<bool>,
+    undated: Option<bool>,
     cursor: Option<&ItemCursor>,
     cursor_mode: bool,
 ) -> Result<Value> {
@@ -226,32 +321,11 @@ fn items_page_query_response_inner(
     } else {
         offset.unwrap_or(0).max(0)
     };
-    let (where_sql, params) = item_page_where(
-        conn,
-        artist_id,
-        media_type,
-        folder,
-        date_from,
-        date_to,
-        image_only,
-        untagged,
-        tag_id,
-        duplicates_only,
-        tag_names,
-        search,
-        search_tags_only,
-        favorite_only,
-        inbox,
-        cursor,
-    )?;
     // The count is the size of the filtered set, not of the page's remainder.
-    // `item_page_where` ANDs the cursor predicate in after everything else, so
-    // reusing `where_sql` here made `total` the number of rows *after* the
-    // cursor: it shrank with every page and disagreed with the offset mode,
-    // where the same field is the whole filtered count. The two modes have to
-    // answer the same question, or a client that reads `total` in one and then
-    // the other gets two different numbers for one search.
-    let (count_sql, count_params) = item_page_where(
+    // Build the cursor-free filter once for `total`, then append the cursor
+    // predicate only when `cursor` is present so `item_page_where` (including
+    // artist path lookup and Pinyin tag matching) never runs twice per request.
+    let (mut where_sql, mut page_params) = item_page_where(
         conn,
         artist_id,
         media_type,
@@ -267,14 +341,22 @@ fn items_page_query_response_inner(
         search_tags_only,
         favorite_only,
         inbox,
+        undated,
         None,
     )?;
     let total = conn.query_row(
-        &format!("SELECT COUNT(*) FROM items i WHERE {count_sql}"),
-        params_from_iter(count_params.iter()),
+        &format!("SELECT COUNT(*) FROM items i WHERE {where_sql}"),
+        params_from_iter(page_params.iter()),
         |row| row.get::<_, i64>(0),
     )?;
-    let mut page_params = params;
+    if let Some(cursor) = cursor {
+        let mut cursor_conditions = Vec::with_capacity(1);
+        append_cursor_condition(&mut cursor_conditions, &mut page_params, cursor);
+        if let Some(cond) = cursor_conditions.pop() {
+            where_sql.push_str(" AND ");
+            where_sql.push_str(&cond);
+        }
+    }
     page_params.push(SqlValue::Integer(if cursor_mode {
         page_limit.saturating_add(1)
     } else {
@@ -294,6 +376,7 @@ fn items_page_query_response_inner(
     if has_more {
         page_items.truncate(page_limit as usize);
     }
+    fill_missing_page_image_dimensions(conn, &mut page_items);
     let next_cursor = if has_more {
         page_items
             .last()
@@ -313,6 +396,63 @@ fn items_page_query_response_inner(
         body["next_cursor"] = next_cursor.map(Value::String).unwrap_or(Value::Null);
     }
     Ok(body)
+}
+
+/// Probe intrinsic dimensions for image rows on the current page whose database
+/// dimensions are still unset, updating both the response items and SQLite so
+/// justified rows (especially hover-only GIF cards) lay out at their real
+/// aspect ratio on initial render without waiting for a hover preview.
+fn fill_missing_page_image_dimensions(conn: &Connection, items: &mut [ItemDetailRow]) {
+    let mut lazy_roots: Option<crate::media_roots::MediaRoots> = None;
+    let mut updates = Vec::new();
+    for item in items.iter_mut() {
+        if item.missing != 0 || item.media_type != "image" || (item.width > 0 && item.height > 0) {
+            continue;
+        }
+        let direct = std::path::Path::new(&item.file_path);
+        let mapped;
+        let target = if direct.is_file() {
+            Some(direct)
+        } else {
+            let roots = lazy_roots.get_or_insert_with(crate::media_roots::env_media_roots);
+            mapped = roots.map_to_real(&item.file_path).ok();
+            mapped.as_deref().filter(|path| path.is_file())
+        };
+        let Some(path) = target else {
+            continue;
+        };
+        if let Ok((width, height)) = crate::dimensions::media_dimensions(path, "image") {
+            if width > 0 && height > 0 {
+                item.width = i64::from(width);
+                item.height = i64::from(height);
+                updates.push((item.id, item.width, item.height));
+            }
+        }
+    }
+    if updates.is_empty() {
+        return;
+    }
+    let query_only = conn
+        .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0)
+        != 0;
+    if query_only {
+        return;
+    }
+    if let Ok(tx) = conn.unchecked_transaction() {
+        if let Ok(mut stmt) = tx.prepare_cached(
+            "UPDATE items
+             SET width=?, height=?
+             WHERE id=? AND missing=0 AND (width <= 0 OR height <= 0)",
+        ) {
+            for (id, width, height) in updates {
+                if stmt.execute(rusqlite::params![width, height, id]).is_err() {
+                    return;
+                }
+            }
+        }
+        let _ = tx.commit();
+    }
 }
 
 /// Base filter conditions for the items page, generated for one row alias.
@@ -337,6 +477,7 @@ fn item_base_conditions(
     search_tags_only: bool,
     favorite_only: Option<bool>,
     inbox: Option<bool>,
+    undated: Option<bool>,
 ) -> Result<(Vec<String>, Vec<SqlValue>)> {
     let mut conditions = vec![format!("{alias}.missing=0")];
     let mut params = Vec::new();
@@ -358,6 +499,18 @@ fn item_base_conditions(
         } else {
             conditions.push(format!(
                 "(EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id={alias}.id)                  AND (COALESCE({alias}.manual_date, '') != '' OR COALESCE({alias}.detected_date, '') != '' OR (COALESCE({alias}.date, '') != '' AND {alias}.date NOT LIKE '0000%'))                  AND COALESCE({alias}.folder_name, '') != '')"
+            ));
+        }
+    }
+
+    if let Some(undated_val) = undated {
+        if undated_val {
+            conditions.push(format!(
+                "(COALESCE({alias}.manual_date, '') = '' AND COALESCE({alias}.detected_date, '') = '' AND (COALESCE({alias}.date, '') = '' OR {alias}.date LIKE '0000%'))"
+            ));
+        } else {
+            conditions.push(format!(
+                "(COALESCE({alias}.manual_date, '') != '' OR COALESCE({alias}.detected_date, '') != '' OR (COALESCE({alias}.date, '') != '' AND {alias}.date NOT LIKE '0000%'))"
             ));
         }
     }
@@ -503,6 +656,7 @@ fn item_page_where(
     search_tags_only: bool,
     favorite_only: Option<bool>,
     inbox: Option<bool>,
+    undated: Option<bool>,
     cursor: Option<&ItemCursor>,
 ) -> Result<(String, Vec<SqlValue>)> {
     let (mut conditions, mut params) = item_base_conditions(
@@ -521,6 +675,7 @@ fn item_page_where(
         search_tags_only,
         favorite_only,
         inbox,
+        undated,
     )?;
     if duplicates_only.unwrap_or(false) {
         // Regenerate the same filters under the twin alias instead of a blind
@@ -542,6 +697,7 @@ fn item_page_where(
             search_tags_only,
             favorite_only,
             inbox,
+            undated,
         )?;
         conditions.push("i.media_type IN ('image', 'video', 'source')".to_string());
         conditions.push("i.is_archive=0".to_string());
@@ -557,75 +713,78 @@ fn item_page_where(
         params.extend(duplicate_params);
     }
     if let Some(cursor) = cursor {
-        let condition = match cursor.sort.as_str() {
-            "date_asc" => "(i.date > ? OR (i.date = ? AND (i.file_name COLLATE NATURAL_NOCASE > ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id > ?))))",
-            "name" => "(i.file_name COLLATE NATURAL_NOCASE > ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id > ?))",
-            "name_desc" => "(i.file_name COLLATE NATURAL_NOCASE < ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id < ?))",
-            "size" => "(i.file_size < ? OR (i.file_size = ? AND i.id < ?))",
-            "size_asc" => "(i.file_size > ? OR (i.file_size = ? AND i.id > ?))",
-            "scanned_desc" => "(i.scanned_at < ? OR (i.scanned_at = ? AND i.id < ?))",
-            _ => "(i.date < ? OR (i.date = ? AND (i.file_name COLLATE NATURAL_NOCASE > ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id > ?))))",
-        };
-        conditions.push(condition.to_string());
-        match cursor.sort.as_str() {
-            "date_asc" | "date_desc" => {
-                params.push(SqlValue::Text(cursor.date.clone()));
-                params.push(SqlValue::Text(cursor.date.clone()));
-                params.push(SqlValue::Text(cursor.file_name.clone()));
-                params.push(SqlValue::Text(cursor.file_name.clone()));
-                params.push(SqlValue::Integer(cursor.id));
-            }
-            "name" => {
-                params.push(SqlValue::Text(cursor.file_name.clone()));
-                params.push(SqlValue::Text(cursor.file_name.clone()));
-                params.push(SqlValue::Integer(cursor.id));
-            }
-            "name_desc" => {
-                params.push(SqlValue::Text(cursor.file_name.clone()));
-                params.push(SqlValue::Text(cursor.file_name.clone()));
-                params.push(SqlValue::Integer(cursor.id));
-            }
-            "size" => {
-                params.push(SqlValue::Integer(cursor.file_size));
-                params.push(SqlValue::Integer(cursor.file_size));
-                params.push(SqlValue::Integer(cursor.id));
-            }
-            "size_asc" => {
-                params.push(SqlValue::Integer(cursor.file_size));
-                params.push(SqlValue::Integer(cursor.file_size));
-                params.push(SqlValue::Integer(cursor.id));
-            }
-            "scanned_desc" => {
-                params.push(SqlValue::Integer(cursor.scanned_at));
-                params.push(SqlValue::Integer(cursor.scanned_at));
-                params.push(SqlValue::Integer(cursor.id));
-            }
-            _ => unreachable!(),
-        }
+        append_cursor_condition(&mut conditions, &mut params, cursor);
     }
     Ok((conditions.join(" AND "), params))
 }
 
-fn matching_tag_ids(conn: &Connection, query: &str, artist_id: Option<i64>) -> Result<Vec<i64>> {
-    let (sql, params) = match artist_id {
-        Some(artist_id) => (
-            "SELECT id, name FROM tags WHERE artist_id=?",
-            vec![SqlValue::Integer(artist_id)],
-        ),
-        None => ("SELECT id, name FROM tags", Vec::new()),
+fn append_cursor_condition(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<SqlValue>,
+    cursor: &ItemCursor,
+) {
+    let condition = match cursor.sort.as_str() {
+        "date_asc" => "(i.date > ? OR (i.date = ? AND (i.file_name COLLATE NATURAL_NOCASE > ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id > ?))))",
+        "name" => "(i.file_name COLLATE NATURAL_NOCASE > ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id > ?))",
+        "name_desc" => "(i.file_name COLLATE NATURAL_NOCASE < ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id < ?))",
+        "size" => "(i.file_size < ? OR (i.file_size = ? AND i.id < ?))",
+        "size_asc" => "(i.file_size > ? OR (i.file_size = ? AND i.id > ?))",
+        "scanned_desc" => "(i.scanned_at < ? OR (i.scanned_at = ? AND i.id < ?))",
+        _ => "(i.date < ? OR (i.date = ? AND (i.file_name COLLATE NATURAL_NOCASE > ? OR (i.file_name COLLATE NATURAL_NOCASE = ? AND i.id > ?))))",
     };
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt
-        .query_map(params_from_iter(params.iter()), |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(id, name)| {
-            crate::pinyin_search::text_matches_search(query, &[&name]).then_some(id)
-        })
-        .collect())
+    conditions.push(condition.to_string());
+    match cursor.sort.as_str() {
+        "date_asc" | "date_desc" => {
+            params.push(SqlValue::Text(cursor.date.clone()));
+            params.push(SqlValue::Text(cursor.date.clone()));
+            params.push(SqlValue::Text(cursor.file_name.clone()));
+            params.push(SqlValue::Text(cursor.file_name.clone()));
+            params.push(SqlValue::Integer(cursor.id));
+        }
+        "name" | "name_desc" => {
+            params.push(SqlValue::Text(cursor.file_name.clone()));
+            params.push(SqlValue::Text(cursor.file_name.clone()));
+            params.push(SqlValue::Integer(cursor.id));
+        }
+        "size" | "size_asc" => {
+            params.push(SqlValue::Integer(cursor.file_size));
+            params.push(SqlValue::Integer(cursor.file_size));
+            params.push(SqlValue::Integer(cursor.id));
+        }
+        "scanned_desc" => {
+            params.push(SqlValue::Integer(cursor.scanned_at));
+            params.push(SqlValue::Integer(cursor.scanned_at));
+            params.push(SqlValue::Integer(cursor.id));
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn matching_tag_ids(conn: &Connection, query: &str, artist_id: Option<i64>) -> Result<Vec<i64>> {
+    let mut out = Vec::new();
+    match artist_id {
+        Some(artist_id) => {
+            let mut stmt = conn.prepare_cached("SELECT id, name FROM tags WHERE artist_id=?")?;
+            let mut rows = stmt.query([artist_id])?;
+            while let Some(row) = rows.next()? {
+                let name = row.get_ref(1)?.as_str()?;
+                if crate::pinyin_search::text_matches_search(query, &[name]) {
+                    out.push(row.get::<_, i64>(0)?);
+                }
+            }
+        }
+        None => {
+            let mut stmt = conn.prepare_cached("SELECT id, name FROM tags")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let name = row.get_ref(1)?.as_str()?;
+                if crate::pinyin_search::text_matches_search(query, &[name]) {
+                    out.push(row.get::<_, i64>(0)?);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The page query. Kept as its own function so the join-order guarantee below
@@ -731,43 +890,56 @@ fn parse_item_cursor(value: &str, sort: Option<&str>) -> Result<ItemCursor> {
 }
 
 fn item_detail_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ItemDetailRow> {
-    let detected_date: String = row.get("detected_date")?;
-    let manual_date: Option<String> = row.get("manual_date")?;
-    let legacy_date: String = row.get("date")?;
+    let file_path: String = row.get(2)?;
+    let file_name: String = row.get(3)?;
+    let file_size: i64 = row.get(4)?;
+    let file_mtime: f64 = row.get(5)?;
+    let legacy_date: String = row.get(7)?;
+    let detected_date: String = row.get(8)?;
+    let manual_date: Option<String> = row.get(9)?;
+    let display_date = crate::item_detail::effective_display_date(
+        &detected_date,
+        manual_date.as_deref(),
+        &legacy_date,
+    );
+    let is_archive: i64 = row.get(12)?;
+    let media_type: String = row.get(13)?;
+    let extractable_archive = if is_archive != 0 || media_type == "archive" {
+        crate::archive_ops::is_extractable_archive(&file_path, &file_name, file_size, file_mtime)
+    } else {
+        false
+    };
     Ok(ItemDetailRow {
-        id: row.get("id")?,
-        artist_id: row.get("artist_id")?,
-        file_path: row.get("file_path")?,
-        file_name: row.get("file_name")?,
-        file_size: row.get("file_size")?,
-        file_mtime: row.get("file_mtime")?,
-        folder_name: row.get("folder_name")?,
-        date: legacy_date.clone(),
-        detected_date: detected_date.clone(),
-        manual_date: manual_date.clone(),
-        display_date: crate::item_detail::effective_display_date(
-            &detected_date,
-            manual_date.as_deref(),
-            &legacy_date,
-        ),
-        auto_role: row.get("auto_role")?,
-        manual_role: row.get("manual_role")?,
+        id: row.get(0)?,
+        artist_id: row.get(1)?,
+        file_path,
+        file_name,
+        file_size,
+        file_mtime,
+        folder_name: row.get(6)?,
+        date: legacy_date,
+        detected_date,
+        manual_date,
+        display_date,
+        auto_role: row.get(10)?,
+        manual_role: row.get(11)?,
         tags: Vec::new(),
-        is_archive: row.get("is_archive")?,
-        media_type: row.get("media_type")?,
-        content_hash: row.get("content_hash")?,
-        hash_status: row.get("hash_status")?,
-        hash_updated_at: row.get("hash_updated_at")?,
-        st_dev: row.get("st_dev")?,
-        st_ino: row.get("st_ino")?,
-        missing: row.get("missing")?,
-        missing_at: row.get("missing_at")?,
-        scanned_at: row.get("scanned_at")?,
-        favorite: row.get("favorite")?,
-        artist_name: row.get("artist_name")?,
-        artist_path: row.get("artist_path")?,
-        width: row.get("width").unwrap_or(0),
-        height: row.get("height").unwrap_or(0),
+        is_archive,
+        media_type,
+        content_hash: row.get(14)?,
+        hash_status: row.get(15)?,
+        hash_updated_at: row.get(16)?,
+        st_dev: row.get(17)?,
+        st_ino: row.get(18)?,
+        missing: row.get(19)?,
+        missing_at: row.get(20)?,
+        scanned_at: row.get(21)?,
+        width: row.get(22).unwrap_or(0),
+        height: row.get(23).unwrap_or(0),
+        favorite: row.get(24)?,
+        artist_name: row.get(25)?,
+        artist_path: row.get(26)?,
+        extractable_archive,
     })
 }
 

@@ -22,9 +22,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 
-use crate::character_ccip::{
-    embed_candidate_with_roots, load_index_vectors, rank_characters, CCIP_EMBEDDING_DIM,
-};
+use crate::character_ccip::{embed_candidate_with_roots, load_index_vectors, CCIP_EMBEDDING_DIM};
 use crate::character_clusters::{cluster_unorganized, prefilter_hit, DEFAULT_MIN_SIMILARITY};
 use crate::media_roots::MediaRoots;
 
@@ -96,6 +94,7 @@ struct Discovery {
     vectors: Vec<Vec<f32>>,
     clusters: Vec<DiscoveredCluster>,
     clusters_omitted: usize,
+    noise_count: usize,
     /// (item_id, character_name, score) — stage-1 matches regardless of the
     /// silent-tagging switch.
     prefilter_candidates: Vec<(i64, String, f32)>,
@@ -215,8 +214,11 @@ fn text_hints_for_members(
         for token in stem.split(|c: char| c == '_' || c == '-' || c == ' ' || c == '.') {
             let token = token.trim();
             if token.len() >= 2 && token.len() < stem.len() {
+                let prev_len = hints.len();
                 push(&mut hints, &mut seen, token.to_string());
-                token_count += 1;
+                if hints.len() > prev_len {
+                    token_count += 1;
+                }
                 if token_count >= HINT_TOKEN_CAP || hints.len() >= HINT_TOTAL_CAP {
                     break 'outer;
                 }
@@ -236,12 +238,15 @@ fn text_hints_for_members(
             .replace('_', "\\_")
     }
     'dirs: for dir in dirs.iter().take(HINT_TXT_DIRS_CAP) {
-        let pattern = format!("{}%", escape_like(dir));
+        let pattern = format!("{}/%", escape_like(dir));
+        let rel_start = (dir.chars().count() + 2) as i64;
         let rows: Vec<(String, String)> = {
             let mut stmt = conn.prepare(
                 "SELECT file_name, file_path FROM items
                  WHERE artist_id = ?3
+                   AND COALESCE(missing, 0) = 0
                    AND file_path LIKE ?1 ESCAPE '\\'
+                   AND substr(file_path, ?4) NOT LIKE '%/%'
                    AND lower(file_name) LIKE '%.txt'
                  ORDER BY id
                  LIMIT ?2",
@@ -249,9 +254,10 @@ fn text_hints_for_members(
             // Bound the MappedRows temporary to an inner statement: a
             // block-tail `?` would extend its borrow past `stmt`'s scope.
             let collected: std::result::Result<Vec<(String, String)>, rusqlite::Error> = stmt
-                .query_map(params![pattern, HINT_TXT_PER_DIR_CAP, artist_id], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })?
+                .query_map(
+                    params![pattern, HINT_TXT_PER_DIR_CAP, artist_id, rel_start],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )?
                 .collect();
             collected?
         };
@@ -362,24 +368,13 @@ fn run_discovery(
     let mut prefilter_candidates: Vec<(i64, String, f32)> = Vec::new();
     if !refs.is_empty() {
         for (item, vector) in embedded.iter() {
-            let ranked = rank_characters(vector, &refs, 2);
-            if ranked.is_empty() {
+            let (Some((top, char_name)), second) =
+                crate::character_ccip::rank_characters_top2(vector, &refs)
+            else {
                 continue;
-            }
-            let top = ranked[0]["score"].as_f64().unwrap_or(0.0) as f32;
-            let second = ranked
-                .get(1)
-                .and_then(|v| v["score"].as_f64())
-                .map(|v| v as f32);
+            };
             if prefilter_hit(top, second) {
-                prefilter_candidates.push((
-                    item.id,
-                    ranked[0]["character_name"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    top,
-                ));
+                prefilter_candidates.push((item.id, char_name.to_string(), top));
             }
         }
     }
@@ -394,30 +389,38 @@ fn run_discovery(
             let tag_id = get_or_create_tag(&tx, artist_id, character_name)?;
             ids_by_tag.entry(tag_id).or_default().push(*item_id);
         }
+        let mut excluded: BTreeSet<i64> =
+            prefilter_candidates.iter().map(|(id, _, _)| *id).collect();
         for (tag_id, ids) in &ids_by_tag {
-            crate::tags_write::update_item_tags_in_tx(&tx, ids, &[*tag_id], "add")?;
+            let res = crate::tags_write::update_item_tags_in_tx(&tx, ids, &[*tag_id], "add")?;
+            if let Some(arr) = res["changed_item_ids"].as_array() {
+                for v in arr {
+                    if let Some(id) = v.as_i64() {
+                        excluded.insert(id);
+                    }
+                }
+            }
         }
         tx.commit()?;
         pre_filtered_count = prefilter_candidates.len();
         // Tagged items leave the clustering input; the next discover run will
         // not select them again (their tag now matches a character name).
-        let excluded: BTreeSet<i64> = prefilter_candidates.iter().map(|(id, _, _)| *id).collect();
         embedded.retain(|(item, _)| !excluded.contains(&item.id));
     }
 
     // Stage 2/3 over the remaining unknowns.
-    let vectors: Vec<Vec<f32>> = embedded.iter().map(|(_, v)| v.clone()).collect();
+    let (items, vectors): (Vec<OrganizeItem>, Vec<Vec<f32>>) = embedded.into_iter().unzip();
     let result = cluster_unorganized(&vectors, min_similarity)?;
+    let noise_count = result.noise.len();
     let mut clusters = Vec::new();
     for (idx, cluster) in result.clusters.iter().enumerate() {
-        let member_items: Vec<&OrganizeItem> =
-            cluster.members.iter().map(|i| &embedded[*i].0).collect();
+        let member_items: Vec<&OrganizeItem> = cluster.members.iter().map(|i| &items[*i]).collect();
         let text_hints = text_hints_for_members(conn, roots, artist_id, &member_items)?;
         clusters.push(DiscoveredCluster {
             cluster_id: (idx + 1) as i64,
-            members: cluster.members.iter().map(|i| embedded[*i].0.id).collect(),
-            medoid: embedded[cluster.medoid].0.id,
-            diverse: cluster.diverse.map(|i| embedded[i].0.id),
+            members: cluster.members.iter().map(|i| items[*i].id).collect(),
+            medoid: items[cluster.medoid].id,
+            diverse: cluster.diverse.map(|i| items[i].id),
             mean_similarity: cluster.mean_similarity,
             is_all_duplicates: cluster.is_all_duplicates,
             text_hints,
@@ -429,13 +432,13 @@ fn run_discovery(
     }
     .len();
 
-    let items: Vec<OrganizeItem> = embedded.iter().map(|(item, _)| item.clone()).collect();
     Ok(Discovery {
         artist_name,
         items,
-        vectors: embedded.into_iter().map(|(_, v)| v).collect(),
+        vectors,
         clusters,
         clusters_omitted,
+        noise_count,
         prefilter_candidates,
         pre_filtered_count,
         embed_failed_count,
@@ -456,7 +459,6 @@ pub fn discover_character_clusters(
     }
     let silent = silent_prefilter_enabled();
     let discovery = run_discovery(conn, roots, artist_id, min_similarity, max_clusters, silent)?;
-    let clustered: usize = discovery.clusters.iter().map(|c| c.members.len()).sum();
     Ok(json!({
         "artist_id": artist_id,
         "artist_name": discovery.artist_name,
@@ -466,7 +468,7 @@ pub fn discover_character_clusters(
         "pre_filtered_count": discovery.pre_filtered_count,
         "total_unorganized_items": discovery.items.len(),
         "embed_failed_count": discovery.embed_failed_count,
-        "unclustered_noise_count": discovery.items.len() - clustered,
+        "unclustered_noise_count": discovery.noise_count,
         "truncated": discovery.truncated,
         "clusters_omitted": discovery.clusters_omitted,
         "clusters": discovery.clusters.iter().map(cluster_json).collect::<Vec<_>>(),
@@ -485,7 +487,8 @@ fn get_or_create_tag(conn: &Connection, artist_id: i64, name: &str) -> Result<i6
         return Ok(id);
     }
     conn.execute(
-        "INSERT INTO tags (artist_id, name) VALUES (?, ?)",
+        "INSERT INTO tags (artist_id, name, sort_order)
+         VALUES (?1, ?2, COALESCE((SELECT MAX(sort_order) FROM tags WHERE artist_id = ?1), 0) + 1)",
         params![artist_id, name],
     )?;
     Ok(conn.last_insert_rowid())
@@ -602,6 +605,7 @@ fn process_decision(
         outcome.reason = format!("item_set_changed:{offending}");
         return Ok(outcome);
     }
+    let decision_item_set: BTreeSet<i64> = decision.item_ids.iter().copied().collect();
     // Enrollment may only use the two cluster representatives (RFC chapter
     // 5.2 assert 3). Validated before any write so a bad decision stays
     // atomic.
@@ -611,11 +615,20 @@ fn process_decision(
             .chain(cluster.diverse.iter().map(|d| (*d, "diverse")))
             .collect();
         let requested = if decision.enroll_prototypes.is_empty() {
-            allowed.iter().map(|(id, _)| *id).collect()
+            allowed
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| decision_item_set.contains(id))
+                .collect()
         } else {
             decision.enroll_prototypes.clone()
         };
         for item_id in requested {
+            if !decision_item_set.contains(&item_id) {
+                outcome.status = "rejected";
+                outcome.reason = format!("invalid_enroll_prototype:{item_id}");
+                return Ok(outcome);
+            }
             match allowed.iter().find(|(id, _)| *id == item_id) {
                 Some((_, role)) => {
                     if !enroll_items.iter().any(|(id, _)| *id == item_id) {
@@ -646,27 +659,20 @@ fn process_decision(
 
     let names: Vec<(String, Option<String>)> = {
         let mut seen = BTreeSet::new();
+        let mut ordered = Vec::new();
         for character in &decision.characters {
             let name = character.name.trim().to_string();
-            if !name.is_empty() && seen.len() < 8 {
-                seen.insert((
-                    name.clone(),
-                    character.series.as_deref().unwrap_or("").to_string(),
-                ));
+            if !name.is_empty() && ordered.len() < 8 && seen.insert(name.clone()) {
+                let series = character
+                    .series
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                ordered.push((name, series));
             }
         }
-        seen.into_iter()
-            .map(|(name, series)| {
-                (
-                    name,
-                    if series.is_empty() {
-                        None
-                    } else {
-                        Some(series)
-                    },
-                )
-            })
-            .collect()
+        ordered
     };
     if names.is_empty() {
         outcome.status = "rejected";
@@ -701,7 +707,7 @@ fn process_decision(
         .as_deref()
         .map(|hint| cluster.text_hints.iter().any(|h| h == hint))
         .unwrap_or(false);
-    if decision.is_multi_character_shot {
+    if decision.is_multi_character_shot || names.len() > 1 {
         // RFC chapter 3.3 hard rule: multi-character shots are tagged but
         // never enroll any vector, not even into the staging pool.
         outcome.enroll_verified = Some(false);
@@ -730,15 +736,24 @@ fn process_decision(
         .map(|(idx, item)| (item.id, &discovery.vectors[idx]))
         .collect();
     for (item_id, role) in enroll_items {
-        let already: Option<i64> = tx
+        let already: Option<(i64, i64)> = tx
             .query_row(
-                "SELECT id FROM character_references
+                "SELECT id, COALESCE(verified, 1) FROM character_references
                  WHERE character_id = ? AND item_id = ? AND source_type = 'cluster_verified'",
                 params![character_id, item_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if already.is_some() {
+        if let Some((existing_id, existing_verified)) = already {
+            if verified == 1 && existing_verified == 0 {
+                tx.execute(
+                    "UPDATE character_references
+                     SET verified = 1, prototype_role = ?1, embedding_updated_at = ?2
+                     WHERE id = ?3",
+                    params![role, now_epoch(), existing_id],
+                )?;
+                outcome.enrolled_reference_ids.push(existing_id);
+            }
             continue;
         }
         let is_video: bool = tx
@@ -811,7 +826,19 @@ pub fn commit_cluster_decisions(
 
     let tx = conn.unchecked_transaction()?;
     let mut outcomes = Vec::new();
+    let mut seen_clusters: BTreeSet<i64> = BTreeSet::new();
     for decision in &parsed {
+        if !seen_clusters.insert(decision.cluster_id) {
+            outcomes.push(serde_json::to_value(DecisionOutcome {
+                cluster_id: decision.cluster_id,
+                status: "rejected",
+                reason: "duplicate_cluster_id".into(),
+                tagged_item_ids: Vec::new(),
+                enrolled_reference_ids: Vec::new(),
+                enroll_verified: None,
+            })?);
+            continue;
+        }
         outcomes.push(serde_json::to_value(process_decision(
             &tx, &discovery, artist_id, decision,
         )?)?);

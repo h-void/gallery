@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use crate::archive_format::{self, RenderContext};
 use crate::folder_archive::{
-    plan_effective_dates_and_tags, recompute_artist_plan_targets, validate_relative_folder,
+    recompute_artist_plan_targets, validate_relative_folder, FolderTagsByArtist, ItemDatesByFolder,
 };
 use crate::fs_util::safe_canonicalize;
 use crate::media_roots::{path_under_authorized_roots, MediaRoots};
@@ -157,6 +157,8 @@ pub fn preview_folder_rename_template(
     let mut previews = Vec::new();
     let mut seen_targets = HashSet::new();
     let mut conflicts = Vec::new();
+    let mut cached_item_dates: Option<ItemDatesByFolder> = None;
+    let mut cached_folder_tags: Option<FolderTagsByArtist> = None;
     let suffix_collisions = profile["collision_strategy"].as_str() == Some("suffix");
     let merge_targets = profile["collision_strategy"].as_str() == Some("merge");
     // `{index}` renders from the plan id, exactly like the executor re-renders
@@ -178,15 +180,34 @@ pub fn preview_folder_rename_template(
             .filter(|name: &String| !name.is_empty())
             .collect();
         let plan_status: String = row.get(6)?;
-        if date.is_empty() || tags.is_empty() {
-            let (item_dates, folder_tags) =
-                plan_effective_dates_and_tags(conn, artist_id, &folder, &selected_raw)?;
-            if date.is_empty() && item_dates.len() == 1 {
+        if date.is_empty() {
+            let by_folder = match &cached_item_dates {
+                Some(cache) => cache,
+                None => {
+                    cached_item_dates = Some(
+                        ItemDatesByFolder::build(conn, artist_id)
+                            .unwrap_or_else(|_| ItemDatesByFolder::empty()),
+                    );
+                    cached_item_dates.as_ref().unwrap()
+                }
+            };
+            let item_dates = by_folder.get(&folder);
+            if item_dates.len() == 1 {
                 date = item_dates[0].clone();
             }
-            if tags.is_empty() {
-                tags = folder_tags;
-            }
+        }
+        if tags.is_empty() {
+            let by_artist = match &cached_folder_tags {
+                Some(cache) => cache,
+                None => {
+                    cached_folder_tags = Some(
+                        FolderTagsByArtist::build(conn, artist_id)
+                            .unwrap_or_else(|_| FolderTagsByArtist::empty()),
+                    );
+                    cached_folder_tags.as_ref().unwrap()
+                }
+            };
+            tags = by_artist.plan_tags(artist_id, &folder, &selected_raw);
         }
         if date.is_empty() {
             date = crate::media_type::extract_date_from_folder(&folder);

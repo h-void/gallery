@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use image::DynamicImage;
+use image::{DynamicImage, ImageDecoder};
 use sha2::{Digest, Sha256};
 
 use crate::fs_util::safe_canonicalize;
@@ -252,7 +252,17 @@ fn scan_jpeg_exif_orientation(data: &[u8]) -> ExifScan {
         if data[pos] != 0xFF {
             return ExifScan::Missing;
         }
+        while pos + 1 < data.len() && data[pos + 1] == 0xFF {
+            pos += 1;
+        }
+        if pos + 4 > data.len() {
+            return ExifScan::Truncated;
+        }
         let marker = data[pos + 1];
+        if marker == 0x00 || (0xD0..=0xD9).contains(&marker) {
+            pos += 2;
+            continue;
+        }
         let seg_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
         let segment_end = match pos
             .checked_add(2)
@@ -381,38 +391,32 @@ pub fn image_preview_bytes(path: &str, max_edge: u32) -> Result<Vec<u8>> {
             }
         }
     }
-    let reader = image::ImageReader::open(path)
-        .with_context(|| format!("open image for preview: {}", path.display()))?
-        .with_guessed_format()
-        .context("identify image format")?;
-    let (width, height) = reader.into_dimensions().context("read image dimensions")?;
-    if width == 0 || height == 0 {
-        anyhow::bail!("invalid image dimensions");
-    }
-    let source_limit = max_source_pixels();
-    if source_limit > 0 && (width as u64) * (height as u64) > source_limit {
-        anyhow::bail!("image is too large for preview");
-    }
-    // The pixel cap above was measured on a *first* open, and the decode
-    // re-opens the path: a file replaced in between (media roots are
-    // user-writable) would decode with no bound at all. Enforce the ceiling in
-    // the decoder as well — 4 bytes per pixel covers the RGBA8 buffer the
-    // resize path can need for these inputs.
     let mut decode_reader = image::ImageReader::open(path)
         .with_context(|| format!("open image for preview: {}", path.display()))?
         .with_guessed_format()
         .context("identify image format")?;
+    let is_jpeg = decode_reader.format() == Some(image::ImageFormat::Jpeg);
+    let source_limit = max_source_pixels();
     if source_limit > 0 {
         let mut limits = image::Limits::default();
         limits.max_alloc = Some(source_limit.saturating_mul(4));
         decode_reader.limits(limits);
     }
-    let img = decode_reader
-        .decode()
+    let decoder = decode_reader
+        .into_decoder()
+        .with_context(|| format!("read image dimensions: {}", path.display()))?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        anyhow::bail!("invalid image dimensions");
+    }
+    if source_limit > 0 && (width as u64) * (height as u64) > source_limit {
+        anyhow::bail!("image is too large for preview");
+    }
+    let img = DynamicImage::from_decoder(decoder)
         .with_context(|| format!("decode image for preview: {}", path.display()))?;
 
-    let oriented = apply_orientation(img, exif_orientation(path));
-    let bytes = dynamic_image_to_jpeg_preview(&oriented, max_edge)?;
+    let orientation = if is_jpeg { exif_orientation(path) } else { 1 };
+    let bytes = dynamic_image_to_jpeg_preview_with_orientation(&img, max_edge, orientation)?;
     if let Some(cache) = cache.as_ref() {
         write_preview_cache(cache, &bytes);
     }
@@ -420,8 +424,17 @@ pub fn image_preview_bytes(path: &str, max_edge: u32) -> Result<Vec<u8>> {
 }
 
 /// Convert a decoded DynamicImage into a scaled JPEG preview payload.
+#[allow(dead_code)]
 pub fn dynamic_image_to_jpeg_preview(img: &DynamicImage, max_edge: u32) -> Result<Vec<u8>> {
-    let thumb = img.thumbnail(max_edge, max_edge);
+    dynamic_image_to_jpeg_preview_with_orientation(img, max_edge, 1)
+}
+
+fn dynamic_image_to_jpeg_preview_with_orientation(
+    img: &DynamicImage,
+    max_edge: u32,
+    orientation: u8,
+) -> Result<Vec<u8>> {
+    let thumb = apply_orientation(img.thumbnail(max_edge, max_edge), orientation);
 
     let rgb = if matches!(
         thumb.color(),
@@ -471,6 +484,7 @@ pub fn image_preview_bytes_from_memory(bytes: &[u8], max_edge: u32) -> Result<Ve
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .context("identify in-memory image format")?;
+    let is_jpeg = reader.format() == Some(image::ImageFormat::Jpeg);
     if source_limit > 0 {
         let (width, height) = reader.into_dimensions().context("read image dimensions")?;
         if width == 0 || height == 0 {
@@ -490,7 +504,15 @@ pub fn image_preview_bytes_from_memory(bytes: &[u8], max_edge: u32) -> Result<Ve
     let img = reader
         .decode()
         .context("decode in-memory image for preview")?;
-    dynamic_image_to_jpeg_preview(&img, max_edge)
+    let orientation = if is_jpeg {
+        match scan_jpeg_exif_orientation(bytes) {
+            ExifScan::Value(value @ 1..=8) => value,
+            _ => 1,
+        }
+    } else {
+        1
+    };
+    dynamic_image_to_jpeg_preview_with_orientation(&img, max_edge, orientation)
 }
 
 fn maybe_cleanup_preview_cache(root: &Path, reserve_bytes: u64) {

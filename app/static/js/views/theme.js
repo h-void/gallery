@@ -7,7 +7,7 @@ import { $ } from '../utils.js';
 
 export const THEME_STORAGE_KEY = 'gallery.theme';
 export const THEME_LIGHT_CANVAS = '#F4ECDD';
-export const THEME_DARK_CANVAS = '#1A1612';
+export const THEME_DARK_CANVAS = '#151413';
 
 let mediaQueryList = null;
 

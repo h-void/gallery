@@ -166,23 +166,23 @@ export const API = {
     return this.parseResponse(r);
   },
   fileUrl(filePath, version) {
-    const params = new URLSearchParams({path: filePath});
-    if (version) params.set('v', version);
-    return '/api/file?' + params.toString();
+    let url = '/api/file?path=' + encodeURIComponent(filePath);
+    if (version) url += '&v=' + encodeURIComponent(version);
+    return url;
   },
   previewUrl(filePath, version, maxEdge) {
-    const params = new URLSearchParams({path: filePath});
-    if (version) params.set('v', version);
-    if (maxEdge) params.set('max', String(maxEdge));
-    return '/api/file/preview?' + params.toString();
+    let url = '/api/file/preview?path=' + encodeURIComponent(filePath);
+    if (version) url += '&v=' + encodeURIComponent(version);
+    if (maxEdge) url += '&max=' + encodeURIComponent(String(maxEdge));
+    return url;
   },
   streamUrl(filePath) {
     return '/api/file/stream?path=' + encodeURIComponent(filePath);
   },
   videoFrameUrl(filePath, version) {
-    const params = new URLSearchParams({path: filePath, t: '0.1'});
-    if (version) params.set('v', version);
-    return '/api/file/video-frame?' + params.toString();
+    let url = '/api/file/video-frame?path=' + encodeURIComponent(filePath) + '&t=0.1';
+    if (version) url += '&v=' + encodeURIComponent(version);
+    return url;
   },
   videoCompatibleUrl(filePath) {
     return '/api/file/video-compatible?path=' + encodeURIComponent(filePath);

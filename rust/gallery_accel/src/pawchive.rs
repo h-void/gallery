@@ -367,6 +367,7 @@ impl FileCategory {
             "zip" | "rar" | "7z" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "lz4" | "zst" => {
                 FileCategory::Archive
             }
+            _ if crate::media_type::is_archive_volume_filename(&lower) => FileCategory::Archive,
             _ => FileCategory::Other,
         }
     }
@@ -8865,20 +8866,28 @@ fn target_suffix(post_db_id: i64, source_identity: &str) -> String {
 }
 
 pub(crate) fn with_stable_suffix(target: &Path, suffix: &str) -> PathBuf {
-    let stem = target
-        .file_stem()
+    let file_name = target
+        .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("file");
-    let extension = target
-        .extension()
-        .and_then(|value| value.to_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| format!(".{s}"))
-        .unwrap_or_default();
-    let stem = clamp_name_bytes(
-        stem,
-        MAX_RENDERED_NAME_BYTES.saturating_sub(suffix.len() + 1 + extension.len()),
-    );
+    let (raw_stem, extension) = crate::media_type::split_filename_stem_and_ext(file_name);
+    let (raw_stem, extension) =
+        if !extension.is_empty() && extension.len() <= MAX_RENDERED_NAME_BYTES / 4 {
+            (raw_stem, extension)
+        } else {
+            (file_name, "")
+        };
+    let raw_stem = if raw_stem.is_empty() {
+        "file"
+    } else {
+        raw_stem
+    };
+    let budget = MAX_RENDERED_NAME_BYTES.saturating_sub(suffix.len() + 1 + extension.len());
+    let mut end = budget.min(raw_stem.len());
+    while end > 0 && !raw_stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    let stem = &raw_stem[..end];
     let name = format!("{stem}_{suffix}{extension}");
     target.parent().unwrap_or_else(|| Path::new(".")).join(name)
 }

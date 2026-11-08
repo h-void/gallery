@@ -36,14 +36,15 @@ use gallery_accel::{
     folder_rename_auto_run, folder_rename_format_settings, folders_response,
     get_character_import_job, get_recycle_target_setting, get_scan_state, hash_status_response,
     health_summary, ignore_move_candidate_response, invalidate_artists_cache, item_detail_response,
-    items_page_cursor_query_response_ext, items_page_query_response_ext, list_folder_renames,
-    list_media_root_directories, log_error, log_warn, mark_move_candidate_new_response,
-    merge_move_candidate_group_with_roots, move_candidate_groups_response,
-    move_candidates_response, move_history_response, open_writable_db, operation_history_response,
-    operation_log_response, preview_artist_folder_move, preview_folder_rename_template,
-    preview_jpeg_allowed, propagate_hash_tags_response, purge_recycle_entry,
-    rebuild_character_index, recheck_plan, recognize_character_native_topk_with_roots,
-    reconfirm_plan, recycle_entries_response, recycle_entry_preview, reindex_artist_links,
+    items_page_cursor_query_response_with_undated, items_page_query_response_with_undated,
+    list_folder_renames, list_media_root_directories, log_error, log_warn,
+    mark_move_candidate_new_response, merge_move_candidate_group_with_roots,
+    move_candidate_groups_response, move_candidates_response, move_history_response,
+    open_writable_db, operation_history_response, operation_log_response,
+    preview_artist_folder_move, preview_folder_rename_template, preview_jpeg_allowed,
+    propagate_hash_tags_response, purge_recycle_entry, rebuild_character_index, recheck_plan,
+    recognize_character_native_topk_with_roots, reconfirm_plan, recycle_entries_response,
+    recycle_entry_preview, reindex_artist_links,
     resolve_existing_scan_candidate_response_with_roots, resolve_scan_scope, restore_recycle_entry,
     run_folder_rename_all_now, run_full_library_scan_claimed, run_hash_batch_with_roots,
     run_scan_claimed, scan_candidates_response, serve_file_response, serve_text,
@@ -53,8 +54,9 @@ use gallery_accel::{
     suggest_artists_native, tag_search_response, tags_response, unconfirm_all_artist_plans,
     unconfirm_plan, undo_folder_rename_plan, update_folder_tags_by_name_response,
     update_folder_tags_response, update_item_dates_response, update_item_tags_by_name_response,
-    update_item_tags_response, update_tag, video_frame_jpeg, video_transcode_status, DbConfig,
-    DbPool, MediaRoots, ScanControl, StatsRefreshGate, WorkerStatus, DEFAULT_BATCH_ITEM_LIMIT,
+    update_item_tags_response, update_tag, verify_all_character_references,
+    verify_character_reference, video_frame_jpeg, video_transcode_status, DbConfig, DbPool,
+    MediaRoots, ScanControl, StatsRefreshGate, WorkerStatus, DEFAULT_BATCH_ITEM_LIMIT,
     DEFAULT_ITEM_PAGE_LIMIT, MAX_CLUSTER_SCORE_VECTORS, MAX_ITEM_PAGE_LIMIT,
 };
 use rusqlite::OptionalExtension;
@@ -492,6 +494,18 @@ pub fn router(state: AppState) -> Router {
             "/api/characters/{character_id}/references/{reference_id}",
             delete(api_delete_character_reference),
         )
+        .route(
+            "/api/characters/{character_id}/references/{reference_id}/verify",
+            post(api_verify_character_reference),
+        )
+        .route(
+            "/api/characters/{character_id}/references/verify-all",
+            post(api_verify_all_character_references),
+        )
+        .route(
+            "/api/characters/{character_id}/references/discover-candidates",
+            post(api_discover_character_reference_candidates),
+        )
         // Manual reference photo. The body is the raw image and the upload cap
         // is set per-route: axum's default body limit is 2 MB, far below a
         // normal photo.
@@ -780,8 +794,10 @@ fn is_ml_path(path: &str) -> bool {
         || path == "/api/ml-runtime/settings"
         || path == "/api/ml-runtime/retry"
         || path.starts_with("/api/characters/import-from-tags")
+        || path.starts_with("/api/characters/clusters/")
         // Uploading a reference photo embeds it, so it needs the ML stack too.
         || (path.starts_with("/api/characters/") && path.ends_with("/references/upload"))
+        || (path.starts_with("/api/characters/") && path.ends_with("/references/discover-candidates"))
         || path.contains("/artist-suggestions")
         || path.contains("/character-recognition")
 }
@@ -789,6 +805,7 @@ fn is_ml_path(path: &str) -> bool {
 fn is_nonmutating_post(path: &str) -> bool {
     path == "/api/cluster-scores"
         || path == "/api/artist-reference-scores"
+        || path == "/api/characters/clusters/discover"
         || path.ends_with("/artist-suggestions")
         || path.contains("/character-recognition")
         || path == "/api/folder-renames/preview"
@@ -2099,12 +2116,19 @@ async fn api_items_page(
     Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let global_search = query.artist_id.is_none()
-        && query
+        && (query
             .search
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .is_some();
+            .is_some()
+            || query.favorite_only.unwrap_or(false)
+            || query
+                .tags
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some());
     if query.cursor.is_some() && (!global_search || query.offset.is_some()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2125,8 +2149,9 @@ async fn api_items_page(
             query.media_type.clone()
         };
         let use_cursor = global_search && (query.cursor.is_some() || query.offset.is_none());
+        let undated = query.undated.or(query.missing_date);
         let result = if use_cursor {
-            items_page_cursor_query_response_ext(
+            items_page_cursor_query_response_with_undated(
                 &conn,
                 query.artist_id,
                 Some(limit),
@@ -2145,10 +2170,11 @@ async fn api_items_page(
                 query.search_tags_only.unwrap_or(false),
                 query.favorite_only,
                 query.inbox,
+                undated,
                 query.cursor.as_deref(),
             )
         } else {
-            items_page_query_response_ext(
+            items_page_query_response_with_undated(
                 &conn,
                 query.artist_id,
                 Some(limit),
@@ -2167,6 +2193,7 @@ async fn api_items_page(
                 query.search_tags_only.unwrap_or(false),
                 query.favorite_only,
                 query.inbox,
+                undated,
             )
         };
         result.map_err(|error| {
@@ -4307,6 +4334,78 @@ async fn api_delete_character_reference(
         .map_err(to_http_error)
 }
 
+async fn api_verify_character_reference(
+    State(state): State<AppState>,
+    Path((character_id, reference_id)): Path<(i64, i64)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "write capability is disabled"})),
+        ));
+    }
+    let conn = state.pool.get().map_err(to_http_error)?;
+    verify_character_reference(&conn, character_id, reference_id)
+        .map(Json)
+        .map_err(to_http_error)
+}
+
+async fn api_verify_all_character_references(
+    State(state): State<AppState>,
+    Path(character_id): Path<i64>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "write capability is disabled"})),
+        ));
+    }
+    let conn = state.pool.get().map_err(to_http_error)?;
+    verify_all_character_references(&conn, character_id)
+        .map(Json)
+        .map_err(to_http_error)
+}
+
+async fn api_discover_character_reference_candidates(
+    State(state): State<AppState>,
+    Path(character_id): Path<i64>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.capabilities.allows_writes() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "write capability is disabled"})),
+        ));
+    }
+    if let Some(blocker) = gallery_accel::product_ui::manual_reference_embedding_blocker() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": blocker})),
+        ));
+    }
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(10)
+        .clamp(1, 24);
+    let pool = Arc::clone(&state.pool);
+    let roots = state.roots.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || -> Result<Value, (StatusCode, Json<Value>)> {
+            let conn = pool.get().map_err(to_http_error)?;
+            gallery_accel::discover_character_reference_candidates(
+                &conn,
+                &roots,
+                character_id,
+                limit,
+            )
+            .map_err(to_http_error)
+        })
+        .await
+        .map_err(blocking_http_error)?;
+    outcome.map(Json)
+}
+
 /// Manual reference photo upload (角色库 → 参考图 → 添加照片). The body is the raw
 /// image. The type is sniffed from the bytes rather than trusted from the file
 /// name or `Content-Type`, and the stored name is generated server-side.
@@ -4981,10 +5080,12 @@ async fn api_archive_inspect(
     let roots = state.roots.clone();
     let conn = state.pool.get().map_err(to_http_error)?;
 
-    let path_str = if let Some(id) = payload.item_id {
-        conn.query_row("SELECT file_path FROM items WHERE id = ?", [id], |row| {
-            row.get::<_, String>(0)
-        })
+    let (path_str, artist_id) = if let Some(id) = payload.item_id {
+        conn.query_row(
+            "SELECT file_path, artist_id FROM items WHERE id = ?",
+            [id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
         .map_err(|_| {
             (
                 StatusCode::NOT_FOUND,
@@ -4992,7 +5093,15 @@ async fn api_archive_inspect(
             )
         })?
     } else if let Some(p) = payload.file_path {
-        p
+        let aid = conn
+            .query_row(
+                "SELECT artist_id FROM items WHERE file_path = ?",
+                [&p],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten();
+        (p, aid)
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -5002,10 +5111,31 @@ async fn api_archive_inspect(
 
     let full_path = gallery_accel::media_serve::resolve_allowed_path(&path_str, &roots)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))))?;
+    let resolved_artist_id = artist_id
+        .or_else(|| gallery_accel::archive_ops::lookup_artist_id_for_archive(&conn, &full_path));
+    let candidates = gallery_accel::archive_ops::collect_candidate_passwords(
+        Some(&conn),
+        resolved_artist_id,
+        &full_path,
+    );
     drop(conn);
 
+    let db_path = state.db_path.clone();
+    let can_write = state.capabilities.allows_writes();
     let inspection = tokio::task::spawn_blocking(move || {
-        gallery_accel::archive_ops::inspect_archive(&full_path, payload.password.as_deref())
+        let res = gallery_accel::archive_ops::inspect_archive_with_candidates(
+            &full_path,
+            payload.password.as_deref(),
+            &candidates,
+        )?;
+        if can_write {
+            if let (Some(aid), Some(ref pwd)) = (resolved_artist_id, &res.matched_password) {
+                if let Ok(c) = open_writable_db(&db_path) {
+                    gallery_accel::archive_ops::record_artist_archive_password(&c, aid, pwd);
+                }
+            }
+        }
+        Ok(res)
     })
     .await
     .map_err(blocking_http_error)?

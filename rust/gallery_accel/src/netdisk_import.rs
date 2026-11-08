@@ -459,6 +459,39 @@ fn import_inner(
         folder,
         names,
     } = destination(conn, task, roots, &paths)?;
+    let mut stem_distinct_names: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+    for name in &names {
+        let lower = name.to_ascii_lowercase();
+        if crate::media_type::is_archive_volume_filename(name)
+            || lower.ends_with(".zip")
+            || lower.ends_with(".rar")
+            || lower.ends_with(".7z")
+        {
+            let stem = crate::media_type::strip_archive_volume_suffix(name).to_ascii_lowercase();
+            stem_distinct_names.entry(stem).or_default().insert(lower);
+        }
+    }
+    let mut occupied_multivolume_stems: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for name in &names {
+        let stem = crate::media_type::strip_archive_volume_suffix(name).to_ascii_lowercase();
+        let is_mv = crate::media_type::is_archive_volume_filename(name)
+            || stem_distinct_names.get(&stem).is_some_and(|s| s.len() > 1);
+        if is_mv {
+            let desired = folder.join(name);
+            let occupied_other: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM download_publish_jobs WHERE target_path=?1 AND NOT (engine='netdisk' AND source_job_id=?2 AND manifest_version=?3))",
+                params![desired.to_string_lossy().as_ref(), task.task_id, task.manifest_version],
+                |r| r.get(0),
+            )?;
+            if occupied_other {
+                occupied_multivolume_stems.insert(stem);
+            }
+        }
+    }
     let mut published = Vec::new();
     for (source, name) in paths.into_iter().zip(names) {
         if automatic {
@@ -469,7 +502,7 @@ fn import_inner(
         }
         let identity = source.to_string_lossy();
         let already_ingested: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM download_publish_jobs WHERE engine='netdisk' AND source_job_id=?1 AND source_identity=?2 AND manifest_version=?3 AND stage='ingested' AND item_id IS NOT NULL)",
+            "SELECT EXISTS(SELECT 1 FROM download_publish_jobs WHERE engine='netdisk' AND source_job_id=?1 AND source_identity=?2 AND manifest_version=?3 AND stage='ingested')",
             params![task.task_id, identity, task.manifest_version],
             |r| r.get(0),
         )?;
@@ -495,13 +528,22 @@ fn import_inner(
         let target = match existing {
             Some(path) => PathBuf::from(path),
             None => {
+                let stem =
+                    crate::media_type::strip_archive_volume_suffix(&name).to_ascii_lowercase();
+                let is_mv_occupied = occupied_multivolume_stems.contains(&stem)
+                    && (crate::media_type::is_archive_volume_filename(&name)
+                        || stem_distinct_names.get(&stem).is_some_and(|s| s.len() > 1));
                 let desired = folder.join(name);
                 let occupied: bool = conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM download_publish_jobs WHERE target_path=?1)",
                     [desired.to_string_lossy().as_ref()],
                     |r| r.get(0),
                 )?;
-                if occupied {
+                if is_mv_occupied {
+                    let suffix =
+                        blake3::hash(format!("{}\n{}", task.task_id, stem).as_bytes()).to_hex();
+                    with_stable_suffix(&desired, &suffix[..8])
+                } else if occupied {
                     let suffix =
                         blake3::hash(format!("{}\n{}", task.task_id, identity).as_bytes()).to_hex();
                     with_stable_suffix(&desired, &suffix[..8])

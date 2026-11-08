@@ -37,6 +37,9 @@ pub(crate) struct ItemDetailRow {
     /// Intrinsic pixel size; 0 means "unknown" and the grid falls back to 4:3.
     pub(crate) width: i64,
     pub(crate) height: i64,
+    /// True when the item is an archive eligible for batch extraction
+    /// (excludes secondary volumes and passwordless `.7z` archives).
+    pub(crate) extractable_archive: bool,
 }
 
 pub fn item_detail_response(conn: &Connection, item_id: i64) -> Result<Value> {
@@ -44,7 +47,7 @@ pub fn item_detail_response(conn: &Connection, item_id: i64) -> Result<Value> {
 }
 
 pub(crate) fn get_item_detail(conn: &Connection, item_id: i64) -> Result<Option<ItemDetailRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             i.id,
@@ -84,43 +87,55 @@ pub(crate) fn get_item_detail(conn: &Connection, item_id: i64) -> Result<Option<
         return Ok(None);
     };
     let item = {
-        let detected_date: String = row.get("detected_date")?;
-        let manual_date: Option<String> = row.get("manual_date")?;
-        let legacy_date: String = row.get("date")?;
+        let file_path: String = row.get(2)?;
+        let file_name: String = row.get(3)?;
+        let file_size: i64 = row.get(4)?;
+        let file_mtime: f64 = row.get(5)?;
+        let legacy_date: String = row.get(7)?;
+        let detected_date: String = row.get(8)?;
+        let manual_date: Option<String> = row.get(9)?;
+        let display_date =
+            effective_display_date(&detected_date, manual_date.as_deref(), &legacy_date);
+        let is_archive: i64 = row.get(12)?;
+        let media_type: String = row.get(13)?;
+        let extractable_archive = if is_archive != 0 || media_type == "archive" {
+            crate::archive_ops::is_extractable_archive(
+                &file_path, &file_name, file_size, file_mtime,
+            )
+        } else {
+            false
+        };
         ItemDetailRow {
-            id: row.get("id")?,
-            artist_id: row.get("artist_id")?,
-            file_path: row.get("file_path")?,
-            file_name: row.get("file_name")?,
-            file_size: row.get("file_size")?,
-            file_mtime: row.get("file_mtime")?,
-            folder_name: row.get("folder_name")?,
-            date: legacy_date.clone(),
-            detected_date: detected_date.clone(),
-            manual_date: manual_date.clone(),
-            display_date: effective_display_date(
-                &detected_date,
-                manual_date.as_deref(),
-                &legacy_date,
-            ),
-            auto_role: row.get("auto_role")?,
-            manual_role: row.get("manual_role")?,
+            id: row.get(0)?,
+            artist_id: row.get(1)?,
+            file_path,
+            file_name,
+            file_size,
+            file_mtime,
+            folder_name: row.get(6)?,
+            date: legacy_date,
+            detected_date,
+            manual_date,
+            display_date,
+            auto_role: row.get(10)?,
+            manual_role: row.get(11)?,
             tags: list_item_detail_tags(conn, item_id)?,
-            is_archive: row.get("is_archive")?,
-            media_type: row.get("media_type")?,
-            content_hash: row.get("content_hash")?,
-            hash_status: row.get("hash_status")?,
-            hash_updated_at: row.get("hash_updated_at")?,
-            st_dev: row.get("st_dev")?,
-            st_ino: row.get("st_ino")?,
-            missing: row.get("missing")?,
-            missing_at: row.get("missing_at")?,
-            scanned_at: row.get("scanned_at")?,
-            favorite: row.get("favorite")?,
-            artist_name: row.get("artist_name")?,
-            artist_path: row.get("artist_path")?,
-            width: row.get("width").unwrap_or(0),
-            height: row.get("height").unwrap_or(0),
+            is_archive,
+            media_type,
+            content_hash: row.get(14)?,
+            hash_status: row.get(15)?,
+            hash_updated_at: row.get(16)?,
+            st_dev: row.get(17)?,
+            st_ino: row.get(18)?,
+            missing: row.get(19)?,
+            missing_at: row.get(20)?,
+            scanned_at: row.get(21)?,
+            width: row.get(22).unwrap_or(0),
+            height: row.get(23).unwrap_or(0),
+            favorite: row.get(24)?,
+            artist_name: row.get(25)?,
+            artist_path: row.get(26)?,
+            extractable_archive,
         }
     };
     Ok(Some(item))

@@ -14,6 +14,18 @@ pub(crate) struct CharacterSummaryCharacterRow {
     pub(crate) reference_count: i64,
     pub(crate) current_model_reference_count: i64,
     pub(crate) stale_reference_count: i64,
+    pub(crate) unverified_reference_count: i64,
+}
+
+fn has_verified_column(conn: &Connection) -> bool {
+    conn.prepare("PRAGMA table_info(character_references)")
+        .and_then(|mut s| {
+            let cols = s
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(cols.iter().any(|c| c == "verified"))
+        })
+        .unwrap_or(false)
 }
 
 pub fn character_summary_response(
@@ -57,7 +69,13 @@ fn list_character_summary_characters(
     model_variant: &str,
     model_file: &str,
 ) -> Result<Vec<CharacterSummaryCharacterRow>> {
-    let mut stmt = conn.prepare(
+    let has_verified = has_verified_column(conn);
+    let unverified_expr = if has_verified {
+        "COUNT(CASE WHEN cr.id IS NOT NULL AND COALESCE(cr.verified, 1) = 0 THEN 1 END)"
+    } else {
+        "0"
+    };
+    let sql = format!(
         "
         SELECT
             c.id,
@@ -83,12 +101,14 @@ fn list_character_summary_characters(
                      )
                     THEN 1
                 END
-            ) AS stale_reference_count
+            ) AS stale_reference_count,
+            {unverified_expr} AS unverified_reference_count
         FROM characters c
         LEFT JOIN character_references cr ON cr.character_id = c.id
         GROUP BY c.id
-        ",
-    )?;
+        "
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let mut characters = stmt
         .query_map(
             rusqlite::params![
@@ -107,6 +127,7 @@ fn list_character_summary_characters(
                     reference_count: row.get("reference_count")?,
                     current_model_reference_count: row.get("current_model_reference_count")?,
                     stale_reference_count: row.get("stale_reference_count")?,
+                    unverified_reference_count: row.get("unverified_reference_count")?,
                 })
             },
         )?
@@ -123,7 +144,13 @@ fn character_summary_totals(
     model_file: &str,
     tags: &[CharacterSummaryTagRow],
 ) -> Result<Value> {
-    let reference_row = conn.query_row(
+    let has_verified = has_verified_column(conn);
+    let unverified_expr = if has_verified {
+        "COUNT(CASE WHEN COALESCE(verified, 1) = 0 THEN 1 END)"
+    } else {
+        "0"
+    };
+    let sql = format!(
         "
         SELECT
             COUNT(*) AS reference_count,
@@ -142,10 +169,14 @@ fn character_summary_totals(
                       OR embedding_model_file != ?
                     THEN 1
                 END
-            ) AS stale_reference_count
+            ) AS stale_reference_count,
+            {unverified_expr} AS unverified_reference_count
         FROM character_references
         WHERE embedding IS NOT NULL
-        ",
+        "
+    );
+    let reference_row = conn.query_row(
+        &sql,
         rusqlite::params![
             model_repo_id,
             model_variant,
@@ -159,6 +190,7 @@ fn character_summary_totals(
                 row.get::<_, i64>("reference_count")?,
                 row.get::<_, i64>("current_model_reference_count")?,
                 row.get::<_, i64>("stale_reference_count")?,
+                row.get::<_, i64>("unverified_reference_count")?,
             ))
         },
     )?;
@@ -175,6 +207,7 @@ fn character_summary_totals(
         "references": reference_row.0,
         "current_model_references": reference_row.1,
         "stale_reference_embeddings": reference_row.2,
+        "unverified_references": reference_row.3,
         "candidate_items": candidate_items,
     }))
 }

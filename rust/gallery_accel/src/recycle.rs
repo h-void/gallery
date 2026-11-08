@@ -1170,20 +1170,21 @@ pub fn recycle_entry_preview(
         }
     }
 
-    let ext = recycled_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let orig_name = Path::new(&original)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let rec_name = recycled_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let detected_type = crate::media_type::media_type_for_file(orig_name)
+        .or_else(|| crate::media_type::media_type_for_file(rec_name));
 
-    let is_archive = matches!(
-        ext.as_str(),
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz"
-    );
-    let is_video = matches!(
-        ext.as_str(),
-        "mp4" | "mkv" | "webm" | "mov" | "avi" | "flv" | "wmv"
-    );
+    let is_archive = detected_type == Some("archive")
+        || crate::media_type::is_archive_volume_filename(orig_name)
+        || crate::media_type::is_archive_volume_filename(rec_name);
+    let is_video = detected_type == Some("video");
 
     if is_archive {
         match generate_archive_recycle_preview(&recycled_path, edge) {
@@ -1241,7 +1242,7 @@ fn generate_archive_recycle_preview(archive_path: &Path, edge: u32) -> Result<Ve
         anyhow::bail!("archive is encrypted");
     }
 
-    let mut image_entries: Vec<_> = inspect
+    let image_entries: Vec<_> = inspect
         .entries
         .iter()
         .filter(|e| {
@@ -1260,21 +1261,23 @@ fn generate_archive_recycle_preview(archive_path: &Path, edge: u32) -> Result<Ve
         })
         .collect();
 
-    if image_entries.is_empty() {
-        anyhow::bail!("no previewable image entry in archive");
-    }
-
-    image_entries.sort_by(|a, b| {
-        let a_cover = a.path.to_ascii_lowercase().contains("cover");
-        let b_cover = b.path.to_ascii_lowercase().contains("cover");
-        match (a_cover, b_cover) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.path.cmp(&b.path),
-        }
-    });
-
-    let best_entry = image_entries[0];
+    let contains_cover_ascii = |s: &str| {
+        s.as_bytes()
+            .windows(5)
+            .any(|w| w.eq_ignore_ascii_case(b"cover"))
+    };
+    let best_entry = image_entries
+        .into_iter()
+        .min_by(|a, b| {
+            let a_cover = contains_cover_ascii(&a.path);
+            let b_cover = contains_cover_ascii(&b.path);
+            match (a_cover, b_cover) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.path.cmp(&b.path),
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("no previewable image entry in archive"))?;
     let image_bytes =
         crate::archive_ops::stream_archive_entry(archive_path, &best_entry.path, None)?;
     crate::image_preview::image_preview_bytes_from_memory(&image_bytes, edge)

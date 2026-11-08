@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -571,8 +571,11 @@ fn load_session() -> Result<&'static Mutex<CcipSessionSlot>> {
     let slot = session_slot();
     // Fast path: a session (or cached failure) is already recorded.
     {
-        let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
         if guard.session.is_some() {
+            if matches!(guard.session, Some(Ok(_))) {
+                guard.last_used = Some(Instant::now());
+            }
             drop(guard);
             start_session_idle_unloader();
             return Ok(slot);
@@ -724,13 +727,15 @@ where
 {
     let slot = load_session()?;
     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-    let result = match guard.session.as_mut() {
-        Some(Ok(sess)) => f(sess),
+    match guard.session.as_mut() {
+        Some(Ok(sess)) => {
+            let res = f(sess);
+            guard.last_used = Some(Instant::now());
+            res
+        }
         Some(Err(msg)) => Err(anyhow!("{msg}")),
         None => Err(anyhow!("session not initialized")),
-    };
-    guard.last_used = Some(Instant::now());
-    result
+    }
 }
 
 pub fn session_status() -> Value {
@@ -810,8 +815,8 @@ fn l2_normalize(mut v: Vec<f32>) -> Result<Vec<f32>> {
         norm += x * x;
     }
     norm = norm.sqrt();
-    if norm <= 1e-12 {
-        return Err(anyhow!("embedding has zero norm"));
+    if !norm.is_finite() || norm <= 1e-12 {
+        return Err(anyhow!("embedding has invalid or zero norm"));
     }
     for x in &mut v {
         *x /= norm;
@@ -1175,7 +1180,7 @@ pub(crate) struct RefMeta {
 /// Parsed-reference cache: recognition used to re-read and re-parse every
 /// embedded blob on each request. Keyed by a table fingerprint so imports,
 /// cleanups, and restores self-invalidate without explicit hooks.
-type ReferenceIndexCache = Mutex<Option<(String, Vec<RefMeta>)>>;
+type ReferenceIndexCache = Mutex<Option<(String, Arc<[RefMeta]>)>>;
 
 static REFERENCE_INDEX_CACHE: OnceLock<ReferenceIndexCache> = OnceLock::new();
 
@@ -1210,7 +1215,7 @@ fn reference_table_signature(conn: &Connection) -> Result<String> {
     .map_err(Into::into)
 }
 
-fn cached_reference_index(conn: &Connection, signature: &str) -> Option<Vec<RefMeta>> {
+fn cached_reference_index(conn: &Connection, signature: &str) -> Option<Arc<[RefMeta]>> {
     // Only file-backed databases are cached: tests share the process-wide
     // slot across distinct in-memory databases.
     let path = conn.path()?;
@@ -1221,10 +1226,10 @@ fn cached_reference_index(conn: &Connection, signature: &str) -> Option<Vec<RefM
     guard
         .as_ref()
         .filter(|(cached_key, _)| *cached_key == key)
-        .map(|(_, vectors)| vectors.clone())
+        .map(|(_, vectors)| Arc::clone(vectors))
 }
 
-fn store_reference_index(conn: &Connection, signature: &str, vectors: &[RefMeta]) {
+fn store_reference_index(conn: &Connection, signature: &str, vectors: &Arc<[RefMeta]>) {
     let Some(path) = conn.path() else {
         return;
     };
@@ -1232,10 +1237,10 @@ fn store_reference_index(conn: &Connection, signature: &str, vectors: &[RefMeta]
     let mut guard = reference_index_cache_slot()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    *guard = Some((key, vectors.to_vec()));
+    *guard = Some((key, Arc::clone(vectors)));
 }
 
-pub(crate) fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
+pub(crate) fn load_index_vectors(conn: &Connection) -> Result<Arc<[RefMeta]>> {
     let signature = reference_table_signature(conn)?;
     if let Some(cached) = cached_reference_index(conn, &signature) {
         return Ok(cached);
@@ -1296,7 +1301,7 @@ pub(crate) fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
     // env switch restores the legacy permissive load.
     if out.is_empty() {
         if !env_bool("CHARACTER_EMBEDDING_LEGACY_FALLBACK", false) {
-            return Ok(out);
+            return Ok(Arc::from(out));
         }
         let mut stmt = conn.prepare(
             "SELECT cr.id, cr.character_id, c.name, cr.item_id, cr.embedding, cr.embedding_dim
@@ -1327,6 +1332,7 @@ pub(crate) fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
             }
         }
     }
+    let out: Arc<[RefMeta]> = Arc::from(out);
     store_reference_index(conn, &signature, &out);
     Ok(out)
 }
@@ -1334,6 +1340,47 @@ pub(crate) fn load_index_vectors(conn: &Connection) -> Result<Vec<RefMeta>> {
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+pub(crate) fn rank_characters_top2<'a>(
+    query: &[f32],
+    refs: &'a [RefMeta],
+) -> (Option<(f32, &'a str)>, Option<f32>) {
+    let mut best: HashMap<i64, (f32, &'a RefMeta)> = HashMap::with_capacity(refs.len().min(256));
+    for r in refs {
+        let score = dot(query, &r.vector);
+        match best.get_mut(&r.character_id) {
+            Some((prev, prev_ref)) => {
+                if score > *prev {
+                    *prev = score;
+                    *prev_ref = r;
+                }
+            }
+            None => {
+                best.insert(r.character_id, (score, r));
+            }
+        }
+    }
+    let mut top1: Option<(f32, &'a RefMeta)> = None;
+    let mut top2: Option<f32> = None;
+    for (score, r) in best.into_values() {
+        match top1 {
+            None => top1 = Some((score, r)),
+            Some((best_score, _)) if score > best_score => {
+                top2 = Some(best_score);
+                top1 = Some((score, r));
+            }
+            _ => {
+                if top2.is_none_or(|second| score > second) {
+                    top2 = Some(score);
+                }
+            }
+        }
+    }
+    (
+        top1.map(|(score, r)| (score, r.character_name.as_str())),
+        top2,
+    )
 }
 
 pub(crate) fn rank_characters(query: &[f32], refs: &[RefMeta], top_k: usize) -> Vec<Value> {

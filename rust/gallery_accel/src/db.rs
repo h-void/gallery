@@ -83,6 +83,7 @@ impl DbPool {
             ensure_product_schema(&conns[0], fresh_database)?;
             crate::artist_profile_links::ensure_artist_profile_links_schema(&conns[0])?;
             crate::link_index::ensure_link_schema(&conns[0])?;
+            crate::archive_ops::ensure_archive_password_schema(&conns[0])?;
             crate::ingest_publish::ensure_ingest_publish_schema(&conns[0])?;
             crate::netdisk::ensure_netdisk_bridge_schema(&conns[0])?;
             crate::pawchive::ensure_pawchive_schema(&conns[0])?;

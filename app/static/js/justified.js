@@ -10,12 +10,14 @@ export const JUSTIFIED_FALLBACK_ASPECT = 1.33;
 // squarer cell: a 4:3 placeholder read as the row's visual center next to
 // portrait artwork, doubling its width for one small icon (fix plan I).
 export const JUSTIFIED_FILE_FALLBACK_ASPECT = 1;
+export const JUSTIFIED_MIN_ASPECT = 0.52;
 
 export function justifiedAspect(item) {
   const width = Number(item && item.width);
   const height = Number(item && item.height);
   if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
-    return width / height;
+    const raw = width / height;
+    return raw < JUSTIFIED_MIN_ASPECT ? JUSTIFIED_MIN_ASPECT : raw;
   }
   const mediaType = item && (item.media_type || (item.is_archive ? 'archive' : 'image'));
   if (mediaType === 'archive' || mediaType === 'text' || mediaType === 'source') {

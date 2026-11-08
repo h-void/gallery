@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
@@ -26,15 +27,47 @@ pub(crate) fn folder_tree_from_paths(artist_path: &str, file_paths: Vec<String>)
     let mut counts: HashMap<String, i64> = HashMap::new();
     let mut child_paths: HashMap<String, HashSet<String>> = HashMap::new();
     names.insert(String::new(), "全部文件夹".to_string());
-    counts.insert(String::new(), 0);
+    counts.insert(String::new(), file_paths.len() as i64);
     child_paths.insert(String::new(), HashSet::new());
 
+    let artist = artist_path
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    let mut direct_counts: HashMap<String, i64> = HashMap::new();
+    let mut last_dir = String::new();
+    let mut last_folder = String::new();
+    let mut last_count = 0i64;
+    let mut has_last = false;
+
     for file_path in file_paths {
-        *counts.entry(String::new()).or_insert(0) += 1;
-        let folder = relative_folder_path(artist_path, &file_path);
-        if folder.is_empty() {
+        let normalized_file: Cow<'_, str> = if file_path.contains('\\') {
+            Cow::Owned(file_path.replace('\\', "/"))
+        } else {
+            Cow::Borrowed(file_path.as_str())
+        };
+        let file_dir = match normalized_file.rfind('/') {
+            Some(index) => normalized_file[..index].trim_end_matches('/'),
+            None => "",
+        };
+        if has_last && file_dir == last_dir {
+            last_count += 1;
             continue;
         }
+        if has_last && !last_folder.is_empty() && last_count > 0 {
+            *direct_counts.entry(last_folder.clone()).or_insert(0) += last_count;
+        }
+        has_last = true;
+        last_dir.clear();
+        last_dir.push_str(file_dir);
+        last_folder = relative_folder_from_normalized(&artist, file_dir);
+        last_count = 1;
+    }
+    if has_last && !last_folder.is_empty() && last_count > 0 {
+        *direct_counts.entry(last_folder).or_insert(0) += last_count;
+    }
+
+    for (folder, folder_count) in direct_counts {
         let mut current = String::new();
         for part in folder.split('/').filter(|part| !part.is_empty()) {
             let next_path = if current.is_empty() {
@@ -42,16 +75,17 @@ pub(crate) fn folder_tree_from_paths(artist_path: &str, file_paths: Vec<String>)
             } else {
                 format!("{current}/{part}")
             };
-            names
-                .entry(next_path.clone())
-                .or_insert_with(|| part.to_string());
-            counts.entry(next_path.clone()).or_insert(0);
-            child_paths.entry(next_path.clone()).or_default();
-            child_paths
-                .entry(current.clone())
-                .or_default()
-                .insert(next_path.clone());
-            *counts.entry(next_path.clone()).or_insert(0) += 1;
+            if let Some(existing_count) = counts.get_mut(&next_path) {
+                *existing_count += folder_count;
+            } else {
+                names.insert(next_path.clone(), part.to_string());
+                child_paths.insert(next_path.clone(), HashSet::new());
+                child_paths
+                    .entry(current)
+                    .or_default()
+                    .insert(next_path.clone());
+                counts.insert(next_path.clone(), folder_count);
+            }
             current = next_path;
         }
     }
@@ -90,33 +124,35 @@ fn build_folder_node(
 }
 
 pub(crate) fn normalize_folder(folder: &str) -> String {
-    folder
+    let trimmed = folder.trim_matches(|c| c == '/' || c == '\\');
+    if trimmed.is_empty() || trimmed == "." {
+        return String::new();
+    }
+    if !trimmed.contains('\\')
+        && !trimmed.contains("//")
+        && !trimmed
+            .split('/')
+            .any(|part| part.is_empty() || part == ".")
+    {
+        return trimmed.to_string();
+    }
+    trimmed
         .replace('\\', "/")
-        .trim_matches('/')
         .split('/')
         .filter(|part| !part.is_empty() && *part != ".")
         .collect::<Vec<_>>()
         .join("/")
 }
 
-fn relative_folder_path(artist_path: &str, file_path: &str) -> String {
-    let artist = artist_path
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string();
-    let normalized_file = file_path.replace('\\', "/");
-    let file_dir = match normalized_file.rfind('/') {
-        Some(index) => normalized_file[..index].trim_end_matches('/').to_string(),
-        None => String::new(),
-    };
+fn relative_folder_from_normalized(artist: &str, file_dir: &str) -> String {
     if file_dir == artist {
         return String::new();
     }
     if let Some(rest) = file_dir
-        .strip_prefix(&artist)
+        .strip_prefix(artist)
         .and_then(|r| r.strip_prefix('/'))
     {
         return normalize_folder(rest);
     }
-    normalize_folder(file_dir.rsplit('/').next().unwrap_or(file_dir.as_str()))
+    normalize_folder(file_dir.rsplit('/').next().unwrap_or(file_dir))
 }

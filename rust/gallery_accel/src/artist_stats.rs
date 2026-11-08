@@ -15,77 +15,97 @@ struct StatsTagRow {
 }
 
 pub fn artist_stats_response(conn: &Connection, artist_id: i64) -> Result<Value> {
-    let total = count_artist_items(
-        conn,
-        artist_id,
-        "AND (media_type IN ('image', 'video', 'source', 'archive', 'text') OR is_archive=1)",
-    )?;
-    let videos = count_artist_items(conn, artist_id, "AND media_type='video' AND is_archive=0")?;
-    let sources = count_artist_items(conn, artist_id, "AND media_type='source' AND is_archive=0")?;
-    let archives = count_artist_items(
-        conn,
-        artist_id,
-        "AND (is_archive=1 OR media_type='archive')",
-    )?;
-    let untagged = conn.query_row(
-        "
-        SELECT COUNT(*) FROM items
-        WHERE artist_id=? AND missing=0
-          AND (media_type IN ('image', 'video', 'source', 'archive', 'text') OR is_archive=1)
-          AND NOT EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id = items.id)
-        ",
-        [artist_id],
-        |row| row.get::<_, i64>(0),
-    )?;
-    let inbox = conn.query_row(
-        "
-        SELECT COUNT(*) FROM items
-        WHERE artist_id=? AND missing=0
-          AND (media_type IN ('image', 'video', 'source', 'archive', 'text') OR is_archive=1)
-          AND (
-              NOT EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id = items.id)
-              OR (COALESCE(manual_date, '') = '' AND COALESCE(detected_date, '') = '' AND (COALESCE(date, '') = '' OR date LIKE '0000%'))
-              OR COALESCE(folder_name, '') = ''
-          )
-        ",
-        [artist_id],
-        |row| row.get::<_, i64>(0),
-    )?;
-    let favorites = conn.query_row(
+    let mut stats_stmt = conn
+        .prepare_cached(
+            "
+            SELECT
+                COALESCE(SUM(is_visible), 0),
+                COALESCE(SUM(CASE WHEN media_type='video' AND is_archive=0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN media_type='source' AND is_archive=0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN is_archive=1 OR media_type='archive' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN is_visible=1 AND has_tag=0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN is_visible=1 AND missing_date=1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN is_visible=1 AND (has_tag=0 OR missing_date=1 OR empty_folder=1) THEN 1 ELSE 0 END), 0)
+            FROM (
+                SELECT
+                    media_type,
+                    is_archive,
+                    CASE WHEN media_type IN ('image', 'video', 'source', 'archive', 'text') OR is_archive=1 THEN 1 ELSE 0 END AS is_visible,
+                    CASE WHEN (media_type IN ('image', 'video', 'source', 'archive', 'text') OR is_archive=1)
+                        THEN EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id = items.id)
+                        ELSE 1 END AS has_tag,
+                    CASE WHEN COALESCE(manual_date, '') = '' AND COALESCE(detected_date, '') = '' AND (COALESCE(date, '') = '' OR date LIKE '0000%')
+                        THEN 1 ELSE 0 END AS missing_date,
+                    CASE WHEN COALESCE(folder_name, '') = '' THEN 1 ELSE 0 END AS empty_folder
+                FROM items
+                WHERE artist_id=? AND missing=0
+            )
+            ",
+        )
+        .context("prepare artist item stats")?;
+    let (total, videos, sources, archives, untagged, undated, inbox) = stats_stmt
+        .query_row([artist_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .context("count artist items")?;
+    let extractable_archives = if archives > 0 {
+        count_extractable_artist_archives(conn, artist_id)?
+    } else {
+        0
+    };
+    let mut fav_stmt = conn.prepare_cached(
         "SELECT COUNT(*) FROM item_favorites f JOIN items i ON i.id=f.item_id
          WHERE i.artist_id=? AND i.missing=0",
-        [artist_id],
-        |row| row.get::<_, i64>(0),
     )?;
+    let favorites = fav_stmt.query_row([artist_id], |row| row.get::<_, i64>(0))?;
     let tags = list_stats_tags(conn, artist_id)?;
     Ok(json!({
         "total": total,
         "archives": archives,
+        "extractable_archives": extractable_archives,
         "videos": videos,
         "sources": sources,
         "untagged": untagged,
+        "undated": undated,
         "inbox": inbox,
         "favorites": favorites,
         "tags": tags,
     }))
 }
 
-fn count_artist_items(conn: &Connection, artist_id: i64, extra_where: &str) -> Result<i64> {
-    conn.query_row(
-        &format!(
-            "
-            SELECT COUNT(*) FROM items
-            WHERE artist_id=? AND missing=0 {extra_where}
-            "
-        ),
-        [artist_id],
-        |row| row.get(0),
-    )
-    .context("count artist items")
+fn count_extractable_artist_archives(conn: &Connection, artist_id: i64) -> Result<i64> {
+    let mut stmt = conn.prepare_cached(
+        "
+        SELECT file_path, file_name, file_size, file_mtime
+        FROM items
+        WHERE artist_id=? AND missing=0 AND (is_archive=1 OR media_type='archive')
+        ",
+    )?;
+    let mut rows = stmt.query([artist_id])?;
+    let mut count = 0i64;
+    while let Some(row) = rows.next()? {
+        let file_path: String = row.get(0)?;
+        let file_name: String = row.get(1)?;
+        let file_size: i64 = row.get(2)?;
+        let file_mtime: f64 = row.get(3)?;
+        if crate::archive_ops::is_extractable_archive(&file_path, &file_name, file_size, file_mtime)
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn list_stats_tags(conn: &Connection, artist_id: i64) -> Result<Vec<StatsTagRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT t.id, t.name, t.sort_order, COUNT(i.id) AS item_count
         FROM tags t
@@ -100,10 +120,10 @@ fn list_stats_tags(conn: &Connection, artist_id: i64) -> Result<Vec<StatsTagRow>
     let mut tags = stmt
         .query_map([artist_id], |row| {
             Ok(StatsTagRow {
-                id: row.get("id")?,
-                name: row.get("name")?,
-                count: row.get("item_count")?,
-                sort_order: row.get("sort_order")?,
+                id: row.get(0)?,
+                name: row.get(1)?,
+                sort_order: row.get(2)?,
+                count: row.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

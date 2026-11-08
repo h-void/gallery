@@ -384,7 +384,7 @@ def sanitize_public_env(text: str) -> str:
 def is_public_file(path: str | Path) -> bool:
     """Return whether a tracked path belongs in the public source snapshot."""
     path = _normalize(path)
-    if path in ROOT_FILES or path in TOOL_FILES:
+    if path in ROOT_FILES or path in TOOL_FILES or path == "docs/API_USAGE.md":
         return True
     if path.startswith("app/static/"):
         return True

@@ -325,11 +325,10 @@ pub(crate) fn move_file_no_overwrite(src: &Path, dest: &Path) -> Result<(PathBuf
     }
 }
 
-fn path_is_within_existing_root(path: &Path, root: &Path) -> bool {
-    safe_canonicalize(path)
+fn canonical_path_is_within_existing_root(canonical_path: &Path, root: &Path) -> bool {
+    safe_canonicalize(root)
         .ok()
-        .zip(safe_canonicalize(root).ok())
-        .is_some_and(|(path, root)| path == root || path.starts_with(root))
+        .is_some_and(|root| canonical_path == root || canonical_path.starts_with(root))
 }
 
 pub(crate) fn recycle_source_is_trusted(
@@ -337,20 +336,25 @@ pub(crate) fn recycle_source_is_trusted(
     original: &Path,
     roots: Option<&MediaRoots>,
 ) -> bool {
-    if path_is_within_existing_root(recycled, &gallery_recycle_dir()) {
-        return true;
-    }
-    for (trash, _) in candidate_recycle_targets(original, roots) {
-        if path_is_within_existing_root(recycled, &trash) {
+    if let Ok(canonical_recycled) = safe_canonicalize(recycled) {
+        if canonical_path_is_within_existing_root(&canonical_recycled, &gallery_recycle_dir()) {
             return true;
         }
-    }
-    if let Some(roots) = roots {
-        for root_str in roots.allowed_roots() {
-            let root = PathBuf::from(root_str);
-            for folder in [".gallery_recycle", ".recycle", "#recycle", ".Recycle_bin"] {
-                if path_is_within_existing_root(recycled, &root.join(folder)) {
-                    return true;
+        for (trash, _) in candidate_recycle_targets(original, roots) {
+            if canonical_path_is_within_existing_root(&canonical_recycled, &trash) {
+                return true;
+            }
+        }
+        if let Some(roots) = roots {
+            for root_str in roots.allowed_roots() {
+                let root = PathBuf::from(root_str);
+                for folder in [".gallery_recycle", ".recycle", "#recycle", ".Recycle_bin"] {
+                    if canonical_path_is_within_existing_root(
+                        &canonical_recycled,
+                        &root.join(folder),
+                    ) {
+                        return true;
+                    }
                 }
             }
         }

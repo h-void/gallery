@@ -81,7 +81,7 @@ pub fn artist_detail_response(conn: &Connection, artist_id: i64) -> Result<Value
 }
 
 fn list_artists(conn: &Connection) -> Result<Vec<ArtistRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT a.id, a.name, a.path, a.missing, a.missing_at, a.created_at,
                COUNT(i.id) AS item_count
@@ -95,16 +95,16 @@ fn list_artists(conn: &Connection) -> Result<Vec<ArtistRow>> {
     )?;
     let mut artists = stmt
         .query_map([], |row| {
-            let name: String = row.get("name")?;
+            let name: String = row.get(1)?;
             let search_text = search_text_for_values(&[&name]);
             Ok(ArtistRow {
-                id: row.get("id")?,
+                id: row.get(0)?,
                 name,
-                path: row.get("path")?,
-                missing: row.get("missing")?,
-                missing_at: row.get("missing_at")?,
-                created_at: row.get("created_at")?,
-                item_count: row.get("item_count")?,
+                path: row.get(2)?,
+                missing: row.get(3)?,
+                missing_at: row.get(4)?,
+                created_at: row.get(5)?,
+                item_count: row.get(6)?,
                 search_text,
             })
         })?
@@ -114,7 +114,7 @@ fn list_artists(conn: &Connection) -> Result<Vec<ArtistRow>> {
 }
 
 fn get_artist_detail(conn: &Connection, artist_id: i64) -> Result<Option<ArtistDetailRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT id, name, path, missing, missing_at, created_at
         FROM artists
@@ -126,11 +126,11 @@ fn get_artist_detail(conn: &Connection, artist_id: i64) -> Result<Option<ArtistD
         return Ok(None);
     };
     Ok(Some(ArtistDetailRow {
-        id: row.get("id")?,
-        name: row.get("name")?,
-        path: row.get("path")?,
-        missing: row.get("missing")?,
-        missing_at: row.get("missing_at")?,
-        created_at: row.get("created_at")?,
+        id: row.get(0)?,
+        name: row.get(1)?,
+        path: row.get(2)?,
+        missing: row.get(3)?,
+        missing_at: row.get(4)?,
+        created_at: row.get(5)?,
     }))
 }

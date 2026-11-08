@@ -16,7 +16,7 @@ pub fn folder_paths_response(conn: &Connection, artist_id: i64) -> Result<Value>
 }
 
 pub(crate) fn list_folder_file_paths(conn: &Connection, artist_id: i64) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT file_path FROM items
         WHERE artist_id=? AND missing=0
@@ -25,15 +25,14 @@ pub(crate) fn list_folder_file_paths(conn: &Connection, artist_id: i64) -> Resul
         ",
     )?;
     let paths = stmt
-        .query_map([artist_id], |row| row.get::<_, String>("file_path"))?
+        .query_map([artist_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(paths)
 }
 
 pub(crate) fn get_artist_path(conn: &Connection, artist_id: i64) -> Result<Option<String>> {
-    match conn.query_row("SELECT path FROM artists WHERE id=?", [artist_id], |row| {
-        row.get::<_, String>(0)
-    }) {
+    let mut stmt = conn.prepare_cached("SELECT path FROM artists WHERE id=?")?;
+    match stmt.query_row([artist_id], |row| row.get::<_, String>(0)) {
         Ok(path) => Ok(Some(path)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => Err(error.into()),

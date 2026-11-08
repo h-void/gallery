@@ -321,8 +321,19 @@ export function openLightbox(idx) {
   }
 }
 
+let cachedLightboxAllItemsRef = null;
+let cachedLightboxAllItemsLen = -1;
+let cachedLightboxItemsList = [];
+
 export function lightboxItems() {
-  return state.allItems.filter(isLightboxItem);
+  const all = state.allItems || [];
+  if (all === cachedLightboxAllItemsRef && all.length === cachedLightboxAllItemsLen) {
+    return cachedLightboxItemsList;
+  }
+  cachedLightboxAllItemsRef = all;
+  cachedLightboxAllItemsLen = all.length;
+  cachedLightboxItemsList = all.filter(isLightboxItem);
+  return cachedLightboxItemsList;
 }
 
 export function isLightboxItem(item) {
@@ -625,8 +636,12 @@ export function showLightboxImage(items) {
   const jumpFolderBtnHtml = canJumpFolder
     ? `<button type="button" class="btn btn-ghost btn-sm lightbox-folder-jump" id="lightboxFolderJumpBtn" data-jump-folder="${escHtml(itemFolderRel)}" data-jump-artist="${item.artist_id || ''}" title="${t('定位到所在文件夹')}">${t('定位文件夹')}</button>`
     : '';
+  const nonLightboxLoaded = Math.max(0, (state.allItems ? state.allItems.length : 0) - items.length);
+  const totalCount = state.hasMoreItems && Number(state.itemsTotal) > items.length
+    ? Math.max(items.length, Number(state.itemsTotal) - nonLightboxLoaded)
+    : items.length;
   const indexBadgeHtml = items.length > 0
-    ? `<span class="lightbox-meta-index" data-i18n-skip>${state.lightboxIndex + 1} / ${items.length}</span>`
+    ? `<span class="lightbox-meta-index" data-i18n-skip>${state.lightboxIndex + 1} / ${totalCount}</span>`
     : '';
   const initialSpecs = formatLightboxSpecs(item);
   const specsBadgeHtml = `<span class="lightbox-meta-specs" id="lightboxMetaSpecs" data-i18n-skip${initialSpecs ? '' : ' hidden'}>${escHtml(initialSpecs)}</span>`;
@@ -911,11 +926,40 @@ export function stopLightboxPan(e) {
 export function moveLightbox(delta) {
   const items = lightboxItems();
   if (!items.length) return;
-  const nextIndex = Math.max(0, Math.min(items.length - 1, state.lightboxIndex + delta));
+  const targetIndex = state.lightboxIndex + delta;
+  if (delta > 0 && targetIndex >= items.length && state.hasMoreItems && !state.loadingItems && !state.loadingMoreItems) {
+    const prevIdx = state.lightboxIndex;
+    loadItems({append: true}).then(loaded => {
+      if (!loaded || state.lightboxIndex !== prevIdx) return;
+      const updated = lightboxItems();
+      if (prevIdx + 1 < updated.length) {
+        state.lightboxIndex = prevIdx + 1;
+        resetLightboxTransform();
+        showLightboxImage(updated);
+      }
+    });
+    return;
+  }
+  const nextIndex = Math.max(0, Math.min(items.length - 1, targetIndex));
   if (nextIndex === state.lightboxIndex) return;
   state.lightboxIndex = nextIndex;
   resetLightboxTransform();
   showLightboxImage(items);
+  if (delta > 0 && nextIndex >= items.length - 3 && state.hasMoreItems && !state.loadingItems && !state.loadingMoreItems) {
+    loadItems({append: true}).then(loaded => {
+      if (loaded && state.lightboxIndex >= 0) {
+        const updated = lightboxItems();
+        const indexEl = $('#lightboxInfo .lightbox-meta-index');
+        if (indexEl && updated.length > 0) {
+          const nonLightboxLoaded = Math.max(0, (state.allItems ? state.allItems.length : 0) - updated.length);
+          const totalCount = state.hasMoreItems && Number(state.itemsTotal) > updated.length
+            ? Math.max(updated.length, Number(state.itemsTotal) - nonLightboxLoaded)
+            : updated.length;
+          indexEl.textContent = `${state.lightboxIndex + 1} / ${totalCount}`;
+        }
+      }
+    });
+  }
 }
 
 export function closeLightboxInlineEditors() {
@@ -1502,6 +1546,9 @@ export async function deleteMediaItem({filePath, itemId, fileName = '', button =
     const removedItem = (state.allItems || []).find(i => i.id === itemId) || null;
     state.allItems = state.allItems.filter(i => i.id !== itemId);
     state.itemsOffset = state.allItems.length;
+    if (typeof state.itemsTotal === 'number' && state.itemsTotal > 0) {
+      state.itemsTotal = Math.max(0, state.itemsTotal - 1);
+    }
     state.selectedIds.delete(itemId);
     if (removedItem && state.stats) {
       if (typeof state.stats.total === 'number') state.stats.total = Math.max(0, state.stats.total - 1);

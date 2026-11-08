@@ -26,6 +26,8 @@ struct CharacterReferenceRow {
     /// item, so the UI previews it through the id-based route instead of
     /// `file_path`. The stored path itself stays server-side.
     has_image: bool,
+    verified: bool,
+    prototype_role: String,
 }
 
 pub fn character_references_response(
@@ -36,13 +38,41 @@ pub fn character_references_response(
     Ok(json!({ "references": list_character_references(conn, character_id, limit)? }))
 }
 
+fn has_column(conn: &Connection, table: &str, col: &str) -> bool {
+    conn.prepare(&format!("PRAGMA table_info({table})"))
+        .and_then(|mut s| {
+            let cols = s
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(cols.iter().any(|c| c == col))
+        })
+        .unwrap_or(false)
+}
+
 fn list_character_references(
     conn: &Connection,
     character_id: i64,
     limit: Option<i64>,
 ) -> Result<Vec<CharacterReferenceRow>> {
     let limit = limit.unwrap_or(200).clamp(1, 500);
-    let mut stmt = conn.prepare(
+    let has_verified = has_column(conn, "character_references", "verified");
+    let has_role = has_column(conn, "character_references", "prototype_role");
+    let verified_expr = if has_verified {
+        "COALESCE(cr.verified, 1) != 0"
+    } else {
+        "1"
+    };
+    let role_expr = if has_role {
+        "COALESCE(cr.prototype_role, 'manual')"
+    } else {
+        "'manual'"
+    };
+    let order_expr = if has_verified {
+        "COALESCE(cr.verified, 1) ASC, cr.id DESC"
+    } else {
+        "cr.id DESC"
+    };
+    let sql = format!(
         "
         SELECT cr.id, cr.character_id, c.name as character_name, cr.source_type,
                cr.embedding_dim, cr.embedding_model_repo_id,
@@ -50,15 +80,18 @@ fn list_character_references(
                cr.embedding_updated_at, cr.item_id, cr.created_at,
                i.file_path, i.file_name, i.file_size, i.file_mtime,
                i.media_type, i.is_archive,
-               (cr.image_path IS NOT NULL) AS has_image
+               (cr.image_path IS NOT NULL) AS has_image,
+               ({verified_expr}) AS verified,
+               {role_expr} AS prototype_role
         FROM character_references cr
         JOIN characters c ON c.id = cr.character_id
         LEFT JOIN items i ON i.id = cr.item_id
         WHERE cr.character_id = ?
-        ORDER BY cr.id DESC
+        ORDER BY {order_expr}
         LIMIT ?
-        ",
-    )?;
+        "
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let references = stmt
         .query_map(rusqlite::params![character_id, limit], |row| {
             Ok(CharacterReferenceRow {
@@ -80,6 +113,8 @@ fn list_character_references(
                 media_type: row.get("media_type")?,
                 is_archive: row.get("is_archive")?,
                 has_image: row.get("has_image")?,
+                verified: row.get("verified")?,
+                prototype_role: row.get("prototype_role")?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()

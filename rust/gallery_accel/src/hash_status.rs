@@ -76,12 +76,12 @@ fn hash_status_counts(
         ("done".to_string(), 0),
         ("error".to_string(), 0),
     ]);
-    let mut stmt = conn.prepare(&query)?;
+    let mut stmt = conn.prepare_cached(&query)?;
     for row in stmt.query_map([], |row| {
         Ok((
-            row.get::<_, Option<String>>("hash_status")?
+            row.get::<_, Option<String>>(0)?
                 .unwrap_or_else(|| "pending".to_string()),
-            row.get::<_, i64>("count")?,
+            row.get::<_, i64>(1)?,
         ))
     })? {
         let (status, count) = row?;

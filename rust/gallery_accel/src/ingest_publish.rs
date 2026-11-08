@@ -925,7 +925,7 @@ pub fn publish_completed_file(
                 params![id, stage_str],
             )?;
             if re_staged == 0 {
-                let (current_stage, _): (String, i64) = conn.query_row(
+                let (current_stage, _): (String, Option<i64>) = conn.query_row(
                     "SELECT stage, item_id FROM download_publish_jobs WHERE id = ?1",
                     params![id],
                     |row| Ok((row.get(0)?, row.get(1)?)),

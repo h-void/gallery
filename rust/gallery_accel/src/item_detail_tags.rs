@@ -16,7 +16,7 @@ pub(crate) fn list_item_detail_tags(
     conn: &Connection,
     item_id: i64,
 ) -> Result<Vec<ItemDetailTagRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT t.id, t.name, t.sort_order
         FROM item_tags it
@@ -27,9 +27,9 @@ pub(crate) fn list_item_detail_tags(
     let mut tags = stmt
         .query_map([item_id], |row| {
             Ok(ItemDetailTagRow {
-                id: row.get("id")?,
-                name: row.get("name")?,
-                sort_order: row.get("sort_order")?,
+                id: row.get(0)?,
+                name: row.get(1)?,
+                sort_order: row.get(2)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

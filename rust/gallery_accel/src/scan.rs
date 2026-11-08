@@ -18,7 +18,7 @@ use crate::db_housekeeping::cleanup_scan_seen;
 use crate::folder_archive::validate_relative_folder;
 use crate::fs_util::safe_canonicalize;
 use crate::media_roots::{normalize_slashes, path_under_authorized_roots, MediaRoots};
-use crate::media_type::{extract_date_from_folder, media_type_for_file};
+use crate::media_type::{extract_date_value_from_folder, media_type_for_file};
 
 /// Category directories that must be drilled through (never registered as artists).
 const CATEGORY_DIR_NAMES: &[&str] = &[
@@ -421,7 +421,11 @@ pub struct DiscoveryResult {
     pub errors: ScanErrors,
 }
 
-fn count_media_files(directory: &Path, errors: &mut ScanErrors) -> usize {
+fn inspect_artist_candidate_dir(
+    directory: &Path,
+    require_media_check: bool,
+    errors: &mut ScanErrors,
+) -> (bool, bool) {
     let entries = match path_read_dir(directory) {
         Ok(e) => e,
         Err(err) => {
@@ -432,10 +436,11 @@ fn count_media_files(directory: &Path, errors: &mut ScanErrors) -> usize {
                     err
                 ));
             }
-            return 0;
+            return (false, false);
         }
     };
-    let mut count = 0usize;
+    let mut has_media = false;
+    let mut has_subdirs = false;
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -452,70 +457,28 @@ fn count_media_files(directory: &Path, errors: &mut ScanErrors) -> usize {
         if name.starts_with('.') {
             continue;
         }
-        let is_file = match entry.file_type() {
-            Ok(t) => t.is_file(),
+        let ftype = match entry.file_type() {
+            Ok(t) => t,
             Err(err) => {
                 errors.push(format!(
                     "file_type error for {}: {}",
                     entry.path().display(),
-                    err
-                ));
-                false
-            }
-        };
-        if is_file && media_type_for_file(&name).is_some() {
-            count += 1;
-        }
-    }
-    count
-}
-
-fn has_subdirs(directory: &Path, errors: &mut ScanErrors) -> bool {
-    let entries = match path_read_dir(directory) {
-        Ok(e) => e,
-        Err(err) => {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                errors.push(format!(
-                    "has_subdirs error on {}: {}",
-                    directory.display(),
-                    err
-                ));
-            }
-            return false;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                errors.push(format!(
-                    "read_dir entry error in {}: {}",
-                    directory.display(),
                     err
                 ));
                 continue;
             }
         };
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
-        }
-        let is_dir = match entry.file_type() {
-            Ok(t) => t.is_dir(),
-            Err(err) => {
-                errors.push(format!(
-                    "file_type error for {}: {}",
-                    entry.path().display(),
-                    err
-                ));
-                false
+        if ftype.is_dir() {
+            has_subdirs = true;
+            if !require_media_check {
+                break;
             }
-        };
-        if is_dir {
-            return true;
+        } else if ftype.is_file() && media_type_for_file(&name).is_some() {
+            has_media = true;
+            break;
         }
     }
-    false
+    (has_media, has_subdirs)
 }
 
 /// Discover artist directories under a real authorized root (Python `_discover_artist_dirs`).
@@ -568,13 +531,17 @@ pub fn discover_artist_dirs(root_path: &Path) -> DiscoveryResult {
                 continue;
             }
             let full = entry.path();
-            let media_count = count_media_files(&full, errors);
-            if is_category_dir_name(&name) || (media_count == 0 && is_collection_wrapper(&name)) {
+            if is_category_dir_name(&name) {
                 walk(&full, artists, errors);
                 continue;
             }
-            let has_children = has_subdirs(&full, errors);
-            if has_children || media_count > 0 {
+            let is_wrapper = is_collection_wrapper(&name);
+            let (has_media, has_children) = inspect_artist_candidate_dir(&full, is_wrapper, errors);
+            if !has_media && is_wrapper {
+                walk(&full, artists, errors);
+                continue;
+            }
+            if has_children || has_media {
                 let path = normalize_slashes(&full.to_string_lossy());
                 artists.push((name, path));
                 continue;
@@ -2127,6 +2094,9 @@ fn walk_artist(
     delete_scan_seen_chunked(conn, None, Some(artist_id))
         .context("clean baseline scan_seen for artist")?;
 
+    let artist_prefix = format!("{artist_norm}/");
+    let mut cached_parent: Option<(PathBuf, String, String, String)> = None;
+
     // Depth 0 is the scan root itself. `filter_entry` runs for the root too,
     // so filtering it out when its own name starts with a dot skipped every
     // descendant: the walk produced no entries, `matched_active` stayed 0, the
@@ -2182,28 +2152,37 @@ fn walk_artist(
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let parent = entry
-            .path()
-            .parent()
-            .map(|p| normalize_slashes(&p.to_string_lossy()))
-            .unwrap_or_default();
-        let mut folder_name = entry
-            .path()
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let mut date_folder = folder_name.clone();
-        if parent.trim_end_matches('/') == artist_norm {
-            folder_name.clear();
-            date_folder.clear();
-        } else if parent.starts_with(&(artist_norm.clone() + "/")) {
-            date_folder = parent[artist_norm.len() + 1..].to_string();
-        }
-        let date_str = extract_date_from_folder(&date_folder);
-        let detected_raw = crate::media_type::extract_date_value_from_folder(&date_folder)
-            .map(|value| value.raw)
-            .unwrap_or_default();
+        let parent_path = entry.path().parent().unwrap_or_else(|| Path::new(""));
+        let (folder_name, date_str, detected_raw) = match &cached_parent {
+            Some((last_path, fname_c, d_str, d_raw)) if last_path.as_path() == parent_path => {
+                (fname_c.clone(), d_str.clone(), d_raw.clone())
+            }
+            _ => {
+                let parent = normalize_slashes(&parent_path.to_string_lossy());
+                let mut folder_name = parent_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let mut date_folder = folder_name.clone();
+                if parent.trim_end_matches('/') == artist_norm {
+                    folder_name.clear();
+                    date_folder.clear();
+                } else if let Some(rest) = parent.strip_prefix(&artist_prefix) {
+                    date_folder = rest.to_string();
+                }
+                let (date_str, detected_raw) = match extract_date_value_from_folder(&date_folder) {
+                    Some(v) => (v.canonical, v.raw),
+                    None => (String::new(), String::new()),
+                };
+                cached_parent = Some((
+                    parent_path.to_path_buf(),
+                    folder_name.clone(),
+                    date_str.clone(),
+                    detected_raw.clone(),
+                ));
+                (folder_name, date_str, detected_raw)
+            }
+        };
         let is_archive = if media_type == "archive" { 1 } else { 0 };
 
         presence.push(full.clone())?;

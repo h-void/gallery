@@ -11,7 +11,7 @@ import {
 import { toast, logUiAction, collectUiLogContext } from '../logging.js';
 import { t } from '../i18n.js';
 import {
-  BROWSE_KINDS, syncBrowseUrl, getSavedTagSort,
+  BROWSE_KINDS, MEDIA_BROWSE_KINDS, syncBrowseUrl, getSavedTagSort, saveItemDates,
 } from '../router.js';
 import { renderGrid, appendItemsToGrid, releaseAllImageLoads, releaseAllVideoPreviewLoads } from './grid.js';
 import { updateEditBar, resetCharacterTagSuggestions, scheduleCharacterTagSuggestions, applySelectionChange, executeBundleSelectedItems } from './editbar.js';
@@ -101,6 +101,7 @@ export function renderLibraryEmptyState() {
   const scanState = state.lastScanState || {};
   const scanButton = $('#emptyScanBtn');
   const selectButton = $('#emptySelectArtistBtn');
+  const globalFavButton = $('#emptyGlobalFavoritesBtn');
   const isScanning = state.scanRunning || scanState.status === 'scanning';
 
   if (needsArtistPick) {
@@ -113,6 +114,10 @@ export function renderLibraryEmptyState() {
     if (selectButton) {
       selectButton.style.display = '';
       selectButton.disabled = false;
+    }
+    if (globalFavButton) {
+      globalFavButton.style.display = '';
+      globalFavButton.disabled = false;
     }
     // The page header already reads 「画廊」; drop the duplicate eyebrow here.
     $('#libraryEmptyKicker').hidden = true;
@@ -128,6 +133,7 @@ export function renderLibraryEmptyState() {
     scanButton.textContent = isScanning ? '扫描中' : '扫描全库';
   }
   if (selectButton) selectButton.style.display = 'none';
+  if (globalFavButton) globalFavButton.style.display = 'none';
   panel.classList.toggle('scanning', isScanning);
 
   if (isScanning) {
@@ -774,7 +780,9 @@ let tagFilterQuery = '';
 
 export function renderSidebar() {
   syncActiveDuplicatePath();
-  $('#tagFilterReset').disabled = !state.activeRole || (String(state.activeRole).startsWith('__') && state.activeRole !== BROWSE_KINDS.untagged);
+  syncUndatedFilterControl();
+  $('#tagFilterReset').disabled = !state.globalTagName && (!state.activeRole || (String(state.activeRole).startsWith('__') && state.activeRole !== BROWSE_KINDS.untagged));
+  const tagCrossArtistBtn = $('#tagCrossArtistBtn');
   const tagSearchBar = $('#tagSearchBar');
   const tagSearchInput = $('#tagSearchInput');
   if (tagSearchInput && !tagSearchInput.dataset.bound) {
@@ -799,11 +807,32 @@ export function renderSidebar() {
   }
   const s = state.stats;
   if (!s) {
-    $('#sidebarList').innerHTML = '';
+    if (tagCrossArtistBtn) {
+      tagCrossArtistBtn.hidden = true;
+      tagCrossArtistBtn.dataset.tagName = '';
+    }
+    if (state.globalTagName) {
+      $('#sidebarList').innerHTML = `<div class="sidebar-item active" data-role="" role="button" tabindex="0"><span data-i18n-skip>${escHtml(state.globalTagName)}</span><span class="count">${escHtml(t('跨画师'))}</span></div>`;
+      bindSidebarEvents();
+    } else {
+      $('#sidebarList').innerHTML = '';
+    }
     if (tagSearchBar) tagSearchBar.hidden = true;
     return;
   }
   const tags = Array.isArray(s.tags) ? s.tags : [];
+  if (tagCrossArtistBtn) {
+    const activeTag = state.activeRole && !String(state.activeRole).startsWith('__')
+      ? tags.find(row => String(row.id) === String(state.activeRole))
+      : null;
+    if (activeTag && activeTag.name) {
+      tagCrossArtistBtn.hidden = false;
+      tagCrossArtistBtn.dataset.tagName = activeTag.name;
+    } else {
+      tagCrossArtistBtn.hidden = true;
+      tagCrossArtistBtn.dataset.tagName = '';
+    }
+  }
   if (tagSearchBar) {
     tagSearchBar.hidden = tags.length <= 6 && !tagFilterQuery;
   }
@@ -856,7 +885,8 @@ export function renderMediaFilter() {
     if (extractArtistArchivesBtn) extractArtistArchivesBtn.style.display = 'none';
     return;
   }
-  const active = Object.values(BROWSE_KINDS).includes(state.activeRole) ? state.activeRole : '';
+  const active = state.activeMedia
+    || (Object.values(MEDIA_BROWSE_KINDS).includes(state.activeRole) ? state.activeRole : '');
   const filters = [
     ['', '全部媒体 {count}', s.total],
     [BROWSE_KINDS.favorites, '收藏 {count}', s.favorites || 0],
@@ -867,11 +897,11 @@ export function renderMediaFilter() {
   select.innerHTML = filters.map(([value, template, count]) =>
     `<option value="${value}">${t(template, {count})}</option>`
   ).join('');
-  select.value = active && active !== BROWSE_KINDS.untagged ? active : '';
+  select.value = active;
   select.disabled = false;
 
   if (extractArtistArchivesBtn) {
-    const archiveCount = Number(s.archives || 0);
+    const archiveCount = Number(s.extractable_archives ?? s.archives ?? 0);
     if (archiveCount > 0) {
       extractArtistArchivesBtn.style.display = '';
       extractArtistArchivesBtn.textContent = t('解压全部压缩包 ({count})', {count: archiveCount});
@@ -895,12 +925,24 @@ function countFolderNodes(node) {
   return total;
 }
 
+let folderFilterMatchCacheQuery = '';
+let folderFilterMatchCache = new WeakMap();
+
 function folderNodeMatchesFilter(node, query) {
   if (!query) return true;
   if (!node || typeof node !== 'object' || Array.isArray(node)) return false;
-  if (searchableTextMatches(query, node.name, node.path)) return true;
+  if (query !== folderFilterMatchCacheQuery) {
+    folderFilterMatchCacheQuery = query;
+    folderFilterMatchCache = new WeakMap();
+  }
+  if (folderFilterMatchCache.has(node)) {
+    return folderFilterMatchCache.get(node);
+  }
   const children = Array.isArray(node.children) ? node.children : [];
-  return children.some(child => folderNodeMatchesFilter(child, query));
+  const matched = searchableTextMatches(query, node.name, node.path)
+    || children.some(child => folderNodeMatchesFilter(child, query));
+  folderFilterMatchCache.set(node, matched);
+  return matched;
 }
 
 export function toggleFolderCollapse(path) {
@@ -1196,9 +1238,45 @@ function bindSidebarEvents() {
 
 export function selectBrowseRole(role) {
   state.activeRole = role || null;
+  if (!role && state.globalTagName) {
+    state.globalTagName = '';
+    setArtistSearchLabel();
+  }
   applySelectionChange([], {reason: 'select_browse_role', schedule: false});
   renderSidebar();
   renderToolbar();
+  scrollToItemsTop();
+  syncBrowseUrl('push');
+  loadItems();
+  closeFilterDrawerIfMobile();
+}
+
+export function selectMediaFilter(kind) {
+  state.activeMedia = Object.values(MEDIA_BROWSE_KINDS).includes(kind) ? kind : null;
+  if (Object.values(MEDIA_BROWSE_KINDS).includes(state.activeRole)) {
+    state.activeRole = null;
+  }
+  applySelectionChange([], {reason: 'select_media_filter', schedule: false});
+  renderSidebar();
+  renderToolbar();
+  scrollToItemsTop();
+  syncBrowseUrl('push');
+  loadItems();
+}
+
+export function toggleUndatedFilter() {
+  state.itemUndatedOnly = !state.itemUndatedOnly;
+  if (state.itemUndatedOnly) {
+    state.itemDateFrom = '';
+    state.itemDateTo = '';
+    saveItemDates('', '');
+    for (const id of ['#itemDateFrom', '#itemDateTo']) {
+      const el = $(id);
+      if (el) el.setCustomValidity('');
+    }
+  }
+  syncItemFilterControls();
+  applySelectionChange([], {reason: 'toggle_undated', schedule: false});
   scrollToItemsTop();
   syncBrowseUrl('push');
   loadItems();
@@ -1230,6 +1308,7 @@ export async function loadItems(options = {}) {
   syncArchiveTriageToggle();
   if (!state.currentArtist && !globalSearch) {
     state.allItems = [];
+    state.itemsTotal = 0;
     state.itemsOffset = 0;
     state.hasMoreItems = false;
     if (!append) {
@@ -1275,24 +1354,34 @@ export async function loadItems(options = {}) {
     const aid = state.currentArtist.id;
     params.set('artist_id', aid);
 
-    if (state.activeRole === '__archives__') {
-      params.set('archive_only', 'true');
-    } else if (state.activeRole === '__videos__') {
-      params.set('media_type', 'video');
-    } else if (state.activeRole === '__sources__') {
-      params.set('media_type', 'source');
-    } else if (state.activeRole === '__untagged__') {
+    if (state.activeRole === '__untagged__') {
       params.set('untagged', 'true');
-    } else if (state.activeRole === '__favorites__') {
-      params.set('favorite_only', 'true');
-    } else if (state.activeRole) {
+    } else if (state.activeRole && !String(state.activeRole).startsWith('__')) {
       params.set('tag_id', state.activeRole);
     }
+  } else if (state.globalTagName) {
+    params.set('tags', state.globalTagName);
+  }
+
+  const activeMedia = state.activeMedia
+    || (Object.values(MEDIA_BROWSE_KINDS).includes(state.activeRole) ? state.activeRole : null);
+  if (activeMedia === '__archives__') {
+    params.set('archive_only', 'true');
+  } else if (activeMedia === '__videos__') {
+    params.set('media_type', 'video');
+  } else if (activeMedia === '__sources__') {
+    params.set('media_type', 'source');
+  } else if (activeMedia === '__favorites__') {
+    params.set('favorite_only', 'true');
   }
 
   if (state.search) params.set('search', state.search);
-  if (state.itemDateFrom) params.set('date_from', state.itemDateFrom);
-  if (state.itemDateTo) params.set('date_to', state.itemDateTo);
+  if (state.itemUndatedOnly) {
+    params.set('undated', 'true');
+  } else {
+    if (state.itemDateFrom) params.set('date_from', state.itemDateFrom);
+    if (state.itemDateTo) params.set('date_to', state.itemDateTo);
+  }
   if (state.search && state.searchTarget === 'tags') params.set('search_tags_only', 'true');
   if (!globalSearch && folderScoped) params.set('folder', state.activeFolder);
   if (!globalSearch && state.duplicatesOnly) params.set('duplicates_only', 'true');
@@ -1325,6 +1414,7 @@ export async function loadItems(options = {}) {
       : [];
     state.allItems = append ? state.allItems.concat(nextItems) : nextItems;
     state.itemsOffset = state.allItems.length;
+    state.itemsTotal = data.total != null ? Number(data.total) : state.allItems.length;
     state.itemsCursor = cursorSearch ? (data.next_cursor || null) : null;
     state.hasMoreItems = cursorSearch
       ? (data.has_more != null ? Boolean(data.has_more) : nextItems.length === ITEM_PAGE_LIMIT)
@@ -1365,6 +1455,7 @@ export async function loadItems(options = {}) {
       toast('加载更多媒体失败', 'error');
     } else if (isCurrentRequestSeq('itemLoadSeq', seq)) {
       state.allItems = [];
+      state.itemsTotal = 0;
       state.itemsOffset = 0;
       state.hasMoreItems = false;
       state.tagSearchResults = [];
@@ -1471,11 +1562,19 @@ export function updateScanFolderButton() {
   const label = state.activeFolder ? '扫描文件夹' : '扫描画师';
   btn.textContent = label;
   btn.title = label;
-  btn.style.display = !state.scanRunning && isCurrentScanScopeActive() ? '' : 'none';
+  const contextActive = !state.scanRunning && isCurrentScanScopeActive();
+  btn.style.display = contextActive ? '' : 'none';
+  const fullScanBtn = $('#scanBtn');
+  if (fullScanBtn && fullScanBtn.classList && typeof fullScanBtn.classList.toggle === 'function') {
+    fullScanBtn.classList.toggle('is-secondary-scan', contextActive);
+  }
 }
 
 export function isGlobalSearchActive() {
-  return Boolean(state.search && effectiveSearchScope() === 'global');
+  return Boolean(
+    (state.search && effectiveSearchScope() === 'global')
+    || (!state.currentArtist && (state.activeRole === BROWSE_KINDS.favorites || Boolean(state.globalTagName)))
+  );
 }
 
 // Tag-only search results render into their own #tagResults container above
@@ -1522,6 +1621,7 @@ export function renderTagSearchResults() {
 
 export function clearUI() {
   state.allItems = [];
+  state.itemsTotal = 0;
   state.itemsOffset = 0;
   state.itemsCursor = null;
   state.hasMoreItems = false;
@@ -1553,7 +1653,31 @@ export function clearUI() {
   tagResultsSignature = null;
   renderLibraryEmptyState();
   renderToolbar();
+  syncItemFilterControls();
   syncActiveDuplicatePath();
+}
+
+export function syncUndatedFilterControl() {
+  const undatedBtn = $('#itemUndatedBtn');
+  const undatedCountEl = $('#itemUndatedCount');
+  const undatedCount = state.currentArtist && state.stats && typeof state.stats.undated === 'number'
+    ? Number(state.stats.undated || 0)
+    : null;
+  if (undatedBtn) {
+    const active = Boolean(state.itemUndatedOnly);
+    undatedBtn.classList.toggle('active', active);
+    undatedBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    undatedBtn.classList.toggle('sidebar-item-empty', undatedCount === 0);
+  }
+  if (undatedCountEl) {
+    if (undatedCount !== null) {
+      undatedCountEl.textContent = String(undatedCount);
+      undatedCountEl.hidden = false;
+    } else {
+      undatedCountEl.textContent = '0';
+      undatedCountEl.hidden = true;
+    }
+  }
 }
 
 export function syncItemFilterControls() {
@@ -1569,15 +1693,34 @@ export function syncItemFilterControls() {
     dateTo.value = state.itemDateTo;
     dateTo.min = state.itemDateFrom;
   }
+  const hasDateFilter = Boolean(state.itemDateFrom || state.itemDateTo || state.itemUndatedOnly);
   const dateReset = $('#itemDateReset');
   if (dateReset) {
-    dateReset.disabled = !state.itemDateFrom && !state.itemDateTo;
+    dateReset.disabled = !hasDateFilter;
+  }
+  syncUndatedFilterControl();
+  const dateBadge = $('#itemDateFilterBadge');
+  if (dateBadge) dateBadge.hidden = !hasDateFilter;
+  const mobileBadge = $('#mobileFilterBadge');
+  if (mobileBadge) mobileBadge.hidden = !hasDateFilter;
+  const filterSection = $('#itemFilterSection');
+  if (filterSection) filterSection.classList.toggle('has-date-filter', hasDateFilter);
+  const filtersToggle = $('#itemFiltersToggle');
+  if (filtersToggle) {
+    filtersToggle.classList.toggle('has-date-filter', hasDateFilter);
+    filtersToggle.title = hasDateFilter ? t('日期筛选生效中') : '';
+  }
+  const mobileFilterBtn = $('#mobileFilterBtn');
+  if (mobileFilterBtn) {
+    mobileFilterBtn.classList.toggle('has-date-filter', hasDateFilter);
+    mobileFilterBtn.classList.toggle('active', hasDateFilter);
+    mobileFilterBtn.title = hasDateFilter ? t('日期筛选生效中') : '';
   }
 }
 
 // Cross-module imports that close the sidebar <-> router/grid cycles. All of
 // these are only ever invoked from function bodies, never at module scope.
-import { recentArtistList, naturalArtistList, artistOptionButtonHtml, bindArtistChoiceContainer, selectArtist } from '../router.js';
+import { recentArtistList, naturalArtistList, artistOptionButtonHtml, bindArtistChoiceContainer, selectArtist, setArtistSearchLabel } from '../router.js';
 import { captureGridScrollAnchor, restoreGridScrollAnchor } from './grid.js';
 import { releaseAllVideoPreviews } from './grid.js';
 import { classifyItems } from './editbar.js';

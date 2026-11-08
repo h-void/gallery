@@ -707,6 +707,8 @@ function ensureDomObserver() {
   observedRoot = root;
 }
 
+let domTranslatedToEn = false;
+
 export function setLanguage(lang, persist = false) {
   const normalized = normalizeLanguage(lang);
   // The shipped dictionary loads lazily: start the fetch on the first English
@@ -714,6 +716,7 @@ export function setLanguage(lang, persist = false) {
   // session stays Chinese) nothing is pending and the sync pass below is final.
   const dictionaryPending = normalized === 'en' && !translationsLoad;
   if (normalized === 'en') {
+    domTranslatedToEn = true;
     // 字典分片加载失败只意味着这次保持中文原文；调用方不处理这个 promise，
     // 在这里收口避免未处理的 rejection。
     ensureTranslations().catch(() => {});
@@ -733,11 +736,13 @@ export function setLanguage(lang, persist = false) {
     if (langBtn) {
       langBtn.textContent = normalized === 'en' ? '中' : 'EN';
       // Tooltip names the action in the language currently displayed.
-      const title = normalized === 'en' ? 'Switch to Chinese' : '切换为中文';
+      const title = normalized === 'en' ? 'Switch to Chinese' : '切换为英文';
       langBtn.setAttribute('title', title);
       langBtn.setAttribute('aria-label', title);
     }
-    translateDom(document);
+    if (normalized === 'en' || domTranslatedToEn) {
+      translateDom(document);
+    }
     ensureDomObserver();
   }
 

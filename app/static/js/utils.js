@@ -29,6 +29,7 @@ export function buttonIcon(name) {
 export function escHtml(s) {
   if (s === null || s === undefined || s === '') return '';
   const text = typeof s === 'string' ? s : String(s);
+  if (!/[&<>"]/.test(text)) return text;
   return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
@@ -48,8 +49,10 @@ export function searchableTextMatches(query, ...values) {
   const compactNeedle = needle.replace(/\s+/g, '');
   return values.some(value => {
     const text = String(value || '').toLowerCase();
-    const compactText = text.replace(/\s+/g, '');
-    return text.includes(needle) || (compactNeedle && compactText.includes(compactNeedle));
+    if (text.includes(needle)) return true;
+    if (!compactNeedle) return false;
+    if (compactNeedle === needle && !/\s/.test(text)) return false;
+    return text.replace(/\s+/g, '').includes(compactNeedle);
   });
 }
 

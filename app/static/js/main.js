@@ -80,7 +80,12 @@ function showProgress(s) {
     s.phase === 'scan' ? '扫描画师文件' :
     s.phase === 'parse' ? '整理文件记录' : '扫描中';
   const pct = s.total_estimate > 0 ? Math.round(s.scanned_count / s.total_estimate * 100) : 0;
-  $('#progressFill').style.width = Math.min(pct, 100) + '%';
+  const clampedPct = Math.min(Math.max(pct, 0), 100);
+  const fillEl = $('#progressFill');
+  if (fillEl) {
+    fillEl.style.width = clampedPct + '%';
+    fillEl.style.transform = `scaleX(${(clampedPct / 100).toFixed(4)})`;
+  }
   $('#progressCount').textContent = `${s.scanned_count} / ${s.total_estimate}`;
   const pathEl = $('#progressPath');
   if (pathEl) {

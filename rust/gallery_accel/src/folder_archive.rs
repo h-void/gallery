@@ -76,16 +76,25 @@ pub(crate) fn validate_relative_folder(folder: &str) -> Result<String> {
 }
 
 pub(crate) fn path_under_artist(path: &Path, artist: &Path) -> bool {
+    let artist_canon = safe_canonicalize(artist).unwrap_or_else(|_| artist.to_path_buf());
+    path_under_artist_canon(path, &artist_canon)
+}
+
+fn path_under_artist_canon(path: &Path, artist_canon: &Path) -> bool {
     let path = safe_canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let artist = safe_canonicalize(artist).unwrap_or_else(|_| artist.to_path_buf());
-    path.starts_with(&artist)
+    path.starts_with(artist_canon)
 }
 
 fn target_parent_under_artist(parent: &Path, artist: &Path) -> bool {
+    let artist_canon = safe_canonicalize(artist).unwrap_or_else(|_| artist.to_path_buf());
+    target_parent_under_artist_canon(parent, &artist_canon)
+}
+
+fn target_parent_under_artist_canon(parent: &Path, artist_canon: &Path) -> bool {
     let mut current = Some(parent);
     while let Some(candidate) = current {
         if candidate.exists() {
-            return candidate.is_dir() && path_under_artist(candidate, artist);
+            return candidate.is_dir() && path_under_artist_canon(candidate, artist_canon);
         }
         current = candidate.parent();
     }
@@ -839,12 +848,12 @@ fn date_head_from_raw(raw: &str) -> Option<String> {
 /// re-ran one full items query per plan; sharing this grouping turns
 /// O(plans × items) work into O(items). The map must be rebuilt whenever item
 /// paths change (after an executed plan rewrote them).
-struct ItemDatesByFolder {
+pub(crate) struct ItemDatesByFolder {
     by_folder: HashMap<String, Vec<String>>,
 }
 
 impl ItemDatesByFolder {
-    fn build(conn: &Connection, artist_id: i64) -> Result<Self> {
+    pub(crate) fn build(conn: &Connection, artist_id: i64) -> Result<Self> {
         // Minimal schemas (tests, pre-scan databases) may lack items entirely;
         // an empty grouping matches the previous lazy per-plan behavior.
         let has_items: bool = conn.query_row(
@@ -857,7 +866,7 @@ impl ItemDatesByFolder {
             return Ok(Self { by_folder });
         }
         let artist_path = artist_plan_path(conn, artist_id)?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT file_path, folder_name, manual_date, COALESCE(detected_date, ''), COALESCE(date, '') FROM items
              WHERE artist_id=? AND COALESCE(missing, 0)=0",
         )?;
@@ -887,7 +896,90 @@ impl ItemDatesByFolder {
         Ok(Self { by_folder })
     }
 
-    fn get(&self, folder: &str) -> Vec<String> {
+    pub(crate) fn empty() -> Self {
+        Self {
+            by_folder: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn get(&self, folder: &str) -> Vec<String> {
+        self.by_folder.get(folder).cloned().unwrap_or_default()
+    }
+}
+
+pub(crate) struct FolderTagsByArtist {
+    tag_cache: TagNameCache,
+    by_folder: HashMap<String, Vec<String>>,
+}
+
+impl FolderTagsByArtist {
+    pub(crate) fn empty() -> Self {
+        Self {
+            tag_cache: TagNameCache::default(),
+            by_folder: HashMap::new(),
+        }
+    }
+    pub(crate) fn build(conn: &Connection, artist_id: i64) -> Result<Self> {
+        let tag_cache = TagNameCache::for_artist(conn, artist_id).unwrap_or_default();
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='item_tags')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !table_exists {
+            return Ok(Self {
+                tag_cache,
+                by_folder: HashMap::new(),
+            });
+        }
+        let artist_path = artist_plan_path(conn, artist_id).unwrap_or_default();
+        let mut by_folder_sets: HashMap<String, BTreeSet<String>> = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare_cached(
+            "SELECT i.file_path, i.folder_name, t.name FROM items i
+             JOIN item_tags it ON it.item_id=i.id
+             JOIN tags t ON t.id=it.tag_id
+             WHERE i.artist_id=? AND COALESCE(i.missing, 0)=0
+             ORDER BY t.name",
+        ) {
+            if let Ok(rows) = stmt.query_map(params![artist_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            }) {
+                for row in rows.flatten() {
+                    let (file_path, folder_name, name) = row;
+                    if let Some(folder) =
+                        source_folder_for_item(&artist_path, &file_path, &folder_name)
+                    {
+                        by_folder_sets.entry(folder).or_default().insert(name);
+                    }
+                }
+            }
+        }
+        let by_folder = by_folder_sets
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect();
+        Ok(Self {
+            tag_cache,
+            by_folder,
+        })
+    }
+
+    pub(crate) fn plan_tags(
+        &self,
+        artist_id: i64,
+        folder: &str,
+        selected_json: &str,
+    ) -> Vec<String> {
+        let ids: Vec<i64> = serde_json::from_str(selected_json).unwrap_or_default();
+        if !ids.is_empty() {
+            return self.tag_cache.names_for(artist_id, &ids);
+        }
         self.by_folder.get(folder).cloned().unwrap_or_default()
     }
 }
@@ -895,6 +987,7 @@ impl ItemDatesByFolder {
 /// Effective item dates and tag names for a single plan folder, used by
 /// template preview so nested folders and item-level dates resolve identically
 /// to `recompute_artist_plan_targets`.
+#[allow(dead_code)]
 pub(crate) fn plan_effective_dates_and_tags(
     conn: &Connection,
     artist_id: i64,
@@ -910,6 +1003,7 @@ pub(crate) fn plan_effective_dates_and_tags(
 
 /// Tag names for a plan: the stored `selected_tag_ids` order when present,
 /// otherwise the distinct artist folder tag names ordered by name.
+#[allow(dead_code)]
 fn plan_tag_names(
     conn: &Connection,
     artist_id: i64,
@@ -1435,6 +1529,7 @@ fn prepare_split_file_moves(
     if !artist_root.is_dir() || !path_under_authorized_roots(&artist_root, roots) {
         bail!("outside_artist");
     }
+    let artist_canon = safe_canonicalize(&artist_root).unwrap_or_else(|_| artist_root.clone());
     let source_folder =
         validate_relative_folder(source_folder).map_err(|_| anyhow!("bad_folder_path"))?;
     let artist: String = conn
@@ -1467,22 +1562,21 @@ fn prepare_split_file_moves(
             String,
             String,
         ) = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT file_path, file_name, folder_name, manual_date, detected_date, date
                  FROM items
                  WHERE id=? AND artist_id=? AND COALESCE(missing, 0)=0",
-                params![item_id, artist_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
+            )?
+            .query_row(params![item_id, artist_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
             .optional()?
             .ok_or_else(|| anyhow!("source_missing"))?;
         if source_folder_for_item(artist_path, &source_db, &folder_name).as_deref()
@@ -1502,7 +1596,7 @@ fn prepare_split_file_moves(
         let raw_date = effective_display_date(&detected_date, manual_date.as_deref(), &legacy_date);
         effective_date_key(&raw_date).ok_or_else(|| anyhow!("stale_split_plan"))?;
         let tag_ids = conn
-            .prepare("SELECT tag_id FROM item_tags WHERE item_id=? ORDER BY tag_id")?
+            .prepare_cached("SELECT tag_id FROM item_tags WHERE item_id=? ORDER BY tag_id")?
             .query_map(params![item_id], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let tag_names = tag_names_for_ids(conn, artist_id, &tag_ids, &tag_cache)?;
@@ -1552,8 +1646,11 @@ fn prepare_split_file_moves(
             if !source.is_file() {
                 bail!("source_missing");
             }
-            if !path_under_artist(&source, &artist_root)
-                || !target_parent_under_artist(target.parent().unwrap_or(&target), &artist_root)
+            if !path_under_artist_canon(&source, &artist_canon)
+                || !target_parent_under_artist_canon(
+                    target.parent().unwrap_or(&target),
+                    &artist_canon,
+                )
             {
                 bail!("outside_artist");
             }
@@ -1562,14 +1659,14 @@ fn prepare_split_file_moves(
             }
         }
         let target_real = target.to_string_lossy().replace('\\', "/");
-        let occupied: bool = conn.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM items
-               WHERE id!=? AND COALESCE(missing, 0)=0 AND file_path IN (?, ?)
-             )",
-            params![item_id, target_db, target_real],
-            |row| row.get(0),
-        )?;
+        let occupied: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(
+                   SELECT 1 FROM items
+                   WHERE id!=? AND COALESCE(missing, 0)=0 AND file_path IN (?, ?)
+                 )",
+            )?
+            .query_row(params![item_id, target_db, target_real], |row| row.get(0))?;
         if occupied || !targets.insert(target_real) {
             bail!("target_exists");
         }
@@ -1907,6 +2004,7 @@ pub fn recompute_artist_plan_targets(
     // One items pass for every plan: recompute only rewrites plan targets,
     // never item paths, so the grouping stays valid across the loop.
     let item_dates = ItemDatesByFolder::build(conn, artist_id)?;
+    let folder_tags = FolderTagsByArtist::build(conn, artist_id)?;
     let mut changed = 0usize;
     for (
         plan_id,
@@ -1967,7 +2065,7 @@ pub fn recompute_artist_plan_targets(
                 dates.push(date_key);
             }
         }
-        let tags = plan_tag_names(conn, artist_id, &source_folder, &selected_json)?;
+        let tags = folder_tags.plan_tags(artist_id, &source_folder, &selected_json);
         let mut target =
             if (requires_tags && tags.is_empty()) || dates.is_empty() || dates.len() > 1 {
                 String::new()
@@ -2457,12 +2555,88 @@ pub fn list_folder_renames(
         )?;
         (total, total > plans.len() as i64)
     };
+    attach_candidate_dates_to_plans(conn, &mut plans);
     Ok(json!({
         "plans": plans,
         "total": total,
         "truncated": truncated,
         "limit": crate::MAX_PAGINATION_LIMIT
     }))
+}
+
+fn attach_candidate_dates_to_plans(conn: &Connection, plans: &mut [Value]) {
+    let mut artist_paths: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT i.file_path, i.folder_name, i.manual_date,
+                COALESCE(i.detected_date, ''), COALESCE(i.date, '')
+         FROM items i
+         WHERE i.artist_id=? AND COALESCE(i.missing, 0)=0
+           AND (instr(REPLACE(i.file_path, '\\', '/'), ?)=1 OR i.folder_name=?)",
+    ) else {
+        return;
+    };
+
+    for plan in plans.iter_mut() {
+        let status = plan["status"].as_str().unwrap_or("");
+        if status != "date_conflict" && status != "needs_date" {
+            continue;
+        }
+        let Some(artist_id) = plan["artist_id"].as_i64() else {
+            continue;
+        };
+        let Some(source_folder) = plan["source_folder"].as_str().map(str::to_string) else {
+            continue;
+        };
+        if source_folder.is_empty() {
+            continue;
+        }
+        let artist_path = artist_paths
+            .entry(artist_id)
+            .or_insert_with(|| artist_plan_path(conn, artist_id).unwrap_or_default())
+            .clone();
+        let prefix = format!("{}/", folder_db_path(&artist_path, &source_folder));
+
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        if let Ok(rows) = stmt.query_map(params![artist_id, prefix, source_folder], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                let (file_path, folder_name, manual_date, detected_date, legacy_date) = row;
+                if source_folder_for_item(&artist_path, &file_path, &folder_name).as_deref()
+                    != Some(source_folder.as_str())
+                {
+                    continue;
+                }
+                let raw_date =
+                    effective_display_date(&detected_date, manual_date.as_deref(), &legacy_date);
+                if let Some(key) = effective_date_key(&raw_date) {
+                    *counts.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
+
+        if let Some(parsed_key) = plan["parsed_date"].as_str().and_then(effective_date_key) {
+            counts.entry(parsed_key).or_insert(0);
+        }
+
+        let mut candidates: Vec<(String, usize)> = counts.into_iter().collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let candidate_json: Vec<Value> = candidates
+            .into_iter()
+            .map(|(date, count)| json!({"date": date, "count": count}))
+            .collect();
+        if let Some(obj) = plan.as_object_mut() {
+            obj.insert("candidate_dates".to_string(), Value::Array(candidate_json));
+        }
+    }
 }
 
 fn map_plan(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
@@ -3954,16 +4128,19 @@ pub(crate) fn evaluate_plan_paths(
         }
     };
     let artist_root = roots.map_to_real(artist_path)?;
+    let artist_canon = safe_canonicalize(&artist_root).unwrap_or_else(|_| artist_root.clone());
+    let under_roots = path_under_authorized_roots(&artist_root, roots);
     let source_path = artist_root.join(&source);
     let target_path = artist_root.join(&target);
     let source_exists = source_path.is_dir();
     let target_exists = target_path.exists();
-    let permission_path = if source_exists
-        && !target_exists
-        && path_under_authorized_roots(&artist_root, roots)
-        && path_under_artist(&source_path, &artist_root)
-        && target_parent_under_artist(target_path.parent().unwrap_or(&target_path), &artist_root)
-    {
+    let paths_within_artist = under_roots
+        && path_under_artist_canon(&source_path, &artist_canon)
+        && target_parent_under_artist_canon(
+            target_path.parent().unwrap_or(&target_path),
+            &artist_canon,
+        );
+    let permission_path = if source_exists && !target_exists && paths_within_artist {
         rename_permission_denied_parent(&source_path, &target_path)
             .map(|path| path.to_string_lossy().replace('\\', "/"))
     } else {
@@ -3971,10 +4148,7 @@ pub(crate) fn evaluate_plan_paths(
     };
     let reason = if target == source || target.starts_with(&format!("{source}/")) {
         Some("target_inside_source".into())
-    } else if !path_under_authorized_roots(&artist_root, roots)
-        || !path_under_artist(&source_path, &artist_root)
-        || !target_parent_under_artist(target_path.parent().unwrap_or(&target_path), &artist_root)
-    {
+    } else if !paths_within_artist {
         Some("outside_artist".into())
     } else if !source_exists {
         Some("source_missing".into())

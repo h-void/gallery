@@ -11,7 +11,7 @@
 
 [English](README.en.md) • [简体中文](README.md)
 
-[Features](#key-features) • [Deployment](#deployment) • [Configuration](#configuration) • [Building](#building--packaging) • [Structure](#project-structure) • [License](#license)
+[Features](#key-features) • [Deployment](#deployment) • [Configuration](#configuration) • [AI Agent & API](#ai-agent--http-api) • [Building](#building--packaging) • [License](#license)
 
 </div>
 
@@ -19,33 +19,32 @@
 
 ## Introduction
 
-**Gallery** is a self-hosted media library built for local illustration collections and creator portfolios. Powered by a pure-Rust backend (Axum + rusqlite + Tokio) with zero Python runtime dependencies and a responsive single-page web UI, it organizes media around **artists as top-level directories** and integrates multi-dimensional tagging, AI character recognition and cluster discovery, BLAKE3 content deduplication, rule-based folder archiving, creator subscriptions, and netdisk dispatch.
+**Gallery** is a self-hosted media library designed for local illustration collections and creator portfolios. Powered by a pure-Rust backend (Axum + rusqlite + Tokio) with zero Python runtime dependencies and a framework-free responsive single-page web UI, it organizes media around **artists as top-level directories** and integrates multi-facet filtering, CCIP character recognition and cluster discovery, BLAKE3 content deduplication, rule-based folder archiving, creator subscriptions, and JDownloader netdisk dispatch.
 
 ---
 
 ## Key Features
 
-- **Multi-Format Browsing & Bilingual UI**
-  - **Broad media support**: Browse JPG/PNG/WebP/AVIF/BMP images, inline GIF hover previews, and streamed MP4/WebM/MOV/MKV videos (`ffmpeg` / HLS), alongside `.txt`/`.md`/`.html` text files and PSD/CLIP/PSB source assets.
-  - **Zero-extraction archive inspection & batch extraction**: Click ZIP/RAR/7Z cards to inspect directory trees, file sizes, and image previews on demand (bounded per-entry memory, with arrow-key navigation and index counters); extract selected archives or all archives under an artist in one click with standalone subfolder mode, automatic password attempts, session password memory, and automatic source recycling.
-  - **Flexible views, drag-and-drop & URL state**: Switch between `4:3 Full` and `3:4 Portrait` grids and a high-density single-row list; the full-screen lightbox supports smooth pan/zoom, media spec inspection, clickable tag filtering, and one-click folder location. Drag cards directly onto sidebar folders to move files or onto character rows to assign tags; filter the folder tree and tag list by name or pinyin; use `Shift + Click` for contiguous range selection across the app, with active filters, sorting, and view state synced to the URL bar.
-  - **Instant English/Chinese toggle**: Built-in i18n switches browsing views, the maintenance workbench, download management, and dialogs between English and Chinese without reloading.
-- **Artist Partitioning & Multi-Dimensional Tagging**
-  - **Directories define artists**: First-level subfolders under each media root map to artists, with hierarchical folder trees, multi-tag filtering, and `All / Pending / Archived` organization views inside each artist.
-  - **Fast batch tagging & search**: Apply or remove tags via single selection, marquee drag-selection, or whole-folder actions (tags are case-sensitive identities and propagate across same-hash copies); pin an "Untagged" character backlog in the sidebar; search artists, folders, and tags with native pinyin matching.
+- **Multi-Format Browsing & Studio Folio Aesthetics**
+  - **Broad media support**: Browse JPG/PNG/WebP/AVIF/BMP images, inline GIF hover previews (with automatic aspect-ratio probing on load for unmeasured GIFs), and streamed MP4/WebM/MOV/MKV videos (`ffmpeg` / HLS), alongside `.txt`/`.md`/`.html` text files and PSD/CLIP/PSB source assets.
+  - **In-archive inspection & smart batch extraction**: Click ZIP/RAR/7Z cards to inspect directory trees, file sizes, and image previews on demand (bounded per-entry memory, with arrow-key navigation and index counters). Extract selected archives or all archives under an artist in one click (skipping passwordless `.7z` cold-storage archives by default while extracting `.zip`, `.rar`, and encrypted `.7z`), with automatic password trial from sibling `.txt` notes, netdisk passcodes, and per-artist password memory, plus automatic source recycling.
+  - **Fluid views, drag-and-drop & URL state**: Switch between `4:3 Full` and `3:4 Portrait` grids and a high-density single-row list, paired with warm-paper light mode, the ink-charcoal Studio Folio Dark palette, and instant English/Chinese switching. The full-screen lightbox supports smooth pan/zoom, media spec inspection, clickable tag filtering, and one-click folder location; drag cards directly onto sidebar folders to move files or onto character rows to assign tags; use `Shift + Click` for contiguous range selection, with active filters, sorting, and scroll state synced to the URL bar.
+- **Artist Partitioning & Multi-Facet Search**
+  - **Per-artist & cross-artist browsing**: First-level subfolders under each media root map to artists, supporting both single-artist views and cross-artist `All Artists` browsing, collapsible folder trees with pinyin filtering, combined character-tag and media-type filtering, date-range and `Undated` filters, and `All / Pending / Archived` organization views.
+  - **Fast batch tagging & search**: Apply or remove tags via single selection, marquee drag-selection, or whole-folder actions (tags are case-sensitive identities and propagate across same-hash copies); pin an "Untagged" character backlog in the sidebar; search artists, folders, and tags with native pinyin matching and a `Character names only` mode.
   - **Automatic link indexing**: Extracts web URLs, cloud-drive links, and passcodes from artist text files, and manages external creator profiles (Pixiv, Fanbox, Patreon, Twitter/X, Bilibili).
-- **AI Character Recognition (CCIP)**
-  - **Automatic hardware acceleration**: Enabled by default for both images and sampled video frames; prepares the CCIP model and CUDA runtime in the background after startup and automatically selects `CUDA → OpenVINO → CPU` (with automatic CPU fallback).
-  - **Reference library, cluster discovery & review**: Extracts reference embeddings from single-character works (pruning ≥0.95 near-duplicates and outliers), supports background character import and manual reference uploads, and discovers cohesive character clusters across untagged works via perceptual-hash folding and feature clustering. All AI suggestions and clusters apply only after confirmation.
+- **AI Character Recognition (CCIP) & Cluster Discovery**
+  - **Automatic hardware acceleration**: Enabled by default for both images and sampled video frames (with automatic fallback past black/white fade-in frames); prepares the CCIP model and CUDA runtime in the background after startup and automatically selects `CUDA → OpenVINO → CPU` (with automatic CPU fallback).
+  - **Reference library, candidate mining & cluster discovery**: Extracts reference embeddings from single-character works (pruning ≥0.95 near-duplicates and outliers), supports background character import, manual reference uploads, and one-click `Discover candidates` with an `Unverified only` review filter for individual or batch approval; groups untagged works into cohesive character clusters via 64-bit perceptual-hash folding and Complete-Linkage feature clustering. All AI suggestions and clusters apply only after confirmation.
 - **Content-Hash Deduplication & Move Tracking**
   - **BLAKE3 deduplication**: Groups duplicate folders and files in the sidebar and silently refreshes views as background hashing completes.
-  - **Automatic move reconciliation**: Relinks renamed or moved files via BLAKE3 hash and inode; same-artist moves keep their tags automatically, while cross-artist conflicts route to Maintenance review.
+  - **Automatic move reconciliation**: Relinks externally renamed or moved files via BLAKE3 hash and inode; same-artist moves preserve their tags automatically, while cross-artist conflicts route to Maintenance review.
 - **Standardized Folder Archiving & Dual-Mode Recycle Bin**
-  - **Rule engine & in-place actions**: Uses an editable `Default` template (default `{year}/{date} {tags}`, deriving missing dates from filenames or Twitter/X snowflake posting dates). Fill missing character tags or manual dates directly from the folder sidebar, archive the current folder in one click, bundle selected files into a target subfolder, and preview library-wide naming-rule migrations before switching.
-  - **Data safety**: Takes an automatic SQLite online backup before moving files; preserves existing targets and rolls back on failure; supports optional auto-archiving after completed full-library scans.
-  - **Dual-mode recycle bin**: Switch between native fnOS system trash and internal app trash from the Maintenance panel (with comparison cards); supports file and folder deletion, image/video/archive thumbnail previews, grid/list view toggle, one-click batch restore, and permanent deletion.
+  - **Rule engine & inline conflict resolution**: Uses an editable `Default` template (default `{year}/{date} {tags}`, deriving missing dates from filenames or Twitter/X snowflake posting dates). Fill missing character tags or manual dates directly from the folder sidebar, archive the current folder in one click, bundle selected files into a target subfolder, resolve `date_conflict` plans inline from the Maintenance panel (unify folder dates or switch to tag/date split archiving), and preview library-wide naming-rule migrations before switching.
+  - **Transactional & backup safety**: Takes an automatic SQLite online backup before moving files; preserves existing targets and rolls back on failure; supports optional auto-archiving after completed full-library scans.
+  - **Dual-mode recycle bin**: Switch between native fnOS system trash and internal app trash from the Maintenance panel (with comparison cards); supports file and folder deletion, image/video/archive cover thumbnail previews, grid/list view toggle, one-click batch restore (including tag and favorite snapshots), and permanent deletion.
 - **Download Subscriptions & Netdisk Dispatch**
-  - **Subscription sync & coverage calendar**: Subscribe to creator profiles in automatic or manual mode for round-based discovery, local folder reconciliation, and resumable downloads, with a 53-week coverage calendar on each card showing daily gaps and post details.
+  - **Subscription sync & coverage calendar**: Subscribe to creator profiles in automatic or manual mode for round-based discovery, local folder reconciliation, and resumable downloads, with a full-width 53-week coverage calendar on each card showing daily gaps and post details.
   - **All Works & JDownloader bridge**: Filter across all subscriptions, inspect file delivery states, and import local works; dispatch post cloud links or direct external links to JDownloader via the local Event Scripter bridge with automatic archive import.
 
 > [!WARNING]
@@ -73,7 +72,7 @@ Persistent application state is stored under `@appshare/gallery` (strictly separ
 ```
 
 > [!TIP]
-> **Offline Model Placement**: The CCIP model downloads automatically in the background after startup. For offline NAS setups, place the model manually at `gallery/models/character/ccip-caformer_b36-24/model_feat.onnx` (see [docs/FNOS_NATIVE.md](docs/FNOS_NATIVE.md)).
+> **Offline Model Placement**: The CCIP model (`deepghs/ccip_onnx`) downloads automatically in the background after startup. For offline NAS setups, place the model manually at `gallery/models/character/ccip-caformer_b36-24/model_feat.onnx`.
 
 ---
 
@@ -139,6 +138,12 @@ Most deployments need no manual tuning. In Docker, customize settings via `.env`
 
 ---
 
+## AI Agent & HTTP API
+
+Gallery exposes a complete HTTP REST API and ships with [`docs/API_USAGE.md`](docs/API_USAGE.md), an operational playbook written specifically for multimodal and coding AI Agents (Claude Code, Codex, Cursor, Antigravity, etc.). Point your Agent to [`docs/API_USAGE.md`](docs/API_USAGE.md) as context or a skill so it can autonomously inspect artist portfolios, test passwords and unpack archives, deduplicate via BLAKE3, run multimodal character clustering and tagging, execute folder archiving, and dispatch JDownloader tasks under built-in approval guardrails.
+
+---
+
 ## Building & Packaging
 
 Cross-compiling the Linux `x86_64` binary and packaging the fnOS FPK on Windows requires **WSL 2** with **Podman** and the official [`fnpack-1.2.3-windows-amd64.exe`](https://static2.fnnas.com/fnpack/fnpack-1.2.3-windows-amd64) placed in `output/fnpack/`:
@@ -151,8 +156,6 @@ python tools/build_release.py --fnpack .\output\fnpack\fnpack-1.2.3-windows-amd6
 python tools/build_rust_accel.py
 ```
 
-See [`docs/API.md`](docs/API.md), [`docs/OPERATIONS.md`](docs/OPERATIONS.md), and [`docs/FNOS_NATIVE.md`](docs/FNOS_NATIVE.md) for API contracts, operations, and packaging specifications.
-
 ---
 
 ## Project Structure
@@ -164,7 +167,7 @@ gallery/
 ├── fnpack/               # fnOS native package manifest (package.json), lifecycle scripts (cmd/main), and permissions
 ├── Dockerfile            # Pure-Rust Docker image build definition (Dockerfile.cuda for CUDA variant)
 ├── docker-compose.yml    # Docker Compose configuration (with .gpu.yml, .cuda.yml, and gallery.yml)
-├── docs/                 # REST API reference, fnOS packaging specs, operations guide, and release notes
+├── docs/API_USAGE.md     # AI-Agent HTTP REST API operational playbook and full route reference
 └── tools/                # Build pipelines, FPK packager, local launcher, and public-release generator
 ```
 

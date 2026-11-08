@@ -200,12 +200,16 @@ function characterLibrarySummaryText(library) {
   const totals = summary.totals || {};
   const status = summary.status || {};
   const scope = '全部画师';
+  const unverifiedTotal = Number(totals.unverified_references || 0);
   const parts = [
     `${t('范围 {scope}', {scope: scope})}`,
     `${t('{totals} 个可导入角色', {totals: totals.tags || (summary.tags || []).length || 0})}`,
     `${t('{totals} 个已建角色', {totals: totals.characters || (summary.characters || []).length || 0})}`,
     `${t('{totals} 张参考图', {totals: totals.references || 0})}`,
   ];
+  if (unverifiedTotal > 0) {
+    parts.push(`${t('待复核 {totals} 张', {totals: unverifiedTotal})}`);
+  }
   if (status.available === false) {
     parts.push(t(status.reason || '角色识别未启用'));
   } else if (status.backend) {
@@ -296,6 +300,13 @@ function characterReferencePreviewVersion(reference) {
   return reference.file_mtime || reference.updated_at || reference.created_at || reference.file_size || '';
 }
 
+let unverifiedCharactersOnly = false;
+
+export function toggleCharacterUnverifiedFilter() {
+  unverifiedCharactersOnly = !unverifiedCharactersOnly;
+  renderCharacterLibrary();
+}
+
 export function renderCharacterLibrary() {
   const summaryEl = $('#characterLibrarySummary');
   const characterList = $('#characterList');
@@ -335,9 +346,21 @@ export function renderCharacterLibrary() {
   // filter as well went away with the single-tag import column in 1.0.425;
   // `summary.tags` is still read for the "N 个可导入角色" summary count.
   const rawCharacters = summary.characters || [];
-  const characters = query
+  const searchedCharacters = query
     ? rawCharacters.filter(c => String(c.name || '').toLowerCase().includes(query) || String(c.id) === query)
     : rawCharacters;
+  const characters = unverifiedCharactersOnly
+    ? searchedCharacters.filter(c => Number(c.unverified_reference_count || 0) > 0)
+    : searchedCharacters;
+  const unverifiedFilterBtn = $('#characterUnverifiedFilterBtn');
+  if (unverifiedFilterBtn) {
+    const unverifiedTotal = Number(summary.totals?.unverified_references || 0);
+    unverifiedFilterBtn.classList.toggle('active', unverifiedCharactersOnly);
+    unverifiedFilterBtn.setAttribute('aria-pressed', unverifiedCharactersOnly ? 'true' : 'false');
+    unverifiedFilterBtn.textContent = unverifiedTotal > 0
+      ? t('待复核 ({totals})', {totals: unverifiedTotal})
+      : t('待复核');
+  }
 
   // Auto-select the first character so the reference column is not blank on open.
   if (
@@ -368,6 +391,7 @@ export function renderCharacterLibrary() {
   const characterButtons = characters.length ? characters.map(character => {
     const active = selectedCharacterId && Number(character.id) === Number(selectedCharacterId);
     const referenceCount = Number(character.reference_count || 0);
+    const unverifiedCount = Number(character.unverified_reference_count || 0);
     return `
       <div class="character-card-shell${active ? ' active' : ''}">
         <button type="button" class="btn character-card-select" data-character-select="${character.id}">
@@ -377,6 +401,7 @@ export function renderCharacterLibrary() {
           <div class="character-card-meta">
             <div class="character-card-meta-row">
               <span>${escHtml(t('{totals} 张参考图', {totals: referenceCount}))}</span>
+              ${unverifiedCount > 0 ? `<span class="badge warn">${escHtml(t('待复核 {totals}', {totals: unverifiedCount}))}</span>` : ''}
             </div>
           </div>
         </button>
@@ -386,8 +411,17 @@ export function renderCharacterLibrary() {
         </div>
       </div>
     `;
-  }).join('') : `<div class="character-library-empty"><span>${query ? t('未找到匹配的角色 "{query}"', {query: escHtml(query)}) : t('暂无角色')}</span><button class="btn character-library-empty-action" type="button" data-character-import-trigger>${t('导入角色')}</button><button class="btn character-library-empty-action" type="button" data-character-create-trigger>${t('新建角色')}</button></div>`;
-  const referenceCards = references.length ? references.map(reference => {
+  }).join('') : (unverifiedCharactersOnly
+    ? `<div class="character-library-empty"><span>${escHtml(t('当前没有待复核的角色，可选择角色后点击右侧「发现候选图」'))}</span></div>`
+    : `<div class="character-library-empty"><span>${query ? t('未找到匹配的角色 "{query}"', {query: escHtml(query)}) : t('暂无角色')}</span><button class="btn character-library-empty-action" type="button" data-character-import-trigger>${t('导入角色')}</button><button class="btn character-library-empty-action" type="button" data-character-create-trigger>${t('新建角色')}</button></div>`);
+  const unverifiedReferences = references.filter(reference => reference && reference.verified === false);
+  const verifyAllBar = (selectedCharacterId && unverifiedReferences.length > 0) ? `
+    <div class="character-reference-review-bar">
+      <span>${escHtml(t('待复核参考图 {totals} 张', {totals: unverifiedReferences.length}))}</span>
+      <button class="btn primary character-reference-verify-all" type="button" data-character-reference-verify-all="${selectedCharacterId}">${escHtml(t('全部通过'))}</button>
+    </div>
+  ` : '';
+  const referenceCards = references.length ? verifyAllBar + references.map(reference => {
     const pathText = reference.file_path || reference.file_name || t('未绑定文件');
     const previewUrl = reference.has_image
       ? `/api/characters/${reference.character_id}/references/${reference.id}/image`
@@ -396,7 +430,7 @@ export function renderCharacterLibrary() {
               ? API.videoFrameUrl(reference.file_path, characterReferencePreviewVersion(reference))
               : API.previewUrl(reference.file_path, characterReferencePreviewVersion(reference), 256))
           : '');
-    const SOURCE_LABELS = {tag_single: '来自单角色作品', manual: '手动添加'};
+    const SOURCE_LABELS = {tag_single: '来自单角色作品', manual: '手动添加', cluster_verified: '来自聚类发现'};
     const MEDIA_LABELS = {image: '图片', video: '视频', text: '文本'};
     const sourceLabel = t(SOURCE_LABELS[reference.source_type] || reference.source_type || '未知来源');
     const mediaLabel = MEDIA_LABELS[reference.media_type] ? t(MEDIA_LABELS[reference.media_type]) : (reference.media_type || '');
@@ -406,8 +440,9 @@ export function renderCharacterLibrary() {
       mediaLabel,
       reference.file_size != null ? formatBytes(reference.file_size) : '',
     ]);
+    const isUnverified = reference.verified === false;
     return `
-      <div class="character-reference-card">
+      <div class="character-reference-card${isUnverified ? ' unverified' : ''}">
         <div class="character-reference-thumb">
           ${previewUrl ? `<img src="${escHtml(previewUrl)}" alt="" loading="lazy" onerror="this.closest('.character-reference-thumb').classList.add('failed')">` : '<span>无预览</span>'}
         </div>
@@ -415,9 +450,13 @@ export function renderCharacterLibrary() {
           <div class="character-reference-head">
             <div title="${escHtml(rawDetail)}">
               <b>${escHtml(reference.character_name || '')}</b>
+              ${isUnverified ? `<span class="badge warn">${escHtml(t('待复核'))}</span>` : ''}
               <span>${escHtml(detail)}</span>
             </div>
-            <button class="btn btn-danger character-reference-delete" type="button" data-character-reference-delete="${reference.id}" data-character-id="${reference.character_id}">${t('{buttonIcon}删除', {buttonIcon: buttonIcon('trash')})}</button>
+            <div class="character-reference-actions">
+              ${isUnverified ? `<button class="btn primary character-reference-verify" type="button" data-character-reference-verify="${reference.id}" data-character-id="${reference.character_id}">${escHtml(t('通过'))}</button>` : ''}
+              <button class="btn btn-danger character-reference-delete" type="button" data-character-reference-delete="${reference.id}" data-character-id="${reference.character_id}">${t('{buttonIcon}删除', {buttonIcon: buttonIcon('trash')})}</button>
+            </div>
           </div>
           <div class="character-reference-path">
             <code title="${escHtml(reference.file_path || '')}">${escHtml(pathText)}</code>
@@ -472,6 +511,14 @@ export function renderCharacterLibrary() {
       || isActionBusy('character-reference-upload', '');
     referenceUploadBtn.title = selectedCharacterId
       ? '从本机选一张照片作为该角色的参考图'
+      : '先选择一个角色';
+  }
+  const discoverCandidatesBtn = $('#characterDiscoverCandidatesBtn');
+  if (discoverCandidatesBtn) {
+    discoverCandidatesBtn.disabled = !selectedCharacterId
+      || isActionBusy('character-discover-candidates', '');
+    discoverCandidatesBtn.title = selectedCharacterId
+      ? '从该角色的作品与相似未标图中发现候选参考图'
       : '先选择一个角色';
   }
   applyCharacterLibraryMobileView();
@@ -600,6 +647,63 @@ export async function deleteCharacterReference(characterId, referenceId) {
     toast('删除参考图失败：' + (e.message || e), 'error');
   } finally {
     setActionBusy('character-library-delete', `${characterId}:${referenceId}`, false);
+  }
+}
+
+export async function verifyCharacterReference(characterId, referenceId) {
+  if (!characterId || !referenceId) return;
+  if (isActionBusy('character-library-verify', `${characterId}:${referenceId}`)) return;
+  setActionBusy('character-library-verify', `${characterId}:${referenceId}`, true);
+  try {
+    await API.post(`/api/characters/${characterId}/references/${referenceId}/verify`);
+    state.characterSuggestionCache?.clear();
+    toast('参考图已通过复核', 'success');
+    await loadCharacterLibrary({characterId});
+  } catch (e) {
+    toast('复核参考图失败：' + (e.message || e), 'error');
+  } finally {
+    setActionBusy('character-library-verify', `${characterId}:${referenceId}`, false);
+  }
+}
+
+export async function verifyAllCharacterReferences(characterId) {
+  if (!characterId) return;
+  if (isActionBusy('character-library-verify-all', String(characterId))) return;
+  setActionBusy('character-library-verify-all', String(characterId), true);
+  try {
+    const res = await API.post(`/api/characters/${characterId}/references/verify-all`);
+    state.characterSuggestionCache?.clear();
+    toast(t('已通过 {totals} 张参考图', {totals: Number(res?.verified || 0)}), 'success');
+    await loadCharacterLibrary({characterId});
+  } catch (e) {
+    toast('批量复核参考图失败：' + (e.message || e), 'error');
+  } finally {
+    setActionBusy('character-library-verify-all', String(characterId), false);
+  }
+}
+
+export async function discoverCharacterReferenceCandidates(characterId) {
+  if (!characterId) {
+    toast('请先选择角色', 'error');
+    return;
+  }
+  if (isActionBusy('character-discover-candidates', '')) return;
+  setActionBusy('character-discover-candidates', '', true);
+  renderCharacterLibrary();
+  try {
+    const res = await API.post(`/api/characters/${characterId}/references/discover-candidates`, undefined, {timeoutMs: 120000});
+    const added = Number(res?.added || 0);
+    if (added > 0) {
+      toast(t('已发现 {totals} 张候选参考图，请复核', {totals: added}), 'success');
+    } else {
+      toast(t('未发现新的候选参考图'), 'info');
+    }
+    await loadCharacterLibrary({characterId});
+  } catch (e) {
+    toast('发现候选参考图失败：' + (e.message || e), 'error');
+  } finally {
+    setActionBusy('character-discover-candidates', '', false);
+    renderCharacterLibrary();
   }
 }
 

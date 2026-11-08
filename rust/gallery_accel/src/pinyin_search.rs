@@ -7,8 +7,6 @@
 //! mixed queries like `泳装01` keep matching.
 
 use pinyin::{Pinyin, ToPinyinMulti};
-use regex::Regex;
-use std::sync::OnceLock;
 
 /// One value character with its match candidates.
 enum CharCandidates {
@@ -47,14 +45,15 @@ fn value_candidates(value: &str) -> Vec<CharCandidates> {
 }
 
 /// True when `query[i..]` can be consumed through `chars[j..]`. Memoized on
-/// `(i, j)`; the answer does not depend on where the substring started, so
-/// every start position shares one table.
+/// `(i, j)` in a flat 1D table; the answer does not depend on where the
+/// substring started, so every start position shares one table.
 fn match_from(
     query: &[char],
     chars: &[CharCandidates],
     i: usize,
     j: usize,
-    memo: &mut Vec<Vec<Option<bool>>>,
+    stride: usize,
+    memo: &mut [Option<bool>],
 ) -> bool {
     if i == query.len() {
         return true;
@@ -62,29 +61,32 @@ fn match_from(
     if j == chars.len() {
         return false;
     }
-    if let Some(cached) = memo[i][j] {
+    let cell = i * stride + j;
+    if let Some(cached) = memo[cell] {
         return cached;
     }
     let matched = match &chars[j] {
         CharCandidates::Literal(ch) => {
-            query[i] == *ch && match_from(query, chars, i + 1, j + 1, memo)
+            query[i] == *ch && match_from(query, chars, i + 1, j + 1, stride, memo)
         }
-        CharCandidates::Han(readings) => {
-            readings.iter().any(|reading| {
-                let syllable: Vec<char> = reading.chars().collect();
-                if query[i..].len() >= syllable.len()
-                    && query[i..i + syllable.len()] == syllable[..]
-                    && match_from(query, chars, i + syllable.len(), j + 1, memo)
-                {
-                    return true;
-                }
-                // Initial: first character of any candidate reading.
-                let initial = reading.chars().next();
-                initial == Some(query[i]) && match_from(query, chars, i + 1, j + 1, memo)
-            })
-        }
+        CharCandidates::Han(readings) => readings.iter().any(|reading| {
+            let syl_len = if reading.is_ascii() {
+                reading.len()
+            } else {
+                reading.chars().count()
+            };
+            if query[i..].len() >= syl_len
+                && query[i..i + syl_len].iter().copied().eq(reading.chars())
+                && match_from(query, chars, i + syl_len, j + 1, stride, memo)
+            {
+                return true;
+            }
+            // Initial: first character of any candidate reading.
+            let initial = reading.chars().next();
+            initial == Some(query[i]) && match_from(query, chars, i + 1, j + 1, stride, memo)
+        }),
     };
-    memo[i][j] = Some(matched);
+    memo[cell] = Some(matched);
     matched
 }
 
@@ -99,13 +101,30 @@ fn match_from(
 /// [`text_matches_search`]; only the per-character fallback ignores the tail.
 const MAX_SEARCH_QUERY_CHARS: usize = 64;
 
+fn candidate_matches_char(cand: &CharCandidates, target: char) -> bool {
+    match cand {
+        CharCandidates::Literal(ch) => *ch == target,
+        CharCandidates::Han(readings) => readings.iter().any(|r| r.starts_with(target)),
+    }
+}
+
 /// Candidate-aware compact match of `query` against one value: the query may
 /// start anywhere, and every Han character may use any of its readings.
 fn query_matches_value(query: &[char], value: &str) -> bool {
     let query = &query[..query.len().min(MAX_SEARCH_QUERY_CHARS)];
+    let Some(&first_q) = query.first() else {
+        return true;
+    };
     let chars = value_candidates(value);
-    let mut memo = vec![vec![None; chars.len() + 1]; query.len() + 1];
-    (0..chars.len()).any(|start| match_from(query, &chars, 0, start, &mut memo))
+    if !chars.iter().any(|c| candidate_matches_char(c, first_q)) {
+        return false;
+    }
+    let stride = chars.len() + 1;
+    let mut memo = vec![None; (query.len() + 1) * stride];
+    (0..chars.len()).any(|start| {
+        candidate_matches_char(&chars[start], first_q)
+            && match_from(query, &chars, 0, start, stride, &mut memo)
+    })
 }
 
 pub fn search_text_for_values(values: &[&str]) -> String {
@@ -169,17 +188,21 @@ pub fn search_text_for_values(values: &[&str]) -> String {
 }
 
 pub fn text_matches_search(query: &str, values: &[&str]) -> bool {
-    static WS: OnceLock<Regex> = OnceLock::new();
-    let ws = WS.get_or_init(|| Regex::new(r"\s+").unwrap());
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
+        return true;
+    }
+    if values
+        .iter()
+        .any(|v| v.trim().to_lowercase().contains(&needle))
+    {
         return true;
     }
     let haystack = search_text_for_values(values);
     if haystack.contains(&needle) {
         return true;
     }
-    let compact_query: Vec<char> = ws.replace_all(&needle, "").chars().collect();
+    let compact_query: Vec<char> = needle.chars().filter(|ch| !ch.is_whitespace()).collect();
     if compact_query.is_empty() {
         return false;
     }

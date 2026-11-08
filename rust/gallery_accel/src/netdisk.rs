@@ -1182,6 +1182,30 @@ pub fn post_evidence_state(conn: &Connection, post_id: i64) -> Result<(i64, i64)
     if !has_evidence_column {
         return Ok((0, 0));
     }
+    let has_publish_jobs: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='download_publish_jobs'",
+            [],
+            |row| Ok(row.get::<_, i64>(0)? > 0),
+        )
+        .unwrap_or(false);
+    if has_publish_jobs {
+        return conn
+            .query_row(
+                "SELECT COALESCE(SUM(CASE
+                    WHEN f.evidence_item_id IS NOT NULL
+                      OR EXISTS (
+                        SELECT 1 FROM download_publish_jobs j
+                        WHERE j.engine = 'pawchive' AND j.source_file_id = f.id AND j.stage = 'ingested'
+                      )
+                    THEN 1 ELSE 0 END), 0),
+                        COUNT(*)
+                 FROM kemono_files f WHERE f.post_id = ?1",
+                params![post_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(Into::into);
+    }
     conn.query_row(
         "SELECT COALESCE(SUM(CASE WHEN evidence_item_id IS NOT NULL THEN 1 ELSE 0 END), 0),
                 COUNT(*)

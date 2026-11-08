@@ -17,6 +17,27 @@ let archiveDialogOpener = null;
 // listing on screen.
 let inspectionToken = 0;
 
+export function stripArchiveVolumeSuffix(filename) {
+  const name = String(filename || '');
+  return name.replace(
+    /\.(?:part0*\d+\.(?:rar|zip|7z)|tar\.(?:gz|bz2|xz|zst|lz4)\.\d{3,4}|(?:7z|zip|rar|tar|gz|bz2|xz)\.\d{3,4}|tar\.(?:gz|bz2|xz|zst|lz4)|[^/.]+)$/i,
+    '',
+  );
+}
+
+export function isSecondaryArchiveVolume(filename) {
+  const name = String(filename || '').split(/[\\/]/).pop().toLowerCase();
+  const partMatch = name.match(/\.part0*(\d+)\.(?:rar|zip|7z)$/);
+  if (partMatch) {
+    return parseInt(partMatch[1], 10) !== 1;
+  }
+  const splitMatch = name.match(/\.(?:7z|zip|rar|tar|gz|bz2|xz)\.(\d{3,4})$/);
+  if (splitMatch) {
+    return parseInt(splitMatch[1], 10) !== 1;
+  }
+  return /\.(?:z\d{2,}|[r-y]\d{2,})$/.test(name);
+}
+
 export function bindArchiveModal() {
   bindBatchArchiveModal();
   const dialog = $('#archiveDialog');
@@ -186,7 +207,12 @@ async function loadArchiveInspection(itemId, password = '', token = null) {
     // about what the user is looking at any more.
     if (token !== null && (token !== inspectionToken || currentItemId !== itemId)) return;
     currentArchiveData = data;
-    renderArchiveInspection(data, password);
+    const effectivePassword = password || data.matched_password || '';
+    const pwdInput = $('#archivePasswordInput');
+    if (!password && data.matched_password && pwdInput) {
+      pwdInput.value = data.matched_password;
+    }
+    renderArchiveInspection(data, effectivePassword);
   } catch (err) {
     if (token !== null && token !== inspectionToken) return;
     const msg = err.message || String(err);
@@ -211,7 +237,7 @@ function renderArchiveInspection(data, currentPassword) {
 
   // Pre-fill folder name if empty
   if (customFolderInput && !customFolderInput.value) {
-    const stem = (data.archive_name || '').replace(/\.[^/.]+$/, '');
+    const stem = stripArchiveVolumeSuffix(data.archive_name || '');
     customFolderInput.value = stem;
   }
 
@@ -479,12 +505,21 @@ export function stopBatchArchiveExtraction() {
   return true;
 }
 
+export function isBatchExtractableArchiveItem(item) {
+  if (!item || !(item.media_type === 'archive' || item.is_archive)) return false;
+  if (isSecondaryArchiveVolume(item.file_name || item.file_path || '')) return false;
+  if (typeof item.extractable_archive === 'boolean') return item.extractable_archive;
+  return true;
+}
+
 function updateBatchArchiveSummaryCount() {
   const dialog = $('#batchArchiveDialog');
   const summary = $('#batchArchiveInfoSummary');
   if (!dialog || !summary) return;
-  const selectedArchives = Array.isArray(batchArchiveOptions?.selectedArchives) ? batchArchiveOptions.selectedArchives : [];
-  const totalArtistArchives = Number(state.stats?.archives || 0);
+  const selectedArchives = Array.isArray(batchArchiveOptions?.selectedArchives)
+    ? batchArchiveOptions.selectedArchives.filter(isBatchExtractableArchiveItem)
+    : [];
+  const totalArtistArchives = Number(state.stats?.extractable_archives ?? state.stats?.archives ?? 0);
   const scopeRadio = dialog.querySelector('input[name="batchArchiveScope"]:checked');
   const scope = scopeRadio ? scopeRadio.value : 'selected';
   const count = scope === 'all_artist' ? totalArtistArchives : selectedArchives.length;
@@ -522,9 +557,11 @@ export function openBatchArchiveModal(options = {}) {
   if (!dialog) return;
 
   batchArchiveOptions = options;
-  const selectedArchives = Array.isArray(options.selectedArchives) ? options.selectedArchives : [];
+  const selectedArchives = Array.isArray(options.selectedArchives)
+    ? options.selectedArchives.filter(isBatchExtractableArchiveItem)
+    : [];
   const artistId = options.artistId || (state.currentArtist ? state.currentArtist.id : null);
-  const totalArtistArchives = Number(state.stats?.archives || 0);
+  const totalArtistArchives = Number(state.stats?.extractable_archives ?? state.stats?.archives ?? 0);
 
   const scopeWrap = $('#batchArchiveScopeToggleWrap');
   const selectedRadio = scopeWrap ? scopeWrap.querySelector('input[value="selected"]') : null;
@@ -604,18 +641,31 @@ export async function executeBatchArchiveExtraction() {
       statusMsg.className = 'archive-status-msg';
     }
     try {
-      const res = await API.get(`/api/items?artist_id=${artistId}&archive_only=true&limit=500`);
-      targetArchives = Array.isArray(res?.items)
-        ? res.items.filter(item => item && (item.media_type === 'archive' || item.is_archive))
-        : [];
+      const pageSize = 500;
+      let offset = 0;
+      const allItems = [];
+      while (true) {
+        const res = await API.get(
+          `/api/items?artist_id=${artistId}&archive_only=true&limit=${pageSize}&offset=${offset}`,
+        );
+        const batch = Array.isArray(res?.items) ? res.items : [];
+        allItems.push(
+          ...batch.filter(item => item && (item.media_type === 'archive' || item.is_archive)),
+        );
+        if (batch.length < pageSize) break;
+        offset += batch.length;
+      }
+      targetArchives = allItems.filter(isBatchExtractableArchiveItem);
     } catch (e) {
       toast('获取画师压缩包列表失败：' + (e.message || e), 'error');
       return;
     }
   } else {
-    targetArchives = Array.isArray(batchArchiveOptions?.selectedArchives)
-      ? batchArchiveOptions.selectedArchives
-      : [];
+    targetArchives = (
+      Array.isArray(batchArchiveOptions?.selectedArchives)
+        ? batchArchiveOptions.selectedArchives
+        : []
+    ).filter(isBatchExtractableArchiveItem);
   }
 
   if (targetArchives.length === 0) {
@@ -699,7 +749,7 @@ export async function executeBatchArchiveExtraction() {
   } else if (failed > 0) {
     toast(t('批量解压完成：成功 {succeeded} 个，失败 {failed} 个', {succeeded, failed}), 'warn');
   } else if (skippedPwd > 0) {
-    toast(recycleSource
+    toast(recycleSource && succeeded > 0
       ? t('批量解压完成：成功 {succeeded} 个，跳过 {skipped} 个需密码，原文件已移入回收站', {succeeded, skipped: skippedPwd})
       : t('批量解压完成：成功 {succeeded} 个，跳过 {skipped} 个需密码', {succeeded, skipped: skippedPwd}), 'warn');
   } else {

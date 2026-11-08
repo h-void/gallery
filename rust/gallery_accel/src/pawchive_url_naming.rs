@@ -823,10 +823,8 @@ impl<'a> PostNamingContext<'a> {
         let safe_title = sanitize_path_component(self.title);
         let date_val = if self.date.is_empty() { "" } else { &self.date };
 
-        let ext = Path::new(&safe_name)
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let (_, compound_ext) = crate::media_type::split_filename_stem_and_ext(&safe_name);
+        let ext = compound_ext.strip_prefix('.').unwrap_or(compound_ext);
         let out = self.fill_template(
             trimmed,
             [
@@ -839,8 +837,12 @@ impl<'a> PostNamingContext<'a> {
             ],
         );
         let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
-        let mut out =
-            safe_download_name(&out, &safe_download_name(&safe_name, "unnamed_attachment"));
+        let trimmed_out = out.trim().trim_matches(|c| c == '.' || c == ' ');
+        let mut out = if trimmed_out.is_empty() {
+            safe_download_name(&safe_name, "unnamed_attachment")
+        } else {
+            trimmed_out.to_string()
+        };
         // Compare against the real extension, not `Path::extension()`'s
         // "anything after the last dot": a title like "Part 2.5" made the
         // rendered name look like it already carried one, and the attachment
@@ -853,7 +855,10 @@ impl<'a> PostNamingContext<'a> {
             out.push('.');
             out.push_str(ext);
         }
-        sanitize_path_component(&out)
+        sanitize_path_component(&safe_download_name(
+            &out,
+            &safe_download_name(&safe_name, "unnamed_attachment"),
+        ))
     }
 
     /// Substitute only tokens in the template, never braces inside source data.
@@ -925,13 +930,10 @@ pub(super) fn clamp_name_bytes(name: &str, max_bytes: usize) -> String {
     if name.len() <= max_bytes {
         return name.to_string();
     }
-    let (stem, extension) = match name.rfind('.') {
-        Some(index) if index > 0 => (&name[..index], &name[index..]),
-        _ => (name, ""),
-    };
+    let (stem, extension) = crate::media_type::split_filename_stem_and_ext(name);
     // A pathological extension (a name that is mostly a "." suffix) must not
     // consume the budget and leave an empty stem.
-    let keep_extension = extension.len() <= max_bytes / 4;
+    let keep_extension = !extension.is_empty() && extension.len() <= max_bytes / 4;
     let (stem, extension) = if keep_extension {
         (stem, extension)
     } else {

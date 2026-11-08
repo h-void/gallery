@@ -865,6 +865,19 @@ export function renderArchiveWorkbench() {
     const confirmBtnMarkup = isAutoOrganize
       ? `<span class="archive-auto-hint" title="${t('自动整理开启时，全库扫描完成后自动处理')}">${t('自动就绪')}</span>`
       : `<button class="btn btn-ghost" type="button" data-archive-plan-confirm="${planId}" ${locked || !canConfirm ? 'disabled' : ''}>${confirmLabel}</button>`;
+    const candidateDates = (plan.status === 'date_conflict' || plan.status === 'needs_date') && Array.isArray(plan.candidate_dates)
+      ? plan.candidate_dates.filter(item => item && item.date)
+      : [];
+    const candidateDatesMarkup = candidateDates.length ? `
+        <div class="archive-plan-date-candidates">
+          <span class="diff-tag">${escHtml(t('选用日期'))}</span>
+          ${candidateDates.map(item => {
+            const d = String(item.date || '');
+            const c = Number(item.count || 0);
+            const label = c > 0 ? `${d} (${c})` : d;
+            return `<button class="btn btn-ghost archive-date-candidate-btn" type="button" data-archive-plan-pick-date="${escHtml(d)}" data-archive-plan-folder="${escHtml(String(plan.source_folder || ''))}" title="${escHtml(t('将该文件夹统一设为 {date}', {date: d}))}">${escHtml(label)}</button>`;
+          }).join('')}
+        </div>` : '';
     return `
       <div class="archive-plan-row${plan.status === 'executed' ? ' executed' : ''}${plan.status === 'reverted' ? ' reverted' : ''}" data-archive-plan-id="${planId}">
         <div class="archive-plan-row-head">
@@ -883,12 +896,13 @@ export function renderArchiveWorkbench() {
           </div>
         </div>
         ${explanation ? `<div class="archive-plan-preview${plan.status === 'aligned' ? '' : ' blocked'}">${escHtml(explanation)}</div>` : ''}
+        ${candidateDatesMarkup}
         <div class="archive-plan-row-actions">
           <span>${plan.file_count ? t('{count} 项', {count: plan.file_count}) : ''}</span>
           <div class="archive-plan-row-controls">
             <button class="btn btn-ghost" type="button" data-archive-plan-jump="${planId}" title="${t('在画库中定位对应文件夹')}">${t('在画库中定位')}</button>
             ${plan.status === 'needs_tags' ? `<button class="btn btn-ghost" type="button" data-archive-plan-annotate="${planId}" title="${t('为该文件夹设置角色')}">${t('设置角色')}</button>` : ''}
-            ${plan.status === 'needs_date' ? `<button class="btn btn-ghost" type="button" data-archive-plan-annotate="${planId}" title="${t('为该文件夹设置日期')}">${t('设置日期')}</button>` : ''}
+            ${(plan.status === 'needs_date' || plan.status === 'date_conflict') ? `<button class="btn btn-ghost" type="button" data-archive-plan-annotate="${planId}" title="${t('为该文件夹设置日期')}">${t('设置日期')}</button>` : ''}
             ${confirmBtnMarkup}
             ${plan.status === 'executed' && !isSplit ? `<button class="btn btn-ops" type="button" data-archive-plan-undo="${planId}" ${canUndo ? '' : 'disabled'} ${undoing ? 'aria-busy="true"' : ''}>${undoing ? '撤销中' : '撤销整理'}</button>` : ''}
           </div>
@@ -1100,7 +1114,7 @@ export async function annotateArchivePlan(planId) {
   // Each gap gets its own fix: needs_tags lacks roles, needs_date lacks a valid
   // date. The date gap cannot be closed by tagging, so it asks for a date and
   // sends the manual_date the annotate endpoint already accepts.
-  if (plan.status === 'needs_date') {
+  if (plan.status === 'needs_date' || plan.status === 'date_conflict') {
     const rawDate = window.prompt(`${t('为「{plan}」设置日期（YYYY-MM 或 YYYY-MM-DD）：', {plan: plan.source_folder})}`);
     if (rawDate == null || !rawDate.trim()) return;
     const manualDate = rawDate.trim();
@@ -1134,5 +1148,27 @@ export async function annotateArchivePlan(planId) {
     await loadArchiveWorkbench({keepPreview: true});
   } catch (e) {
     toast('设置角色失败：' + (e.message || e), 'error');
+  }
+}
+
+export async function pickArchivePlanDate(sourceFolder, dateValue) {
+  const folder = String(sourceFolder || '').trim();
+  const manualDate = String(dateValue || '').trim();
+  const aid = Number(archiveCurrentArtistId());
+  if (!folder || !manualDate || !aid) return;
+  if (isActionBusy('archive-plan-pick-date', `${aid}:${folder}`)) return;
+  setActionBusy('archive-plan-pick-date', `${aid}:${folder}`, true);
+  try {
+    await API.postJson('/api/folders/annotate', {
+      artist_id: aid,
+      folder,
+      manual_date: manualDate,
+    });
+    toast(`${t('已设置日期 {manualDate}', {manualDate})}`, 'success');
+    await loadArchiveWorkbench({keepPreview: true});
+  } catch (e) {
+    toast('设置日期失败：' + (e.message || e), 'error');
+  } finally {
+    setActionBusy('archive-plan-pick-date', `${aid}:${folder}`, false);
   }
 }

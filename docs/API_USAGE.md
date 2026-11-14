@@ -1,6 +1,6 @@
 # Gallery HTTP API 调用规范与工作流指南（AI Agent 专用）
 
-> **用途说明**：本文档专为**用户侧的多模态 / 编码 AI Agent**（如 Claude Code、Codex、Cursor、Antigravity 等）编写。用户可将本文档直接作为上下文或 Skill 提供给自己的 Agent，使 Agent 能够通过 HTTP REST API 安全、自主地完成画师作品检索、压缩包解压、BLAKE3 去重、多模态看图角色识别与聚类打标、目录归档以及网盘任务派发。
+> **用途说明**：本文档专为**用户侧的多模态与编码 AI Agent** 编写。用户可将本文档直接作为上下文或 Skill 提供给自己的 Agent，使 Agent 能够通过 HTTP REST API 安全、自主地完成画师作品检索、压缩包解压、BLAKE3 去重、多模态看图角色识别与聚类打标、目录归档以及网盘任务派发。
 
 ---
 
@@ -277,7 +277,7 @@ Content-Type: application/json
 
 ---
 
-### 工作流 F：创作者订阅（Pawchive）与 JDownloader 网盘任务派发
+### 工作流 F：创作者订阅与 JDownloader 网盘任务派发
 
 1. **检查 JDownloader 桥接状态**：
    - 调用 `GET /api/netdisk/connection`，确认返回 `connected: true` 且 `handshaked: true`。
@@ -430,7 +430,7 @@ def gallery_api(method: str, path: str, data=None, params=None, timeout: int = 6
 | `POST` | `/api/characters/clusters/commit` | JSON：`{"artist_id": int, "decisions": [...]}` |
 | `GET` / `PUT` / `POST` | `/api/ml-runtime/status`, `/api/ml-runtime/settings`, `/api/ml-runtime/retry` | 查询推理后端与模型下载进度、切换镜像源（`official`\|`china`）或重试 |
 
-### 5.6 创作者订阅（Pawchive）与 JDownloader 网盘桥接
+### 5.6 创作者订阅与 JDownloader 网盘桥接
 | 方法 | 路径 | 请求参数 / 载荷要点 |
 | --- | --- | --- |
 | `GET` / `POST` / `DELETE` | `/api/pawchive/subscriptions`, `/{id}`, `/{id}/toggle`, `/{id}/mode`, `/{id}/summary`, `/{id}/posts` | 创作者订阅增删改查、启停切换、覆盖率摘要与帖子列表 |

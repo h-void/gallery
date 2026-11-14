@@ -140,7 +140,7 @@ Most deployments need no manual tuning. In Docker, customize settings via `.env`
 
 ## AI Agent & HTTP API
 
-Gallery exposes a complete HTTP REST API and ships with [`docs/API_USAGE.md`](docs/API_USAGE.md), an operational playbook written specifically for multimodal and coding AI Agents (Claude Code, Codex, Cursor, Antigravity, etc.). Point your Agent to [`docs/API_USAGE.md`](docs/API_USAGE.md) as context or a skill so it can autonomously inspect artist portfolios, test passwords and unpack archives, deduplicate via BLAKE3, run multimodal character clustering and tagging, execute folder archiving, and dispatch JDownloader tasks under built-in approval guardrails.
+Gallery exposes a complete HTTP REST API and ships with [`docs/API_USAGE.md`](docs/API_USAGE.md), an operational playbook written for multimodal and coding AI Agents. Point your Agent to [`docs/API_USAGE.md`](docs/API_USAGE.md) as context or a skill so it can autonomously inspect artist portfolios, test passwords and unpack archives, deduplicate via BLAKE3, run multimodal character clustering and tagging, execute folder archiving, and dispatch JDownloader tasks under built-in approval guardrails.
 
 ---
 

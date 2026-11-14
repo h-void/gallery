@@ -140,7 +140,7 @@ Gallery 提供原生 fnOS 安装包（FPK），单一 Rust 二进制直接运行
 
 ## AI Agent 与 HTTP API
 
-Gallery 原生提供完整的 REST API，并随仓库附带专为多模态与编码 AI Agent（Claude Code、Codex、Cursor、Antigravity 等）编写的行动指南 [`docs/API_USAGE.md`](docs/API_USAGE.md)。将 [`docs/API_USAGE.md`](docs/API_USAGE.md) 作为上下文或 Skill 提供给你的 Agent，即可让其按内置安全护栏自动执行画师盘点、压缩包试密解压、BLAKE3 去重、多模态看图角色聚类与打标、目录归档及 JDownloader 网盘任务投递。
+Gallery 原生提供完整的 REST API，并随仓库附带专为多模态与编码 AI Agent 编写的行动指南 [`docs/API_USAGE.md`](docs/API_USAGE.md)。将 [`docs/API_USAGE.md`](docs/API_USAGE.md) 作为上下文或 Skill 提供给你的 Agent，即可让其按内置安全护栏自动执行画师盘点、压缩包试密解压、BLAKE3 去重、多模态看图角色聚类与打标、目录归档及 JDownloader 网盘任务投递。
 
 ---
 
